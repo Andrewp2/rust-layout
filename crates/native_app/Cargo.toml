@@ -1,0 +1,51 @@
+[package]
+name = "native_app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+default = ["native"]
+native = ["eframe/default_fonts", "eframe/wgpu", "eframe/x11", "eframe/wayland"]
+web = ["eframe/default_fonts", "eframe/glow", "eframe/wgpu"]
+
+[lib]
+name = "fabricad_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fabricad"
+path = "src/main.rs"
+required-features = ["native"]
+
+[dependencies]
+drc = { path = "../drc" }
+eframe.workspace = true
+egui.workspace = true
+egui-wgpu.workspace = true
+geometry_core = { path = "../geometry_core" }
+layout_model = { path = "../layout_model" }
+pollster.workspace = true
+renderer = { path = "../renderer" }
+router = { path = "../router" }
+serde_json.workspace = true
+uuid.workspace = true
+web-time.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+futures-util.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen.workspace = true
+web-sys = { workspace = true, features = [
+	"CloseEvent",
+	"ErrorEvent",
+	"Event",
+	"Location",
+	"MessageEvent",
+	"WebSocket",
+	"Window",
+] }

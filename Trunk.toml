@@ -1,0 +1,4 @@
+[build]
+target = "crates/wasm_app/index.html"
+dist = "dist"
+

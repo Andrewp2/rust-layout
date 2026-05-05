@@ -1,0 +1,156 @@
+{
+  "name": "Fabricad high-density process",
+  "dbu_per_micron": 1000,
+  "grid": 5,
+  "layers": [
+    {
+      "id": 1,
+      "name": "diffusion",
+      "process": "diffusion",
+      "purpose": "active silicon",
+      "color": [0.08, 0.68, 0.36, 0.4],
+      "display_order": 10,
+      "gds_layer": 11,
+      "gds_datatype": 0,
+      "gds_texttype": 0,
+      "visible": true,
+      "locked": false
+    },
+    {
+      "id": 2,
+      "name": "poly",
+      "process": "poly",
+      "purpose": "gate polysilicon",
+      "color": [0.95, 0.53, 0.16, 0.46],
+      "display_order": 20,
+      "gds_layer": 12,
+      "gds_datatype": 0,
+      "gds_texttype": 0,
+      "visible": true,
+      "locked": false
+    },
+    {
+      "id": 3,
+      "name": "contact",
+      "process": "contact",
+      "purpose": "diffusion/poly to metal1 cut",
+      "color": [0.95, 0.95, 0.82, 0.84],
+      "display_order": 30,
+      "gds_layer": 13,
+      "gds_datatype": 0,
+      "gds_texttype": 0,
+      "visible": true,
+      "locked": false
+    },
+    {
+      "id": 4,
+      "name": "metal1",
+      "process": "metal1",
+      "purpose": "first routing metal",
+      "color": [0.1, 0.62, 1.0, 0.44],
+      "display_order": 40,
+      "gds_layer": 14,
+      "gds_datatype": 0,
+      "gds_texttype": 0,
+      "visible": true,
+      "locked": false
+    },
+    {
+      "id": 5,
+      "name": "via1",
+      "process": "via1",
+      "purpose": "metal1 to metal2 cut",
+      "color": [0.74, 0.58, 1.0, 0.76],
+      "display_order": 50,
+      "gds_layer": 15,
+      "gds_datatype": 0,
+      "gds_texttype": 0,
+      "visible": true,
+      "locked": false
+    },
+    {
+      "id": 6,
+      "name": "metal2",
+      "process": "metal2",
+      "purpose": "second routing metal",
+      "color": [0.92, 0.15, 0.47, 0.4],
+      "display_order": 60,
+      "gds_layer": 16,
+      "gds_datatype": 0,
+      "gds_texttype": 0,
+      "visible": true,
+      "locked": false
+    },
+    {
+      "id": 7,
+      "name": "oxide",
+      "process": "oxide",
+      "purpose": "oxide mask",
+      "color": [0.3, 0.82, 0.95, 0.2],
+      "display_order": 70,
+      "gds_layer": 17,
+      "gds_datatype": 0,
+      "gds_texttype": 0,
+      "visible": true,
+      "locked": false
+    },
+    {
+      "id": 8,
+      "name": "annotation",
+      "process": "annotation",
+      "purpose": "labels and measurements",
+      "color": [0.95, 0.95, 0.95, 0.92],
+      "display_order": 100,
+      "gds_layer": 18,
+      "gds_datatype": 0,
+      "gds_texttype": 0,
+      "visible": true,
+      "locked": false
+    }
+  ],
+  "connectivity": [
+    {
+      "from": "diffusion",
+      "through": "contact",
+      "to": "metal1"
+    },
+    {
+      "from": "metal1",
+      "through": "via1",
+      "to": "metal2"
+    }
+  ],
+  "drc": {
+    "min_width": [
+      { "layer": "diffusion", "value": 120 },
+      { "layer": "poly", "value": 90 },
+      { "layer": "contact", "value": 80 },
+      { "layer": "metal1", "value": 150 },
+      { "layer": "via1", "value": 90 },
+      { "layer": "metal2", "value": 170 },
+      { "layer": "oxide", "value": 220 }
+    ],
+    "min_spacing": [
+      { "layer": "diffusion", "value": 110 },
+      { "layer": "poly", "value": 90 },
+      { "layer": "contact", "value": 80 },
+      { "layer": "metal1", "value": 150 },
+      { "layer": "via1", "value": 90 },
+      { "layer": "metal2", "value": 170 },
+      { "layer": "oxide", "value": 130 }
+    ],
+    "via_enclosure": [
+      { "via": "contact", "enclosure": "diffusion", "required": 40 },
+      { "via": "contact", "enclosure": "metal1", "required": 40 },
+      { "via": "via1", "enclosure": "metal1", "required": 45 },
+      { "via": "via1", "enclosure": "metal2", "required": 45 }
+    ],
+    "forbidden_overlaps": [
+      {
+        "a": "poly",
+        "b": "metal2",
+        "name": "poly_metal2_forbidden_overlap"
+      }
+    ]
+  }
+}
