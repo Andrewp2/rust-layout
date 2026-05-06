@@ -1,6 +1,7 @@
 #[cfg(target_arch = "wasm32")]
 use std::{cell::RefCell, rc::Rc};
 use std::{
+    cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     fs,
     path::PathBuf,
@@ -25,6 +26,7 @@ use layout_model::{
 use renderer::gpu::OffscreenRenderRequest;
 use renderer::gpu::{
     BufferUploadResult, GpuPickRequest, GpuUploadStats, LayoutGpuRenderer, ViewUniforms,
+    Viewport3dRenderer, Viewport3dUniforms, viewport_3d_target_size,
 };
 use router::{RouteRequest, RouterConfig, route};
 use uuid::Uuid;
@@ -37,9 +39,13 @@ use wasm_bindgen::{JsCast, closure::Closure};
 
 const SAVE_PATH: &str = "examples/fabricad_layout.json";
 const GDS_PATH: &str = "examples/fabricad_layout.gds";
+#[cfg(target_arch = "wasm32")]
+const WASM_AUTOSAVE_KEY: &str = "fabricad.autosave.document";
 const MAX_LORO_SEED_OBJECTS: usize = 5_000;
 const MAX_CONNECTIVITY_OBJECTS: usize = 50_000;
 const TILE_MEMORY_BUDGET_BYTES: usize = 96 * 1024 * 1024;
+const MAX_3D_FACES: usize = 24_000;
+const CAMERA_NEAR_PLANE: f32 = 10.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tool {
@@ -50,6 +56,278 @@ enum Tool {
     Via,
     Measure,
     Route,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ViewMode {
+    Layout2d,
+    Layout3d,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnitDisplay {
+    Auto,
+    Nanometers,
+    Microns,
+    Dbu,
+}
+
+impl UnitDisplay {
+    const ALL: [Self; 4] = [Self::Auto, Self::Nanometers, Self::Microns, Self::Dbu];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Nanometers => "Nanometers",
+            Self::Microns => "Microns",
+            Self::Dbu => "DBU",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditorTheme {
+    Dark,
+    Light,
+}
+
+impl EditorTheme {
+    const ALL: [Self; 2] = [Self::Dark, Self::Light];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Dark => "Dark",
+            Self::Light => "Light",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct EditorSettings {
+    snap_enabled: bool,
+    show_grid_2d: bool,
+    show_grid_3d: bool,
+    show_origin_marker: bool,
+    min_grid_pixels: f32,
+    units: UnitDisplay,
+    unit_precision: usize,
+    theme: EditorTheme,
+    autosave_enabled: bool,
+    autosave_interval_seconds: u64,
+    single_key_shortcuts: bool,
+}
+
+impl Default for EditorSettings {
+    fn default() -> Self {
+        Self {
+            snap_enabled: true,
+            show_grid_2d: true,
+            show_grid_3d: true,
+            show_origin_marker: true,
+            min_grid_pixels: 24.0,
+            units: UnitDisplay::Auto,
+            unit_precision: 2,
+            theme: EditorTheme::Dark,
+            autosave_enabled: false,
+            autosave_interval_seconds: 30,
+            single_key_shortcuts: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Camera3d {
+    position: Vec3f,
+    yaw: f32,
+    pitch: f32,
+    speed: f32,
+    fov_y: f32,
+}
+
+impl Default for Camera3d {
+    fn default() -> Self {
+        Self {
+            position: Vec3f::new(-8_000.0, -9_000.0, 6_000.0),
+            yaw: 45.0_f32.to_radians(),
+            pitch: -28.0_f32.to_radians(),
+            speed: 4_000.0,
+            fov_y: 58.0_f32.to_radians(),
+        }
+    }
+}
+
+impl Camera3d {
+    fn look_at(position: Vec3f, target: Vec3f, speed: f32) -> Self {
+        let direction = (target - position).normalized();
+        let yaw = direction.y.atan2(direction.x);
+        let horizontal = (direction.x * direction.x + direction.y * direction.y).sqrt();
+        let pitch = direction.z.atan2(horizontal);
+        Self {
+            position,
+            yaw,
+            pitch: pitch.clamp(-1.45, 1.45),
+            speed: speed.max(100.0),
+            fov_y: 58.0_f32.to_radians(),
+        }
+    }
+
+    fn forward(self) -> Vec3f {
+        let (yaw_sin, yaw_cos) = self.yaw.sin_cos();
+        let (pitch_sin, pitch_cos) = self.pitch.sin_cos();
+        Vec3f::new(yaw_cos * pitch_cos, yaw_sin * pitch_cos, pitch_sin).normalized()
+    }
+
+    fn right(self) -> Vec3f {
+        Vec3f::new(-self.yaw.sin(), self.yaw.cos(), 0.0)
+    }
+
+    fn up(self) -> Vec3f {
+        self.forward().cross(self.right()).normalized()
+    }
+
+    fn basis(self) -> CameraBasis {
+        CameraBasis {
+            forward: self.forward(),
+            right: self.right(),
+            up: self.up(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Vec3f {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+impl Vec3f {
+    const ZERO: Self = Self::new(0.0, 0.0, 0.0);
+
+    const fn new(x: f32, y: f32, z: f32) -> Self {
+        Self { x, y, z }
+    }
+
+    fn dot(self, other: Self) -> f32 {
+        self.x * other.x + self.y * other.y + self.z * other.z
+    }
+
+    fn cross(self, other: Self) -> Self {
+        Self::new(
+            self.y * other.z - self.z * other.y,
+            self.z * other.x - self.x * other.z,
+            self.x * other.y - self.y * other.x,
+        )
+    }
+
+    fn length(self) -> f32 {
+        self.dot(self).sqrt()
+    }
+
+    fn normalized(self) -> Self {
+        let length = self.length();
+        if length <= f32::EPSILON {
+            Self::ZERO
+        } else {
+            self / length
+        }
+    }
+}
+
+impl std::ops::Add for Vec3f {
+    type Output = Self;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        Self::new(self.x + rhs.x, self.y + rhs.y, self.z + rhs.z)
+    }
+}
+
+impl std::ops::AddAssign for Vec3f {
+    fn add_assign(&mut self, rhs: Self) {
+        *self = *self + rhs;
+    }
+}
+
+impl std::ops::Sub for Vec3f {
+    type Output = Self;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        Self::new(self.x - rhs.x, self.y - rhs.y, self.z - rhs.z)
+    }
+}
+
+impl std::ops::Mul<f32> for Vec3f {
+    type Output = Self;
+
+    fn mul(self, rhs: f32) -> Self::Output {
+        Self::new(self.x * rhs, self.y * rhs, self.z * rhs)
+    }
+}
+
+impl std::ops::Div<f32> for Vec3f {
+    type Output = Self;
+
+    fn div(self, rhs: f32) -> Self::Output {
+        Self::new(self.x / rhs, self.y / rhs, self.z / rhs)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CameraBasis {
+    forward: Vec3f,
+    right: Vec3f,
+    up: Vec3f,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CameraPoint3d {
+    x: f32,
+    y: f32,
+    depth: f32,
+}
+
+impl CameraPoint3d {
+    fn lerp(self, other: Self, t: f32) -> Self {
+        Self {
+            x: self.x + (other.x - self.x) * t,
+            y: self.y + (other.y - self.y) * t,
+            depth: self.depth + (other.depth - self.depth) * t,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FaceSurface3d {
+    Side,
+    Top,
+}
+
+impl FaceSurface3d {
+    fn draw_order(self) -> u8 {
+        match self {
+            Self::Side => 0,
+            Self::Top => 1,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Face3d {
+    surface: FaceSurface3d,
+    order: usize,
+    points: Vec<Vec3f>,
+    fill: Color32,
+    stroke: Color32,
+}
+
+#[derive(Clone, Debug)]
+struct ProjectedFace {
+    surface: FaceSurface3d,
+    depth: f32,
+    order: usize,
+    points: Vec<Pos2>,
+    fill: Color32,
+    stroke: Color32,
 }
 
 #[derive(Clone, Debug)]
@@ -194,8 +472,13 @@ pub struct FabricadApp {
     selected_occurrence: Option<ShapeOccurrenceId>,
     active_layer: LayerId,
     tool: Tool,
+    view_mode: ViewMode,
     zoom: f32,
     pan: Vec2,
+    camera_3d: Camera3d,
+    settings: EditorSettings,
+    show_options: bool,
+    show_diagnostics: bool,
     drawing_start: Option<Point>,
     drawing_points: Vec<Point>,
     measure_start: Option<Point>,
@@ -210,6 +493,7 @@ pub struct FabricadApp {
     clipboard_shapes: Vec<Shape>,
     perf: PerfStats,
     last_drc_run: Instant,
+    last_autosave: Instant,
     status: String,
     user_id: Uuid,
     loro_log: LoroCrdtLog,
@@ -232,6 +516,8 @@ pub struct FabricadApp {
 pub struct StartupOptions {
     pub stress_count: Option<usize>,
     pub hierarchy_demo: bool,
+    pub view_3d: bool,
+    pub show_options: bool,
     pub select_first_shape: bool,
     pub move_first_vertex: bool,
     pub zoom: Option<f32>,
@@ -345,7 +631,7 @@ impl FabricadApp {
         let violations = run_drc(&document, &rules);
         let connectivity =
             connectivity_report_for_document(&document, &technologies[active_technology]);
-        Self {
+        let mut app = Self {
             document,
             index,
             technologies,
@@ -359,8 +645,13 @@ impl FabricadApp {
             selected_occurrence: None,
             active_layer,
             tool: Tool::Select,
+            view_mode: ViewMode::Layout2d,
             zoom: 0.075,
             pan: Vec2::ZERO,
+            camera_3d: Camera3d::default(),
+            settings: EditorSettings::default(),
+            show_options: false,
+            show_diagnostics: false,
             drawing_start: None,
             drawing_points: Vec::new(),
             measure_start: None,
@@ -375,6 +666,7 @@ impl FabricadApp {
             clipboard_shapes: Vec::new(),
             perf: PerfStats::default(),
             last_drc_run: Instant::now(),
+            last_autosave: Instant::now(),
             status: "ready".to_string(),
             user_id,
             loro_log,
@@ -394,7 +686,9 @@ impl FabricadApp {
             collab: None,
             cell_name_drafts: BTreeMap::new(),
             instance_name_drafts: BTreeMap::new(),
-        }
+        };
+        app.reset_3d_camera_to_document();
+        app
     }
 
     pub fn new_with_options(cc: &eframe::CreationContext<'_>, options: StartupOptions) -> Self {
@@ -426,6 +720,7 @@ impl FabricadApp {
             app.rerun_drc();
             app.status = format!("test scene: {count} polygons");
         }
+        app.reset_3d_camera_to_document();
         if let Some(zoom) = options.zoom {
             app.zoom = zoom.clamp(0.008, 4.0);
         }
@@ -440,6 +735,13 @@ impl FabricadApp {
         }
         if options.hierarchy_workflow_demo {
             app.apply_hierarchy_workflow_demo();
+        }
+        if options.view_3d {
+            app.view_mode = ViewMode::Layout3d;
+            app.reset_3d_camera_to_document();
+        }
+        if options.show_options {
+            app.show_options = true;
         }
         app
     }
@@ -512,6 +814,67 @@ impl FabricadApp {
             .min(self.technologies.len().saturating_sub(1))]
     }
 
+    fn snap_grid(&self) -> Coord {
+        self.document.grid.max(1)
+    }
+
+    fn snap_point(&self, point: Point) -> Point {
+        if self.settings.snap_enabled {
+            point.snap(self.snap_grid())
+        } else {
+            point
+        }
+    }
+
+    fn edit_step(&self) -> f64 {
+        self.snap_grid() as f64
+    }
+
+    fn minimum_draw_size(&self) -> Coord {
+        if self.settings.snap_enabled {
+            self.snap_grid()
+        } else {
+            1
+        }
+    }
+
+    fn set_document_grid(&mut self, grid: Coord) {
+        let grid = grid.clamp(1, 10_000_000);
+        if self.document.grid == grid {
+            return;
+        }
+        self.document.grid = grid;
+        self.reset_render_cache();
+        self.status = format!("grid spacing set to {grid} dbu");
+    }
+
+    fn format_length(&self, length_dbu: f64) -> String {
+        format_physical_length_with_options(
+            length_dbu,
+            self.current_technology().dbu_per_micron,
+            self.settings.units,
+            self.settings.unit_precision,
+        )
+    }
+
+    fn apply_theme(&self, ctx: &egui::Context) {
+        match self.settings.theme {
+            EditorTheme::Dark => ctx.set_visuals(egui::Visuals::dark()),
+            EditorTheme::Light => ctx.set_visuals(egui::Visuals::light()),
+        }
+    }
+
+    fn maybe_autosave(&mut self) {
+        if !self.settings.autosave_enabled {
+            return;
+        }
+        let interval = Duration::from_secs(self.settings.autosave_interval_seconds.max(5));
+        if self.last_autosave.elapsed() >= interval {
+            self.autosave_document();
+            self.last_autosave = Instant::now();
+        }
+    }
+
     fn rebuild_rules_from_technology(&mut self) {
         let technology = self.current_technology();
         match RuleDeck::from_technology(&self.document, technology) {
@@ -552,6 +915,7 @@ impl FabricadApp {
         self.reset_render_cache();
         self.rebuild_indexes();
         self.rerun_drc();
+        self.reset_3d_camera_to_document();
         self.status = format!("technology: {}", self.current_technology().name);
     }
 
@@ -1317,7 +1681,7 @@ impl FabricadApp {
         let Some(bounds) = shape_bounds(self.clipboard_shapes.iter()) else {
             return;
         };
-        let target = self.last_view_center.snap(self.document.grid);
+        let target = self.snap_point(self.last_view_center);
         let center = bounds.center();
         let delta = Vector::new(target.x - center.x, target.y - center.y);
         self.add_copied_shapes(delta, "pasted");
@@ -1330,7 +1694,7 @@ impl FabricadApp {
             return;
         }
         self.clipboard_shapes = shapes;
-        let offset = (self.document.grid.max(10) * 8).max(80);
+        let offset = (self.snap_grid().max(10) * 8).max(80);
         self.add_copied_shapes(Vector::new(offset, -offset), "duplicated");
     }
 
@@ -1559,7 +1923,7 @@ impl FabricadApp {
         else {
             return;
         };
-        let origin = bounds.min.snap(self.document.grid);
+        let origin = self.snap_point(bounds.min);
         let origin_delta = Vector::new(-origin.x, -origin.y);
         let cell_id = self.document.allocate_cell_id();
         let instance_id = self.document.allocate_instance_id();
@@ -1635,7 +1999,7 @@ impl FabricadApp {
             return;
         };
         let instance_id = self.document.allocate_instance_id();
-        let location = self.last_view_center.snap(self.document.grid);
+        let location = self.snap_point(self.last_view_center);
         let instance = CellInstance {
             id: instance_id,
             name: Some(format!("{} inst", cell.name)),
@@ -1674,9 +2038,118 @@ impl FabricadApp {
         match serde_json::to_string_pretty(&self.document)
             .and_then(|contents| fs::write(&path, contents).map_err(serde_json::Error::io))
         {
-            Ok(()) => self.status = format!("saved {SAVE_PATH}"),
+            Ok(()) => {
+                self.last_autosave = Instant::now();
+                self.status = format!("saved {SAVE_PATH}");
+            }
             Err(err) => self.status = format!("save failed: {err}"),
         }
+    }
+
+    fn autosave_document(&mut self) {
+        let contents = match serde_json::to_string_pretty(&self.document) {
+            Ok(contents) => contents,
+            Err(err) => {
+                self.status = format!("autosave failed: {err}");
+                return;
+            }
+        };
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            let Some(window) = web_sys::window() else {
+                self.status = "autosave failed: no browser window".to_string();
+                return;
+            };
+            let storage = match window.local_storage() {
+                Ok(Some(storage)) => storage,
+                Ok(None) => {
+                    self.status = "autosave failed: local storage unavailable".to_string();
+                    return;
+                }
+                Err(_) => {
+                    self.status = "autosave failed: local storage blocked".to_string();
+                    return;
+                }
+            };
+            match storage.set_item(WASM_AUTOSAVE_KEY, &contents) {
+                Ok(()) => self.status = "autosaved to browser storage".to_string(),
+                Err(_) => self.status = "autosave failed: browser storage write failed".to_string(),
+            }
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let path = PathBuf::from(SAVE_PATH);
+            if let Some(parent) = path.parent()
+                && let Err(err) = fs::create_dir_all(parent)
+            {
+                self.status = format!("autosave failed: {err}");
+                return;
+            }
+            match fs::write(&path, contents) {
+                Ok(()) => self.status = format!("autosaved {SAVE_PATH}"),
+                Err(err) => self.status = format!("autosave failed: {err}"),
+            }
+        }
+    }
+
+    fn restore_autosave_document(&mut self) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let Some(window) = web_sys::window() else {
+                self.status = "restore failed: no browser window".to_string();
+                return;
+            };
+            let storage = match window.local_storage() {
+                Ok(Some(storage)) => storage,
+                Ok(None) => {
+                    self.status = "restore failed: local storage unavailable".to_string();
+                    return;
+                }
+                Err(_) => {
+                    self.status = "restore failed: local storage blocked".to_string();
+                    return;
+                }
+            };
+            let contents = match storage.get_item(WASM_AUTOSAVE_KEY) {
+                Ok(Some(contents)) => contents,
+                Ok(None) => {
+                    self.status = "restore failed: no browser autosave".to_string();
+                    return;
+                }
+                Err(_) => {
+                    self.status = "restore failed: browser storage read failed".to_string();
+                    return;
+                }
+            };
+            match serde_json::from_str::<Document>(&contents) {
+                Ok(document) => self.replace_document(document, "restored browser autosave"),
+                Err(err) => self.status = format!("restore failed: {err}"),
+            }
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.load_document();
+        }
+    }
+
+    fn replace_document(&mut self, document: Document, label: &str) {
+        self.document = document;
+        self.reset_active_layer();
+        self.rebuild_rules_from_technology();
+        self.undo.clear();
+        self.redo.clear();
+        self.selected.clear();
+        self.selected_occurrence = None;
+        self.clear_edit_drafts();
+        self.reset_loro_log_from_document();
+        self.reset_render_cache();
+        self.rebuild_indexes();
+        self.rerun_drc();
+        self.reset_3d_camera_to_document();
+        self.status = label.to_string();
     }
 
     fn load_document(&mut self) {
@@ -1685,19 +2158,7 @@ impl FabricadApp {
             .and_then(|contents| serde_json::from_str::<Document>(&contents))
         {
             Ok(document) => {
-                self.document = document;
-                self.reset_active_layer();
-                self.rebuild_rules_from_technology();
-                self.undo.clear();
-                self.redo.clear();
-                self.selected.clear();
-                self.selected_occurrence = None;
-                self.clear_edit_drafts();
-                self.reset_loro_log_from_document();
-                self.reset_render_cache();
-                self.rebuild_indexes();
-                self.rerun_drc();
-                self.status = format!("loaded {SAVE_PATH}");
+                self.replace_document(document, &format!("loaded {SAVE_PATH}"));
             }
             Err(err) => self.status = format!("load failed: {err}"),
         }
@@ -1736,19 +2197,7 @@ impl FabricadApp {
         };
         match import_gdsii(&bytes, &technology) {
             Ok(document) => {
-                self.document = document;
-                self.reset_active_layer();
-                self.rebuild_rules_from_technology();
-                self.undo.clear();
-                self.redo.clear();
-                self.selected.clear();
-                self.selected_occurrence = None;
-                self.clear_edit_drafts();
-                self.reset_loro_log_from_document();
-                self.reset_render_cache();
-                self.rebuild_indexes();
-                self.rerun_drc();
-                self.status = format!("imported {GDS_PATH}");
+                self.replace_document(document, &format!("imported {GDS_PATH}"));
             }
             Err(err) => self.status = format!("GDS import failed: {err}"),
         }
@@ -1766,6 +2215,7 @@ impl FabricadApp {
         self.reset_render_cache();
         self.rebuild_indexes();
         self.rerun_drc();
+        self.reset_3d_camera_to_document();
         self.status = format!("generated {count} polygons");
     }
 
@@ -1781,6 +2231,7 @@ impl FabricadApp {
         self.reset_render_cache();
         self.rebuild_indexes();
         self.rerun_drc();
+        self.reset_3d_camera_to_document();
         self.status = "generated hierarchy demo".to_string();
     }
 
@@ -1837,7 +2288,7 @@ impl FabricadApp {
     }
 
     fn route_net_metadata(&self, start: Point, goal: Point) -> RouteNetMetadata {
-        let tolerance = self.document.grid.max(1) * 2;
+        let tolerance = self.snap_grid() * 2;
         let start_component = self.component_at_point(start, tolerance);
         let goal_component = self.component_at_point(goal, tolerance);
         match (start_component, goal_component) {
@@ -1879,23 +2330,25 @@ impl FabricadApp {
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         let wants_keyboard = ctx.wants_keyboard_input();
         ctx.input(|input| {
-            if input.key_pressed(Key::Num1) {
-                self.tool = Tool::Select;
-            }
-            if input.key_pressed(Key::Num2) {
-                self.tool = Tool::Rect;
-            }
-            if input.key_pressed(Key::Num3) {
-                self.tool = Tool::Polygon;
-            }
-            if input.key_pressed(Key::Num4) {
-                self.tool = Tool::Path;
-            }
-            if input.key_pressed(Key::Num5) {
-                self.tool = Tool::Measure;
-            }
-            if input.key_pressed(Key::Num6) {
-                self.tool = Tool::Route;
+            if self.settings.single_key_shortcuts {
+                if input.key_pressed(Key::Num1) {
+                    self.tool = Tool::Select;
+                }
+                if input.key_pressed(Key::Num2) {
+                    self.tool = Tool::Rect;
+                }
+                if input.key_pressed(Key::Num3) {
+                    self.tool = Tool::Polygon;
+                }
+                if input.key_pressed(Key::Num4) {
+                    self.tool = Tool::Path;
+                }
+                if input.key_pressed(Key::Num5) {
+                    self.tool = Tool::Measure;
+                }
+                if input.key_pressed(Key::Num6) {
+                    self.tool = Tool::Route;
+                }
             }
             if input.modifiers.command && input.key_pressed(Key::Z) {
                 self.undo();
@@ -1913,7 +2366,7 @@ impl FabricadApp {
                 if input.modifiers.command && input.key_pressed(Key::D) {
                     self.duplicate_selection();
                 }
-                if !input.modifiers.any() {
+                if self.settings.single_key_shortcuts && !input.modifiers.any() {
                     if input.key_pressed(Key::R) {
                         self.rotate_selected_90();
                     }
@@ -1930,6 +2383,23 @@ impl FabricadApp {
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(&mut self.view_mode, ViewMode::Layout2d, "2D");
+            if ui
+                .selectable_value(&mut self.view_mode, ViewMode::Layout3d, "3D")
+                .clicked()
+            {
+                self.status = "3D flycam view".to_string();
+            }
+            if matches!(self.view_mode, ViewMode::Layout3d) && ui.button("Reset 3D").clicked() {
+                self.reset_3d_camera_to_document();
+            }
+            if matches!(self.view_mode, ViewMode::Layout3d) && ui.button("Up").clicked() {
+                self.nudge_3d_camera_vertical(1.0);
+            }
+            if matches!(self.view_mode, ViewMode::Layout3d) && ui.button("Down").clicked() {
+                self.nudge_3d_camera_vertical(-1.0);
+            }
+            ui.separator();
             tool_button(ui, &mut self.tool, Tool::Select, "Select");
             tool_button(ui, &mut self.tool, Tool::Rect, "Rect");
             tool_button(ui, &mut self.tool, Tool::Polygon, "Poly");
@@ -1983,6 +2453,9 @@ impl FabricadApp {
             if ui.button("Connect").clicked() {
                 self.connect_collaboration();
             }
+            if ui.button("Options").clicked() {
+                self.show_options = true;
+            }
             if ui.button("Make Cell").clicked() {
                 self.create_cell_from_selection();
             }
@@ -2005,6 +2478,165 @@ impl FabricadApp {
         });
     }
 
+    fn options_window(&mut self, ctx: &egui::Context) {
+        if !self.show_options {
+            return;
+        }
+        let mut open = self.show_options;
+        egui::Window::new("Options")
+            .open(&mut open)
+            .resizable(false)
+            .default_width(380.0)
+            .show(ctx, |ui| self.options_ui(ui));
+        self.show_options = open;
+    }
+
+    fn diagnostics_window(&mut self, ctx: &egui::Context) {
+        if !self.show_diagnostics {
+            return;
+        }
+        let mut open = self.show_diagnostics;
+        egui::Window::new("Diagnostics")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(380.0)
+            .show(ctx, |ui| self.diagnostics_ui(ui));
+        self.show_diagnostics = open;
+    }
+
+    fn options_ui(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new("Snapping grid")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.settings.snap_enabled, "Snap");
+                    ui.checkbox(&mut self.settings.show_grid_2d, "2D grid");
+                    ui.checkbox(&mut self.settings.show_grid_3d, "3D grid");
+                });
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.settings.show_origin_marker, "Origin");
+                    ui.label("Min px");
+                    ui.add(
+                        egui::DragValue::new(&mut self.settings.min_grid_pixels)
+                            .range(8.0..=80.0)
+                            .speed(1.0),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Spacing");
+                    let mut grid = self.document.grid;
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut grid)
+                                .range(1..=10_000_000)
+                                .speed(self.edit_step())
+                                .suffix(" dbu"),
+                        )
+                        .changed()
+                    {
+                        self.set_document_grid(grid);
+                    }
+                    if ui.button("Tech").clicked() {
+                        self.set_document_grid(self.current_technology().grid);
+                    }
+                });
+                let dbu_per_micron = self.current_technology().dbu_per_micron.max(1);
+                ui.label(format!(
+                    "{} per snap, {} DBU/um",
+                    self.format_length(self.document.grid as f64),
+                    dbu_per_micron
+                ));
+            });
+
+        egui::CollapsingHeader::new("Units")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Display");
+                    egui::ComboBox::from_id_salt("unit_display_options")
+                        .selected_text(self.settings.units.label())
+                        .show_ui(ui, |ui| {
+                            for unit in UnitDisplay::ALL {
+                                ui.selectable_value(&mut self.settings.units, unit, unit.label());
+                            }
+                        });
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Precision");
+                    ui.add(
+                        egui::DragValue::new(&mut self.settings.unit_precision)
+                            .range(0..=6)
+                            .speed(1),
+                    );
+                    ui.label(format!(
+                        "Preview: {}",
+                        self.format_length((self.document.grid * 25) as f64)
+                    ));
+                });
+            });
+
+        egui::CollapsingHeader::new("Appearance")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Theme");
+                    egui::ComboBox::from_id_salt("theme_options")
+                        .selected_text(self.settings.theme.label())
+                        .show_ui(ui, |ui| {
+                            for theme in EditorTheme::ALL {
+                                ui.selectable_value(&mut self.settings.theme, theme, theme.label());
+                            }
+                        });
+                });
+            });
+
+        egui::CollapsingHeader::new("Autosave")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.settings.autosave_enabled, "Enable");
+                    ui.label("Every");
+                    ui.add(
+                        egui::DragValue::new(&mut self.settings.autosave_interval_seconds)
+                            .range(5..=3_600)
+                            .speed(5)
+                            .suffix(" s"),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Save now").clicked() {
+                        self.save_document();
+                    }
+                    if ui.button("Autosave now").clicked() {
+                        self.autosave_document();
+                        self.last_autosave = Instant::now();
+                    }
+                    if ui.button("Restore").clicked() {
+                        self.restore_autosave_document();
+                    }
+                });
+            });
+
+        egui::CollapsingHeader::new("Input")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.checkbox(
+                    &mut self.settings.single_key_shortcuts,
+                    "Single-key shortcuts",
+                );
+            });
+
+        egui::CollapsingHeader::new("Debug")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.checkbox(&mut self.show_diagnostics, "Diagnostics window");
+                ui.label(format!(
+                    "Frame: {:.2} ms, visible shapes: {}",
+                    self.perf.frame_ms, self.perf.visible_count
+                ));
+            });
+    }
+
     fn technology_panel(&mut self, ui: &mut egui::Ui) {
         ui.label("Technology");
         let mut selected = self.active_technology;
@@ -2021,20 +2653,134 @@ impl FabricadApp {
         }
         let technology = self.current_technology();
         ui.label(format!(
-            "Grid: {} dbu, DBU/um: {}",
-            technology.grid, technology.dbu_per_micron
+            "Grid: {} dbu (tech {}), DBU/um: {}",
+            self.document.grid, technology.grid, technology.dbu_per_micron
         ));
     }
 
-    fn side_panel(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::left("layers")
+    fn status_panel(&mut self, ui: &mut egui::Ui) {
+        ui.label("Status");
+        ui.label(format!("Shapes: {}", self.document.shapes.len()));
+        ui.label(format!("Visible: {}", self.perf.visible_count));
+        ui.label(format!(
+            "DRC markers: {} active / {} total",
+            self.active_marker_count(),
+            self.violations.len()
+        ));
+        ui.label(format!("Frame: {:.2} ms", self.perf.frame_ms));
+        if ui.small_button("Diagnostics...").clicked() {
+            self.show_diagnostics = true;
+        }
+    }
+
+    fn diagnostics_ui(&mut self, ui: &mut egui::Ui) {
+        ui.label("Renderer");
+        ui.label(format!("Visible: {}", self.perf.visible_count));
+        ui.label(format!("Query: {:.3} ms", self.perf.query_ms));
+        ui.label(format!("GPU build: {:.3} ms", self.perf.gpu_build_ms));
+        ui.label(format!("Pick build: {:.3} ms", self.perf.pick_build_ms));
+        ui.label(format!(
+            "GPU geometry: {} verts / {} idx",
+            self.perf.gpu_vertices, self.perf.gpu_indices
+        ));
+        ui.label(format!(
+            "GPU pick: {} verts / {} idx / {}",
+            self.perf.gpu_pick_vertices,
+            self.perf.gpu_pick_indices,
+            self.gpu_pick_label()
+        ));
+        ui.label(format!(
+            "GPU upload: {:.2} MB/frame / {:.2} MB resident",
+            self.perf.gpu_upload_bytes as f64 / (1024.0 * 1024.0),
+            self.perf.gpu_resident_bytes as f64 / (1024.0 * 1024.0)
+        ));
+        ui.label(format!(
+            "GPU buffer cache: {} layout up / {} skip, {} pick up / {} skip",
+            self.perf.gpu_layout_uploads,
+            self.perf.gpu_layout_skips,
+            self.perf.gpu_pick_uploads,
+            self.perf.gpu_pick_skips
+        ));
+
+        ui.separator();
+        ui.label("Tiles");
+        ui.label(format!(
+            "{} visible / {} resident / {} rebuilt / {} dirty / {} evicted",
+            self.perf.tile_visible_count,
+            self.perf.tile_resident_count,
+            self.perf.tile_rebuilt_count,
+            self.perf.tile_dirty_count,
+            self.perf.tile_evicted_count
+        ));
+        ui.label(format!(
+            "Shape cache: {} hit / {} miss / {} resident / {} evicted",
+            self.perf.shape_cache_hits,
+            self.perf.shape_cache_misses,
+            self.perf.resident_shape_batches,
+            self.perf.evicted_shape_batches
+        ));
+        ui.label(format!(
+            "Tile shapes: {} visible / {} pick candidates",
+            self.perf.tile_shape_count, self.perf.tile_pick_shape_count
+        ));
+        ui.label(format!("Draw ranges: {}", self.perf.draw_range_count));
+        ui.label(format!(
+            "LOD: {} tiles / {} summarized / {} precise",
+            self.perf.tile_lod_count,
+            self.perf.tile_lod_shape_count,
+            self.perf.tile_precise_shape_count
+        ));
+        ui.label(format!(
+            "Tile cache: {:.2} / {:.0} MB, over {:.2} MB",
+            self.perf.tile_cache_bytes as f64 / (1024.0 * 1024.0),
+            self.perf.tile_memory_budget_bytes as f64 / (1024.0 * 1024.0),
+            self.perf.tile_over_budget_bytes as f64 / (1024.0 * 1024.0)
+        ));
+
+        ui.separator();
+        ui.label("Analysis");
+        ui.label(format!("Shapes: {}", self.document.shapes.len()));
+        ui.label(format!(
+            "Markers: {} active / {} total",
+            self.active_marker_count(),
+            self.violations.len()
+        ));
+        ui.label(format!("DRC: {:.3} ms", self.perf.drc_ms));
+        ui.label(format!("Net: {:.3} ms", self.perf.connectivity_ms));
+        ui.label(format!("Route: {:.3} ms", self.perf.route_ms));
+        ui.label(format!("Frame: {:.2} ms", self.perf.frame_ms));
+        ui.label(format!(
+            "Batch: {:.2} MB",
+            (self.perf.batch_bytes + self.perf.pick_batch_bytes) as f64 / (1024.0 * 1024.0)
+        ));
+    }
+
+    fn inspector_panel(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::left("inspector")
             .resizable(true)
             .default_width(250.0)
             .show(ctx, |ui| {
-                ui.heading("Fabricad");
-                ui.separator();
-                self.technology_panel(ui);
-                ui.separator();
+                egui::ScrollArea::vertical()
+                    .id_salt("inspector_panel_scroll")
+                    .show(ui, |ui| {
+                        self.technology_panel(ui);
+                        ui.separator();
+                        self.hierarchy_panel(ui);
+                        ui.separator();
+                        self.status_panel(ui);
+                        ui.separator();
+                        self.net_panel(ui);
+                        ui.separator();
+                        self.marker_panel(ui);
+                    });
+            });
+    }
+
+    fn layers_panel(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::right("layers")
+            .resizable(true)
+            .default_width(220.0)
+            .show(ctx, |ui| {
                 ui.label("Layers");
                 let mut visibility_ops = Vec::new();
                 let mut layer_rows: Vec<_> = self
@@ -2053,111 +2799,36 @@ impl FabricadApp {
                     })
                     .collect();
                 layer_rows.sort_by_key(|(id, _, _, _, _, order)| (*order, *id));
-                for (layer_id, name, purpose, color, mut visible, _) in layer_rows {
-                    ui.push_id(("layer_row", layer_id.0), |ui| {
-                        ui.horizontal(|ui| {
-                            let color = layer_color32(color, 1.0);
-                            let (swatch_rect, _) =
-                                ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
-                            ui.painter().rect_filled(swatch_rect, 2.0, color);
-                            if ui
-                                .selectable_label(self.active_layer == layer_id, &name)
-                                .on_hover_text(purpose)
-                                .clicked()
-                            {
-                                self.active_layer = layer_id;
-                            }
-                            if ui.checkbox(&mut visible, "").changed() {
-                                visibility_ops.push((layer_id, visible));
-                            }
-                        });
+                egui::ScrollArea::vertical()
+                    .id_salt("layers_panel_scroll")
+                    .show(ui, |ui| {
+                        for (layer_id, name, purpose, color, mut visible, _) in layer_rows {
+                            ui.push_id(("layer_row", layer_id.0), |ui| {
+                                ui.horizontal(|ui| {
+                                    let color = layer_color32(color, 1.0);
+                                    let (swatch_rect, _) =
+                                        ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
+                                    ui.painter().rect_filled(swatch_rect, 2.0, color);
+                                    if ui
+                                        .selectable_label(self.active_layer == layer_id, &name)
+                                        .on_hover_text(purpose)
+                                        .clicked()
+                                    {
+                                        self.active_layer = layer_id;
+                                    }
+                                    if ui.checkbox(&mut visible, "").changed() {
+                                        visibility_ops.push((layer_id, visible));
+                                    }
+                                });
+                            });
+                        }
                     });
-                }
                 for (layer, visible) in visibility_ops {
                     self.apply_operation_without_history(&Operation::SetLayerVisibility {
                         layer,
                         visible,
                     });
                 }
-                ui.separator();
-                self.hierarchy_panel(ui);
-                ui.separator();
-                ui.label(format!("Shapes: {}", self.document.shapes.len()));
-                ui.label(format!("Visible: {}", self.perf.visible_count));
-                ui.label(format!(
-                    "Markers: {} active / {} total",
-                    self.active_marker_count(),
-                    self.violations.len()
-                ));
-                ui.label(format!("Query: {:.3} ms", self.perf.query_ms));
-                ui.label(format!("GPU build: {:.3} ms", self.perf.gpu_build_ms));
-                ui.label(format!("Pick build: {:.3} ms", self.perf.pick_build_ms));
-                ui.label(format!(
-                    "GPU geometry: {} verts / {} idx",
-                    self.perf.gpu_vertices, self.perf.gpu_indices
-                ));
-                ui.label(format!(
-                    "GPU pick: {} verts / {} idx / {}",
-                    self.perf.gpu_pick_vertices,
-                    self.perf.gpu_pick_indices,
-                    self.gpu_pick_label()
-                ));
-                ui.label(format!(
-                    "GPU upload: {:.2} MB/frame / {:.2} MB resident",
-                    self.perf.gpu_upload_bytes as f64 / (1024.0 * 1024.0),
-                    self.perf.gpu_resident_bytes as f64 / (1024.0 * 1024.0)
-                ));
-                ui.label(format!(
-                    "GPU buffer cache: {} layout up / {} skip, {} pick up / {} skip",
-                    self.perf.gpu_layout_uploads,
-                    self.perf.gpu_layout_skips,
-                    self.perf.gpu_pick_uploads,
-                    self.perf.gpu_pick_skips
-                ));
-                ui.label(format!(
-                    "Tiles: {} visible / {} resident / {} rebuilt / {} dirty / {} evicted",
-                    self.perf.tile_visible_count,
-                    self.perf.tile_resident_count,
-                    self.perf.tile_rebuilt_count,
-                    self.perf.tile_dirty_count,
-                    self.perf.tile_evicted_count
-                ));
-                ui.label(format!(
-                    "Shape cache: {} hit / {} miss / {} resident / {} evicted",
-                    self.perf.shape_cache_hits,
-                    self.perf.shape_cache_misses,
-                    self.perf.resident_shape_batches,
-                    self.perf.evicted_shape_batches
-                ));
-                ui.label(format!(
-                    "Tile shapes: {} visible / {} pick candidates",
-                    self.perf.tile_shape_count, self.perf.tile_pick_shape_count
-                ));
-                ui.label(format!("Draw ranges: {}", self.perf.draw_range_count));
-                ui.label(format!(
-                    "LOD: {} tiles / {} summarized / {} precise",
-                    self.perf.tile_lod_count,
-                    self.perf.tile_lod_shape_count,
-                    self.perf.tile_precise_shape_count
-                ));
-                ui.label(format!("DRC: {:.3} ms", self.perf.drc_ms));
-                ui.label(format!("Net: {:.3} ms", self.perf.connectivity_ms));
-                ui.label(format!("Route: {:.3} ms", self.perf.route_ms));
-                ui.label(format!("Frame: {:.2} ms", self.perf.frame_ms));
-                ui.label(format!(
-                    "Batch: {:.2} MB",
-                    (self.perf.batch_bytes + self.perf.pick_batch_bytes) as f64 / (1024.0 * 1024.0)
-                ));
-                ui.label(format!(
-                    "Tile cache: {:.2} / {:.0} MB, over {:.2} MB",
-                    self.perf.tile_cache_bytes as f64 / (1024.0 * 1024.0),
-                    self.perf.tile_memory_budget_bytes as f64 / (1024.0 * 1024.0),
-                    self.perf.tile_over_budget_bytes as f64 / (1024.0 * 1024.0)
-                ));
-                ui.separator();
-                self.net_panel(ui);
-                ui.separator();
-                self.marker_panel(ui);
             });
     }
 
@@ -2387,9 +3058,9 @@ impl FabricadApp {
             let mut y = info.translation.dy;
             ui.horizontal(|ui| {
                 ui.label("X");
-                ui.add(egui::DragValue::new(&mut x).speed(self.document.grid.max(1) as f64));
+                ui.add(egui::DragValue::new(&mut x).speed(self.edit_step()));
                 ui.label("Y");
-                ui.add(egui::DragValue::new(&mut y).speed(self.document.grid.max(1) as f64));
+                ui.add(egui::DragValue::new(&mut y).speed(self.edit_step()));
             });
             let delta = Vector::new(x - info.translation.dx, y - info.translation.dy);
             if delta != Vector::ZERO {
@@ -2417,27 +3088,15 @@ impl FabricadApp {
             });
             ui.horizontal(|ui| {
                 ui.label("Col dx");
-                ui.add(
-                    egui::DragValue::new(&mut array.column_pitch.dx)
-                        .speed(self.document.grid.max(1) as f64),
-                );
+                ui.add(egui::DragValue::new(&mut array.column_pitch.dx).speed(self.edit_step()));
                 ui.label("dy");
-                ui.add(
-                    egui::DragValue::new(&mut array.column_pitch.dy)
-                        .speed(self.document.grid.max(1) as f64),
-                );
+                ui.add(egui::DragValue::new(&mut array.column_pitch.dy).speed(self.edit_step()));
             });
             ui.horizontal(|ui| {
                 ui.label("Row dx");
-                ui.add(
-                    egui::DragValue::new(&mut array.row_pitch.dx)
-                        .speed(self.document.grid.max(1) as f64),
-                );
+                ui.add(egui::DragValue::new(&mut array.row_pitch.dx).speed(self.edit_step()));
                 ui.label("dy");
-                ui.add(
-                    egui::DragValue::new(&mut array.row_pitch.dy)
-                        .speed(self.document.grid.max(1) as f64),
-                );
+                ui.add(egui::DragValue::new(&mut array.row_pitch.dy).speed(self.edit_step()));
             });
             let array = array.normalized();
             if array != info.array {
@@ -2519,7 +3178,7 @@ impl FabricadApp {
         }
 
         ui.separator();
-        shape_kind_property_ui(ui, &mut edited.kind, self.document.grid);
+        shape_kind_property_ui(ui, &mut edited.kind, self.snap_grid());
 
         if edited != original {
             self.replace_shape(id, original, edited, "updated properties");
@@ -2612,7 +3271,7 @@ impl FabricadApp {
         let Some(first) = editable_vertex_points(&shape.kind).first().copied() else {
             return;
         };
-        let moved = Point::new(first.x - 500, first.y + 420).snap(self.document.grid);
+        let moved = Point::new(first.x - 500, first.y + 420).snap(self.snap_grid());
         if let Some(new_shape) = shape_with_moved_vertex(&shape, 0, moved) {
             self.document
                 .apply_operation_without_log(&Operation::ReplaceShape {
@@ -2713,6 +3372,26 @@ impl FabricadApp {
         self.pan = vec2(-(center.x as f32) * self.zoom, center.y as f32 * self.zoom);
     }
 
+    fn reset_3d_camera_to_document(&mut self) {
+        let bounds = self
+            .layout_bounds()
+            .unwrap_or_else(|| Rect::new(Point::new(-5_000, -5_000), Point::new(5_000, 5_000)));
+        let center = bounds.center();
+        let span = bounds.width().abs().max(bounds.height().abs()).max(1_000) as f32;
+        let target = Vec3f::new(center.x as f32, center.y as f32, 360.0);
+        let position = Vec3f::new(
+            center.x as f32 - span * 0.85,
+            center.y as f32 - span * 0.95,
+            span * 0.62 + 1_800.0,
+        );
+        self.camera_3d = Camera3d::look_at(position, target, span.max(2_000.0) * 0.85);
+    }
+
+    fn nudge_3d_camera_vertical(&mut self, direction: f32) {
+        let amount = (self.camera_3d.speed * 0.18).clamp(120.0, 4_000.0);
+        self.camera_3d.position += Vec3f::new(0.0, 0.0, direction.signum() * amount);
+    }
+
     fn canvas(&mut self, ui: &mut egui::Ui) {
         let frame_start = Instant::now();
         let available = ui.available_size_before_wrap();
@@ -2740,15 +3419,13 @@ impl FabricadApp {
                 }
             }
             if let Some(pointer) = response.hover_pos() {
-                let world = self
-                    .screen_to_world(pointer, canvas)
-                    .snap(self.document.grid);
+                let world = self.snap_point(self.screen_to_world(pointer, canvas));
                 self.broadcast_cursor(world);
             }
         }
 
         let viewport = self.viewport_world(canvas);
-        self.last_view_center = viewport.center().snap(self.document.grid);
+        self.last_view_center = self.snap_point(viewport.center());
         self.draw_background(&painter, canvas, viewport);
         let query_started = Instant::now();
         let visible_occurrences = self.index.query_occurrences(viewport);
@@ -2853,8 +3530,467 @@ impl FabricadApp {
         self.perf.frame_ms = frame_start.elapsed().as_secs_f64() * 1000.0;
     }
 
+    fn canvas_3d(&mut self, ui: &mut egui::Ui) {
+        let available = ui.available_size_before_wrap();
+        let (response, painter) = ui.allocate_painter(available, Sense::click_and_drag());
+        let canvas = response.rect;
+        if canvas.width() <= 1.0 || canvas.height() <= 1.0 {
+            return;
+        }
+
+        self.handle_3d_input(ui, &response);
+        let face_count = if let Some(target_format) = self.gpu_target_format {
+            let (batch, face_count) = self.build_3d_render_batch();
+            painter.add(egui_wgpu::Callback::new_paint_callback(
+                canvas,
+                Viewport3dGpuCallback {
+                    batch,
+                    uniforms: self.viewport_3d_uniforms(canvas),
+                    viewport_size: [canvas.width(), canvas.height()],
+                    target_format,
+                },
+            ));
+            face_count
+        } else {
+            painter.rect_filled(canvas, 0.0, Color32::from_rgb(8, 11, 14));
+            self.draw_3d_ground_grid(&painter, canvas);
+            self.draw_3d_layout_cpu_fallback(&painter, canvas)
+        };
+        self.draw_3d_hud(&painter, canvas, face_count);
+    }
+
+    fn handle_3d_input(&mut self, ui: &egui::Ui, response: &egui::Response) {
+        if response.dragged_by(PointerButton::Primary)
+            || response.dragged_by(PointerButton::Secondary)
+        {
+            let delta = ui.input(|input| input.pointer.delta());
+            self.camera_3d.yaw += delta.x * 0.006;
+            self.camera_3d.pitch = (self.camera_3d.pitch - delta.y * 0.006).clamp(-1.45, 1.45);
+        }
+
+        if !response.hovered() && !response.has_focus() && !response.dragged() {
+            return;
+        }
+
+        let basis = self.camera_3d.basis();
+        ui.input(|input| {
+            let mut direction = Vec3f::ZERO;
+            if input.key_down(Key::W) || input.key_down(Key::ArrowUp) {
+                direction += basis.forward;
+            }
+            if input.key_down(Key::S) || input.key_down(Key::ArrowDown) {
+                direction += basis.forward * -1.0;
+            }
+            if input.key_down(Key::D) || input.key_down(Key::ArrowRight) {
+                direction += basis.right;
+            }
+            if input.key_down(Key::A) || input.key_down(Key::ArrowLeft) {
+                direction += basis.right * -1.0;
+            }
+            if input.key_down(Key::Space) {
+                direction += Vec3f::new(0.0, 0.0, 1.0);
+            }
+            if input.key_down(Key::E) {
+                direction += Vec3f::new(0.0, 0.0, 1.0);
+            }
+            if input.key_down(Key::Q) {
+                direction += Vec3f::new(0.0, 0.0, -1.0);
+            }
+
+            let speed = if input.modifiers.shift {
+                self.camera_3d.speed * 3.0
+            } else {
+                self.camera_3d.speed
+            };
+            let dt = input.stable_dt.clamp(1.0 / 240.0, 1.0 / 20.0);
+            if direction.length() > 0.0 {
+                self.camera_3d.position += direction.normalized() * speed * dt;
+            }
+
+            let scroll = input.raw_scroll_delta.y;
+            if scroll.abs() > 0.0 {
+                self.camera_3d.position += basis.forward * scroll * self.camera_3d.speed * 0.0015;
+            }
+        });
+    }
+
+    fn build_3d_render_batch(&self) -> (renderer::RenderBatch3d, usize) {
+        let mut faces = Vec::new();
+        for flattened in self.document.visible_flattened_shapes() {
+            let shape = flattened.transformed_shape();
+            self.add_shape_3d_faces(&mut faces, &shape);
+            if faces.len() >= MAX_3D_FACES {
+                break;
+            }
+        }
+
+        let face_count = faces.len();
+        let mut batch = renderer::RenderBatch3d::default();
+        for face in &faces {
+            append_face_to_3d_batch(&mut batch, face);
+        }
+        self.append_3d_scene_guides(&mut batch);
+        (batch, face_count)
+    }
+
+    fn draw_3d_layout_cpu_fallback(&self, painter: &Painter, canvas: EguiRect) -> usize {
+        let mut faces = Vec::new();
+        for flattened in self.document.visible_flattened_shapes() {
+            let shape = flattened.transformed_shape();
+            self.add_shape_3d_faces(&mut faces, &shape);
+            if faces.len() >= MAX_3D_FACES {
+                break;
+            }
+        }
+
+        let basis = self.camera_3d.basis();
+        let mut projected = Vec::with_capacity(faces.len());
+        for face in faces {
+            let clipped = self.clip_3d_face_to_near_plane(&face.points, basis);
+            if clipped.len() < 3 {
+                continue;
+            }
+
+            let mut points = Vec::with_capacity(clipped.len());
+            let mut depth = 0.0;
+            for point in &clipped {
+                points.push(self.project_camera_point(*point, canvas));
+                depth += point.depth;
+            }
+            let average_depth = depth / points.len() as f32;
+            projected.push(ProjectedFace {
+                surface: face.surface,
+                depth: average_depth,
+                order: face.order,
+                points,
+                fill: face.fill,
+                stroke: face.stroke,
+            });
+        }
+
+        projected.sort_by(compare_projected_faces_3d_cpu_fallback);
+        let rendered = projected.len();
+        for face in projected {
+            painter.add(egui::Shape::convex_polygon(
+                face.points,
+                face.fill,
+                Stroke::new(0.75, face.stroke),
+            ));
+        }
+        rendered
+    }
+
+    fn viewport_3d_uniforms(&self, canvas: EguiRect) -> Viewport3dUniforms {
+        Viewport3dUniforms::from_view_projection(self.view_projection_3d(canvas))
+    }
+
+    fn view_projection_3d(&self, canvas: EguiRect) -> [f32; 16] {
+        let basis = self.camera_3d.basis();
+        let aspect = (canvas.width() / canvas.height()).max(0.001);
+        let y_scale = 1.0 / (self.camera_3d.fov_y * 0.5).tan();
+        let x_scale = y_scale / aspect;
+        let near = CAMERA_NEAR_PLANE.max(0.001);
+        let far = self.camera_3d_far_plane().max(near + 1.0);
+        let z_scale = far / (far - near);
+        let z_bias = -near * far / (far - near);
+        let camera = self.camera_3d.position;
+
+        let rows = [
+            [
+                basis.right.x * x_scale,
+                basis.right.y * x_scale,
+                basis.right.z * x_scale,
+                -camera.dot(basis.right) * x_scale,
+            ],
+            [
+                basis.up.x * y_scale,
+                basis.up.y * y_scale,
+                basis.up.z * y_scale,
+                -camera.dot(basis.up) * y_scale,
+            ],
+            [
+                basis.forward.x * z_scale,
+                basis.forward.y * z_scale,
+                basis.forward.z * z_scale,
+                -camera.dot(basis.forward) * z_scale + z_bias,
+            ],
+            [
+                basis.forward.x,
+                basis.forward.y,
+                basis.forward.z,
+                -camera.dot(basis.forward),
+            ],
+        ];
+        row_major_4x4_to_column_major(rows)
+    }
+
+    fn camera_3d_far_plane(&self) -> f32 {
+        let Some(bounds) = self.layout_bounds() else {
+            return 100_000.0;
+        };
+        let max_layer_z = self.document.layers.len().max(1) as f32 * 320.0 + 2_000.0;
+        let corners = [
+            Vec3f::new(bounds.min.x as f32, bounds.min.y as f32, 0.0),
+            Vec3f::new(bounds.max.x as f32, bounds.min.y as f32, 0.0),
+            Vec3f::new(bounds.max.x as f32, bounds.max.y as f32, 0.0),
+            Vec3f::new(bounds.min.x as f32, bounds.max.y as f32, 0.0),
+            Vec3f::new(bounds.min.x as f32, bounds.min.y as f32, max_layer_z),
+            Vec3f::new(bounds.max.x as f32, bounds.min.y as f32, max_layer_z),
+            Vec3f::new(bounds.max.x as f32, bounds.max.y as f32, max_layer_z),
+            Vec3f::new(bounds.min.x as f32, bounds.max.y as f32, max_layer_z),
+        ];
+        let forward = self.camera_3d.forward();
+        let max_forward_depth = corners
+            .into_iter()
+            .map(|corner| (corner - self.camera_3d.position).dot(forward))
+            .fold(CAMERA_NEAR_PLANE * 4.0, f32::max);
+        let margin =
+            bounds.width().abs().max(bounds.height().abs()).max(1_000) as f32 * 0.15 + max_layer_z;
+        (max_forward_depth + margin).max(50_000.0)
+    }
+
+    fn add_shape_3d_faces(&self, faces: &mut Vec<Face3d>, shape: &Shape) {
+        if faces.len() >= MAX_3D_FACES {
+            return;
+        }
+        let Some((base_z, top_z, color)) = self.layer_3d_style(shape.layer) else {
+            return;
+        };
+        match &shape.kind {
+            ShapeKind::Rectangle(rect) => {
+                add_slab_faces(faces, &rect.corners(), base_z, top_z, color);
+            }
+            ShapeKind::Polygon(poly) if poly.points.len() >= 3 => {
+                add_slab_faces(faces, &poly.points, base_z, top_z, color);
+            }
+            ShapeKind::Path { points, width } => {
+                for segment in points.windows(2) {
+                    if let [a, b] = segment {
+                        add_path_segment_3d_faces(faces, *a, *b, *width, base_z, top_z, color);
+                    }
+                    if faces.len() >= MAX_3D_FACES {
+                        break;
+                    }
+                }
+            }
+            ShapeKind::Via { center, size, .. } => {
+                let half = *size / 2;
+                let rect = Rect::new(
+                    Point::new(center.x - half, center.y - half),
+                    Point::new(center.x + half, center.y + half),
+                );
+                add_slab_faces(faces, &rect.corners(), base_z, top_z + 120.0, color);
+            }
+            ShapeKind::Label { .. } | ShapeKind::Measurement { .. } | ShapeKind::Polygon(_) => {}
+        }
+    }
+
+    fn draw_3d_ground_grid(&self, painter: &Painter, canvas: EguiRect) {
+        if !self.settings.show_grid_3d {
+            return;
+        }
+        let bounds = self
+            .layout_bounds()
+            .unwrap_or_else(|| Rect::new(Point::new(-5_000, -5_000), Point::new(5_000, 5_000)));
+        let span = bounds.width().abs().max(bounds.height().abs()).max(1_000);
+        let expanded = bounds.expanded(span / 2);
+        let step = nice_scale_length_dbu((span as f32 / 10.0).max(self.snap_grid() as f32));
+        let basis = self.camera_3d.basis();
+        let stroke = Stroke::new(1.0, Color32::from_rgba_unmultiplied(115, 150, 160, 80));
+
+        let min_x = expanded.min.x.div_euclid(step) * step;
+        let max_x = expanded.max.x.div_euclid(step) * step + step;
+        let min_y = expanded.min.y.div_euclid(step) * step;
+        let max_y = expanded.max.y.div_euclid(step) * step + step;
+        let mut x = min_x;
+        while x <= max_x {
+            self.draw_3d_line(
+                painter,
+                canvas,
+                basis,
+                Vec3f::new(x as f32, min_y as f32, 0.0),
+                Vec3f::new(x as f32, max_y as f32, 0.0),
+                stroke,
+            );
+            x += step;
+        }
+        let mut y = min_y;
+        while y <= max_y {
+            self.draw_3d_line(
+                painter,
+                canvas,
+                basis,
+                Vec3f::new(min_x as f32, y as f32, 0.0),
+                Vec3f::new(max_x as f32, y as f32, 0.0),
+                stroke,
+            );
+            y += step;
+        }
+    }
+
+    fn append_3d_scene_guides(&self, batch: &mut renderer::RenderBatch3d) {
+        if !self.settings.show_grid_3d {
+            return;
+        }
+        let bounds = self
+            .layout_bounds()
+            .unwrap_or_else(|| Rect::new(Point::new(-5_000, -5_000), Point::new(5_000, 5_000)));
+        let span = bounds.width().abs().max(bounds.height().abs()).max(1_000);
+        let expanded = bounds.expanded(span / 2);
+        let step = nice_scale_length_dbu((span as f32 / 10.0).max(self.snap_grid() as f32));
+        let min_x = expanded.min.x.div_euclid(step) * step;
+        let max_x = expanded.max.x.div_euclid(step) * step + step;
+        let min_y = expanded.min.y.div_euclid(step) * step;
+        let max_y = expanded.max.y.div_euclid(step) * step + step;
+        let grid_color = color32_to_gpu(Color32::from_rgba_unmultiplied(115, 150, 160, 82));
+        let major_color = color32_to_gpu(Color32::from_rgba_unmultiplied(170, 200, 204, 118));
+        let x_axis_color = color32_to_gpu(Color32::from_rgba_unmultiplied(235, 96, 90, 190));
+        let y_axis_color = color32_to_gpu(Color32::from_rgba_unmultiplied(90, 210, 138, 190));
+
+        let mut x = min_x;
+        while x <= max_x {
+            let color = if x == 0 || x % (step * 5) == 0 {
+                major_color
+            } else {
+                grid_color
+            };
+            append_guide_line_to_3d_batch(
+                batch,
+                Vec3f::new(x as f32, min_y as f32, 0.0),
+                Vec3f::new(x as f32, max_y as f32, 0.0),
+                if x == 0 { x_axis_color } else { color },
+            );
+            x += step;
+        }
+
+        let mut y = min_y;
+        while y <= max_y {
+            let color = if y == 0 || y % (step * 5) == 0 {
+                major_color
+            } else {
+                grid_color
+            };
+            append_guide_line_to_3d_batch(
+                batch,
+                Vec3f::new(min_x as f32, y as f32, 0.0),
+                Vec3f::new(max_x as f32, y as f32, 0.0),
+                if y == 0 { y_axis_color } else { color },
+            );
+            y += step;
+        }
+    }
+
+    fn draw_3d_line(
+        &self,
+        painter: &Painter,
+        canvas: EguiRect,
+        basis: CameraBasis,
+        a: Vec3f,
+        b: Vec3f,
+        stroke: Stroke,
+    ) {
+        let a = self.camera_space_3d_point(a, basis);
+        let b = self.camera_space_3d_point(b, basis);
+        let Some((a, b)) = clip_camera_line_to_near(a, b, CAMERA_NEAR_PLANE) else {
+            return;
+        };
+        painter.line_segment(
+            [
+                self.project_camera_point(a, canvas),
+                self.project_camera_point(b, canvas),
+            ],
+            stroke,
+        );
+    }
+
+    fn draw_3d_hud(&self, painter: &Painter, canvas: EguiRect, face_count: usize) {
+        let position = self.camera_3d.position;
+        let text = format!(
+            "3D flycam  faces: {}  xyz: {:.0}, {:.0}, {:.0}",
+            face_count, position.x, position.y, position.z
+        );
+        painter.text(
+            canvas.left_top() + vec2(12.0, 12.0),
+            Align2::LEFT_TOP,
+            text,
+            FontId::monospace(12.0),
+            Color32::from_rgb(220, 232, 228),
+        );
+    }
+
+    fn camera_space_3d_point(&self, point: Vec3f, basis: CameraBasis) -> CameraPoint3d {
+        let relative = point - self.camera_3d.position;
+        CameraPoint3d {
+            x: relative.dot(basis.right),
+            y: relative.dot(basis.up),
+            depth: relative.dot(basis.forward),
+        }
+    }
+
+    fn project_camera_point(&self, point: CameraPoint3d, canvas: EguiRect) -> Pos2 {
+        let focal = 0.5 * canvas.height() / (0.5 * self.camera_3d.fov_y).tan();
+        canvas.center()
+            + vec2(
+                point.x * focal / point.depth,
+                -point.y * focal / point.depth,
+            )
+    }
+
+    fn clip_3d_face_to_near_plane(
+        &self,
+        points: &[Vec3f],
+        basis: CameraBasis,
+    ) -> Vec<CameraPoint3d> {
+        let camera_points: Vec<_> = points
+            .iter()
+            .map(|point| self.camera_space_3d_point(*point, basis))
+            .collect();
+        clip_camera_polygon_to_near(&camera_points, CAMERA_NEAR_PLANE)
+    }
+
+    fn layer_3d_style(&self, layer_id: LayerId) -> Option<(f32, f32, Color32)> {
+        let layer = self.document.layers.get(&layer_id)?;
+        if !layer.visible || matches!(layer.process, ProcessLayer::Annotation) {
+            return None;
+        }
+        let mut layer_order: Vec<_> = self
+            .document
+            .layers
+            .values()
+            .filter(|layer| !matches!(layer.process, ProcessLayer::Annotation))
+            .map(|layer| (layer.display_order, layer.id))
+            .collect();
+        layer_order.sort_unstable();
+        let index = layer_order
+            .iter()
+            .position(|(_, id)| *id == layer_id)
+            .unwrap_or(0) as f32;
+        let base_z = index * 170.0;
+        let thickness = match layer.process {
+            ProcessLayer::Contact | ProcessLayer::Via1 => 240.0,
+            ProcessLayer::Oxide => 55.0,
+            _ => 95.0,
+        };
+        Some((base_z, base_z + thickness, layer_color_3d(layer.color)))
+    }
+
+    fn layout_bounds(&self) -> Option<Rect> {
+        self.document
+            .visible_flattened_shapes()
+            .into_iter()
+            .map(|shape| shape.bounds)
+            .reduce(|left, right| left.union(right))
+    }
+
     fn draw_background(&self, painter: &Painter, canvas: EguiRect, viewport: Rect) {
         painter.rect_filled(canvas, 0.0, Color32::from_rgb(13, 16, 18));
+        if !self.settings.show_grid_2d {
+            if self.settings.show_origin_marker {
+                let origin = self.world_to_screen(Point::ZERO, canvas);
+                painter.circle_filled(origin, 3.0, Color32::from_rgb(220, 220, 210));
+            }
+            return;
+        }
         let grid = self.grid_step_for_zoom();
         let min_x = viewport.min.x.div_euclid(grid) * grid;
         let max_x = viewport.max.x.div_euclid(grid) * grid + grid;
@@ -2882,8 +4018,10 @@ impl FabricadApp {
             let b = self.world_to_screen(Point::new(max_x, y), canvas);
             painter.line_segment([a, b], stroke);
         }
-        let origin = self.world_to_screen(Point::ZERO, canvas);
-        painter.circle_filled(origin, 3.0, Color32::from_rgb(220, 220, 210));
+        if self.settings.show_origin_marker {
+            let origin = self.world_to_screen(Point::ZERO, canvas);
+            painter.circle_filled(origin, 3.0, Color32::from_rgb(220, 220, 210));
+        }
     }
 
     fn draw_scale_bar(&self, painter: &Painter, canvas: EguiRect) {
@@ -2900,7 +4038,7 @@ impl FabricadApp {
         let baseline = canvas.bottom() - 22.0;
         let right = left + length_px;
         let tick_top = baseline - 8.0;
-        let label = format_scale_label(length_dbu, self.current_technology().dbu_per_micron);
+        let label = self.format_length(length_dbu as f64);
         let text_pos = Pos2::new((left + right) * 0.5, tick_top - 5.0);
         let bg = EguiRect::from_min_max(
             Pos2::new(left - 10.0, tick_top - 26.0),
@@ -3290,9 +4428,7 @@ impl FabricadApp {
         let Some(pointer) = ui.input(|input| input.pointer.hover_pos()) else {
             return;
         };
-        let current = self
-            .screen_to_world(pointer, canvas)
-            .snap(self.document.grid);
+        let current = self.snap_point(self.screen_to_world(pointer, canvas));
         match self.tool {
             Tool::Rect => {
                 if let Some(start) = self.drawing_start {
@@ -3388,9 +4524,7 @@ impl FabricadApp {
         let Some(pointer) = response.interact_pointer_pos() else {
             return;
         };
-        let world = self
-            .screen_to_world(pointer, canvas)
-            .snap(self.document.grid);
+        let world = self.snap_point(self.screen_to_world(pointer, canvas));
         if ui.input(|input| input.key_pressed(Key::Escape)) {
             self.drawing_start = None;
             self.drawing_points.clear();
@@ -3423,7 +4557,7 @@ impl FabricadApp {
         pointer: Pos2,
         world: Point,
     ) {
-        let tolerance = (10.0 / self.zoom).max(self.document.grid as f32) as Coord;
+        let tolerance = (10.0 / self.zoom).max(self.snap_grid() as f32) as Coord;
         if response.double_clicked() {
             if let Some(edge) = self.hit_selected_edge(world, tolerance) {
                 self.insert_vertex(edge.shape, edge.edge, world);
@@ -3554,9 +4688,8 @@ impl FabricadApp {
         if response.drag_stopped_by(PointerButton::Primary) {
             if let Some(start) = self.drawing_start.take() {
                 let rect = Rect::new(start, world);
-                if rect.width().abs() >= self.document.grid
-                    && rect.height().abs() >= self.document.grid
-                {
+                let minimum_size = self.minimum_draw_size();
+                if rect.width().abs() >= minimum_size && rect.height().abs() >= minimum_size {
                     self.add_shape(self.active_layer, ShapeKind::Rectangle(rect));
                 }
             }
@@ -3628,10 +4761,7 @@ impl FabricadApp {
                     ShapeKind::Measurement {
                         a: start,
                         b: world,
-                        label: format_physical_length(
-                            distance,
-                            self.current_technology().dbu_per_micron,
-                        ),
+                        label: self.format_length(distance),
                     },
                 );
             } else {
@@ -3691,9 +4821,9 @@ impl FabricadApp {
     }
 
     fn grid_step_for_zoom(&self) -> Coord {
-        let target_px = 24.0;
-        let raw = (target_px / self.zoom).max(self.document.grid as f32) as Coord;
-        let base = self.document.grid.max(1);
+        let target_px = self.settings.min_grid_pixels.clamp(8.0, 80.0);
+        let raw = (target_px / self.zoom).max(self.snap_grid() as f32) as Coord;
+        let base = self.snap_grid();
         let mut step = base;
         while step < raw {
             step *= 2;
@@ -3704,11 +4834,19 @@ impl FabricadApp {
 
 impl eframe::App for FabricadApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.apply_theme(ctx);
         self.poll_collaboration();
+        self.maybe_autosave();
         self.handle_shortcuts(ctx);
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| self.toolbar(ui));
-        self.side_panel(ctx);
-        egui::CentralPanel::default().show(ctx, |ui| self.canvas(ui));
+        self.inspector_panel(ctx);
+        self.layers_panel(ctx);
+        self.options_window(ctx);
+        self.diagnostics_window(ctx);
+        egui::CentralPanel::default().show(ctx, |ui| match self.view_mode {
+            ViewMode::Layout2d => self.canvas(ui),
+            ViewMode::Layout3d => self.canvas_3d(ui),
+        });
         ctx.request_repaint();
     }
 }
@@ -3729,6 +4867,13 @@ type SharedGpuPickState = Arc<Mutex<GpuPickState>>;
 
 type SharedGpuUploadState = Arc<Mutex<GpuUploadStats>>;
 
+struct Viewport3dGpuCallback {
+    batch: renderer::RenderBatch3d,
+    uniforms: Viewport3dUniforms,
+    viewport_size: [f32; 2],
+    target_format: egui_wgpu::wgpu::TextureFormat,
+}
+
 struct LayoutGpuCallback {
     batch: renderer::RenderBatch,
     pick_batch: Option<renderer::PickBatch>,
@@ -3737,6 +4882,49 @@ struct LayoutGpuCallback {
     upload_state: SharedGpuUploadState,
     uniforms: ViewUniforms,
     target_format: egui_wgpu::wgpu::TextureFormat,
+}
+
+impl egui_wgpu::CallbackTrait for Viewport3dGpuCallback {
+    fn prepare(
+        &self,
+        device: &egui_wgpu::wgpu::Device,
+        queue: &egui_wgpu::wgpu::Queue,
+        screen_descriptor: &egui_wgpu::ScreenDescriptor,
+        egui_encoder: &mut egui_wgpu::wgpu::CommandEncoder,
+        callback_resources: &mut egui_wgpu::CallbackResources,
+    ) -> Vec<egui_wgpu::wgpu::CommandBuffer> {
+        if callback_resources.get::<Viewport3dRenderer>().is_none() {
+            callback_resources.insert(Viewport3dRenderer::new(device, self.target_format));
+        }
+        if let Some(resources) = callback_resources.get_mut::<Viewport3dRenderer>() {
+            resources.upload(device, queue, &self.batch, self.uniforms);
+            let target_size =
+                viewport_3d_target_size(self.viewport_size, screen_descriptor.pixels_per_point);
+            resources.render_to_texture(
+                device,
+                egui_encoder,
+                target_size,
+                egui_wgpu::wgpu::Color {
+                    r: 8.0 / 255.0,
+                    g: 11.0 / 255.0,
+                    b: 14.0 / 255.0,
+                    a: 1.0,
+                },
+            );
+        }
+        Vec::new()
+    }
+
+    fn paint(
+        &self,
+        _info: egui::PaintCallbackInfo,
+        render_pass: &mut egui_wgpu::wgpu::RenderPass<'static>,
+        callback_resources: &egui_wgpu::CallbackResources,
+    ) {
+        if let Some(resources) = callback_resources.get::<Viewport3dRenderer>() {
+            resources.paint(render_pass);
+        }
+    }
 }
 
 impl egui_wgpu::CallbackTrait for LayoutGpuCallback {
@@ -3922,28 +5110,59 @@ fn nice_scale_length_dbu(target_dbu: f32) -> Coord {
     (multiplier * exponent).round().max(1.0) as Coord
 }
 
+#[cfg(test)]
 fn format_scale_label(length_dbu: Coord, dbu_per_micron: Coord) -> String {
     format_physical_length(length_dbu as f64, dbu_per_micron)
 }
 
+#[cfg(test)]
 fn format_physical_length(length_dbu: f64, dbu_per_micron: Coord) -> String {
+    format_physical_length_with_options(length_dbu, dbu_per_micron, UnitDisplay::Auto, 2)
+}
+
+fn format_physical_length_with_options(
+    length_dbu: f64,
+    dbu_per_micron: Coord,
+    units: UnitDisplay,
+    precision: usize,
+) -> String {
     let microns = length_dbu / dbu_per_micron.max(1) as f64;
-    if microns.abs() < 1.0 {
-        let nanometers = microns * 1_000.0;
-        if nanometers.abs() >= 100.0 {
-            format!("{nanometers:.0} nm")
-        } else if nanometers.abs() >= 10.0 {
-            format!("{nanometers:.1} nm")
-        } else {
-            format!("{nanometers:.2} nm")
+    match units {
+        UnitDisplay::Auto if microns.abs() < 1.0 => {
+            let nanometers = microns * 1_000.0;
+            let precision = if nanometers.abs() >= 100.0 {
+                0
+            } else if nanometers.abs() >= 10.0 {
+                precision.min(1)
+            } else {
+                precision.min(3)
+            };
+            format!("{} nm", format_decimal(nanometers, precision))
         }
-    } else if is_effectively_integer(microns) {
-        format!("{microns:.0} um")
-    } else if microns.abs() < 10.0 {
-        format!("{microns:.2} um")
-    } else {
-        format!("{microns:.1} um")
+        UnitDisplay::Auto => {
+            let precision = if is_effectively_integer(microns) {
+                0
+            } else if microns.abs() < 10.0 {
+                precision
+            } else {
+                precision.min(1)
+            };
+            format!("{} um", format_decimal(microns, precision))
+        }
+        UnitDisplay::Nanometers => {
+            format!("{} nm", format_decimal(microns * 1_000.0, precision))
+        }
+        UnitDisplay::Microns => format!("{} um", format_decimal(microns, precision)),
+        UnitDisplay::Dbu => format!("{} dbu", format_decimal(length_dbu, precision.min(3))),
     }
+}
+
+fn format_decimal(value: f64, precision: usize) -> String {
+    let precision = precision.min(6);
+    if precision == 0 || is_effectively_integer(value) {
+        return format!("{value:.0}");
+    }
+    format!("{value:.precision$}")
 }
 
 fn is_effectively_integer(value: f64) -> bool {
@@ -4453,6 +5672,275 @@ fn tool_button(ui: &mut egui::Ui, active: &mut Tool, value: Tool, label: &str) {
     }
 }
 
+fn add_slab_faces(
+    faces: &mut Vec<Face3d>,
+    points: &[Point],
+    base_z: f32,
+    top_z: f32,
+    color: Color32,
+) {
+    if points.len() < 3 || faces.len() >= MAX_3D_FACES {
+        return;
+    }
+    let top: Vec<_> = points
+        .iter()
+        .map(|point| Vec3f::new(point.x as f32, point.y as f32, top_z))
+        .collect();
+    let bottom: Vec<_> = points
+        .iter()
+        .map(|point| Vec3f::new(point.x as f32, point.y as f32, base_z))
+        .collect();
+    push_face(
+        faces,
+        FaceSurface3d::Top,
+        top.clone(),
+        color,
+        shade_color(color, 1.25),
+    );
+
+    for index in 0..points.len() {
+        if faces.len() >= MAX_3D_FACES {
+            return;
+        }
+        let next = (index + 1) % points.len();
+        let side = vec![bottom[index], bottom[next], top[next], top[index]];
+        push_face(
+            faces,
+            FaceSurface3d::Side,
+            side,
+            shade_color(color, 0.62),
+            shade_color(color, 0.92),
+        );
+    }
+}
+
+fn add_path_segment_3d_faces(
+    faces: &mut Vec<Face3d>,
+    a: Point,
+    b: Point,
+    width: Coord,
+    base_z: f32,
+    top_z: f32,
+    color: Color32,
+) {
+    let dx = (b.x - a.x) as f32;
+    let dy = (b.y - a.y) as f32;
+    let length = (dx * dx + dy * dy).sqrt();
+    if length <= f32::EPSILON {
+        return;
+    }
+    let half = width.max(1) as f32 * 0.5;
+    let nx = -dy / length * half;
+    let ny = dx / length * half;
+    let points = [
+        Point::new(
+            (a.x as f32 + nx).round() as Coord,
+            (a.y as f32 + ny).round() as Coord,
+        ),
+        Point::new(
+            (b.x as f32 + nx).round() as Coord,
+            (b.y as f32 + ny).round() as Coord,
+        ),
+        Point::new(
+            (b.x as f32 - nx).round() as Coord,
+            (b.y as f32 - ny).round() as Coord,
+        ),
+        Point::new(
+            (a.x as f32 - nx).round() as Coord,
+            (a.y as f32 - ny).round() as Coord,
+        ),
+    ];
+    add_slab_faces(faces, &points, base_z, top_z, color);
+}
+
+fn push_face(
+    faces: &mut Vec<Face3d>,
+    surface: FaceSurface3d,
+    points: Vec<Vec3f>,
+    fill: Color32,
+    stroke: Color32,
+) {
+    if faces.len() < MAX_3D_FACES {
+        faces.push(Face3d {
+            surface,
+            order: faces.len(),
+            points,
+            fill,
+            stroke,
+        });
+    }
+}
+
+fn append_face_to_3d_batch(batch: &mut renderer::RenderBatch3d, face: &Face3d) {
+    if face.points.len() < 3 {
+        return;
+    }
+    let base = batch.vertices.len().min(u32::MAX as usize) as u32;
+    let color = color32_to_gpu(face.fill);
+    let normal = face_normal(face);
+    batch
+        .vertices
+        .extend(face.points.iter().map(|point| renderer::GpuVertex3d {
+            position: [point.x, point.y, point.z],
+            normal: [normal.x, normal.y, normal.z],
+            color,
+        }));
+    for index in 1..face.points.len().saturating_sub(1) {
+        batch
+            .indices
+            .extend_from_slice(&[base, base + index as u32, base + index as u32 + 1]);
+    }
+}
+
+fn append_guide_line_to_3d_batch(
+    batch: &mut renderer::RenderBatch3d,
+    a: Vec3f,
+    b: Vec3f,
+    color: [f32; 4],
+) {
+    let Ok(base) = u32::try_from(batch.guide_vertices.len()) else {
+        return;
+    };
+    if base == u32::MAX {
+        return;
+    }
+    batch.guide_vertices.extend([
+        renderer::GpuVertex3d {
+            position: [a.x, a.y, a.z],
+            normal: [0.0, 0.0, 0.0],
+            color,
+        },
+        renderer::GpuVertex3d {
+            position: [b.x, b.y, b.z],
+            normal: [0.0, 0.0, 0.0],
+            color,
+        },
+    ]);
+    batch.guide_indices.extend_from_slice(&[base, base + 1]);
+}
+
+fn face_normal(face: &Face3d) -> Vec3f {
+    let normal = polygon_normal_3d(&face.points);
+    if face.surface == FaceSurface3d::Top && normal.z < 0.0 {
+        normal * -1.0
+    } else {
+        normal
+    }
+}
+
+fn polygon_normal_3d(points: &[Vec3f]) -> Vec3f {
+    let Some(origin) = points.first().copied() else {
+        return Vec3f::new(0.0, 0.0, 1.0);
+    };
+    for index in 1..points.len().saturating_sub(1) {
+        let normal = (points[index] - origin).cross(points[index + 1] - origin);
+        if normal.length() > f32::EPSILON {
+            return normal.normalized();
+        }
+    }
+    Vec3f::new(0.0, 0.0, 1.0)
+}
+
+fn color32_to_gpu(color: Color32) -> [f32; 4] {
+    [
+        color.r() as f32 / 255.0,
+        color.g() as f32 / 255.0,
+        color.b() as f32 / 255.0,
+        color.a() as f32 / 255.0,
+    ]
+}
+
+fn row_major_4x4_to_column_major(rows: [[f32; 4]; 4]) -> [f32; 16] {
+    [
+        rows[0][0], rows[1][0], rows[2][0], rows[3][0], rows[0][1], rows[1][1], rows[2][1],
+        rows[3][1], rows[0][2], rows[1][2], rows[2][2], rows[3][2], rows[0][3], rows[1][3],
+        rows[2][3], rows[3][3],
+    ]
+}
+
+fn compare_projected_faces_3d_cpu_fallback(
+    left: &ProjectedFace,
+    right: &ProjectedFace,
+) -> Ordering {
+    // CPU fallback only: egui's painter has no depth buffer, so draw farther faces first.
+    right
+        .depth
+        .total_cmp(&left.depth)
+        .then_with(|| left.surface.draw_order().cmp(&right.surface.draw_order()))
+        .then_with(|| left.order.cmp(&right.order))
+}
+
+fn clip_camera_polygon_to_near(points: &[CameraPoint3d], near: f32) -> Vec<CameraPoint3d> {
+    let Some(mut previous) = points.last().copied() else {
+        return Vec::new();
+    };
+
+    let mut clipped = Vec::with_capacity(points.len() + 2);
+    let mut previous_inside = previous.depth >= near;
+    for current in points.iter().copied() {
+        let current_inside = current.depth >= near;
+        if current_inside != previous_inside {
+            clipped.push(intersect_camera_depth(previous, current, near));
+        }
+        if current_inside {
+            clipped.push(current);
+        }
+        previous = current;
+        previous_inside = current_inside;
+    }
+    clipped
+}
+
+fn clip_camera_line_to_near(
+    mut a: CameraPoint3d,
+    mut b: CameraPoint3d,
+    near: f32,
+) -> Option<(CameraPoint3d, CameraPoint3d)> {
+    let a_inside = a.depth >= near;
+    let b_inside = b.depth >= near;
+    match (a_inside, b_inside) {
+        (true, true) => Some((a, b)),
+        (false, false) => None,
+        (false, true) => {
+            a = intersect_camera_depth(a, b, near);
+            Some((a, b))
+        }
+        (true, false) => {
+            b = intersect_camera_depth(a, b, near);
+            Some((a, b))
+        }
+    }
+}
+
+fn intersect_camera_depth(a: CameraPoint3d, b: CameraPoint3d, depth: f32) -> CameraPoint3d {
+    let denominator = b.depth - a.depth;
+    let t = if denominator.abs() <= f32::EPSILON {
+        0.0
+    } else {
+        ((depth - a.depth) / denominator).clamp(0.0, 1.0)
+    };
+    let mut point = a.lerp(b, t);
+    point.depth = depth;
+    point
+}
+
+fn layer_color_3d(color: [f32; 4]) -> Color32 {
+    Color32::from_rgb(
+        (color[0] * 255.0).clamp(0.0, 255.0) as u8,
+        (color[1] * 255.0).clamp(0.0, 255.0) as u8,
+        (color[2] * 255.0).clamp(0.0, 255.0) as u8,
+    )
+}
+
+fn shade_color(color: Color32, multiplier: f32) -> Color32 {
+    Color32::from_rgba_unmultiplied(
+        (color.r() as f32 * multiplier).clamp(0.0, 255.0) as u8,
+        (color.g() as f32 * multiplier).clamp(0.0, 255.0) as u8,
+        (color.b() as f32 * multiplier).clamp(0.0, 255.0) as u8,
+        color.a(),
+    )
+}
+
 fn layer_color32(color: [f32; 4], multiplier: f32) -> Color32 {
     Color32::from_rgba_premultiplied(
         (color[0] * 255.0 * multiplier).clamp(0.0, 255.0) as u8,
@@ -4535,6 +6023,302 @@ mod tests {
         assert_eq!(
             format_physical_length(1_414.213_562, DBU_PER_MICRON),
             "1.41 um"
+        );
+    }
+
+    #[test]
+    fn length_format_honors_unit_preferences_and_precision() {
+        assert_eq!(
+            format_physical_length_with_options(500.0, DBU_PER_MICRON, UnitDisplay::Microns, 3,),
+            "0.500 um"
+        );
+        assert_eq!(
+            format_physical_length_with_options(
+                1_500.0,
+                DBU_PER_MICRON,
+                UnitDisplay::Nanometers,
+                0,
+            ),
+            "1500 nm"
+        );
+        assert_eq!(
+            format_physical_length_with_options(12.5, DBU_PER_MICRON, UnitDisplay::Dbu, 1),
+            "12.5 dbu"
+        );
+    }
+
+    #[test]
+    fn fly_camera_looks_at_target() {
+        let camera = Camera3d::look_at(Vec3f::new(-1_000.0, 0.0, 0.0), Vec3f::ZERO, 2_000.0);
+        let forward = camera.forward();
+        assert!(forward.x > 0.999);
+        assert!(forward.y.abs() < 0.001);
+        assert!(forward.z.abs() < 0.001);
+        assert!(camera.up().z > 0.999);
+    }
+
+    #[test]
+    fn near_plane_clips_partially_visible_faces() {
+        let points = [
+            CameraPoint3d {
+                x: -20.0,
+                y: -10.0,
+                depth: 5.0,
+            },
+            CameraPoint3d {
+                x: 20.0,
+                y: -10.0,
+                depth: 5.0,
+            },
+            CameraPoint3d {
+                x: 20.0,
+                y: 10.0,
+                depth: 50.0,
+            },
+            CameraPoint3d {
+                x: -20.0,
+                y: 10.0,
+                depth: 50.0,
+            },
+        ];
+        let clipped = clip_camera_polygon_to_near(&points, CAMERA_NEAR_PLANE);
+        assert_eq!(clipped.len(), 4);
+        assert!(clipped.iter().all(|point| point.depth >= CAMERA_NEAR_PLANE));
+        assert!(
+            clipped
+                .iter()
+                .any(|point| (point.depth - CAMERA_NEAR_PLANE).abs() < 0.001)
+        );
+    }
+
+    #[test]
+    fn near_plane_clips_grid_lines() {
+        let a = CameraPoint3d {
+            x: -10.0,
+            y: 0.0,
+            depth: 4.0,
+        };
+        let b = CameraPoint3d {
+            x: 10.0,
+            y: 0.0,
+            depth: 40.0,
+        };
+        let Some((clipped_a, clipped_b)) = clip_camera_line_to_near(a, b, CAMERA_NEAR_PLANE) else {
+            panic!("partially visible line should survive clipping");
+        };
+        assert!((clipped_a.depth - CAMERA_NEAR_PLANE).abs() < 0.001);
+        assert_eq!(clipped_b, b);
+    }
+
+    #[test]
+    fn layer_color_3d_is_opaque() {
+        let color = layer_color_3d([0.2, 0.4, 0.6, 0.25]);
+        assert_eq!(color.a(), 255);
+        assert_eq!(color.r(), 51);
+        assert_eq!(color.g(), 102);
+        assert_eq!(color.b(), 153);
+    }
+
+    #[test]
+    fn cpu_fallback_3d_sort_draws_side_walls_before_top_caps_at_same_depth() {
+        let mut faces = vec![
+            ProjectedFace {
+                surface: FaceSurface3d::Top,
+                depth: 768.0,
+                order: 0,
+                points: Vec::new(),
+                fill: Color32::WHITE,
+                stroke: Color32::WHITE,
+            },
+            ProjectedFace {
+                surface: FaceSurface3d::Side,
+                depth: 768.0,
+                order: 1,
+                points: Vec::new(),
+                fill: Color32::WHITE,
+                stroke: Color32::WHITE,
+            },
+        ];
+        faces.sort_by(compare_projected_faces_3d_cpu_fallback);
+        assert_eq!(faces[0].surface, FaceSurface3d::Side);
+        assert_eq!(faces[1].surface, FaceSurface3d::Top);
+    }
+
+    #[test]
+    fn cpu_fallback_3d_sort_draws_far_primitive_before_near_primitive() {
+        let mut faces = vec![
+            ProjectedFace {
+                surface: FaceSurface3d::Side,
+                depth: 1_000.0,
+                order: 0,
+                points: Vec::new(),
+                fill: Color32::from_rgb(255, 0, 0),
+                stroke: Color32::WHITE,
+            },
+            ProjectedFace {
+                surface: FaceSurface3d::Top,
+                depth: 1_020.0,
+                order: 1,
+                points: Vec::new(),
+                fill: Color32::from_rgb(0, 0, 255),
+                stroke: Color32::WHITE,
+            },
+        ];
+
+        faces.sort_by(compare_projected_faces_3d_cpu_fallback);
+
+        assert_eq!(faces[0].depth, 1_020.0);
+        assert_eq!(faces[1].depth, 1_000.0);
+        assert_eq!(faces[1].fill, Color32::from_rgb(255, 0, 0));
+    }
+
+    #[test]
+    fn cpu_fallback_3d_overlays_are_after_sorted_layout() {
+        let mut layout_faces = vec![
+            ProjectedFace {
+                surface: FaceSurface3d::Top,
+                depth: 1_200.0,
+                order: 0,
+                points: Vec::new(),
+                fill: Color32::from_rgb(0, 0, 255),
+                stroke: Color32::WHITE,
+            },
+            ProjectedFace {
+                surface: FaceSurface3d::Top,
+                depth: 900.0,
+                order: 1,
+                points: Vec::new(),
+                fill: Color32::from_rgb(255, 0, 0),
+                stroke: Color32::WHITE,
+            },
+        ];
+
+        layout_faces.sort_by(compare_projected_faces_3d_cpu_fallback);
+        let mut draw_order = layout_faces
+            .iter()
+            .map(|face| face.fill)
+            .collect::<Vec<_>>();
+        draw_order.push(Color32::from_rgb(255, 255, 255));
+
+        assert_eq!(draw_order[0], Color32::from_rgb(0, 0, 255));
+        assert_eq!(draw_order[1], Color32::from_rgb(255, 0, 0));
+        assert_eq!(draw_order[2], Color32::from_rgb(255, 255, 255));
+    }
+
+    #[test]
+    fn slab_faces_build_top_and_sides() {
+        let mut faces = Vec::new();
+        let rect = Rect::new(Point::new(0, 0), Point::new(100, 50));
+        add_slab_faces(
+            &mut faces,
+            &rect.corners(),
+            10.0,
+            40.0,
+            Color32::from_rgb(40, 200, 120),
+        );
+        assert_eq!(faces.len(), 5);
+        assert_eq!(faces[0].surface, FaceSurface3d::Top);
+        assert!(
+            faces[1..]
+                .iter()
+                .all(|face| face.surface == FaceSurface3d::Side)
+        );
+        assert!(faces.iter().all(|face| face.points.len() >= 3));
+    }
+
+    #[test]
+    fn path_segment_3d_faces_have_width() {
+        let mut faces = Vec::new();
+        add_path_segment_3d_faces(
+            &mut faces,
+            Point::new(0, 0),
+            Point::new(100, 0),
+            20,
+            0.0,
+            10.0,
+            Color32::from_rgb(40, 120, 220),
+        );
+        assert_eq!(faces.len(), 5);
+        let top = &faces[0].points;
+        let y_values: Vec<_> = top.iter().map(|point| point.y.round() as i32).collect();
+        assert!(y_values.contains(&10));
+        assert!(y_values.contains(&-10));
+    }
+
+    #[test]
+    fn face_3d_gpu_batch_keeps_world_depth_coordinates() {
+        let face = Face3d {
+            surface: FaceSurface3d::Top,
+            order: 0,
+            points: vec![
+                Vec3f::new(0.0, 0.0, 20.0),
+                Vec3f::new(100.0, 0.0, 20.0),
+                Vec3f::new(100.0, 100.0, 20.0),
+                Vec3f::new(0.0, 100.0, 20.0),
+            ],
+            fill: Color32::from_rgb(64, 128, 255),
+            stroke: Color32::WHITE,
+        };
+        let mut batch = renderer::RenderBatch3d::default();
+        append_face_to_3d_batch(&mut batch, &face);
+
+        assert_eq!(batch.vertices.len(), 4);
+        assert_eq!(batch.indices, vec![0, 1, 2, 0, 2, 3]);
+        assert!(
+            batch
+                .vertices
+                .iter()
+                .all(|vertex| vertex.position[2] == 20.0)
+        );
+        assert!(
+            batch
+                .vertices
+                .iter()
+                .all(|vertex| vertex.normal == [0.0, 0.0, 1.0])
+        );
+        assert_eq!(
+            batch.vertices[0].color,
+            [64.0 / 255.0, 128.0 / 255.0, 1.0, 1.0]
+        );
+    }
+
+    #[test]
+    fn guide_lines_use_separate_unlit_3d_batch_stream() {
+        let mut batch = renderer::RenderBatch3d::default();
+        append_guide_line_to_3d_batch(
+            &mut batch,
+            Vec3f::new(-10.0, 0.0, 0.0),
+            Vec3f::new(10.0, 0.0, 0.0),
+            [1.0, 0.0, 0.0, 0.5],
+        );
+
+        assert!(batch.vertices.is_empty());
+        assert!(batch.indices.is_empty());
+        assert_eq!(batch.guide_indices, vec![0, 1]);
+        assert_eq!(batch.guide_vertices.len(), 2);
+        assert!(
+            batch
+                .guide_vertices
+                .iter()
+                .all(|vertex| vertex.normal == [0.0, 0.0, 0.0])
+        );
+    }
+
+    #[test]
+    fn row_major_matrix_is_uploaded_column_major_for_wgsl() {
+        let matrix = row_major_4x4_to_column_major([
+            [1.0, 2.0, 3.0, 4.0],
+            [5.0, 6.0, 7.0, 8.0],
+            [9.0, 10.0, 11.0, 12.0],
+            [13.0, 14.0, 15.0, 16.0],
+        ]);
+
+        assert_eq!(
+            matrix,
+            [
+                1.0, 5.0, 9.0, 13.0, 2.0, 6.0, 10.0, 14.0, 3.0, 7.0, 11.0, 15.0, 4.0, 8.0, 12.0,
+                16.0,
+            ]
         );
     }
 

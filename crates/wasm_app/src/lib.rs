@@ -45,6 +45,12 @@ fn startup_options_from_url() -> fabricad_app::StartupOptions {
             "scene" if value == "stress" => {
                 options.stress_count = Some(options.stress_count.unwrap_or(10_000));
             }
+            "view" if value == "3d" => {
+                options.view_3d = true;
+            }
+            "options" if value == "1" || value == "true" => {
+                options.show_options = true;
+            }
             "count" => {
                 if let Ok(count) = value.parse::<usize>() {
                     options.stress_count = Some(count);

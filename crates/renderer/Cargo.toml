@@ -9,5 +9,5 @@ build = "build.rs"
 [dependencies]
 geometry_core = { path = "../geometry_core" }
 layout_model = { path = "../layout_model" }
+web-time.workspace = true
 wgpu.workspace = true
-

@@ -11,6 +11,7 @@ use geometry_core::{Point, Rect};
 use layout_model::{
     Document, InstanceId, LayerId, LayoutIndex, Shape, ShapeId, ShapeKind, ShapeOccurrenceId,
 };
+use web_time::Instant;
 
 pub const DEFAULT_TILE_SIZE: i64 = 16_384;
 pub const DEFAULT_LOD_MAX_TILE_SCREEN_PX: f32 = 220.0;
@@ -25,6 +26,14 @@ pub struct GpuVertex {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct GpuVertex3d {
+    pub position: [f32; 3],
+    pub normal: [f32; 3],
+    pub color: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PickVertex {
     pub position: [f32; 2],
     pub pick_id: u32,
@@ -34,6 +43,14 @@ pub struct PickVertex {
 pub struct RenderBatch {
     pub vertices: Vec<GpuVertex>,
     pub indices: Vec<u32>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RenderBatch3d {
+    pub vertices: Vec<GpuVertex3d>,
+    pub indices: Vec<u32>,
+    pub guide_vertices: Vec<GpuVertex3d>,
+    pub guide_indices: Vec<u32>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -184,6 +201,50 @@ impl RenderBatch {
         BatchFingerprint {
             vertex_count: self.vertices.len(),
             index_count: self.indices.len(),
+            hash: hasher.finish(),
+        }
+    }
+}
+
+impl RenderBatch3d {
+    pub fn estimate_bytes(&self) -> usize {
+        (self.vertices.len() + self.guide_vertices.len()) * std::mem::size_of::<GpuVertex3d>()
+            + (self.indices.len() + self.guide_indices.len()) * std::mem::size_of::<u32>()
+    }
+
+    pub fn fingerprint(&self) -> BatchFingerprint {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.vertices.len().hash(&mut hasher);
+        self.indices.len().hash(&mut hasher);
+        self.guide_vertices.len().hash(&mut hasher);
+        self.guide_indices.len().hash(&mut hasher);
+        for vertex in &self.vertices {
+            for component in vertex.position {
+                component.to_bits().hash(&mut hasher);
+            }
+            for component in vertex.normal {
+                component.to_bits().hash(&mut hasher);
+            }
+            for channel in vertex.color {
+                channel.to_bits().hash(&mut hasher);
+            }
+        }
+        for vertex in &self.guide_vertices {
+            for component in vertex.position {
+                component.to_bits().hash(&mut hasher);
+            }
+            for component in vertex.normal {
+                component.to_bits().hash(&mut hasher);
+            }
+            for channel in vertex.color {
+                channel.to_bits().hash(&mut hasher);
+            }
+        }
+        self.indices.hash(&mut hasher);
+        self.guide_indices.hash(&mut hasher);
+        BatchFingerprint {
+            vertex_count: self.vertices.len() + self.guide_vertices.len(),
+            index_count: self.indices.len() + self.guide_indices.len(),
             hash: hasher.finish(),
         }
     }
@@ -423,7 +484,7 @@ impl TileCache {
         }
 
         if let (Some(pick), Some(pick_occurrences)) = (&mut pick, pick_occurrences) {
-            let pick_started = std::time::Instant::now();
+            let pick_started = Instant::now();
             stats.pick_shapes = pick_occurrences.len();
             for id in pick_occurrences {
                 let Some(shape) = shape_for_occurrence(document, occurrence_shapes.as_ref(), &id)
@@ -848,6 +909,57 @@ mod tests {
 
         assert_eq!(first.fingerprint(), second.fingerprint());
         assert_ne!(first.fingerprint(), changed.fingerprint());
+    }
+
+    #[test]
+    fn render_batch_3d_fingerprint_tracks_depth_geometry() {
+        let first = RenderBatch3d {
+            vertices: vec![
+                GpuVertex3d {
+                    position: [0.0, 0.0, 10.0],
+                    normal: [0.0, 0.0, 1.0],
+                    color: [1.0, 0.0, 0.0, 1.0],
+                },
+                GpuVertex3d {
+                    position: [10.0, 0.0, 10.0],
+                    normal: [0.0, 0.0, 1.0],
+                    color: [1.0, 0.0, 0.0, 1.0],
+                },
+                GpuVertex3d {
+                    position: [0.0, 10.0, 10.0],
+                    normal: [0.0, 0.0, 1.0],
+                    color: [1.0, 0.0, 0.0, 1.0],
+                },
+            ],
+            indices: vec![0, 1, 2],
+            guide_vertices: vec![
+                GpuVertex3d {
+                    position: [0.0, 0.0, 0.0],
+                    normal: [0.0, 0.0, 0.0],
+                    color: [0.5, 0.5, 0.5, 0.5],
+                },
+                GpuVertex3d {
+                    position: [10.0, 0.0, 0.0],
+                    normal: [0.0, 0.0, 0.0],
+                    color: [0.5, 0.5, 0.5, 0.5],
+                },
+            ],
+            guide_indices: vec![0, 1],
+        };
+        let mut changed = first.clone();
+        changed.vertices[0].position[2] = 20.0;
+        let mut changed_guide = first.clone();
+        changed_guide.guide_vertices[0].position[0] = 5.0;
+        let mut changed_normal = first.clone();
+        changed_normal.vertices[0].normal = [1.0, 0.0, 0.0];
+
+        assert_ne!(first.fingerprint(), changed.fingerprint());
+        assert_ne!(first.fingerprint(), changed_guide.fingerprint());
+        assert_ne!(first.fingerprint(), changed_normal.fingerprint());
+        assert_eq!(
+            first.estimate_bytes(),
+            5 * std::mem::size_of::<GpuVertex3d>() + 5 * std::mem::size_of::<u32>()
+        );
     }
 
     #[test]

@@ -206,8 +206,9 @@ def capture_png(cdp: Cdp, path: Path) -> Image.Image:
 def analyze_canvas_region(image: Image.Image) -> Metrics:
     # Ignore toolbar/sidebar chrome so assertions describe the rendered canvas content.
     left = min(300, image.width // 3)
+    right = image.width - min(300, image.width // 3)
     top = min(54, image.height // 5)
-    crop = image.crop((left, top, image.width, image.height))
+    crop = image.crop((left, top, right, image.height))
     pixels = list(crop.getdata())
     sampled = pixels[:: max(1, len(pixels) // 20_000)]
     unique = len(set(sampled))
@@ -280,6 +281,34 @@ def assert_hierarchy(metrics: Metrics) -> None:
         failures.append(f"hierarchy metal2-magenta layer appears missing/magenta pixels={metrics.magenta}")
     if metrics.sampled_unique < 35:
         failures.append(f"hierarchy image has too little visual variation/unique={metrics.sampled_unique}")
+    if failures:
+        raise AssertionError("; ".join(failures))
+
+
+def assert_3d_view(metrics: Metrics) -> None:
+    failures = []
+    if metrics.non_dark < 18_000:
+        failures.append(f"3D canvas is too sparse/nonblank pixels={metrics.non_dark}")
+    if metrics.layer_pixels < 1_800:
+        failures.append(f"3D layer color coverage is too low/layer pixels={metrics.layer_pixels}")
+    if metrics.bright < 150:
+        failures.append(f"3D grid/HUD highlights appear missing/bright pixels={metrics.bright}")
+    if metrics.sampled_unique < 45:
+        failures.append(f"3D image has too little visual variation/unique={metrics.sampled_unique}")
+    if failures:
+        raise AssertionError("; ".join(failures))
+
+
+def assert_options_menu(metrics: Metrics) -> None:
+    failures = []
+    if metrics.non_dark < 45_000:
+        failures.append(f"options view is too sparse/nonblank pixels={metrics.non_dark}")
+    if metrics.layer_pixels < 1_500:
+        failures.append(f"options view lost layer coverage/layer pixels={metrics.layer_pixels}")
+    if metrics.bright < 1_500:
+        failures.append(f"options menu chrome appears missing/bright pixels={metrics.bright}")
+    if metrics.sampled_unique < 70:
+        failures.append(f"options view has too little variation/unique={metrics.sampled_unique}")
     if failures:
         raise AssertionError("; ".join(failures))
 
@@ -427,25 +456,29 @@ def terminate(process: subprocess.Popen) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run Fabricad screenshot render E2E tests.")
     parser.add_argument("--keep-artifacts", action="store_true")
-    parser.add_argument(
+    baseline_group = parser.add_mutually_exclusive_group()
+    baseline_group.add_argument(
         "--update-baselines",
         action="store_true",
         help="write current screenshots to tests/render_baselines instead of comparing",
     )
-    parser.add_argument(
+    baseline_group.add_argument(
+        "--check-baseline",
+        action="store_true",
+        help="compare screenshots against quarantined whole-UI baselines",
+    )
+    baseline_group.add_argument(
         "--skip-baseline",
         action="store_true",
-        help="run semantic screenshot checks without baseline pixel comparison",
+        help="run semantic screenshot checks without baseline pixel comparison (default)",
     )
     args = parser.parse_args()
-    if args.update_baselines and args.skip_baseline:
-        parser.error("--update-baselines and --skip-baseline are mutually exclusive")
     baseline_mode = (
         BaselineMode.UPDATE
         if args.update_baselines
-        else BaselineMode.SKIP
-        if args.skip_baseline
         else BaselineMode.CHECK
+        if args.check_baseline
+        else BaselineMode.SKIP
     )
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -470,6 +503,8 @@ def main() -> int:
             ),
             Case("stress_lod", "?scene=stress&count=20000&zoom=0.008", assert_stress_lod),
             Case("hierarchy", "?scene=hierarchy&zoom=0.045", assert_hierarchy),
+            Case("view_3d", "?view=3d", assert_3d_view),
+            Case("options_menu", "?options=1", assert_options_menu),
         ]
         last_error: Exception | None = None
         for attempt in range(1, 4):

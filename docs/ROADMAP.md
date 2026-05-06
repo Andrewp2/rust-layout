@@ -350,6 +350,13 @@ Completed hierarchy polish pass:
 - Added a deterministic screenshot E2E case for the create-cell/place-instance workflow.
 - Added model, Loro object-store, old-document compatibility, GDS import, GDS export/import, and flattening tests for arrays and oriented transforms.
 
+Started real 3D viewport renderer:
+
+- Added renderer-owned 3D vertex batches and an egui-wgpu callback path that renders the 3D view into a dedicated offscreen color texture with a depth attachment.
+- Added a wgpu 3D scene pipeline with depth test/write for opaque layout solids, followed by a separate composite pass back into the egui UI.
+- Kept HUD and future handles as egui overlays above the composited viewport, with the old painter-sorted 3D path isolated as a no-wgpu fallback.
+- Added focused invariants for 3D batch fingerprinting, face triangulation, and WGSL matrix upload ordering.
+
 ## Immediate Next Checkpoint
 
 The roadmap milestones and listed hierarchy polish items are implemented. The next task should be a completion audit unless one of the follow-on polish areas takes priority.

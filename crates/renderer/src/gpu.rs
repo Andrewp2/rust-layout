@@ -1,6 +1,6 @@
 use std::error::Error;
 
-use crate::{PickBatch, RenderBatch, shader};
+use crate::{PickBatch, RenderBatch, RenderBatch3d, shader};
 use geometry_core::{Coord, Point, Rect};
 use layout_model::{Document, LayoutIndex, ShapeOccurrenceId};
 
@@ -80,6 +80,41 @@ pub struct LayoutGpuRenderer {
     pick_index_count: u32,
 }
 
+pub const VIEWPORT_3D_COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+pub const VIEWPORT_3D_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
+
+#[derive(Clone, Copy, Debug)]
+pub struct Viewport3dUniforms {
+    view_projection: [f32; 16],
+}
+
+pub struct Viewport3dRenderer {
+    scene_pipeline: wgpu::RenderPipeline,
+    guide_pipeline: wgpu::RenderPipeline,
+    composite_pipeline: wgpu::RenderPipeline,
+    scene_bind_group: wgpu::BindGroup,
+    uniform_buffer: wgpu::Buffer,
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    guide_vertex_buffer: wgpu::Buffer,
+    guide_index_buffer: wgpu::Buffer,
+    composite_bind_group_layout: wgpu::BindGroupLayout,
+    composite_sampler: wgpu::Sampler,
+    color_texture: Option<wgpu::Texture>,
+    color_view: Option<wgpu::TextureView>,
+    depth_texture: Option<wgpu::Texture>,
+    depth_view: Option<wgpu::TextureView>,
+    composite_bind_group: Option<wgpu::BindGroup>,
+    target_size: [u32; 2],
+    vertex_capacity: usize,
+    index_capacity: usize,
+    guide_vertex_capacity: usize,
+    guide_index_capacity: usize,
+    render_fingerprint: Option<crate::BatchFingerprint>,
+    index_count: u32,
+    guide_index_count: u32,
+}
+
 impl ViewUniforms {
     pub fn from_viewport(viewport: Rect) -> Self {
         let center = viewport.center();
@@ -96,6 +131,20 @@ impl ViewUniforms {
         let values = [self.center[0], self.center[1], self.scale[0], self.scale[1]];
         let mut bytes = [0u8; 16];
         for (index, value) in values.into_iter().enumerate() {
+            bytes[index * 4..index * 4 + 4].copy_from_slice(&value.to_ne_bytes());
+        }
+        bytes
+    }
+}
+
+impl Viewport3dUniforms {
+    pub fn from_view_projection(view_projection: [f32; 16]) -> Self {
+        Self { view_projection }
+    }
+
+    fn as_bytes(self) -> [u8; 64] {
+        let mut bytes = [0u8; 64];
+        for (index, value) in self.view_projection.into_iter().enumerate() {
             bytes[index * 4..index * 4 + 4].copy_from_slice(&value.to_ne_bytes());
         }
         bytes
@@ -134,6 +183,13 @@ impl OffscreenRenderReport {
             self.non_dark_pixels
         )
     }
+}
+
+pub fn viewport_3d_target_size(logical_size: [f32; 2], pixels_per_point: f32) -> [u32; 2] {
+    [
+        physical_viewport_extent(logical_size[0], pixels_per_point),
+        physical_viewport_extent(logical_size[1], pixels_per_point),
+    ]
 }
 
 impl LayoutGpuRenderer {
@@ -590,6 +646,497 @@ impl LayoutGpuRenderer {
     }
 }
 
+impl Viewport3dRenderer {
+    pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
+        let scene_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Fabricad 3D scene shader"),
+            source: wgpu::ShaderSource::Wgsl(VIEWPORT_3D_SCENE_SHADER.into()),
+        });
+        let composite_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Fabricad 3D composite shader"),
+            source: wgpu::ShaderSource::Wgsl(VIEWPORT_3D_COMPOSITE_SHADER.into()),
+        });
+        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Fabricad 3D viewport uniforms"),
+            size: 64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let scene_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Fabricad 3D scene bind group layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+        let scene_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Fabricad 3D scene bind group"),
+            layout: &scene_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            }],
+        });
+        let scene_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Fabricad 3D scene pipeline layout"),
+                bind_group_layouts: &[&scene_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+        let scene_targets = [Some(wgpu::ColorTargetState {
+            format: VIEWPORT_3D_COLOR_FORMAT,
+            blend: None,
+            write_mask: wgpu::ColorWrites::ALL,
+        })];
+        let guide_targets = [Some(wgpu::ColorTargetState {
+            format: VIEWPORT_3D_COLOR_FORMAT,
+            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+            write_mask: wgpu::ColorWrites::ALL,
+        })];
+        let scene_vertex_attributes = [
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x3,
+                offset: 0,
+                shader_location: 0,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x3,
+                offset: 12,
+                shader_location: 1,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x4,
+                offset: 24,
+                shader_location: 2,
+            },
+        ];
+        let scene_vertex_buffers = [wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<crate::GpuVertex3d>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &scene_vertex_attributes,
+        }];
+        let scene_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Fabricad 3D scene pipeline"),
+            layout: Some(&scene_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &scene_shader,
+                entry_point: Some("vertex_main"),
+                buffers: &scene_vertex_buffers,
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &scene_shader,
+                entry_point: Some("fragment_main"),
+                targets: &scene_targets,
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: VIEWPORT_3D_DEPTH_FORMAT,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+        let guide_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Fabricad 3D guide pipeline"),
+            layout: Some(&scene_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &scene_shader,
+                entry_point: Some("vertex_main"),
+                buffers: &scene_vertex_buffers,
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &scene_shader,
+                entry_point: Some("fragment_main"),
+                targets: &guide_targets,
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::LineList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: VIEWPORT_3D_DEPTH_FORMAT,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        let composite_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Fabricad 3D composite bind group layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+        let composite_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Fabricad 3D composite pipeline layout"),
+                bind_group_layouts: &[&composite_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+        let composite_targets = [Some(wgpu::ColorTargetState {
+            format: target_format,
+            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+            write_mask: wgpu::ColorWrites::ALL,
+        })];
+        let composite_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Fabricad 3D composite pipeline"),
+            layout: Some(&composite_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &composite_shader,
+                entry_point: Some("vertex_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &composite_shader,
+                entry_point: Some("fragment_main"),
+                targets: &composite_targets,
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+        let composite_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Fabricad 3D composite sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        Self {
+            scene_pipeline,
+            guide_pipeline,
+            composite_pipeline,
+            scene_bind_group,
+            uniform_buffer,
+            vertex_buffer: create_upload_buffer(
+                device,
+                "Fabricad 3D vertex buffer",
+                4,
+                wgpu::BufferUsages::VERTEX,
+            ),
+            index_buffer: create_upload_buffer(
+                device,
+                "Fabricad 3D index buffer",
+                4,
+                wgpu::BufferUsages::INDEX,
+            ),
+            guide_vertex_buffer: create_upload_buffer(
+                device,
+                "Fabricad 3D guide vertex buffer",
+                4,
+                wgpu::BufferUsages::VERTEX,
+            ),
+            guide_index_buffer: create_upload_buffer(
+                device,
+                "Fabricad 3D guide index buffer",
+                4,
+                wgpu::BufferUsages::INDEX,
+            ),
+            composite_bind_group_layout,
+            composite_sampler,
+            color_texture: None,
+            color_view: None,
+            depth_texture: None,
+            depth_view: None,
+            composite_bind_group: None,
+            target_size: [0, 0],
+            vertex_capacity: 4,
+            index_capacity: 4,
+            guide_vertex_capacity: 4,
+            guide_index_capacity: 4,
+            render_fingerprint: None,
+            index_count: 0,
+            guide_index_count: 0,
+        }
+    }
+
+    pub fn upload(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        batch: &RenderBatch3d,
+        uniforms: Viewport3dUniforms,
+    ) -> BufferUploadResult {
+        queue.write_buffer(&self.uniform_buffer, 0, &uniforms.as_bytes());
+        let fingerprint = batch.fingerprint();
+        let changed = self.render_fingerprint != Some(fingerprint);
+        let mut bytes_uploaded = 0;
+        if changed {
+            let vertex_bytes = vertex_3d_bytes(&batch.vertices);
+            let mesh_index_bytes = index_bytes(&batch.indices);
+            let guide_vertex_bytes = vertex_3d_bytes(&batch.guide_vertices);
+            let guide_index_bytes = index_bytes(&batch.guide_indices);
+            self.ensure_vertex_capacity(device, vertex_bytes.len());
+            self.ensure_index_capacity(device, mesh_index_bytes.len());
+            self.ensure_guide_vertex_capacity(device, guide_vertex_bytes.len());
+            self.ensure_guide_index_capacity(device, guide_index_bytes.len());
+            if !vertex_bytes.is_empty() {
+                queue.write_buffer(&self.vertex_buffer, 0, &vertex_bytes);
+                bytes_uploaded += vertex_bytes.len();
+            }
+            if !mesh_index_bytes.is_empty() {
+                queue.write_buffer(&self.index_buffer, 0, &mesh_index_bytes);
+                bytes_uploaded += mesh_index_bytes.len();
+            }
+            if !guide_vertex_bytes.is_empty() {
+                queue.write_buffer(&self.guide_vertex_buffer, 0, &guide_vertex_bytes);
+                bytes_uploaded += guide_vertex_bytes.len();
+            }
+            if !guide_index_bytes.is_empty() {
+                queue.write_buffer(&self.guide_index_buffer, 0, &guide_index_bytes);
+                bytes_uploaded += guide_index_bytes.len();
+            }
+            self.render_fingerprint = Some(fingerprint);
+        }
+        self.index_count = batch.indices.len().min(u32::MAX as usize) as u32;
+        self.guide_index_count = batch.guide_indices.len().min(u32::MAX as usize) as u32;
+        BufferUploadResult {
+            uploaded: bytes_uploaded > 0,
+            skipped: !changed,
+            bytes_uploaded,
+        }
+    }
+
+    pub fn render_to_texture(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        target_size: [u32; 2],
+        clear_color: wgpu::Color,
+    ) {
+        let width = target_size[0].max(1);
+        let height = target_size[1].max(1);
+        self.ensure_targets(device, width, height);
+        let Some(color_view) = self.color_view.as_ref() else {
+            return;
+        };
+        let Some(depth_view) = self.depth_view.as_ref() else {
+            return;
+        };
+
+        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Fabricad 3D viewport render pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: color_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(clear_color),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        if self.index_count > 0 {
+            render_pass.set_pipeline(&self.scene_pipeline);
+            render_pass.set_bind_group(0, &self.scene_bind_group, &[]);
+            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            render_pass.draw_indexed(0..self.index_count, 0, 0..1);
+        }
+        if self.guide_index_count > 0 {
+            render_pass.set_pipeline(&self.guide_pipeline);
+            render_pass.set_bind_group(0, &self.scene_bind_group, &[]);
+            render_pass.set_vertex_buffer(0, self.guide_vertex_buffer.slice(..));
+            render_pass
+                .set_index_buffer(self.guide_index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            render_pass.draw_indexed(0..self.guide_index_count, 0, 0..1);
+        }
+    }
+
+    pub fn paint(&self, render_pass: &mut wgpu::RenderPass<'static>) {
+        let Some(bind_group) = self.composite_bind_group.as_ref() else {
+            return;
+        };
+        render_pass.set_pipeline(&self.composite_pipeline);
+        render_pass.set_bind_group(0, bind_group, &[]);
+        render_pass.draw(0..3, 0..1);
+    }
+
+    fn ensure_vertex_capacity(&mut self, device: &wgpu::Device, required: usize) {
+        if required <= self.vertex_capacity {
+            return;
+        }
+        self.vertex_capacity = next_buffer_capacity(required);
+        self.vertex_buffer = create_upload_buffer(
+            device,
+            "Fabricad 3D vertex buffer",
+            self.vertex_capacity,
+            wgpu::BufferUsages::VERTEX,
+        );
+    }
+
+    fn ensure_index_capacity(&mut self, device: &wgpu::Device, required: usize) {
+        if required <= self.index_capacity {
+            return;
+        }
+        self.index_capacity = next_buffer_capacity(required);
+        self.index_buffer = create_upload_buffer(
+            device,
+            "Fabricad 3D index buffer",
+            self.index_capacity,
+            wgpu::BufferUsages::INDEX,
+        );
+    }
+
+    fn ensure_guide_vertex_capacity(&mut self, device: &wgpu::Device, required: usize) {
+        if required <= self.guide_vertex_capacity {
+            return;
+        }
+        self.guide_vertex_capacity = next_buffer_capacity(required);
+        self.guide_vertex_buffer = create_upload_buffer(
+            device,
+            "Fabricad 3D guide vertex buffer",
+            self.guide_vertex_capacity,
+            wgpu::BufferUsages::VERTEX,
+        );
+    }
+
+    fn ensure_guide_index_capacity(&mut self, device: &wgpu::Device, required: usize) {
+        if required <= self.guide_index_capacity {
+            return;
+        }
+        self.guide_index_capacity = next_buffer_capacity(required);
+        self.guide_index_buffer = create_upload_buffer(
+            device,
+            "Fabricad 3D guide index buffer",
+            self.guide_index_capacity,
+            wgpu::BufferUsages::INDEX,
+        );
+    }
+
+    fn ensure_targets(&mut self, device: &wgpu::Device, width: u32, height: u32) {
+        if self.target_size == [width, height]
+            && self.color_view.is_some()
+            && self.depth_view.is_some()
+            && self.composite_bind_group.is_some()
+        {
+            return;
+        }
+
+        self.target_size = [width, height];
+        let color_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Fabricad 3D viewport color target"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: VIEWPORT_3D_COLOR_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let color_view = color_texture.create_view(&Default::default());
+        let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Fabricad 3D viewport depth target"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: VIEWPORT_3D_DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let depth_view = depth_texture.create_view(&Default::default());
+        let composite_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Fabricad 3D composite bind group"),
+            layout: &self.composite_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&color_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.composite_sampler),
+                },
+            ],
+        });
+
+        self.color_texture = Some(color_texture);
+        self.color_view = Some(color_view);
+        self.depth_texture = Some(depth_texture);
+        self.depth_view = Some(depth_view);
+        self.composite_bind_group = Some(composite_bind_group);
+    }
+}
+
 pub async fn render_document_offscreen(
     request: OffscreenRenderRequest,
 ) -> Result<OffscreenRenderReport, Box<dyn Error>> {
@@ -793,10 +1340,42 @@ fn next_buffer_capacity(required: usize) -> usize {
     required.max(4).next_power_of_two()
 }
 
+fn physical_viewport_extent(logical_points: f32, pixels_per_point: f32) -> u32 {
+    let logical_points = if logical_points.is_finite() && logical_points > 0.0 {
+        logical_points
+    } else {
+        0.0
+    };
+    let pixels_per_point = if pixels_per_point.is_finite() && pixels_per_point > 0.0 {
+        pixels_per_point
+    } else {
+        1.0
+    };
+    (logical_points * pixels_per_point)
+        .ceil()
+        .clamp(1.0, u32::MAX as f32) as u32
+}
+
 fn vertex_bytes(vertices: &[crate::GpuVertex]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(std::mem::size_of_val(vertices));
     for vertex in vertices {
         for value in vertex.position {
+            bytes.extend_from_slice(&value.to_ne_bytes());
+        }
+        for value in vertex.color {
+            bytes.extend_from_slice(&value.to_ne_bytes());
+        }
+    }
+    bytes
+}
+
+fn vertex_3d_bytes(vertices: &[crate::GpuVertex3d]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(std::mem::size_of_val(vertices));
+    for vertex in vertices {
+        for value in vertex.position {
+            bytes.extend_from_slice(&value.to_ne_bytes());
+        }
+        for value in vertex.normal {
             bytes.extend_from_slice(&value.to_ne_bytes());
         }
         for value in vertex.color {
@@ -824,6 +1403,83 @@ fn index_bytes(indices: &[u32]) -> Vec<u8> {
     }
     bytes
 }
+
+const VIEWPORT_3D_SCENE_SHADER: &str = r#"
+struct Viewport3dUniforms {
+    view_projection: mat4x4<f32>,
+};
+
+@group(0) @binding(0)
+var<uniform> viewport: Viewport3dUniforms;
+
+struct VertexInput {
+    @location(0) position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) color: vec4<f32>,
+};
+
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) color: vec4<f32>,
+    @location(1) normal: vec3<f32>,
+};
+
+@vertex
+fn vertex_main(input: VertexInput) -> VertexOutput {
+    var output: VertexOutput;
+    output.position = viewport.view_projection * vec4<f32>(input.position, 1.0);
+    output.color = input.color;
+    output.normal = input.normal;
+    return output;
+}
+
+@fragment
+fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    let normal_length = length(input.normal);
+    if normal_length < 0.001 {
+        return input.color;
+    }
+    let normal = normalize(input.normal);
+    let key_light = normalize(vec3<f32>(-0.35, -0.55, 0.76));
+    let fill_light = normalize(vec3<f32>(0.55, 0.2, 0.42));
+    let diffuse = max(dot(normal, key_light), 0.0);
+    let fill = max(dot(normal, fill_light), 0.0);
+    let upward = clamp(normal.z * 0.5 + 0.5, 0.0, 1.0);
+    let shade = 0.52 + diffuse * 0.26 + fill * 0.08 + upward * 0.14;
+    return vec4<f32>(input.color.rgb * shade, input.color.a);
+}
+"#;
+
+const VIEWPORT_3D_COMPOSITE_SHADER: &str = r#"
+@group(0) @binding(0)
+var viewport_color: texture_2d<f32>;
+@group(0) @binding(1)
+var viewport_sampler: sampler;
+
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vertex_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
+    var positions = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>(3.0, -1.0),
+        vec2<f32>(-1.0, 3.0),
+    );
+    let position = positions[vertex_index];
+    var output: VertexOutput;
+    output.position = vec4<f32>(position, 0.0, 1.0);
+    output.uv = vec2<f32>(position.x * 0.5 + 0.5, 0.5 - position.y * 0.5);
+    return output;
+}
+
+@fragment
+fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    return textureSample(viewport_color, viewport_sampler, input.uv);
+}
+"#;
 
 #[cfg(not(target_arch = "wasm32"))]
 fn create_layout_shader_module(device: &wgpu::Device) -> Option<wgpu::ShaderModule> {
@@ -867,6 +1523,23 @@ fn offscreen_viewport(width: u32, height: u32, zoom: f32, pan: [f32; 2]) -> Rect
         Point::new(center.x - half_width, center.y - half_height),
         Point::new(center.x + half_width, center.y + half_height),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn viewport_3d_target_size_rounds_fractional_high_dpi_extents_up() {
+        assert_eq!(viewport_3d_target_size([320.25, 200.5], 1.5), [481, 301]);
+        assert_eq!(viewport_3d_target_size([320.0, 200.0], 2.0), [640, 400]);
+    }
+
+    #[test]
+    fn viewport_3d_target_size_sanitizes_empty_or_invalid_inputs() {
+        assert_eq!(viewport_3d_target_size([0.0, -4.0], 2.0), [1, 1]);
+        assert_eq!(viewport_3d_target_size([f32::NAN, 10.0], f32::NAN), [1, 10]);
+    }
 }
 
 fn align_to(value: u32, alignment: u32) -> u32 {
