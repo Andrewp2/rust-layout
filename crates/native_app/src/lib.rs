@@ -20,7 +20,24 @@ use layout_model::{
     Operation, ProcessLayer, ServerMessage, Shape, ShapeId, ShapeKind, ShapeOccurrenceId,
     TechnologyFile, Transform, builtin_technologies,
     connectivity::{ConnectivityReport, NetComponent, extract_connectivity},
+    equipment::{
+        AlarmSeverity, EquipmentEvent, EquipmentSimulator, HostCommand,
+        RecipeId as EquipmentRecipeId, RecipeSelection, RunStatus, SensorSample,
+        Tool as EquipmentTool, ToolId as EquipmentToolId, ToolKind as EquipmentToolKind,
+        ToolState as EquipmentToolState,
+    },
     gdsii::{export_gdsii, import_gdsii},
+    mes::{
+        AuditOutcome, FabMesData, Lot, LotId, OperatorAction, ProcessRoute, ToolId, TravelerState,
+        TravelerStatus,
+    },
+    metrology::{
+        DieCoord, HistogramBin, Measurement, MeasurementKind, MeasurementStatus, WaferMap,
+    },
+    yield_analysis::{
+        CorrelationRecord, DieOutcome, FailureMode, LotComparison, ProcessMeasurement,
+        YieldAnalysis, YieldSummary,
+    },
 };
 #[cfg(not(target_arch = "wasm32"))]
 use renderer::gpu::OffscreenRenderRequest;
@@ -31,6 +48,9 @@ use renderer::gpu::{
 use router::{RouteRequest, RouterConfig, route};
 use uuid::Uuid;
 use web_time::{Duration, Instant};
+
+mod recipe_panel;
+use recipe_panel::RecipeManagerPanel;
 
 #[cfg(not(target_arch = "wasm32"))]
 use futures_util::{Sink, SinkExt, StreamExt};
@@ -62,6 +82,9 @@ enum Tool {
 enum ViewMode {
     Layout2d,
     Layout3d,
+    FabControl,
+    Metrology,
+    Yield,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -461,6 +484,9 @@ struct SelectedInstanceInfo {
 pub struct FabricadApp {
     document: Document,
     index: LayoutIndex,
+    yield_analysis: YieldAnalysis,
+    selected_yield_lot: String,
+    selected_yield_wafer: String,
     technologies: Vec<TechnologyFile>,
     active_technology: usize,
     rules: RuleDeck,
@@ -473,6 +499,10 @@ pub struct FabricadApp {
     active_layer: LayerId,
     tool: Tool,
     view_mode: ViewMode,
+    wafer_map: WaferMap,
+    metrology_kind: MeasurementKind,
+    selected_die: Option<DieCoord>,
+    metrology_failed_only: bool,
     zoom: f32,
     pan: Vec2,
     camera_3d: Camera3d,
@@ -510,6 +540,15 @@ pub struct FabricadApp {
     collab: Option<CollabClient>,
     cell_name_drafts: BTreeMap<CellId, String>,
     instance_name_drafts: BTreeMap<(CellId, InstanceId), String>,
+    mes: FabMesData,
+    selected_mes_lot: Option<LotId>,
+    show_mes_panel: bool,
+    mes_operator: String,
+    recipe_panel: RecipeManagerPanel,
+    equipment_sim: EquipmentSimulator,
+    selected_equipment_tool: Option<EquipmentToolId>,
+    equipment_recipe_drafts: BTreeMap<EquipmentToolId, EquipmentRecipeId>,
+    last_equipment_tick: Instant,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -615,6 +654,17 @@ impl FabricadApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let technologies = builtin_technologies();
         let document = Document::demo();
+        let yield_analysis = YieldAnalysis::synthetic();
+        let selected_yield_lot = yield_analysis
+            .lots
+            .first()
+            .map(|lot| lot.id.clone())
+            .unwrap_or_default();
+        let selected_yield_wafer = yield_analysis
+            .wafer_ids_for_lot(&selected_yield_lot)
+            .first()
+            .cloned()
+            .unwrap_or_default();
         let user_id = Uuid::new_v4();
         let mut loro_log = LoroCrdtLog::new(user_id).expect("create Loro CRDT log");
         if document_object_count(&document) <= MAX_LORO_SEED_OBJECTS {
@@ -631,9 +681,16 @@ impl FabricadApp {
         let violations = run_drc(&document, &rules);
         let connectivity =
             connectivity_report_for_document(&document, &technologies[active_technology]);
+        let mes = FabMesData::sample();
+        let selected_mes_lot = mes.lots.keys().next().cloned();
+        let equipment_sim = EquipmentSimulator::demo_fab();
+        let selected_equipment_tool = equipment_sim.tools().next().map(|tool| tool.id.clone());
         let mut app = Self {
             document,
             index,
+            yield_analysis,
+            selected_yield_lot,
+            selected_yield_wafer,
             technologies,
             active_technology,
             rules,
@@ -646,6 +703,10 @@ impl FabricadApp {
             active_layer,
             tool: Tool::Select,
             view_mode: ViewMode::Layout2d,
+            wafer_map: WaferMap::synthetic_demo(),
+            metrology_kind: MeasurementKind::ThicknessNm,
+            selected_die: Some(DieCoord::new(0, 0)),
+            metrology_failed_only: false,
             zoom: 0.075,
             pan: Vec2::ZERO,
             camera_3d: Camera3d::default(),
@@ -686,6 +747,15 @@ impl FabricadApp {
             collab: None,
             cell_name_drafts: BTreeMap::new(),
             instance_name_drafts: BTreeMap::new(),
+            mes,
+            selected_mes_lot,
+            show_mes_panel: true,
+            mes_operator: "op.demo".to_string(),
+            recipe_panel: RecipeManagerPanel::new(),
+            equipment_sim,
+            selected_equipment_tool,
+            equipment_recipe_drafts: BTreeMap::new(),
+            last_equipment_tick: Instant::now(),
         };
         app.reset_3d_camera_to_document();
         app
@@ -2381,6 +2451,534 @@ impl FabricadApp {
         });
     }
 
+    fn advance_equipment_simulator(&mut self) {
+        let seconds = self.last_equipment_tick.elapsed().as_secs().min(4);
+        if seconds == 0 {
+            return;
+        }
+        let events = self.equipment_sim.tick(seconds);
+        self.last_equipment_tick = Instant::now();
+        if events
+            .iter()
+            .any(|event| matches!(event, EquipmentEvent::AlarmRaised { .. }))
+        {
+            self.status = "equipment simulator raised an alarm".to_string();
+        }
+    }
+
+    fn send_equipment_command(&mut self, tool_id: EquipmentToolId, command: HostCommand) {
+        let label = command.label();
+        match self.equipment_sim.command(&tool_id, command) {
+            Ok(events) => {
+                let state = self
+                    .equipment_sim
+                    .tool(&tool_id)
+                    .map(|tool| tool.state.label())
+                    .unwrap_or("unknown");
+                let major_events = events
+                    .iter()
+                    .filter(|event| !matches!(event, EquipmentEvent::SensorSample { .. }))
+                    .count();
+                self.status = format!("{tool_id} {label}: {state}, {major_events} event(s)");
+            }
+            Err(err) => {
+                self.status = err.to_string();
+            }
+        }
+    }
+
+    fn selected_recipe_for_tool(&self, tool: &EquipmentTool) -> Option<EquipmentRecipeId> {
+        self.equipment_recipe_drafts
+            .get(&tool.id)
+            .cloned()
+            .or_else(|| {
+                tool.selected_recipe
+                    .as_ref()
+                    .map(|selection| selection.recipe_id.clone())
+            })
+            .or_else(|| tool.available_recipes.keys().next().cloned())
+    }
+
+    fn selection_for_tool(
+        &self,
+        tool: &EquipmentTool,
+        recipe_id: EquipmentRecipeId,
+    ) -> RecipeSelection {
+        let version = tool
+            .available_recipes
+            .get(&recipe_id)
+            .map(|recipe| recipe.version)
+            .unwrap_or(1);
+        RecipeSelection {
+            recipe_id,
+            recipe_version: version,
+            lot_id: Some("LOT-FABOS-0042".to_string()),
+            wafer_id: Some(format!("W{:02}", (self.equipment_sim.now_s % 25) + 1)),
+            process_step_id: Some(equipment_process_step_label(tool.kind).to_string()),
+            operator: Some(short_user(self.user_id)),
+        }
+    }
+
+    fn fab_control_room(&mut self, ui: &mut egui::Ui) {
+        let tools = self.equipment_sim.tools().cloned().collect::<Vec<_>>();
+        if self
+            .selected_equipment_tool
+            .as_ref()
+            .is_none_or(|id| !tools.iter().any(|tool| &tool.id == id))
+        {
+            self.selected_equipment_tool = tools.first().map(|tool| tool.id.clone());
+        }
+
+        ui.vertical(|ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.heading("Fab Control Room");
+                ui.separator();
+                ui.label(format!("Sim time: {} s", self.equipment_sim.now_s));
+                ui.label(format!("Tools: {}", tools.len()));
+                ui.label(format!(
+                    "Running: {}",
+                    tools
+                        .iter()
+                        .filter(|tool| tool.state == EquipmentToolState::Running)
+                        .count()
+                ));
+                ui.colored_label(
+                    equipment_state_color(EquipmentToolState::Alarm),
+                    format!(
+                        "Active alarms: {}",
+                        self.equipment_sim.active_alarms().len()
+                    ),
+                );
+            });
+            ui.separator();
+
+            let wide = ui.available_width() > 980.0;
+            if wide {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.set_width((ui.available_width() * 0.62).max(560.0));
+                        self.equipment_tool_grid(ui, &tools);
+                    });
+                    ui.separator();
+                    ui.vertical(|ui| {
+                        self.selected_equipment_panel(ui, &tools);
+                    });
+                });
+            } else {
+                self.equipment_tool_grid(ui, &tools);
+                ui.separator();
+                self.selected_equipment_panel(ui, &tools);
+            }
+        });
+    }
+
+    fn equipment_tool_grid(&mut self, ui: &mut egui::Ui, tools: &[EquipmentTool]) {
+        ui.strong("Tool Grid");
+        let mut pending_command: Option<(EquipmentToolId, HostCommand)> = None;
+        egui::ScrollArea::vertical()
+            .id_salt("equipment_tool_grid_scroll")
+            .max_height(if ui.available_height() > 520.0 {
+                ui.available_height() - 16.0
+            } else {
+                420.0
+            })
+            .show(ui, |ui| {
+                egui::Grid::new("equipment_tool_grid")
+                    .num_columns(5)
+                    .striped(true)
+                    .spacing(vec2(14.0, 8.0))
+                    .show(ui, |ui| {
+                        ui.strong("Tool");
+                        ui.strong("State");
+                        ui.strong("Recipe / run");
+                        ui.strong("Sensors");
+                        ui.strong("Commands");
+                        ui.end_row();
+
+                        for tool in tools {
+                            let selected = self.selected_equipment_tool.as_ref() == Some(&tool.id);
+                            let label = format!("{}\n{}", tool.name, tool.id);
+                            if ui.selectable_label(selected, label).clicked() {
+                                self.selected_equipment_tool = Some(tool.id.clone());
+                            }
+
+                            ui.label(
+                                egui::RichText::new(tool.state.label())
+                                    .color(equipment_state_color(tool.state))
+                                    .strong(),
+                            );
+                            ui.label(equipment_recipe_run_summary(tool, self.equipment_sim.now_s));
+                            ui.label(equipment_recent_sensor_summary(tool));
+
+                            ui.horizontal_wrapped(|ui| {
+                                if ui
+                                    .add_enabled(
+                                        tool.state == EquipmentToolState::Offline,
+                                        egui::Button::new("Online"),
+                                    )
+                                    .clicked()
+                                {
+                                    pending_command =
+                                        Some((tool.id.clone(), HostCommand::BringOnline));
+                                }
+                                if let Some(recipe_id) = self.selected_recipe_for_tool(tool)
+                                    && ui
+                                        .add_enabled(
+                                            tool.state.accepts_recipe_load(),
+                                            egui::Button::new("Load"),
+                                        )
+                                        .clicked()
+                                {
+                                    pending_command = Some((
+                                        tool.id.clone(),
+                                        HostCommand::LoadRecipe {
+                                            selection: self.selection_for_tool(tool, recipe_id),
+                                        },
+                                    ));
+                                }
+                                if ui
+                                    .add_enabled(
+                                        tool.state == EquipmentToolState::RecipeLoaded,
+                                        egui::Button::new("Start"),
+                                    )
+                                    .clicked()
+                                {
+                                    pending_command = Some((tool.id.clone(), HostCommand::Start));
+                                }
+                                if ui
+                                    .add_enabled(
+                                        tool.state == EquipmentToolState::Running,
+                                        egui::Button::new("Stop"),
+                                    )
+                                    .clicked()
+                                {
+                                    pending_command = Some((tool.id.clone(), HostCommand::Stop));
+                                }
+                                if ui
+                                    .add_enabled(
+                                        !matches!(
+                                            tool.state,
+                                            EquipmentToolState::Offline
+                                                | EquipmentToolState::Maintenance
+                                        ),
+                                        egui::Button::new("Alarm"),
+                                    )
+                                    .clicked()
+                                {
+                                    pending_command = Some((
+                                        tool.id.clone(),
+                                        HostCommand::TriggerAlarm {
+                                            code: "HOST-SIM".to_string(),
+                                            message: "operator injected simulator alarm"
+                                                .to_string(),
+                                            severity: AlarmSeverity::Warning,
+                                        },
+                                    ));
+                                }
+                                if ui
+                                    .add_enabled(
+                                        tool.state == EquipmentToolState::Alarm,
+                                        egui::Button::new("Clear"),
+                                    )
+                                    .clicked()
+                                {
+                                    pending_command =
+                                        Some((tool.id.clone(), HostCommand::ClearAlarm));
+                                }
+                            });
+                            ui.end_row();
+                        }
+                    });
+            });
+
+        if let Some((tool_id, command)) = pending_command {
+            self.send_equipment_command(tool_id, command);
+        }
+    }
+
+    fn selected_equipment_panel(&mut self, ui: &mut egui::Ui, tools: &[EquipmentTool]) {
+        let selected_id = self
+            .selected_equipment_tool
+            .clone()
+            .or_else(|| tools.first().map(|tool| tool.id.clone()));
+        let Some(selected_id) = selected_id else {
+            ui.label("No simulator tools configured");
+            return;
+        };
+        let Some(tool) = tools.iter().find(|tool| tool.id == selected_id).cloned() else {
+            ui.label("Selected simulator tool is unavailable");
+            return;
+        };
+
+        ui.heading(&tool.name);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(tool.id.to_string());
+            ui.separator();
+            ui.label(tool.kind.label());
+            ui.separator();
+            ui.label(tool.class.label());
+            ui.separator();
+            ui.label(
+                egui::RichText::new(tool.state.label())
+                    .color(equipment_state_color(tool.state))
+                    .strong(),
+            );
+        });
+
+        ui.separator();
+        ui.strong("Recipe");
+        let mut draft = self
+            .selected_recipe_for_tool(&tool)
+            .unwrap_or_else(|| EquipmentRecipeId::new(""));
+        let selected_recipe_text = tool
+            .available_recipes
+            .get(&draft)
+            .map(|recipe| format!("{} v{}", recipe.name, recipe.version))
+            .unwrap_or_else(|| "No recipe".to_string());
+        egui::ComboBox::from_id_salt(("equipment_recipe", tool.id.as_str()))
+            .selected_text(selected_recipe_text)
+            .show_ui(ui, |ui| {
+                for recipe in tool.available_recipes.values() {
+                    ui.selectable_value(
+                        &mut draft,
+                        recipe.id.clone(),
+                        format!("{} v{}", recipe.name, recipe.version),
+                    );
+                }
+            });
+        if !draft.as_str().is_empty() {
+            self.equipment_recipe_drafts
+                .insert(tool.id.clone(), draft.clone());
+        }
+
+        let mut pending_command: Option<(EquipmentToolId, HostCommand)> = None;
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(
+                    tool.state == EquipmentToolState::Offline,
+                    egui::Button::new("Bring Online"),
+                )
+                .clicked()
+            {
+                pending_command = Some((tool.id.clone(), HostCommand::BringOnline));
+            }
+            if ui
+                .add_enabled(
+                    tool.state.accepts_recipe_load() && !draft.as_str().is_empty(),
+                    egui::Button::new("Load Recipe"),
+                )
+                .clicked()
+            {
+                pending_command = Some((
+                    tool.id.clone(),
+                    HostCommand::LoadRecipe {
+                        selection: self.selection_for_tool(&tool, draft.clone()),
+                    },
+                ));
+            }
+            if ui
+                .add_enabled(
+                    tool.state == EquipmentToolState::RecipeLoaded,
+                    egui::Button::new("Start"),
+                )
+                .clicked()
+            {
+                pending_command = Some((tool.id.clone(), HostCommand::Start));
+            }
+            if ui
+                .add_enabled(
+                    tool.state == EquipmentToolState::Running,
+                    egui::Button::new("Stop"),
+                )
+                .clicked()
+            {
+                pending_command = Some((tool.id.clone(), HostCommand::Stop));
+            }
+            if ui
+                .add_enabled(
+                    tool.state != EquipmentToolState::Running,
+                    egui::Button::new("Reset"),
+                )
+                .clicked()
+            {
+                pending_command = Some((tool.id.clone(), HostCommand::Reset));
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(
+                    !matches!(
+                        tool.state,
+                        EquipmentToolState::Offline | EquipmentToolState::Maintenance
+                    ),
+                    egui::Button::new("Trigger Alarm"),
+                )
+                .clicked()
+            {
+                pending_command = Some((
+                    tool.id.clone(),
+                    HostCommand::TriggerAlarm {
+                        code: "HOST-SIM".to_string(),
+                        message: "operator injected simulator alarm".to_string(),
+                        severity: AlarmSeverity::Warning,
+                    },
+                ));
+            }
+            if ui
+                .add_enabled(
+                    tool.state == EquipmentToolState::Alarm,
+                    egui::Button::new("Clear Alarm"),
+                )
+                .clicked()
+            {
+                pending_command = Some((tool.id.clone(), HostCommand::ClearAlarm));
+            }
+            let maintenance_label = if tool.state == EquipmentToolState::Maintenance {
+                "Exit Maintenance"
+            } else {
+                "Maintenance"
+            };
+            if ui
+                .add_enabled(
+                    tool.state != EquipmentToolState::Running,
+                    egui::Button::new(maintenance_label),
+                )
+                .clicked()
+            {
+                pending_command = Some((
+                    tool.id.clone(),
+                    if tool.state == EquipmentToolState::Maintenance {
+                        HostCommand::ExitMaintenance
+                    } else {
+                        HostCommand::EnterMaintenance
+                    },
+                ));
+            }
+        });
+
+        if let Some((tool_id, command)) = pending_command {
+            self.send_equipment_command(tool_id, command);
+        }
+
+        ui.separator();
+        self.equipment_run_panel(ui, &tool);
+        ui.separator();
+        self.equipment_sensor_panel(ui, &tool);
+        ui.separator();
+        self.equipment_alarm_panel(ui);
+    }
+
+    fn equipment_run_panel(&self, ui: &mut egui::Ui, tool: &EquipmentTool) {
+        ui.strong("Current Run");
+        if let Some(run) = &tool.active_run {
+            ui.label(format!(
+                "{} on {} for {} s",
+                run.id,
+                run.recipe.recipe_id,
+                run.elapsed_s(self.equipment_sim.now_s)
+            ));
+            if let Some(recipe) = tool.selected_recipe_details() {
+                let progress = (run.elapsed_s(self.equipment_sim.now_s) as f32
+                    / recipe.duration_s as f32)
+                    .clamp(0.0, 1.0);
+                ui.add(
+                    egui::ProgressBar::new(progress)
+                        .desired_width(ui.available_width().min(360.0))
+                        .text(format!("{:.0}%", progress * 100.0)),
+                );
+            }
+        } else if let Some(selection) = &tool.selected_recipe {
+            ui.label(format!(
+                "Loaded {} v{}",
+                selection.recipe_id, selection.recipe_version
+            ));
+        } else {
+            ui.label("No active run");
+        }
+
+        ui.strong("Recent Runs");
+        if tool.recent_runs.is_empty() {
+            ui.label("No completed runs");
+            return;
+        }
+        for run in tool.recent_runs.iter().take(4) {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(run.id.to_string());
+                ui.label(
+                    egui::RichText::new(run.status.label())
+                        .color(equipment_run_status_color(run.status)),
+                );
+                ui.label(format!(
+                    "{} s, {} samples",
+                    run.elapsed_s(self.equipment_sim.now_s),
+                    run.sensor_count
+                ));
+            });
+        }
+    }
+
+    fn equipment_sensor_panel(&self, ui: &mut egui::Ui, tool: &EquipmentTool) {
+        ui.strong("Sensor Streams");
+        let names = equipment_sensor_names(tool);
+        if names.is_empty() {
+            ui.label("Waiting for samples");
+            return;
+        }
+        for name in names {
+            let values = equipment_sensor_series(tool, &name, 36);
+            let latest = tool.latest_sensor(&name);
+            ui.horizontal(|ui| {
+                ui.set_min_height(42.0);
+                ui.vertical(|ui| {
+                    ui.label(&name);
+                    if let Some(sample) = latest {
+                        ui.label(equipment_sensor_value(sample));
+                    }
+                });
+                equipment_sparkline(ui, &values, Color32::from_rgb(96, 178, 255));
+            });
+        }
+    }
+
+    fn equipment_alarm_panel(&self, ui: &mut egui::Ui) {
+        ui.strong("Active Alarms");
+        let alarms = self.equipment_sim.active_alarms();
+        if alarms.is_empty() {
+            ui.label("None");
+        } else {
+            for alarm in alarms {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new(alarm.severity.label())
+                            .color(equipment_alarm_color(alarm.severity))
+                            .strong(),
+                    );
+                    ui.label(format!("{} {}", alarm.tool_id, alarm.code));
+                    ui.label(&alarm.message);
+                });
+            }
+        }
+
+        ui.separator();
+        ui.strong("Fab Run Log");
+        let recent_runs = self.equipment_sim.recent_runs();
+        if recent_runs.is_empty() {
+            ui.label("No logged runs");
+        } else {
+            for run in recent_runs.into_iter().take(5) {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(run.tool_id.to_string());
+                    ui.label(run.id.to_string());
+                    ui.label(run.recipe.recipe_id.to_string());
+                    ui.label(
+                        egui::RichText::new(run.status.label())
+                            .color(equipment_run_status_color(run.status)),
+                    );
+                });
+            }
+        }
+    }
+
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
             ui.selectable_value(&mut self.view_mode, ViewMode::Layout2d, "2D");
@@ -2389,6 +2987,24 @@ impl FabricadApp {
                 .clicked()
             {
                 self.status = "3D flycam view".to_string();
+            }
+            if ui
+                .selectable_value(&mut self.view_mode, ViewMode::FabControl, "Fab Control")
+                .clicked()
+            {
+                self.status = "FabOS equipment control room".to_string();
+            }
+            if ui
+                .selectable_value(&mut self.view_mode, ViewMode::Metrology, "Wafer")
+                .clicked()
+            {
+                self.status = "metrology wafer map".to_string();
+            }
+            if ui
+                .selectable_value(&mut self.view_mode, ViewMode::Yield, "Yield")
+                .clicked()
+            {
+                self.status = "FabOS yield dashboard".to_string();
             }
             if matches!(self.view_mode, ViewMode::Layout3d) && ui.button("Reset 3D").clicked() {
                 self.reset_3d_camera_to_document();
@@ -2456,6 +3072,7 @@ impl FabricadApp {
             if ui.button("Options").clicked() {
                 self.show_options = true;
             }
+            ui.toggle_value(&mut self.show_mes_panel, "MES");
             if ui.button("Make Cell").clicked() {
                 self.create_cell_from_selection();
             }
@@ -2755,6 +3372,319 @@ impl FabricadApp {
         ));
     }
 
+    fn mes_panel(&mut self, ctx: &egui::Context) {
+        if !self.show_mes_panel {
+            return;
+        }
+        egui::TopBottomPanel::bottom("mes_traveler")
+            .resizable(true)
+            .default_height(260.0)
+            .show(ctx, |ui| self.mes_ui(ui));
+    }
+
+    fn mes_ui(&mut self, ui: &mut egui::Ui) {
+        let mut action = None;
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| self.mes_wip_board_ui(ui));
+            ui.separator();
+            ui.vertical(|ui| {
+                action = self.mes_selected_lot_ui(ui);
+            });
+        });
+        if let Some((lot_id, action)) = action {
+            self.apply_mes_action(&lot_id, action);
+        }
+    }
+
+    fn mes_wip_board_ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading("MES WIP");
+        if self.selected_mes_lot.is_none() {
+            self.selected_mes_lot = self.mes.lots.keys().next().cloned();
+        }
+        let lot_ids: Vec<_> = self.mes.lots.keys().cloned().collect();
+        for lot_id in lot_ids {
+            let Some((label, detail)) = self.mes_wip_row(&lot_id) else {
+                continue;
+            };
+            let selected = self.selected_mes_lot.as_ref() == Some(&lot_id);
+            if ui.selectable_label(selected, label).clicked() {
+                self.selected_mes_lot = Some(lot_id);
+            }
+            ui.small(detail);
+        }
+    }
+
+    fn mes_wip_row(&self, lot_id: &LotId) -> Option<(String, String)> {
+        let lot = self.mes.lots.get(lot_id)?;
+        let traveler = self.mes.travelers.get(lot_id)?;
+        let route = self.mes.routes.get(&lot.route_id)?;
+        let step = traveler
+            .current_step(route)
+            .map(|step| step.name.as_str())
+            .unwrap_or("route complete");
+        Some((
+            format!("{}  {}  {}", lot.id, traveler.status.label(), step),
+            format!(
+                "{} wafers, {} scrap, {} rework",
+                lot.processable_wafer_count(),
+                lot.scrapped_wafer_count(),
+                lot.rework_wafer_count()
+            ),
+        ))
+    }
+
+    fn mes_selected_lot_ui(&mut self, ui: &mut egui::Ui) -> Option<(LotId, OperatorAction)> {
+        let lot_id = self
+            .selected_mes_lot
+            .clone()
+            .or_else(|| self.mes.lots.keys().next().cloned())?;
+        self.selected_mes_lot = Some(lot_id.clone());
+        let lot = self.mes.lots.get(&lot_id).cloned()?;
+        let traveler = self.mes.travelers.get(&lot_id).cloned()?;
+        let route = self.mes.routes.get(&lot.route_id).cloned()?;
+
+        ui.heading(format!("Traveler {}", lot.id));
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!("Product: {}", lot.product));
+            ui.separator();
+            ui.label(format!("Route: {} {}", route.name, route.revision));
+            ui.separator();
+            ui.label(format!("Mask: {}", lot.mask_design_id));
+            ui.separator();
+            ui.label(format!("Layout: {}", lot.layout_revision));
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!("Status: {}", traveler.status.label()));
+            ui.separator();
+            ui.label(format!(
+                "Wafers: {} processable / {} scrapped / {} rework",
+                lot.processable_wafer_count(),
+                lot.scrapped_wafer_count(),
+                lot.rework_wafer_count()
+            ));
+            if let Some(run) = &traveler.active_run {
+                ui.separator();
+                ui.label(format!("Running: {} on {}", run.step_id, run.tool_id));
+            }
+            if let Some(hold) = &traveler.hold {
+                ui.separator();
+                ui.colored_label(Color32::YELLOW, format!("Hold: {}", hold.reason));
+            }
+        });
+
+        if let Some(step) = traveler.current_step(&route) {
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!("Current step: {} ({})", step.name, step.id));
+                ui.separator();
+                ui.label(format!("Area: {}", step.area));
+                ui.separator();
+                ui.label(format!(
+                    "Requires: {} / {}",
+                    step.required_tool_class, step.required_recipe
+                ));
+                ui.separator();
+                let tools = step
+                    .eligible_tools
+                    .iter()
+                    .map(ToolId::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                ui.label(format!("Eligible tools: {tools}"));
+            });
+        } else {
+            ui.separator();
+            ui.label("No current step.");
+        }
+
+        ui.separator();
+        let mut action = self.mes_actions_ui(ui, &lot, &route, &traveler);
+        ui.separator();
+        self.mes_audit_ui(ui, &traveler);
+        action.take().map(|action| (lot_id, action))
+    }
+
+    fn mes_actions_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        lot: &Lot,
+        route: &ProcessRoute,
+        traveler: &TravelerState,
+    ) -> Option<OperatorAction> {
+        let mut action = None;
+        ui.horizontal(|ui| {
+            ui.label("Operator");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.mes_operator)
+                    .desired_width(120.0)
+                    .hint_text("operator"),
+            );
+        });
+
+        ui.horizontal_wrapped(|ui| {
+            match traveler.status {
+                TravelerStatus::WaitingForStep => {
+                    if let Some(step) = traveler.current_step(route) {
+                        let tool_id = step
+                            .primary_tool()
+                            .cloned()
+                            .unwrap_or_else(|| ToolId::new("NO-ELIGIBLE-TOOL"));
+                        if ui
+                            .button(format!("Start {}", step.id))
+                            .on_hover_text(format!(
+                                "{} / {} on {}",
+                                step.required_tool_class, step.required_recipe, tool_id
+                            ))
+                            .clicked()
+                        {
+                            action = Some(OperatorAction::StartStep {
+                                step_id: step.id.clone(),
+                                tool_id,
+                                tool_class: step.required_tool_class,
+                                recipe_id: step.required_recipe.clone(),
+                                operator: self.mes_action_operator(),
+                            });
+                        }
+                    }
+                }
+                TravelerStatus::Running => {
+                    if let Some(run) = &traveler.active_run {
+                        if ui.button(format!("Complete {}", run.step_id)).clicked() {
+                            action = Some(OperatorAction::CompleteStep {
+                                step_id: run.step_id.clone(),
+                                operator: self.mes_action_operator(),
+                            });
+                        }
+                    }
+                }
+                TravelerStatus::WaitingForSignoff => {
+                    if let Some(pending) = &traveler.pending_signoff {
+                        if ui
+                            .button(format!("Sign off {}", pending.run.step_id))
+                            .clicked()
+                        {
+                            action = Some(OperatorAction::SignOff {
+                                step_id: pending.run.step_id.clone(),
+                                operator: self.mes_action_operator(),
+                            });
+                        }
+                    }
+                }
+                TravelerStatus::OnHold => {
+                    if ui.button("Release hold").clicked() {
+                        action = Some(OperatorAction::ReleaseHold {
+                            operator: self.mes_action_operator(),
+                        });
+                    }
+                }
+                TravelerStatus::Complete => {
+                    ui.label("Route complete");
+                }
+                TravelerStatus::Scrapped => {
+                    ui.label("Lot scrapped");
+                }
+            }
+
+            if !matches!(
+                traveler.status,
+                TravelerStatus::OnHold | TravelerStatus::Complete | TravelerStatus::Scrapped
+            ) {
+                if ui.button("Place hold").clicked() {
+                    action = Some(OperatorAction::PlaceHold {
+                        reason: "MES demo process review".to_string(),
+                        operator: self.mes_action_operator(),
+                    });
+                }
+                if let Some(wafer_id) = lot.last_processable_wafer_id() {
+                    if ui.button(format!("Scrap {}", wafer_id)).clicked() {
+                        action = Some(OperatorAction::ScrapWafer {
+                            wafer_id,
+                            reason: "MES demo edge defect".to_string(),
+                            operator: self.mes_action_operator(),
+                        });
+                    }
+                }
+                if let (Some(step_id), Some(wafer_id)) = (
+                    traveler.current_step_id.clone(),
+                    lot.first_processable_wafer_id(),
+                ) {
+                    if ui
+                        .button(format!("Rework {} to {}", wafer_id, step_id))
+                        .clicked()
+                    {
+                        action = Some(OperatorAction::SendToRework {
+                            wafer_ids: vec![wafer_id],
+                            target_step: step_id,
+                            reason: "MES demo rework verification".to_string(),
+                            operator: self.mes_action_operator(),
+                        });
+                    }
+                }
+            }
+        });
+        action
+    }
+
+    fn mes_audit_ui(&self, ui: &mut egui::Ui, traveler: &TravelerState) {
+        ui.label("Audit trail");
+        egui::ScrollArea::vertical()
+            .id_salt("mes_audit_scroll")
+            .max_height(110.0)
+            .show(ui, |ui| {
+                for event in traveler.audit_events.iter().rev().take(10) {
+                    ui.horizontal_wrapped(|ui| {
+                        let color = match event.outcome {
+                            AuditOutcome::Accepted => Color32::LIGHT_GREEN,
+                            AuditOutcome::Rejected => Color32::LIGHT_RED,
+                        };
+                        ui.colored_label(
+                            color,
+                            format!("#{} {}", event.sequence, event.outcome.label()),
+                        );
+                        ui.label(event.action.summary());
+                        ui.small(&event.message);
+                    });
+                }
+            });
+    }
+
+    fn mes_action_operator(&self) -> String {
+        let operator = self.mes_operator.trim();
+        if operator.is_empty() {
+            "op.demo".to_string()
+        } else {
+            operator.to_string()
+        }
+    }
+
+    fn apply_mes_action(&mut self, lot_id: &LotId, action: OperatorAction) {
+        let summary = action.summary();
+        let Some(route_id) = self.mes.lots.get(lot_id).map(|lot| lot.route_id.clone()) else {
+            self.status = format!("MES lot not found: {lot_id}");
+            return;
+        };
+        let Some(route) = self.mes.routes.get(&route_id).cloned() else {
+            self.status = format!("MES route not found: {route_id}");
+            return;
+        };
+        let Some(lot) = self.mes.lots.get_mut(lot_id) else {
+            self.status = format!("MES lot not found: {lot_id}");
+            return;
+        };
+        let Some(traveler) = self.mes.travelers.get_mut(lot_id) else {
+            self.status = format!("MES traveler not found: {lot_id}");
+            return;
+        };
+        match traveler.apply_action(lot, &route, action) {
+            Ok(()) => {
+                self.status = format!("MES: {summary}");
+            }
+            Err(err) => {
+                self.status = format!("MES blocked: {err}");
+            }
+        }
+    }
+
     fn inspector_panel(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("inspector")
             .resizable(true)
@@ -2763,15 +3693,21 @@ impl FabricadApp {
                 egui::ScrollArea::vertical()
                     .id_salt("inspector_panel_scroll")
                     .show(ui, |ui| {
-                        self.technology_panel(ui);
-                        ui.separator();
-                        self.hierarchy_panel(ui);
-                        ui.separator();
-                        self.status_panel(ui);
-                        ui.separator();
-                        self.net_panel(ui);
-                        ui.separator();
-                        self.marker_panel(ui);
+                        if matches!(self.view_mode, ViewMode::Metrology) {
+                            self.metrology_context_panel(ui);
+                        } else {
+                            self.technology_panel(ui);
+                            ui.separator();
+                            self.recipe_panel.ui(ui, &mut self.status);
+                            ui.separator();
+                            self.hierarchy_panel(ui);
+                            ui.separator();
+                            self.status_panel(ui);
+                            ui.separator();
+                            self.net_panel(ui);
+                            ui.separator();
+                            self.marker_panel(ui);
+                        }
                     });
             });
     }
@@ -2781,6 +3717,10 @@ impl FabricadApp {
             .resizable(true)
             .default_width(220.0)
             .show(ctx, |ui| {
+                if matches!(self.view_mode, ViewMode::Metrology) {
+                    self.metrology_panel(ui);
+                    return;
+                }
                 ui.label("Layers");
                 let mut visibility_ops = Vec::new();
                 let mut layer_rows: Vec<_> = self
@@ -2830,6 +3770,211 @@ impl FabricadApp {
                     });
                 }
             });
+    }
+
+    fn metrology_context_panel(&mut self, ui: &mut egui::Ui) {
+        ui.label("FabOS Context");
+        ui.label(&self.wafer_map.name);
+        ui.separator();
+        let links = &self.wafer_map.links;
+        ui.label(format!("Lot: {}", links.lot_id));
+        ui.label(format!("Wafer: {}", links.wafer_id));
+        ui.label(format!("Step: {}", links.process_step_id));
+        ui.label(format!("Recipe: {}", links.recipe_id));
+        ui.label(format!("Tool run: {}", links.tool_run_id));
+
+        ui.separator();
+        let geometry = self.wafer_map.geometry;
+        ui.label("Wafer");
+        ui.label(format!(
+            "{:.0} mm diameter, {:.1} mm edge exclusion",
+            geometry.diameter_mm, geometry.edge_exclusion_mm
+        ));
+        ui.label(format!(
+            "{} die, pitch {:.1} x {:.1} mm",
+            self.wafer_map.dies.len(),
+            geometry.die_pitch_mm[0],
+            geometry.die_pitch_mm[1]
+        ));
+
+        ui.separator();
+        ui.label("Inspection Annotations");
+        for annotation in self.wafer_map.annotations.iter().take(5) {
+            let location = annotation
+                .die
+                .map(|die| format!("C{} R{}", die.column, die.row))
+                .unwrap_or_else(|| "wafer".to_string());
+            ui.label(format!(
+                "{:?} {}: {}",
+                annotation.kind, location, annotation.note
+            ));
+        }
+    }
+
+    fn metrology_panel(&mut self, ui: &mut egui::Ui) {
+        ui.label("Metrology");
+        let previous_kind = self.metrology_kind;
+        egui::ComboBox::from_id_salt("metrology_kind_picker")
+            .selected_text(self.metrology_kind.label())
+            .show_ui(ui, |ui| {
+                for kind in MeasurementKind::ALL {
+                    ui.selectable_value(&mut self.metrology_kind, kind, kind.label());
+                }
+            });
+        if self.metrology_kind != previous_kind {
+            self.status = format!("metrology filter: {}", self.metrology_kind.label());
+        }
+        ui.checkbox(&mut self.metrology_failed_only, "Fail/outlier only");
+
+        ui.separator();
+        let summary = self.wafer_map.summary(self.metrology_kind);
+        self.metrology_summary_ui(ui, summary);
+
+        ui.separator();
+        self.metrology_legend_ui(ui, summary);
+
+        ui.separator();
+        let histogram = self.wafer_map.histogram(self.metrology_kind, 18);
+        self.metrology_histogram_ui(ui, &histogram);
+
+        ui.separator();
+        self.metrology_selected_die_ui(ui);
+    }
+
+    fn metrology_summary_ui(
+        &self,
+        ui: &mut egui::Ui,
+        summary: layout_model::metrology::MeasurementSummary,
+    ) {
+        ui.label("Summary");
+        ui.label(format!("Samples: {}", summary.sample_count));
+        ui.label(format!(
+            "Pass: {}  Fail: {}  Outlier: {}",
+            summary.pass_count, summary.fail_count, summary.outlier_count
+        ));
+        if let Some(mean) = summary.mean {
+            ui.label(format!(
+                "Mean: {}",
+                format_metrology_value(summary.kind, mean)
+            ));
+        }
+        if let Some(stddev) = summary.stddev {
+            ui.label(format!(
+                "Stddev: {}",
+                format_metrology_delta(summary.kind, stddev)
+            ));
+        }
+        if let (Some(min), Some(max)) = (summary.min, summary.max) {
+            ui.label(format!(
+                "Range: {} to {}",
+                format_metrology_value(summary.kind, min),
+                format_metrology_value(summary.kind, max)
+            ));
+        }
+    }
+
+    fn metrology_legend_ui(
+        &self,
+        ui: &mut egui::Ui,
+        summary: layout_model::metrology::MeasurementSummary,
+    ) {
+        ui.label("Legend");
+        if let (Some(min), Some(max)) = (summary.min, summary.max) {
+            ui.horizontal(|ui| {
+                metrology_swatch(ui, metrology_gradient_color(0.0));
+                ui.label(format_metrology_value(summary.kind, min));
+            });
+            ui.horizontal(|ui| {
+                metrology_swatch(ui, metrology_gradient_color(0.5));
+                if let Some(target) = summary.kind.spec().target {
+                    ui.label(format!(
+                        "Target {}",
+                        format_metrology_value(summary.kind, target)
+                    ));
+                } else {
+                    ui.label("Nominal");
+                }
+            });
+            ui.horizontal(|ui| {
+                metrology_swatch(ui, metrology_gradient_color(1.0));
+                ui.label(format_metrology_value(summary.kind, max));
+            });
+        }
+        ui.horizontal(|ui| {
+            metrology_swatch(ui, metrology_status_color(MeasurementStatus::Fail));
+            ui.label("Fail");
+        });
+        ui.horizontal(|ui| {
+            metrology_swatch(ui, metrology_status_color(MeasurementStatus::Outlier));
+            ui.label("Outlier");
+        });
+    }
+
+    fn metrology_histogram_ui(&self, ui: &mut egui::Ui, bins: &[HistogramBin]) {
+        ui.label("Histogram");
+        let desired = vec2(ui.available_width().max(120.0), 120.0);
+        let (rect, _) = ui.allocate_exact_size(desired, Sense::hover());
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 4.0, Color32::from_rgb(18, 22, 24));
+        painter.rect_stroke(
+            rect,
+            4.0,
+            Stroke::new(1.0, Color32::from_rgb(70, 82, 86)),
+            StrokeKind::Inside,
+        );
+        if bins.is_empty() {
+            return;
+        }
+        let max_count = bins.iter().map(|bin| bin.count).max().unwrap_or(1).max(1);
+        let gap = 2.0;
+        let width =
+            (rect.width() - gap * (bins.len().saturating_sub(1) as f32)) / bins.len() as f32;
+        for (index, bin) in bins.iter().enumerate() {
+            let height = rect.height() * (bin.count as f32 / max_count as f32);
+            let x = rect.left() + index as f32 * (width + gap);
+            let bar = EguiRect::from_min_max(
+                Pos2::new(x, rect.bottom() - height),
+                Pos2::new(x + width.max(1.0), rect.bottom()),
+            );
+            painter.rect_filled(
+                bar,
+                1.0,
+                metrology_gradient_color(index as f32 / bins.len() as f32),
+            );
+        }
+    }
+
+    fn metrology_selected_die_ui(&self, ui: &mut egui::Ui) {
+        ui.label("Selected Die");
+        let Some(die) = self.selected_die else {
+            ui.label("None");
+            return;
+        };
+        ui.label(format!("C{} R{}", die.column, die.row));
+        for kind in MeasurementKind::ALL {
+            if let Some(measurement) = self.wafer_map.measurement_for(die, kind) {
+                ui.horizontal(|ui| {
+                    metrology_swatch(
+                        ui,
+                        metrology_measurement_color(
+                            measurement,
+                            self.wafer_map.summary(measurement.kind),
+                        ),
+                    );
+                    ui.label(kind.label());
+                    ui.label(format_metrology_value(kind, measurement.value));
+                    ui.label(measurement.status.label());
+                });
+            }
+        }
+
+        let defect_count = self.wafer_map.defects_for_die(die).count();
+        if defect_count > 0 {
+            ui.label(format!("Defect records: {defect_count}"));
+        }
+        for annotation in self.wafer_map.annotations_for_die(die) {
+            ui.label(format!("{:?}: {}", annotation.kind, annotation.note));
+        }
     }
 
     fn marker_panel(&mut self, ui: &mut egui::Ui) {
@@ -3392,6 +4537,193 @@ impl FabricadApp {
         self.camera_3d.position += Vec3f::new(0.0, 0.0, direction.signum() * amount);
     }
 
+    fn yield_dashboard(&mut self, ui: &mut egui::Ui) {
+        let lot_ids = self
+            .yield_analysis
+            .lots
+            .iter()
+            .map(|lot| lot.id.clone())
+            .collect::<Vec<_>>();
+        if self.selected_yield_lot.is_empty() {
+            if let Some(lot_id) = lot_ids.first() {
+                self.selected_yield_lot = lot_id.clone();
+            }
+        }
+        if !lot_ids.contains(&self.selected_yield_lot) {
+            self.selected_yield_lot = lot_ids.first().cloned().unwrap_or_default();
+        }
+
+        let wafer_ids = self
+            .yield_analysis
+            .wafer_ids_for_lot(&self.selected_yield_lot);
+        if !wafer_ids.contains(&self.selected_yield_wafer) {
+            self.selected_yield_wafer = wafer_ids.first().cloned().unwrap_or_default();
+        }
+
+        let lot_id = self.selected_yield_lot.clone();
+        let wafer_id = self.selected_yield_wafer.clone();
+        let lot_summary = self.yield_analysis.lot_summary(&lot_id).cloned();
+        let wafer_summary = self
+            .yield_analysis
+            .wafer_summary(&lot_id, &wafer_id)
+            .cloned();
+        let die_outcomes = self
+            .yield_analysis
+            .die_outcomes_for_wafer(&lot_id, &wafer_id);
+        let wafer_rows = self
+            .yield_analysis
+            .wafer_summaries_for_lot(&lot_id)
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let measurements = self
+            .yield_analysis
+            .measurements_for_wafer(&lot_id, &wafer_id)
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let comparisons = self.yield_analysis.lot_comparisons.clone();
+        let correlations = self.yield_analysis.correlations.clone();
+
+        egui::ScrollArea::vertical()
+            .id_salt("yield_dashboard_scroll")
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("FabOS Yield");
+                    ui.separator();
+                    ui.label("Lot");
+                    egui::ComboBox::from_id_salt("yield_lot_picker")
+                        .selected_text(if lot_id.is_empty() {
+                            "none"
+                        } else {
+                            lot_id.as_str()
+                        })
+                        .show_ui(ui, |ui| {
+                            for candidate in &lot_ids {
+                                ui.selectable_value(
+                                    &mut self.selected_yield_lot,
+                                    candidate.clone(),
+                                    candidate,
+                                );
+                            }
+                        });
+                    ui.label("Wafer");
+                    egui::ComboBox::from_id_salt("yield_wafer_picker")
+                        .selected_text(if wafer_id.is_empty() {
+                            "none"
+                        } else {
+                            wafer_id.as_str()
+                        })
+                        .show_ui(ui, |ui| {
+                            for candidate in &wafer_ids {
+                                ui.selectable_value(
+                                    &mut self.selected_yield_wafer,
+                                    candidate.clone(),
+                                    candidate,
+                                );
+                            }
+                        });
+                });
+
+                if let Some(summary) = &lot_summary {
+                    ui.horizontal_wrapped(|ui| {
+                        yield_metric_ui(
+                            ui,
+                            "Lot yield",
+                            format_percent(summary.yield_fraction),
+                            format!(
+                                "{} pass / {} fail / {} dies",
+                                summary.passing_dies, summary.failing_dies, summary.total_dies
+                            ),
+                        );
+                        yield_metric_ui(
+                            ui,
+                            "Main fail",
+                            summary
+                                .dominant_failure
+                                .map(FailureMode::label)
+                                .unwrap_or("none")
+                                .to_string(),
+                            summary.spatial_pattern.label().to_string(),
+                        );
+                        yield_metric_ui(
+                            ui,
+                            "Recipe path",
+                            lot_recipe_label(&self.yield_analysis, &lot_id),
+                            lot_route_label(&self.yield_analysis, &lot_id),
+                        );
+                    });
+                }
+
+                ui.separator();
+                ui.columns(2, |columns| {
+                    columns[0].label(format!("Wafer map {wafer_id}"));
+                    draw_yield_wafer_map(&mut columns[0], &die_outcomes);
+                    if let Some(summary) = &wafer_summary {
+                        columns[0].label(format!(
+                            "{} yield, {} failures, {}",
+                            format_percent(summary.yield_fraction),
+                            summary.failing_dies,
+                            summary.spatial_pattern.label()
+                        ));
+                        for hint in &summary.root_cause_hints {
+                            columns[0].label(hint);
+                        }
+                    }
+
+                    columns[1].label("Wafer yield");
+                    self.yield_wafer_rows(&mut columns[1], &wafer_rows);
+                    columns[1].separator();
+                    columns[1].label("Failure modes");
+                    if let Some(summary) = &lot_summary {
+                        failure_breakdown_ui(&mut columns[1], summary);
+                    }
+                });
+
+                ui.separator();
+                ui.columns(2, |columns| {
+                    columns[0].label("Lot / recipe comparison");
+                    lot_comparison_ui(&mut columns[0], &comparisons);
+                    columns[1].label("Selected wafer process measurements");
+                    wafer_measurements_ui(&mut columns[1], &measurements);
+                });
+
+                ui.separator();
+                ui.label("Measurement correlation");
+                correlation_table_ui(ui, &correlations);
+            });
+    }
+
+    fn yield_wafer_rows(&mut self, ui: &mut egui::Ui, rows: &[YieldSummary]) {
+        let mut selected = None;
+        egui::Grid::new("yield_wafer_rows")
+            .striped(true)
+            .min_col_width(62.0)
+            .show(ui, |ui| {
+                ui.strong("Wafer");
+                ui.strong("Yield");
+                ui.strong("Fails");
+                ui.strong("Pattern");
+                ui.end_row();
+                for summary in rows {
+                    let wafer_id = summary.wafer_id.as_deref().unwrap_or("lot");
+                    if ui
+                        .selectable_label(self.selected_yield_wafer == wafer_id, wafer_id)
+                        .clicked()
+                    {
+                        selected = Some(wafer_id.to_string());
+                    }
+                    ui.label(format_percent(summary.yield_fraction));
+                    ui.label(summary.failing_dies.to_string());
+                    ui.label(summary.spatial_pattern.label());
+                    ui.end_row();
+                }
+            });
+        if let Some(wafer_id) = selected {
+            self.selected_yield_wafer = wafer_id;
+        }
+    }
+
     fn canvas(&mut self, ui: &mut egui::Ui) {
         let frame_start = Instant::now();
         let available = ui.available_size_before_wrap();
@@ -3557,6 +4889,146 @@ impl FabricadApp {
             self.draw_3d_layout_cpu_fallback(&painter, canvas)
         };
         self.draw_3d_hud(&painter, canvas, face_count);
+    }
+
+    fn metrology_canvas(&mut self, ui: &mut egui::Ui) {
+        let available = ui.available_size_before_wrap();
+        let (response, painter) = ui.allocate_painter(available, Sense::click());
+        let canvas = response.rect;
+        if canvas.width() <= 1.0 || canvas.height() <= 1.0 {
+            return;
+        }
+
+        painter.rect_filled(canvas, 0.0, Color32::from_rgb(12, 15, 17));
+        let side = (canvas.width().min(canvas.height()) - 56.0).max(180.0);
+        let wafer_rect = EguiRect::from_center_size(canvas.center(), vec2(side, side));
+        let center = wafer_rect.center();
+        let geometry = self.wafer_map.geometry;
+        let wafer_radius_px = side * 0.5;
+        let scale = side / geometry.diameter_mm as f32;
+        let active_radius_px = geometry.active_radius_mm() as f32 * scale;
+        let summary = self.wafer_map.summary(self.metrology_kind);
+
+        painter.circle_filled(center, wafer_radius_px, Color32::from_rgb(24, 29, 31));
+        painter.circle_stroke(
+            center,
+            wafer_radius_px,
+            Stroke::new(2.0, Color32::from_rgb(135, 154, 158)),
+        );
+        painter.circle_stroke(
+            center,
+            active_radius_px,
+            Stroke::new(1.0, Color32::from_rgba_unmultiplied(180, 190, 184, 105)),
+        );
+
+        let mut hovered_die = None;
+        let pointer = response.hover_pos();
+        for &die in &self.wafer_map.dies {
+            let Some(measurement) = self.wafer_map.measurement_for(die, self.metrology_kind) else {
+                continue;
+            };
+            let die_center = wafer_mm_to_screen(geometry.die_center_mm(die), center, scale);
+            let die_size = vec2(
+                (geometry.die_size_mm[0] as f32 * scale).max(2.0),
+                (geometry.die_size_mm[1] as f32 * scale).max(2.0),
+            ) * 0.92;
+            let die_rect = EguiRect::from_center_size(die_center, die_size);
+            if pointer.is_some_and(|point| die_rect.contains(point)) {
+                hovered_die = Some(die);
+            }
+
+            let filtered =
+                self.metrology_failed_only && measurement.status == MeasurementStatus::Pass;
+            let fill = if filtered {
+                Color32::from_rgba_unmultiplied(42, 48, 50, 72)
+            } else {
+                metrology_measurement_color(measurement, summary)
+            };
+            painter.rect_filled(die_rect, 1.0, fill);
+            painter.rect_stroke(
+                die_rect,
+                1.0,
+                Stroke::new(0.5, Color32::from_rgba_unmultiplied(9, 12, 14, 150)),
+                StrokeKind::Inside,
+            );
+
+            if self.selected_die == Some(die) {
+                painter.rect_stroke(
+                    die_rect.expand(1.5),
+                    1.0,
+                    Stroke::new(2.0, Color32::WHITE),
+                    StrokeKind::Outside,
+                );
+            }
+        }
+
+        if self.metrology_kind == MeasurementKind::DefectCount || self.selected_die.is_some() {
+            for defect in &self.wafer_map.defects {
+                if self.metrology_kind != MeasurementKind::DefectCount
+                    && Some(defect.die) != self.selected_die
+                {
+                    continue;
+                }
+                let pos = wafer_mm_to_screen(defect.position_mm, center, scale);
+                painter.circle_filled(
+                    pos,
+                    (2.0 + defect.severity as f32).min(6.0),
+                    Color32::from_rgb(28, 28, 28),
+                );
+                painter.circle_stroke(
+                    pos,
+                    (2.0 + defect.severity as f32).min(6.0),
+                    Stroke::new(1.0, Color32::from_rgb(255, 224, 128)),
+                );
+            }
+        }
+
+        for annotation in &self.wafer_map.annotations {
+            let pos = wafer_mm_to_screen(annotation.position_mm, center, scale);
+            painter.circle_stroke(pos, 7.0, Stroke::new(1.5, Color32::from_rgb(130, 210, 230)));
+        }
+
+        if let Some(die) = hovered_die {
+            let die_center = wafer_mm_to_screen(geometry.die_center_mm(die), center, scale);
+            let die_size = vec2(
+                geometry.die_size_mm[0] as f32 * scale,
+                geometry.die_size_mm[1] as f32 * scale,
+            ) * 0.96;
+            painter.rect_stroke(
+                EguiRect::from_center_size(die_center, die_size).expand(2.5),
+                1.0,
+                Stroke::new(1.5, Color32::from_rgb(255, 255, 190)),
+                StrokeKind::Outside,
+            );
+        }
+
+        if response.clicked() {
+            self.selected_die = hovered_die;
+            if let Some(die) = hovered_die {
+                self.status = format!("selected wafer die C{} R{}", die.column, die.row);
+            }
+        }
+
+        let header = format!(
+            "{}  {}  {} die",
+            self.wafer_map.links.lot_id,
+            self.wafer_map.links.wafer_id,
+            self.wafer_map.dies.len()
+        );
+        painter.text(
+            canvas.left_top() + vec2(16.0, 14.0),
+            Align2::LEFT_TOP,
+            header,
+            FontId::proportional(14.0),
+            Color32::from_rgb(220, 230, 226),
+        );
+        painter.text(
+            canvas.left_top() + vec2(16.0, 36.0),
+            Align2::LEFT_TOP,
+            self.metrology_kind.label(),
+            FontId::proportional(18.0),
+            Color32::from_rgb(240, 244, 236),
+        );
     }
 
     fn handle_3d_input(&mut self, ui: &egui::Ui, response: &egui::Response) {
@@ -4837,15 +6309,22 @@ impl eframe::App for FabricadApp {
         self.apply_theme(ctx);
         self.poll_collaboration();
         self.maybe_autosave();
+        self.advance_equipment_simulator();
         self.handle_shortcuts(ctx);
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| self.toolbar(ui));
         self.inspector_panel(ctx);
-        self.layers_panel(ctx);
+        if !matches!(self.view_mode, ViewMode::FabControl) {
+            self.layers_panel(ctx);
+        }
         self.options_window(ctx);
         self.diagnostics_window(ctx);
+        self.mes_panel(ctx);
         egui::CentralPanel::default().show(ctx, |ui| match self.view_mode {
             ViewMode::Layout2d => self.canvas(ui),
             ViewMode::Layout3d => self.canvas_3d(ui),
+            ViewMode::FabControl => self.fab_control_room(ui),
+            ViewMode::Metrology => self.metrology_canvas(ui),
+            ViewMode::Yield => self.yield_dashboard(ui),
         });
         ctx.request_repaint();
     }
@@ -5067,6 +6546,297 @@ fn document_object_count(document: &Document) -> usize {
             .values()
             .map(|cell| 1 + cell.shapes.len() + cell.instances.len())
             .sum::<usize>()
+}
+
+fn yield_metric_ui(ui: &mut egui::Ui, label: &str, value: String, detail: String) {
+    ui.group(|ui| {
+        ui.set_min_width(176.0);
+        ui.label(label);
+        ui.label(egui::RichText::new(value).strong().size(18.0));
+        ui.label(egui::RichText::new(detail).small());
+    });
+}
+
+fn draw_yield_wafer_map(ui: &mut egui::Ui, outcomes: &[DieOutcome]) {
+    let size = ui.available_width().clamp(220.0, 360.0);
+    let (rect, response) = ui.allocate_exact_size(vec2(size, size), Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 4.0, ui.visuals().faint_bg_color);
+
+    if outcomes.is_empty() {
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            "no wafer data",
+            FontId::proportional(14.0),
+            ui.visuals().weak_text_color(),
+        );
+        return;
+    }
+
+    let center = rect.center();
+    let radius = rect.width().min(rect.height()) * 0.46;
+    painter.circle_stroke(
+        center,
+        radius,
+        Stroke::new(1.0, Color32::from_rgb(132, 142, 154)),
+    );
+    painter.circle_stroke(
+        center,
+        radius * 0.72,
+        Stroke::new(0.5, Color32::from_gray(78)),
+    );
+
+    let max_coordinate = outcomes
+        .iter()
+        .map(|outcome| outcome.die.column.abs().max(outcome.die.row.abs()))
+        .max()
+        .unwrap_or(1)
+        .max(1) as f32;
+    let die_size = ((radius * 2.0) / (max_coordinate * 2.0 + 1.0) * 0.72).clamp(5.0, 16.0);
+    let scale = radius * 0.9 / max_coordinate;
+    let mut hovered = None;
+
+    for outcome in outcomes {
+        let pos = Pos2::new(
+            center.x + outcome.die.column as f32 * scale,
+            center.y - outcome.die.row as f32 * scale,
+        );
+        let die_rect = EguiRect::from_center_size(pos, vec2(die_size, die_size));
+        let color = outcome_color(outcome);
+        painter.rect_filled(die_rect, 1.5, color);
+        if !outcome.passed {
+            painter.rect_stroke(
+                die_rect,
+                1.5,
+                Stroke::new(0.75, Color32::BLACK),
+                StrokeKind::Outside,
+            );
+        }
+        if response
+            .hover_pos()
+            .is_some_and(|pointer| die_rect.expand(2.0).contains(pointer))
+        {
+            hovered = Some(outcome);
+        }
+    }
+
+    if let Some(outcome) = hovered {
+        let mode = outcome
+            .failure_modes
+            .first()
+            .map(|mode| mode.label())
+            .unwrap_or(if outcome.passed { "pass" } else { "fail" });
+        response.on_hover_text(format!(
+            "die ({}, {})\n{}\n{} failed / {} tests",
+            outcome.die.column, outcome.die.row, mode, outcome.failed_tests, outcome.test_count
+        ));
+    }
+}
+
+fn outcome_color(outcome: &DieOutcome) -> Color32 {
+    if outcome.passed {
+        return Color32::from_rgb(72, 164, 108);
+    }
+    outcome
+        .failure_modes
+        .first()
+        .copied()
+        .map(failure_mode_color)
+        .unwrap_or(Color32::from_rgb(202, 88, 88))
+}
+
+fn failure_mode_color(mode: FailureMode) -> Color32 {
+    match mode {
+        FailureMode::LowFrequency => Color32::from_rgb(222, 154, 58),
+        FailureMode::HighLeakage => Color32::from_rgb(214, 82, 116),
+        FailureMode::ContactResistance => Color32::from_rgb(168, 98, 210),
+        FailureMode::OpenCircuit => Color32::from_rgb(207, 94, 72),
+        FailureMode::ShortCircuit => Color32::from_rgb(190, 72, 72),
+        FailureMode::ParametricDrift => Color32::from_rgb(76, 139, 205),
+        FailureMode::EdgeDefect => Color32::from_rgb(218, 130, 70),
+    }
+}
+
+fn failure_breakdown_ui(ui: &mut egui::Ui, summary: &YieldSummary) {
+    if summary.failure_counts.is_empty() {
+        ui.label("No failing dies in selected scope");
+        return;
+    }
+    let mut rows = summary
+        .failure_counts
+        .iter()
+        .map(|(mode, count)| (*mode, *count))
+        .collect::<Vec<_>>();
+    rows.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+    let denominator = summary.failing_dies.max(1) as f32;
+    for (mode, count) in rows {
+        ui.horizontal(|ui| {
+            let (swatch, _) = ui.allocate_exact_size(vec2(12.0, 12.0), Sense::hover());
+            ui.painter()
+                .rect_filled(swatch, 2.0, failure_mode_color(mode));
+            ui.label(mode.label());
+            ui.add(
+                egui::ProgressBar::new(count as f32 / denominator)
+                    .desired_width(120.0)
+                    .text(format!("{} dies", count)),
+            );
+        });
+    }
+}
+
+fn lot_comparison_ui(ui: &mut egui::Ui, comparisons: &[LotComparison]) {
+    if comparisons.is_empty() {
+        ui.label("No comparison lots loaded");
+        return;
+    }
+    for comparison in comparisons {
+        ui.label(format!(
+            "{} / {} -> {} / {}",
+            comparison.baseline_lot_id,
+            comparison.baseline_recipe_id,
+            comparison.candidate_lot_id,
+            comparison.candidate_recipe_id
+        ));
+        ui.label(format!(
+            "{} to {} ({})",
+            format_percent(comparison.baseline_yield),
+            format_percent(comparison.candidate_yield),
+            format_signed_percent(comparison.yield_delta)
+        ));
+        ui.label(&comparison.root_cause_hint);
+        egui::Grid::new(("lot_comparison_modes", &comparison.baseline_lot_id))
+            .striped(true)
+            .show(ui, |ui| {
+                ui.strong("Mode");
+                ui.strong("Base");
+                ui.strong("Candidate");
+                ui.strong("Delta");
+                ui.end_row();
+                for delta in comparison.failure_mode_deltas.iter().take(5) {
+                    ui.label(delta.mode.label());
+                    ui.label(format_percent(delta.baseline_fraction));
+                    ui.label(format_percent(delta.candidate_fraction));
+                    ui.label(format_signed_percent(delta.delta_fraction));
+                    ui.end_row();
+                }
+            });
+    }
+}
+
+fn wafer_measurements_ui(ui: &mut egui::Ui, measurements: &[ProcessMeasurement]) {
+    if measurements.is_empty() {
+        ui.label("No measurements for selected wafer");
+        return;
+    }
+    egui::Grid::new("yield_wafer_measurements")
+        .striped(true)
+        .show(ui, |ui| {
+            ui.strong("Measurement");
+            ui.strong("Value");
+            ui.strong("Target");
+            ui.strong("Step");
+            ui.end_row();
+            for measurement in measurements {
+                ui.label(measurement.name.replace('_', " "));
+                ui.label(format_measurement(measurement.value, &measurement.unit));
+                ui.label(
+                    measurement
+                        .target
+                        .map(|target| format_measurement(target, &measurement.unit))
+                        .unwrap_or_else(|| "-".to_string()),
+                );
+                ui.label(&measurement.step_id);
+                ui.end_row();
+            }
+        });
+}
+
+fn correlation_table_ui(ui: &mut egui::Ui, correlations: &[CorrelationRecord]) {
+    if correlations.is_empty() {
+        ui.label("No wafer-level correlations");
+        return;
+    }
+    egui::ScrollArea::horizontal()
+        .id_salt("yield_correlation_horizontal")
+        .show(ui, |ui| {
+            egui::Grid::new("yield_correlation_table")
+                .striped(true)
+                .min_col_width(88.0)
+                .show(ui, |ui| {
+                    ui.strong("Measurement");
+                    ui.strong("Corr");
+                    ui.strong("High fail mean");
+                    ui.strong("Low fail mean");
+                    ui.strong("Mode");
+                    ui.strong("Hint");
+                    ui.end_row();
+                    for record in correlations {
+                        ui.label(record.measurement_name.replace('_', " "));
+                        ui.label(format!("{:+.2}", record.correlation_to_failure_rate));
+                        ui.label(format_measurement(
+                            record.mean_high_failure_value,
+                            &record.unit,
+                        ));
+                        ui.label(format_measurement(
+                            record.mean_low_failure_value,
+                            &record.unit,
+                        ));
+                        ui.label(
+                            record
+                                .likely_failure_mode
+                                .map(FailureMode::label)
+                                .unwrap_or("-"),
+                        );
+                        ui.label(&record.root_cause_hint);
+                        ui.end_row();
+                    }
+                });
+        });
+}
+
+fn lot_recipe_label(analysis: &YieldAnalysis, lot_id: &str) -> String {
+    let Some(lot) = analysis.lots.iter().find(|lot| lot.id == lot_id) else {
+        return "-".to_string();
+    };
+    let version = analysis
+        .recipes
+        .iter()
+        .find(|recipe| recipe.id == lot.recipe_id)
+        .map(|recipe| recipe.version)
+        .unwrap_or(0);
+    if version == 0 {
+        lot.recipe_id.clone()
+    } else {
+        format!("{} v{}", lot.recipe_id, version)
+    }
+}
+
+fn lot_route_label(analysis: &YieldAnalysis, lot_id: &str) -> String {
+    analysis
+        .lots
+        .iter()
+        .find(|lot| lot.id == lot_id)
+        .map(|lot| format!("{} / {}", lot.product, lot.route_id))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn format_percent(value: f64) -> String {
+    format!("{:.1}%", value * 100.0)
+}
+
+fn format_signed_percent(value: f64) -> String {
+    format!("{:+.1} pp", value * 100.0)
+}
+
+fn format_measurement(value: f64, unit: &str) -> String {
+    if value.abs() >= 100.0 {
+        format!("{value:.0} {unit}")
+    } else if value.abs() >= 10.0 {
+        format!("{value:.1} {unit}")
+    } else {
+        format!("{value:.2} {unit}")
+    }
 }
 
 fn component_route_metadata(component: &NetComponent) -> RouteNetMetadata {
@@ -5947,6 +7717,239 @@ fn layer_color32(color: [f32; 4], multiplier: f32) -> Color32 {
         (color[1] * 255.0 * multiplier).clamp(0.0, 255.0) as u8,
         (color[2] * 255.0 * multiplier).clamp(0.0, 255.0) as u8,
         (color[3] * 255.0).clamp(0.0, 255.0) as u8,
+    )
+}
+
+fn equipment_process_step_label(kind: EquipmentToolKind) -> &'static str {
+    match kind {
+        EquipmentToolKind::SpinCoater => "litho.coat",
+        EquipmentToolKind::HotPlate => "litho.soft_bake",
+        EquipmentToolKind::MaskAligner => "litho.expose",
+        EquipmentToolKind::Etcher => "etch.pattern_transfer",
+        EquipmentToolKind::Microscope => "metrology.visual_inspection",
+        EquipmentToolKind::ProbeStation => "metrology.parametric_probe",
+    }
+}
+
+fn equipment_state_color(state: EquipmentToolState) -> Color32 {
+    match state {
+        EquipmentToolState::Offline => Color32::from_rgb(145, 150, 158),
+        EquipmentToolState::OnlineIdle => Color32::from_rgb(105, 190, 120),
+        EquipmentToolState::RecipeLoaded => Color32::from_rgb(98, 170, 235),
+        EquipmentToolState::Running => Color32::from_rgb(250, 198, 90),
+        EquipmentToolState::Completed => Color32::from_rgb(120, 205, 180),
+        EquipmentToolState::Alarm => Color32::from_rgb(245, 98, 98),
+        EquipmentToolState::Maintenance => Color32::from_rgb(205, 150, 245),
+    }
+}
+
+fn equipment_alarm_color(severity: AlarmSeverity) -> Color32 {
+    match severity {
+        AlarmSeverity::Advisory => Color32::from_rgb(120, 185, 235),
+        AlarmSeverity::Warning => Color32::from_rgb(245, 185, 75),
+        AlarmSeverity::Critical => Color32::from_rgb(245, 92, 92),
+    }
+}
+
+fn equipment_run_status_color(status: RunStatus) -> Color32 {
+    match status {
+        RunStatus::Running => Color32::from_rgb(250, 198, 90),
+        RunStatus::Completed => Color32::from_rgb(105, 190, 120),
+        RunStatus::Aborted => Color32::from_rgb(180, 160, 130),
+        RunStatus::Alarmed => Color32::from_rgb(245, 92, 92),
+    }
+}
+
+fn equipment_recipe_run_summary(tool: &EquipmentTool, now_s: u64) -> String {
+    if let Some(run) = &tool.active_run {
+        return format!(
+            "{}\n{} s active",
+            run.recipe.recipe_id,
+            run.elapsed_s(now_s)
+        );
+    }
+    if let Some(selection) = &tool.selected_recipe {
+        return format!(
+            "{}\nv{} loaded",
+            selection.recipe_id, selection.recipe_version
+        );
+    }
+    "No recipe".to_string()
+}
+
+fn equipment_recent_sensor_summary(tool: &EquipmentTool) -> String {
+    let names = equipment_sensor_names(tool);
+    if names.is_empty() {
+        return "No samples".to_string();
+    }
+    names
+        .into_iter()
+        .take(2)
+        .filter_map(|name| {
+            tool.latest_sensor(&name)
+                .map(|sample| format!("{name}: {}", equipment_sensor_value(sample)))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn equipment_sensor_names(tool: &EquipmentTool) -> Vec<String> {
+    let mut names = BTreeSet::new();
+    for sample in &tool.recent_sensors {
+        names.insert(sample.name.clone());
+    }
+    names.into_iter().collect()
+}
+
+fn equipment_sensor_series(tool: &EquipmentTool, name: &str, max_samples: usize) -> Vec<f64> {
+    let mut values = tool
+        .recent_sensors
+        .iter()
+        .rev()
+        .filter(|sample| sample.name == name)
+        .take(max_samples)
+        .map(|sample| sample.value)
+        .collect::<Vec<_>>();
+    values.reverse();
+    values
+}
+
+fn equipment_sensor_value(sample: &SensorSample) -> String {
+    let precision = if sample.value.abs() >= 100.0 { 0 } else { 2 };
+    format!("{:.*} {}", precision, sample.value, sample.unit)
+}
+
+fn equipment_sparkline(ui: &mut egui::Ui, values: &[f64], color: Color32) {
+    let width = ui.available_width().clamp(120.0, 260.0);
+    let (rect, _) = ui.allocate_exact_size(vec2(width, 34.0), Sense::hover());
+    ui.painter().rect_stroke(
+        rect,
+        3.0,
+        Stroke::new(1.0, Color32::from_gray(78)),
+        StrokeKind::Inside,
+    );
+    if values.len() < 2 {
+        return;
+    }
+
+    let min = values.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let span = (max - min).max(0.000_001);
+    let points = values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let x = rect.left()
+                + rect.width() * (index as f32 / (values.len().saturating_sub(1)) as f32);
+            let normalized = ((*value - min) / span) as f32;
+            let y = rect.bottom() - rect.height() * normalized;
+            Pos2::new(x, y)
+        })
+        .collect::<Vec<_>>();
+    for pair in points.windows(2) {
+        ui.painter()
+            .line_segment([pair[0], pair[1]], Stroke::new(1.6, color));
+    }
+}
+
+fn wafer_mm_to_screen(point_mm: [f64; 2], center: Pos2, scale: f32) -> Pos2 {
+    center + vec2(point_mm[0] as f32 * scale, -(point_mm[1] as f32) * scale)
+}
+
+fn metrology_swatch(ui: &mut egui::Ui, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(vec2(12.0, 12.0), Sense::hover());
+    ui.painter().rect_filled(rect, 2.0, color);
+    ui.painter().rect_stroke(
+        rect,
+        2.0,
+        Stroke::new(1.0, Color32::from_rgba_unmultiplied(230, 235, 228, 85)),
+        StrokeKind::Inside,
+    );
+}
+
+fn format_metrology_value(kind: MeasurementKind, value: f64) -> String {
+    match kind {
+        MeasurementKind::DefectCount => format!("{:.0}", value),
+        MeasurementKind::PassFail => {
+            if value >= 0.5 {
+                "pass".to_string()
+            } else {
+                "fail".to_string()
+            }
+        }
+        _ => format!("{:.2} {}", value, kind.unit()),
+    }
+}
+
+fn format_metrology_delta(kind: MeasurementKind, value: f64) -> String {
+    match kind {
+        MeasurementKind::DefectCount => format!("{:.2}", value),
+        MeasurementKind::PassFail => format!("{:.2}", value),
+        _ => format!("{:.2} {}", value, kind.unit()),
+    }
+}
+
+fn metrology_measurement_color(
+    measurement: &Measurement,
+    summary: layout_model::metrology::MeasurementSummary,
+) -> Color32 {
+    if measurement.status != MeasurementStatus::Pass {
+        return metrology_status_color(measurement.status);
+    }
+    if measurement.kind == MeasurementKind::PassFail {
+        return if measurement.value >= 0.5 {
+            Color32::from_rgb(76, 178, 116)
+        } else {
+            metrology_status_color(MeasurementStatus::Fail)
+        };
+    }
+    let Some(min) = summary.min else {
+        return Color32::from_rgb(86, 130, 150);
+    };
+    let Some(max) = summary.max else {
+        return Color32::from_rgb(86, 130, 150);
+    };
+    let t = if (max - min).abs() <= f64::EPSILON {
+        0.5
+    } else {
+        ((measurement.value - min) / (max - min)).clamp(0.0, 1.0) as f32
+    };
+    metrology_gradient_color(t)
+}
+
+fn metrology_status_color(status: MeasurementStatus) -> Color32 {
+    match status {
+        MeasurementStatus::Pass => Color32::from_rgb(76, 178, 116),
+        MeasurementStatus::Fail => Color32::from_rgb(224, 80, 75),
+        MeasurementStatus::Outlier => Color32::from_rgb(238, 184, 72),
+    }
+}
+
+fn metrology_gradient_color(t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    if t < 0.5 {
+        lerp_color(
+            Color32::from_rgb(64, 138, 194),
+            Color32::from_rgb(78, 176, 118),
+            t * 2.0,
+        )
+    } else {
+        lerp_color(
+            Color32::from_rgb(78, 176, 118),
+            Color32::from_rgb(224, 150, 72),
+            (t - 0.5) * 2.0,
+        )
+    }
+}
+
+fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
+    let channel = |left: u8, right: u8| {
+        (left as f32 + (right as f32 - left as f32) * t).clamp(0.0, 255.0) as u8
+    };
+    Color32::from_rgb(
+        channel(a.r(), b.r()),
+        channel(a.g(), b.g()),
+        channel(a.b(), b.b()),
     )
 }
 

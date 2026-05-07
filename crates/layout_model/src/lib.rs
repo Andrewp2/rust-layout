@@ -14,7 +14,12 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use uuid::Uuid;
 
 pub mod connectivity;
+pub mod equipment;
 pub mod gdsii;
+pub mod mes;
+pub mod metrology;
+pub mod recipe;
+pub mod yield_analysis;
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 5;
 pub const DEFAULT_TOP_CELL_ID: CellId = CellId(1);
