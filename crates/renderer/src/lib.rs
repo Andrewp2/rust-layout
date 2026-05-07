@@ -578,39 +578,46 @@ struct EvictionStats {
 
 pub fn build_layout_triangles(document: &Document, viewport: Rect) -> RenderBatch {
     let mut batch = RenderBatch::default();
-    for shape in document.visible_flattened_shapes() {
+    document.for_each_visible_flattened_shape_view(|_, shape| {
         if !shape.bounds.intersects(viewport) {
-            continue;
+            return;
         }
-        let shape = shape.transformed_shape();
-        append_shape_triangles(&mut batch, document, &shape);
-    }
+        append_shape_view_triangles(&mut batch, document, shape.shape, shape.transform);
+    });
     batch
 }
 
 pub fn build_pick_triangles(document: &Document, viewport: Rect) -> PickBatch {
     let mut batch = PickBatch::default();
-    for shape in document.visible_flattened_shapes() {
+    document.for_each_visible_flattened_shape_view(|id, shape| {
         if !shape.bounds.intersects(viewport) {
-            continue;
+            return;
         }
         let pick_id = (batch.occurrences.len() + 1).min(u32::MAX as usize) as u32;
-        batch.occurrences.push(shape.id.clone());
-        let transformed = shape.transformed_shape();
-        match &transformed.kind {
-            ShapeKind::Rectangle(rect) => push_pick_rect(&mut batch, *rect, pick_id),
-            ShapeKind::Polygon(poly) => {
+        batch.occurrences.push(id);
+        match shape.shape.kind {
+            ShapeKindView::Rectangle(rect) => {
+                push_pick_rect(&mut batch, shape.transform.apply_rect(rect), pick_id)
+            }
+            ShapeKindView::Polygon(poly) => {
                 if poly.points.len() >= 3 {
-                    push_pick_fan(&mut batch, &poly.points, pick_id);
+                    push_transformed_pick_fan(&mut batch, &poly.points, shape.transform, pick_id);
                 }
             }
-            ShapeKind::Path { points, width } => {
+            ShapeKindView::Path { points, width } => {
                 for window in points.windows(2) {
-                    push_pick_segment_as_rect(&mut batch, window[0], window[1], *width, pick_id);
+                    push_pick_segment_as_rect(
+                        &mut batch,
+                        shape.transform.apply_point(window[0]),
+                        shape.transform.apply_point(window[1]),
+                        width,
+                        pick_id,
+                    );
                 }
             }
-            ShapeKind::Via { center, size, .. } => {
-                let half = *size / 2;
+            ShapeKindView::Via { center, size, .. } => {
+                let center = shape.transform.apply_point(center);
+                let half = size / 2;
                 push_pick_rect(
                     &mut batch,
                     Rect::new(
@@ -620,9 +627,9 @@ pub fn build_pick_triangles(document: &Document, viewport: Rect) -> PickBatch {
                     pick_id,
                 );
             }
-            ShapeKind::Label { .. } | ShapeKind::Measurement { .. } => {}
+            ShapeKindView::Label { .. } | ShapeKindView::Measurement { .. } => {}
         }
-    }
+    });
     batch
 }
 
@@ -899,6 +906,27 @@ fn push_pick_rect(batch: &mut PickBatch, rect: Rect, pick_id: u32) {
 fn push_pick_fan(batch: &mut PickBatch, points: &[Point], pick_id: u32) {
     let base = batch.vertices.len() as u32;
     for point in points {
+        batch.vertices.push(PickVertex {
+            position: [point.x as f32, point.y as f32],
+            pick_id,
+        });
+    }
+    for index in 1..points.len().saturating_sub(1) {
+        batch
+            .indices
+            .extend_from_slice(&[base, base + index as u32, base + index as u32 + 1]);
+    }
+}
+
+fn push_transformed_pick_fan(
+    batch: &mut PickBatch,
+    points: &[Point],
+    transform: Transform,
+    pick_id: u32,
+) {
+    let base = batch.vertices.len() as u32;
+    for point in points {
+        let point = transform.apply_point(*point);
         batch.vertices.push(PickVertex {
             position: [point.x as f32, point.y as f32],
             pick_id,

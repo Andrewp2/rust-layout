@@ -5770,13 +5770,15 @@ impl FabricadApp {
 
     fn build_3d_render_batch(&self) -> (renderer::RenderBatch3d, usize) {
         let mut faces = Vec::new();
-        for flattened in self.document.visible_flattened_shapes() {
-            let shape = flattened.transformed_shape();
-            self.add_shape_3d_faces(&mut faces, &shape);
-            if faces.len() >= MAX_3D_FACES {
-                break;
-            }
-        }
+        self.document
+            .visit_visible_flattened_shape_views(|_, flattened| {
+                if faces.len() >= MAX_3D_FACES {
+                    return false;
+                }
+                let shape = flattened.transformed_shape();
+                self.add_shape_3d_faces(&mut faces, &shape);
+                faces.len() < MAX_3D_FACES
+            });
 
         let face_count = faces.len();
         let mut batch = renderer::RenderBatch3d::default();
@@ -5789,13 +5791,15 @@ impl FabricadApp {
 
     fn draw_3d_layout_cpu_fallback(&self, painter: &Painter, canvas: EguiRect) -> usize {
         let mut faces = Vec::new();
-        for flattened in self.document.visible_flattened_shapes() {
-            let shape = flattened.transformed_shape();
-            self.add_shape_3d_faces(&mut faces, &shape);
-            if faces.len() >= MAX_3D_FACES {
-                break;
-            }
-        }
+        self.document
+            .visit_visible_flattened_shape_views(|_, flattened| {
+                if faces.len() >= MAX_3D_FACES {
+                    return false;
+                }
+                let shape = flattened.transformed_shape();
+                self.add_shape_3d_faces(&mut faces, &shape);
+                faces.len() < MAX_3D_FACES
+            });
 
         let basis = self.camera_3d.basis();
         let mut projected = Vec::with_capacity(faces.len());
@@ -6129,11 +6133,13 @@ impl FabricadApp {
     }
 
     fn layout_bounds(&self) -> Option<Rect> {
+        let mut bounds = None;
         self.document
-            .visible_flattened_shapes()
-            .into_iter()
-            .map(|shape| shape.bounds)
-            .reduce(|left, right| left.union(right))
+            .for_each_visible_flattened_shape_view(|_, shape| {
+                bounds =
+                    Some(bounds.map_or(shape.bounds, |current: Rect| current.union(shape.bounds)));
+            });
+        bounds
     }
 
     fn draw_background(&self, painter: &Painter, canvas: EguiRect, viewport: Rect) {

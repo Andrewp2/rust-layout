@@ -3614,50 +3614,95 @@ impl Document {
     }
 
     pub fn visible_flattened_shapes(&self) -> Vec<FlattenedShape> {
-        let mut flattened = Vec::new();
-        let identity = Transform::IDENTITY;
-        for shape in self.visible_shapes() {
-            let bounds = shape.kind.bounds();
+        let mut flattened = Vec::with_capacity(self.flattened_shape_count_estimate());
+        self.for_each_visible_flattened_shape_view(|id, view| {
+            let instance_path = id.instance_path.clone();
             flattened.push(FlattenedShape {
-                id: ShapeOccurrenceId::top_level(shape.id),
-                shape,
-                source_cell: self.top_cell,
-                instance_path: Vec::new(),
-                transform: identity,
-                bounds,
+                id,
+                shape: view.shape.to_shape(),
+                source_cell: view.source_cell,
+                instance_path,
+                transform: view.transform,
+                bounds: view.bounds,
             });
+        });
+        flattened
+    }
+
+    pub fn for_each_visible_flattened_shape_view<'a, V>(&'a self, mut visit: V)
+    where
+        V: FnMut(ShapeOccurrenceId, FlattenedShapeView<'a>),
+    {
+        self.visit_visible_flattened_shape_views(|id, shape| {
+            visit(id, shape);
+            true
+        });
+    }
+
+    pub fn visit_visible_flattened_shape_views<'a, V>(&'a self, mut visit: V)
+    where
+        V: FnMut(ShapeOccurrenceId, FlattenedShapeView<'a>) -> bool,
+    {
+        let identity = Transform::IDENTITY;
+        for row in self.shapes.live_rows() {
+            if !self.layer_is_visible(self.shapes.row_layer(row)) {
+                continue;
+            }
+            let shape = self.shapes.row_view(row);
+            if !visit(
+                ShapeOccurrenceId::top_level(shape.id),
+                FlattenedShapeView {
+                    shape,
+                    source_cell: self.top_cell,
+                    transform: identity,
+                    bounds: shape.bounds(),
+                },
+            ) {
+                return;
+            }
         }
 
         let mut stack = Vec::new();
         let mut array_stack = Vec::new();
         if let Some(top) = self.cells.get(&self.top_cell) {
             for row in top.shapes.live_rows() {
-                if self.layer_is_visible(top.shapes.row_layer(row)) {
-                    let shape = top.shapes.materialize_row(row);
-                    let bounds = top.shapes.row_bounds(row);
-                    flattened.push(FlattenedShape {
-                        id: ShapeOccurrenceId::top_level(shape.id),
+                if !self.layer_is_visible(top.shapes.row_layer(row)) {
+                    continue;
+                }
+                let shape = top.shapes.row_view(row);
+                if !visit(
+                    ShapeOccurrenceId::top_level(shape.id),
+                    FlattenedShapeView {
                         shape,
                         source_cell: self.top_cell,
-                        instance_path: Vec::new(),
                         transform: identity,
-                        bounds,
-                    });
+                        bounds: shape.bounds(),
+                    },
+                ) {
+                    return;
                 }
             }
-            self.flatten_instances(top, identity, &mut stack, &mut array_stack, &mut flattened);
+            let _ = self.visit_instance_shape_views(
+                top,
+                identity,
+                &mut stack,
+                &mut array_stack,
+                &mut visit,
+            );
         }
-        flattened
     }
 
-    fn flatten_instances(
-        &self,
-        parent: &Cell,
+    fn visit_instance_shape_views<'a, V>(
+        &'a self,
+        parent: &'a Cell,
         parent_transform: Transform,
         instance_path: &mut Vec<InstanceId>,
         array_path: &mut Vec<ArrayIndex>,
-        flattened: &mut Vec<FlattenedShape>,
-    ) {
+        visit: &mut V,
+    ) -> bool
+    where
+        V: FnMut(ShapeOccurrenceId, FlattenedShapeView<'a>) -> bool,
+    {
         for instance_row in parent.instances.live_rows() {
             let instance_id = parent.instances.row_id(instance_row);
             if instance_path.contains(&instance_id) {
@@ -3682,22 +3727,40 @@ impl Document {
                         if !self.layer_is_visible(cell.shapes.row_layer(shape_row)) {
                             continue;
                         }
-                        let shape = cell.shapes.materialize_row(shape_row);
-                        let bounds = transform.apply_rect(cell.shapes.row_bounds(shape_row));
-                        flattened.push(FlattenedShape {
-                            id: ShapeOccurrenceId::from_instance_array_path(
+                        let shape = cell.shapes.row_view(shape_row);
+                        if !visit(
+                            ShapeOccurrenceId::from_instance_array_path(
                                 shape.id,
                                 instance_path,
                                 array_path,
                             ),
-                            shape,
-                            source_cell: cell.id,
-                            instance_path: instance_path.clone(),
-                            transform,
-                            bounds,
-                        });
+                            FlattenedShapeView {
+                                shape,
+                                source_cell: cell.id,
+                                transform,
+                                bounds: transform.apply_rect(shape.bounds()),
+                            },
+                        ) {
+                            if include_array_index {
+                                array_path.pop();
+                            }
+                            instance_path.pop();
+                            return false;
+                        }
                     }
-                    self.flatten_instances(cell, transform, instance_path, array_path, flattened);
+                    if !self.visit_instance_shape_views(
+                        cell,
+                        transform,
+                        instance_path,
+                        array_path,
+                        visit,
+                    ) {
+                        if include_array_index {
+                            array_path.pop();
+                        }
+                        instance_path.pop();
+                        return false;
+                    }
                     if include_array_index {
                         array_path.pop();
                     }
@@ -3705,6 +3768,7 @@ impl Document {
                 }
             }
         }
+        true
     }
 
     fn layer_is_visible(&self, layer: LayerId) -> bool {
