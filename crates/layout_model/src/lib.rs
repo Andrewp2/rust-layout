@@ -1402,6 +1402,26 @@ impl ShapeStore {
         self.values().map(|shape| (shape.id, shape))
     }
 
+    fn live_rows(&self) -> impl Iterator<Item = usize> + '_ {
+        self.alive
+            .iter()
+            .enumerate()
+            .filter(|(_, alive)| **alive)
+            .map(|(row, _)| row)
+    }
+
+    fn row_id(&self, row: usize) -> ShapeId {
+        self.ids[row]
+    }
+
+    fn row_layer(&self, row: usize) -> LayerId {
+        self.layers[row]
+    }
+
+    fn row_bounds(&self, row: usize) -> Rect {
+        self.geometry_bounds(self.geometry[row])
+    }
+
     fn row_for_id(&self, id: ShapeId) -> Option<usize> {
         dense_shape_index(id)
             .and_then(|index| self.id_to_row.get(index).copied().flatten())
@@ -1543,6 +1563,31 @@ impl ShapeStore {
                     b: measurement.b,
                     label: measurement.label.clone(),
                 }
+            }
+        }
+    }
+
+    fn geometry_bounds(&self, geometry: ShapeGeometryRef) -> Rect {
+        match geometry {
+            ShapeGeometryRef::Rectangle(index) => self.rectangles[index],
+            ShapeGeometryRef::Polygon(index) => self.polygons[index].bounds().unwrap_or_default(),
+            ShapeGeometryRef::Path(index) => Rect::from_points(&self.paths[index].points)
+                .unwrap_or_default()
+                .expanded(self.paths[index].width / 2),
+            ShapeGeometryRef::Via(index) => {
+                let via = &self.vias[index];
+                let half = via.size / 2;
+                Rect::new(
+                    Point::new(via.center.x - half, via.center.y - half),
+                    Point::new(via.center.x + half, via.center.y + half),
+                )
+            }
+            ShapeGeometryRef::Label(index) => {
+                Rect::new(self.labels[index].position, self.labels[index].position).expanded(80)
+            }
+            ShapeGeometryRef::Measurement(index) => {
+                let measurement = &self.measurements[index];
+                Rect::new(measurement.a, measurement.b).expanded(40)
             }
         }
     }
@@ -2893,9 +2938,15 @@ pub struct LayoutIndex {
 impl LayoutIndex {
     pub fn rebuild(document: &Document) -> Self {
         let mut entries = Vec::with_capacity(document.shapes.len());
-        entries.extend(document.visible_shapes().map(|shape| IndexedShape {
-            id: ShapeOccurrenceId::top_level(shape.id),
-            bounds: shape.kind.bounds(),
+        entries.extend(document.shapes.live_rows().filter_map(|row| {
+            document
+                .layers
+                .get(&document.shapes.row_layer(row))
+                .is_some_and(|layer| layer.visible)
+                .then(|| IndexedShape {
+                    id: ShapeOccurrenceId::top_level(document.shapes.row_id(row)),
+                    bounds: document.shapes.row_bounds(row),
+                })
         }));
         Self::bulk_load(entries)
     }
