@@ -1892,7 +1892,7 @@ impl FabricadApp {
     }
 
     fn move_vertex(&mut self, id: ShapeId, vertex: usize, position: Point) {
-        let Some(old_shape) = self.document.shapes.get(&id).cloned() else {
+        let Some(old_shape) = self.document.shapes.get(&id) else {
             return;
         };
         let Some(new_shape) = shape_with_moved_vertex(&old_shape, vertex, position) else {
@@ -1915,7 +1915,7 @@ impl FabricadApp {
     }
 
     fn insert_vertex(&mut self, id: ShapeId, edge: usize, position: Point) {
-        let Some(old_shape) = self.document.shapes.get(&id).cloned() else {
+        let Some(old_shape) = self.document.shapes.get(&id) else {
             return;
         };
         let Some(new_shape) = shape_with_inserted_vertex(&old_shape, edge, position) else {
@@ -1926,7 +1926,7 @@ impl FabricadApp {
     }
 
     fn delete_vertex(&mut self, id: ShapeId, vertex: usize) {
-        let Some(old_shape) = self.document.shapes.get(&id).cloned() else {
+        let Some(old_shape) = self.document.shapes.get(&id) else {
             return;
         };
         let Some(new_shape) = shape_with_deleted_vertex(&old_shape, vertex) else {
@@ -1940,7 +1940,7 @@ impl FabricadApp {
         if delta == Vector::ZERO {
             return;
         }
-        let Some(old_shape) = self.document.shapes.get(&id).cloned() else {
+        let Some(old_shape) = self.document.shapes.get(&id) else {
             return;
         };
         let Some(new_shape) = shape_with_moved_edge(&old_shape, edge, delta) else {
@@ -2271,7 +2271,7 @@ impl FabricadApp {
         let mut shapes: Vec<Shape> = self
             .selected
             .iter()
-            .filter_map(|id| self.document.shapes.get(id).cloned())
+            .filter_map(|id| self.document.shapes.get(id))
             .collect();
         if shapes.is_empty() {
             self.status = "select top-level shapes before creating a cell".to_string();
@@ -4917,7 +4917,7 @@ impl FabricadApp {
     }
 
     fn shape_property_panel(&mut self, ui: &mut egui::Ui, id: ShapeId) {
-        let Some(mut edited) = self.document.shapes.get(&id).cloned() else {
+        let Some(mut edited) = self.document.shapes.get(&id) else {
             return;
         };
         let original = edited.clone();
@@ -5061,7 +5061,7 @@ impl FabricadApp {
         }
         self.selected
             .iter()
-            .filter_map(|id| self.document.shapes.get(id).cloned())
+            .filter_map(|id| self.document.shapes.get(id))
             .collect()
     }
 
@@ -5070,7 +5070,7 @@ impl FabricadApp {
         let Some(id) = self.selected_top_level_shape() else {
             return;
         };
-        let Some(shape) = self.document.shapes.get(&id).cloned() else {
+        let Some(shape) = self.document.shapes.get(&id) else {
             return;
         };
         let Some(first) = editable_vertex_points(&shape.kind).first().copied() else {
@@ -6411,7 +6411,7 @@ impl FabricadApp {
         } else {
             for occurrence in visible_occurrences {
                 if let Some(shape) = self.document.shapes.get(&occurrence.source_shape_id()) {
-                    self.draw_shape_for_occurrence(painter, canvas, occurrence, shape);
+                    self.draw_shape_for_occurrence(painter, canvas, occurrence, &shape);
                 }
             }
         }
@@ -6438,7 +6438,7 @@ impl FabricadApp {
         } else {
             for occurrence in visible_occurrences {
                 if let Some(shape) = self.document.shapes.get(&occurrence.source_shape_id()) {
-                    self.draw_shape_overlay_for_occurrence(painter, canvas, occurrence, shape);
+                    self.draw_shape_overlay_for_occurrence(painter, canvas, occurrence, &shape);
                 }
             }
         }

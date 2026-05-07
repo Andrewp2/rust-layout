@@ -199,7 +199,7 @@ fn check_min_width(document: &Document, rules: &RuleDeck, violations: &mut Vec<D
         let Some(required) = rules.min_width.get(&shape.layer).copied() else {
             continue;
         };
-        let actual = approximate_width(shape);
+        let actual = approximate_width(&shape);
         if actual > 0.0 && actual < required as f64 {
             violations.push(DrcViolation {
                 id: 0,
@@ -215,9 +215,9 @@ fn check_min_width(document: &Document, rules: &RuleDeck, violations: &mut Vec<D
 }
 
 fn check_spacing(document: &Document, rules: &RuleDeck, violations: &mut Vec<DrcViolation>) {
-    let shapes: Vec<&Shape> = document.visible_shapes().collect();
+    let shapes: Vec<Shape> = document.visible_shapes().collect();
     for left_index in 0..shapes.len() {
-        let left = shapes[left_index];
+        let left = &shapes[left_index];
         let Some(required) = rules.min_spacing.get(&left.layer).copied() else {
             continue;
         };
@@ -257,10 +257,10 @@ fn check_forbidden_overlaps(
     rules: &RuleDeck,
     violations: &mut Vec<DrcViolation>,
 ) {
-    let shapes: Vec<&Shape> = document.visible_shapes().collect();
+    let shapes: Vec<Shape> = document.visible_shapes().collect();
     for rule in &rules.forbidden_overlaps {
         for left_index in 0..shapes.len() {
-            let left = shapes[left_index];
+            let left = &shapes[left_index];
             if left.layer != rule.a && left.layer != rule.b {
                 continue;
             }
@@ -289,18 +289,13 @@ fn check_forbidden_overlaps(
 }
 
 fn check_via_enclosure(document: &Document, rules: &RuleDeck, violations: &mut Vec<DrcViolation>) {
-    let shapes: Vec<&Shape> = document.visible_shapes().collect();
+    let shapes: Vec<Shape> = document.visible_shapes().collect();
     for rule in &rules.via_enclosure {
-        for via in shapes
-            .iter()
-            .copied()
-            .filter(|shape| shape.layer == rule.via_layer)
-        {
+        for via in shapes.iter().filter(|shape| shape.layer == rule.via_layer) {
             let via_bounds = via.kind.bounds();
             let required_rect = via_bounds.expanded(rule.required);
             let enclosed = shapes
                 .iter()
-                .copied()
                 .filter(|shape| shape.layer == rule.enclosure_layer)
                 .any(|shape| shape.kind.bounds().contains_rect(required_rect));
             if !enclosed {

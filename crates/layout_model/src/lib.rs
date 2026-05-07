@@ -285,12 +285,12 @@ impl LoroCrdtLog {
 
     pub fn seed_document_objects(&mut self, document: &Document) -> Result<(), LoroCrdtError> {
         for shape in document.shapes.values() {
-            self.upsert_shape(None, shape)?;
+            self.upsert_shape(None, &shape)?;
         }
         for cell in document.cells.values() {
             self.upsert_cell(cell)?;
             for shape in cell.shapes.values() {
-                self.upsert_shape(Some(cell.id), shape)?;
+                self.upsert_shape(Some(cell.id), &shape)?;
             }
             for instance in cell.instances.values() {
                 self.upsert_instance(cell.id, instance)?;
@@ -400,7 +400,7 @@ impl LoroCrdtLog {
             Operation::AddCell { cell } => {
                 self.upsert_cell(cell)?;
                 for shape in cell.shapes.values() {
-                    self.upsert_shape(Some(cell.id), shape)?;
+                    self.upsert_shape(Some(cell.id), &shape)?;
                 }
                 for instance in cell.instances.values() {
                     self.upsert_instance(cell.id, instance)?;
@@ -1176,10 +1176,65 @@ const MAX_DENSE_SHAPE_ID_INDEX: usize = 10_000_000;
 
 #[derive(Clone, Debug, Default)]
 pub struct ShapeStore {
-    rows: Vec<Option<Shape>>,
+    alive: Vec<bool>,
+    ids: Vec<ShapeId>,
+    layers: Vec<LayerId>,
+    nets: Vec<Option<NetId>>,
+    geometry: Vec<ShapeGeometryRef>,
+    names: Vec<Option<String>>,
+    rectangles: Vec<Rect>,
+    polygons: Vec<Polygon>,
+    paths: Vec<PathGeometry>,
+    vias: Vec<ViaGeometry>,
+    labels: Vec<LabelGeometry>,
+    measurements: Vec<MeasurementGeometry>,
     id_to_row: Vec<Option<usize>>,
     overflow_id_to_row: BTreeMap<ShapeId, usize>,
     len: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShapeGeometryRef {
+    Rectangle(usize),
+    Polygon(usize),
+    Path(usize),
+    Via(usize),
+    Label(usize),
+    Measurement(usize),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PathGeometry {
+    points: Vec<Point>,
+    width: Coord,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ViaGeometry {
+    center: Point,
+    size: Coord,
+    lower: LayerId,
+    upper: LayerId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LabelGeometry {
+    position: Point,
+    text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MeasurementGeometry {
+    a: Point,
+    b: Point,
+    label: String,
+}
+
+pub struct ShapeMut<'a> {
+    store: &'a mut ShapeStore,
+    row: usize,
+    old_id: ShapeId,
+    shape: Shape,
 }
 
 impl ShapeStore {
@@ -1189,7 +1244,18 @@ impl ShapeStore {
 
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            rows: Vec::with_capacity(capacity),
+            alive: Vec::with_capacity(capacity),
+            ids: Vec::with_capacity(capacity),
+            layers: Vec::with_capacity(capacity),
+            nets: Vec::with_capacity(capacity),
+            geometry: Vec::with_capacity(capacity),
+            names: Vec::with_capacity(capacity),
+            rectangles: Vec::new(),
+            polygons: Vec::new(),
+            paths: Vec::new(),
+            vias: Vec::new(),
+            labels: Vec::new(),
+            measurements: Vec::new(),
             id_to_row: Vec::new(),
             overflow_id_to_row: BTreeMap::new(),
             len: 0,
@@ -1207,9 +1273,9 @@ impl ShapeStore {
         store.id_to_row.resize(dense_len, None);
 
         for shape in shapes {
-            let row = store.rows.len();
+            let row = store.ids.len();
             store.set_row_for_id(shape.id, row);
-            store.rows.push(Some(shape));
+            store.push_row(shape);
             store.len += 1;
         }
         store
@@ -1235,9 +1301,9 @@ impl ShapeStore {
             let id = ShapeId(first_id.0 + index as u64);
             let mut shape = make_shape(index, id);
             shape.id = id;
-            let row = store.rows.len();
+            let row = store.ids.len();
             store.set_row_for_id(id, row);
-            store.rows.push(Some(shape));
+            store.push_row(shape);
             store.len += 1;
         }
         store
@@ -1252,21 +1318,35 @@ impl ShapeStore {
     }
 
     pub fn clear(&mut self) {
-        self.rows.clear();
+        self.alive.clear();
+        self.ids.clear();
+        self.layers.clear();
+        self.nets.clear();
+        self.geometry.clear();
+        self.names.clear();
+        self.rectangles.clear();
+        self.polygons.clear();
+        self.paths.clear();
+        self.vias.clear();
+        self.labels.clear();
+        self.measurements.clear();
         self.id_to_row.clear();
         self.overflow_id_to_row.clear();
         self.len = 0;
     }
 
-    pub fn get(&self, id: &ShapeId) -> Option<&Shape> {
-        self.row_for_id(*id)
-            .and_then(|row| self.rows.get(row))
-            .and_then(Option::as_ref)
+    pub fn get(&self, id: &ShapeId) -> Option<Shape> {
+        self.row_for_id(*id).map(|row| self.materialize_row(row))
     }
 
-    pub fn get_mut(&mut self, id: &ShapeId) -> Option<&mut Shape> {
+    pub fn get_mut(&mut self, id: &ShapeId) -> Option<ShapeMut<'_>> {
         let row = self.row_for_id(*id)?;
-        self.rows.get_mut(row).and_then(Option::as_mut)
+        Some(ShapeMut {
+            old_id: *id,
+            shape: self.materialize_row(row),
+            store: self,
+            row,
+        })
     }
 
     pub fn contains_key(&self, id: &ShapeId) -> bool {
@@ -1276,15 +1356,16 @@ impl ShapeStore {
     pub fn insert(&mut self, id: ShapeId, mut shape: Shape) -> Option<Shape> {
         shape.id = id;
         if let Some(row) = self.row_for_id(id)
-            && let Some(slot) = self.rows.get_mut(row)
-            && slot.is_some()
+            && self.alive.get(row).copied().unwrap_or(false)
         {
-            return slot.replace(shape);
+            let old_shape = self.materialize_row(row);
+            self.write_row(row, shape);
+            return Some(old_shape);
         }
 
-        let row = self.rows.len();
+        let row = self.ids.len();
         self.set_row_for_id(id, row);
-        self.rows.push(Some(shape));
+        self.push_row(shape);
         self.len += 1;
         None
     }
@@ -1292,33 +1373,40 @@ impl ShapeStore {
     pub fn remove(&mut self, id: &ShapeId) -> Option<Shape> {
         let row = self.row_for_id(*id)?;
         self.clear_row_for_id(*id);
-        let removed = self.rows.get_mut(row)?.take();
-        if removed.is_some() {
-            self.len -= 1;
+        if !self.alive.get(row).copied().unwrap_or(false) {
+            return None;
         }
-        removed
+        let removed = self.materialize_row(row);
+        self.alive[row] = false;
+        self.len -= 1;
+        Some(removed)
     }
 
-    pub fn values(&self) -> impl Iterator<Item = &Shape> {
-        self.rows.iter().filter_map(Option::as_ref)
-    }
-
-    pub fn values_mut(&mut self) -> impl Iterator<Item = &mut Shape> {
-        self.rows.iter_mut().filter_map(Option::as_mut)
+    pub fn values(&self) -> impl Iterator<Item = Shape> + '_ {
+        self.alive
+            .iter()
+            .enumerate()
+            .filter(|(_, alive)| **alive)
+            .map(|(row, _)| self.materialize_row(row))
     }
 
     pub fn keys(&self) -> impl Iterator<Item = &ShapeId> {
-        self.values().map(|shape| &shape.id)
+        self.ids
+            .iter()
+            .enumerate()
+            .filter(|(row, _)| self.alive.get(*row).copied().unwrap_or(false))
+            .map(|(_, id)| id)
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (&ShapeId, &Shape)> {
-        self.values().map(|shape| (&shape.id, shape))
+    pub fn iter(&self) -> impl Iterator<Item = (ShapeId, Shape)> + '_ {
+        self.values().map(|shape| (shape.id, shape))
     }
 
     fn row_for_id(&self, id: ShapeId) -> Option<usize> {
         dense_shape_index(id)
             .and_then(|index| self.id_to_row.get(index).copied().flatten())
             .or_else(|| self.overflow_id_to_row.get(&id).copied())
+            .filter(|row| self.alive.get(*row).copied().unwrap_or(false))
     }
 
     fn set_row_for_id(&mut self, id: ShapeId, row: usize) {
@@ -1340,6 +1428,146 @@ impl ShapeStore {
             return;
         }
         self.overflow_id_to_row.remove(&id);
+    }
+
+    fn push_row(&mut self, shape: Shape) {
+        self.alive.push(true);
+        self.ids.push(shape.id);
+        self.layers.push(shape.layer);
+        self.nets.push(shape.net);
+        let geometry = self.push_geometry(shape.kind);
+        self.geometry.push(geometry);
+        self.names.push(shape.name);
+    }
+
+    fn materialize_row(&self, row: usize) -> Shape {
+        Shape {
+            id: self.ids[row],
+            layer: self.layers[row],
+            net: self.nets[row],
+            kind: self.materialize_geometry(self.geometry[row]),
+            name: self.names[row].clone(),
+        }
+    }
+
+    fn write_row(&mut self, row: usize, shape: Shape) {
+        let old_id = self.ids[row];
+        if old_id != shape.id {
+            self.clear_row_for_id(old_id);
+            self.set_row_for_id(shape.id, row);
+        }
+        self.ids[row] = shape.id;
+        self.layers[row] = shape.layer;
+        self.nets[row] = shape.net;
+        self.geometry[row] = self.push_geometry(shape.kind);
+        self.names[row] = shape.name;
+        self.alive[row] = true;
+    }
+
+    fn push_geometry(&mut self, kind: ShapeKind) -> ShapeGeometryRef {
+        match kind {
+            ShapeKind::Rectangle(rect) => {
+                let index = self.rectangles.len();
+                self.rectangles.push(rect);
+                ShapeGeometryRef::Rectangle(index)
+            }
+            ShapeKind::Polygon(poly) => {
+                let index = self.polygons.len();
+                self.polygons.push(poly);
+                ShapeGeometryRef::Polygon(index)
+            }
+            ShapeKind::Path { points, width } => {
+                let index = self.paths.len();
+                self.paths.push(PathGeometry { points, width });
+                ShapeGeometryRef::Path(index)
+            }
+            ShapeKind::Via {
+                center,
+                size,
+                lower,
+                upper,
+            } => {
+                let index = self.vias.len();
+                self.vias.push(ViaGeometry {
+                    center,
+                    size,
+                    lower,
+                    upper,
+                });
+                ShapeGeometryRef::Via(index)
+            }
+            ShapeKind::Label { position, text } => {
+                let index = self.labels.len();
+                self.labels.push(LabelGeometry { position, text });
+                ShapeGeometryRef::Label(index)
+            }
+            ShapeKind::Measurement { a, b, label } => {
+                let index = self.measurements.len();
+                self.measurements.push(MeasurementGeometry { a, b, label });
+                ShapeGeometryRef::Measurement(index)
+            }
+        }
+    }
+
+    fn materialize_geometry(&self, geometry: ShapeGeometryRef) -> ShapeKind {
+        match geometry {
+            ShapeGeometryRef::Rectangle(index) => ShapeKind::Rectangle(self.rectangles[index]),
+            ShapeGeometryRef::Polygon(index) => ShapeKind::Polygon(self.polygons[index].clone()),
+            ShapeGeometryRef::Path(index) => {
+                let path = &self.paths[index];
+                ShapeKind::Path {
+                    points: path.points.clone(),
+                    width: path.width,
+                }
+            }
+            ShapeGeometryRef::Via(index) => {
+                let via = &self.vias[index];
+                ShapeKind::Via {
+                    center: via.center,
+                    size: via.size,
+                    lower: via.lower,
+                    upper: via.upper,
+                }
+            }
+            ShapeGeometryRef::Label(index) => {
+                let label = &self.labels[index];
+                ShapeKind::Label {
+                    position: label.position,
+                    text: label.text.clone(),
+                }
+            }
+            ShapeGeometryRef::Measurement(index) => {
+                let measurement = &self.measurements[index];
+                ShapeKind::Measurement {
+                    a: measurement.a,
+                    b: measurement.b,
+                    label: measurement.label.clone(),
+                }
+            }
+        }
+    }
+}
+
+impl std::ops::Deref for ShapeMut<'_> {
+    type Target = Shape;
+
+    fn deref(&self) -> &Self::Target {
+        &self.shape
+    }
+}
+
+impl std::ops::DerefMut for ShapeMut<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.shape
+    }
+}
+
+impl Drop for ShapeMut<'_> {
+    fn drop(&mut self) {
+        if self.shape.id != self.old_id {
+            self.store.clear_row_for_id(self.old_id);
+        }
+        self.store.write_row(self.row, self.shape.clone());
     }
 }
 
@@ -1367,7 +1595,7 @@ impl Serialize for ShapeStore {
     {
         let mut map = serializer.serialize_map(Some(self.len))?;
         for shape in self.values() {
-            map.serialize_entry(&shape.id, shape)?;
+            map.serialize_entry(&shape.id, &shape)?;
         }
         map.end()
     }
@@ -1669,16 +1897,16 @@ fn default_array_count() -> u32 {
 }
 
 #[derive(Clone, Debug)]
-pub struct FlattenedShape<'a> {
+pub struct FlattenedShape {
     pub id: ShapeOccurrenceId,
-    pub shape: &'a Shape,
+    pub shape: Shape,
     pub source_cell: CellId,
     pub instance_path: Vec<InstanceId>,
     pub transform: Transform,
     pub bounds: Rect,
 }
 
-impl<'a> FlattenedShape<'a> {
+impl FlattenedShape {
     pub fn source_shape_id(&self) -> ShapeId {
         self.id.source_shape_id()
     }
@@ -2353,7 +2581,7 @@ impl Document {
                 }
             }
             Operation::MoveShape { id, delta } => {
-                if let Some(shape) = self.shapes.get_mut(id) {
+                if let Some(mut shape) = self.shapes.get_mut(id) {
                     shape.kind.translate(*delta);
                 }
             }
@@ -2447,7 +2675,7 @@ impl Document {
             .unwrap_or([0.8, 0.8, 0.8, 0.35])
     }
 
-    pub fn visible_shapes(&self) -> impl Iterator<Item = &Shape> {
+    pub fn visible_shapes(&self) -> impl Iterator<Item = Shape> + '_ {
         self.shapes.values().filter(|shape| {
             self.layers
                 .get(&shape.layer)
@@ -2461,17 +2689,18 @@ impl Document {
             .any(|cell| !cell.shapes.is_empty() || !cell.instances.is_empty())
     }
 
-    pub fn visible_flattened_shapes(&self) -> Vec<FlattenedShape<'_>> {
+    pub fn visible_flattened_shapes(&self) -> Vec<FlattenedShape> {
         let mut flattened = Vec::new();
         let identity = Transform::IDENTITY;
         for shape in self.visible_shapes() {
+            let bounds = shape.kind.bounds();
             flattened.push(FlattenedShape {
                 id: ShapeOccurrenceId::top_level(shape.id),
                 shape,
                 source_cell: self.top_cell,
                 instance_path: Vec::new(),
                 transform: identity,
-                bounds: shape.kind.bounds(),
+                bounds,
             });
         }
 
@@ -2479,14 +2708,15 @@ impl Document {
         let mut array_stack = Vec::new();
         if let Some(top) = self.cells.get(&self.top_cell) {
             for shape in top.shapes.values() {
-                if self.shape_layer_is_visible(shape) {
+                if self.shape_layer_is_visible(&shape) {
+                    let bounds = shape.kind.bounds();
                     flattened.push(FlattenedShape {
                         id: ShapeOccurrenceId::top_level(shape.id),
                         shape,
                         source_cell: self.top_cell,
                         instance_path: Vec::new(),
                         transform: identity,
-                        bounds: shape.kind.bounds(),
+                        bounds,
                     });
                 }
             }
@@ -2495,13 +2725,13 @@ impl Document {
         flattened
     }
 
-    fn flatten_instances<'a>(
-        &'a self,
-        parent: &'a Cell,
+    fn flatten_instances(
+        &self,
+        parent: &Cell,
         parent_transform: Transform,
         instance_path: &mut Vec<InstanceId>,
         array_path: &mut Vec<ArrayIndex>,
-        flattened: &mut Vec<FlattenedShape<'a>>,
+        flattened: &mut Vec<FlattenedShape>,
     ) {
         for instance in parent.instances.values() {
             if instance_path.contains(&instance.id) {
@@ -2522,9 +2752,10 @@ impl Document {
                         array_path.push(ArrayIndex { column, row });
                     }
                     for shape in cell.shapes.values() {
-                        if !self.shape_layer_is_visible(shape) {
+                        if !self.shape_layer_is_visible(&shape) {
                             continue;
                         }
+                        let bounds = transform.apply_rect(shape.kind.bounds());
                         flattened.push(FlattenedShape {
                             id: ShapeOccurrenceId::from_instance_array_path(
                                 shape.id,
@@ -2535,7 +2766,7 @@ impl Document {
                             source_cell: cell.id,
                             instance_path: instance_path.clone(),
                             transform,
-                            bounds: transform.apply_rect(shape.kind.bounds()),
+                            bounds,
                         });
                     }
                     self.flatten_instances(cell, transform, instance_path, array_path, flattened);

@@ -316,11 +316,11 @@ fn write_structure(
 
     if cell.id == document.top_cell {
         for shape in document.shapes.values() {
-            write_shape(writer, document, technology, shape)?;
+            write_shape(writer, document, technology, &shape)?;
         }
     }
     for shape in cell.shapes.values() {
-        write_shape(writer, document, technology, shape)?;
+        write_shape(writer, document, technology, &shape)?;
     }
     for instance in cell.instances.values() {
         let Some(child_name) = names.get(&instance.cell) else {

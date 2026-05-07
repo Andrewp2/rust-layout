@@ -714,7 +714,7 @@ fn shape_for_occurrence<'a>(
     document
         .shapes
         .get(&occurrence.source_shape_id())
-        .map(Cow::Borrowed)
+        .map(Cow::Owned)
 }
 
 fn is_geometry_shape(kind: &ShapeKind) -> bool {
