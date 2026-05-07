@@ -1397,6 +1397,16 @@ impl ShapeView<'_> {
     pub fn bounds(self) -> Rect {
         self.kind.bounds()
     }
+
+    pub fn to_shape(self) -> Shape {
+        Shape {
+            id: self.id,
+            layer: self.layer,
+            net: self.net,
+            kind: self.kind.to_shape_kind(),
+            name: self.name.map(str::to_owned),
+        }
+    }
 }
 
 impl ShapeKindView<'_> {
@@ -1416,6 +1426,37 @@ impl ShapeKindView<'_> {
             }
             Self::Label { position, .. } => Rect::new(position, position).expanded(80),
             Self::Measurement { a, b, .. } => Rect::new(a, b).expanded(40),
+        }
+    }
+
+    pub fn to_shape_kind(self) -> ShapeKind {
+        match self {
+            Self::Rectangle(rect) => ShapeKind::Rectangle(rect),
+            Self::Polygon(poly) => ShapeKind::Polygon(poly.clone()),
+            Self::Path { points, width } => ShapeKind::Path {
+                points: points.to_vec(),
+                width,
+            },
+            Self::Via {
+                center,
+                size,
+                lower,
+                upper,
+            } => ShapeKind::Via {
+                center,
+                size,
+                lower,
+                upper,
+            },
+            Self::Label { position, text } => ShapeKind::Label {
+                position,
+                text: text.to_string(),
+            },
+            Self::Measurement { a, b, label } => ShapeKind::Measurement {
+                a,
+                b,
+                label: label.to_string(),
+            },
         }
     }
 }
@@ -2718,6 +2759,14 @@ pub struct FlattenedShapeView<'a> {
     pub source_cell: CellId,
     pub transform: Transform,
     pub bounds: Rect,
+}
+
+impl FlattenedShapeView<'_> {
+    pub fn transformed_shape(self) -> Shape {
+        let mut shape = self.shape.to_shape();
+        shape.kind = self.transform.apply_shape_kind(&shape.kind);
+        shape
+    }
 }
 
 impl FlattenedShape {

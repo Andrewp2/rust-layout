@@ -6398,14 +6398,13 @@ impl FabricadApp {
         visible_occurrences: &[ShapeOccurrenceId],
     ) {
         if self.document.has_hierarchy_instances() {
-            for shape in self.document.visible_flattened_shapes() {
+            for occurrence in visible_occurrences {
+                let Some(shape) = self.document.shape_view_for_occurrence(occurrence) else {
+                    continue;
+                };
                 if shape.bounds.intersects(viewport) {
-                    self.draw_shape_for_occurrence(
-                        painter,
-                        canvas,
-                        &shape.id,
-                        &shape.transformed_shape(),
-                    );
+                    let shape = shape.transformed_shape();
+                    self.draw_shape_for_occurrence(painter, canvas, occurrence, &shape);
                 }
             }
         } else {
@@ -6425,14 +6424,13 @@ impl FabricadApp {
         visible_occurrences: &[ShapeOccurrenceId],
     ) {
         if self.document.has_hierarchy_instances() {
-            for shape in self.document.visible_flattened_shapes() {
+            for occurrence in visible_occurrences {
+                let Some(shape) = self.document.shape_view_for_occurrence(occurrence) else {
+                    continue;
+                };
                 if shape.bounds.intersects(viewport) {
-                    self.draw_shape_overlay_for_occurrence(
-                        painter,
-                        canvas,
-                        &shape.id,
-                        &shape.transformed_shape(),
-                    );
+                    let shape = shape.transformed_shape();
+                    self.draw_shape_overlay_for_occurrence(painter, canvas, occurrence, &shape);
                 }
             }
         } else {
@@ -6453,8 +6451,11 @@ impl FabricadApp {
         }
         let highlighted = component.shapes.iter().cloned().collect::<BTreeSet<_>>();
         let stroke = Stroke::new(3.0, Color32::from_rgb(112, 236, 214));
-        for flattened in self.document.visible_flattened_shapes() {
-            if !flattened.bounds.intersects(viewport) || !highlighted.contains(&flattened.id) {
+        for occurrence in &highlighted {
+            let Some(flattened) = self.document.shape_view_for_occurrence(occurrence) else {
+                continue;
+            };
+            if !flattened.bounds.intersects(viewport) {
                 continue;
             }
             let shape = flattened.transformed_shape();
@@ -6639,8 +6640,11 @@ impl FabricadApp {
             let stroke = Stroke::new(2.0, color);
             let selected = selections.iter().cloned().collect::<BTreeSet<_>>();
             let mut label_position = None;
-            for flattened in self.document.visible_flattened_shapes() {
-                if !flattened.bounds.intersects(viewport) || !selected.contains(&flattened.id) {
+            for occurrence in &selected {
+                let Some(flattened) = self.document.shape_view_for_occurrence(occurrence) else {
+                    continue;
+                };
+                if !flattened.bounds.intersects(viewport) {
                     continue;
                 }
                 let shape = flattened.transformed_shape();
