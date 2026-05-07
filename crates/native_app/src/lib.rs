@@ -82,6 +82,7 @@ const GDS_PATH: &str = "examples/fabricad_layout.gds";
 const WASM_AUTOSAVE_KEY: &str = "fabricad.autosave.document";
 const MAX_LORO_SEED_OBJECTS: usize = 5_000;
 const MAX_CONNECTIVITY_OBJECTS: usize = 50_000;
+const MAX_DRC_OBJECTS: usize = 50_000;
 const TILE_MEMORY_BUDGET_BYTES: usize = 96 * 1024 * 1024;
 const MAX_3D_FACES: usize = 24_000;
 const CAMERA_NEAR_PLANE: f32 = 10.0;
@@ -1117,6 +1118,13 @@ impl FabricadApp {
     }
 
     fn rerun_drc(&mut self) {
+        if let Some(message) = drc_skip_message(&self.document) {
+            self.violations.clear();
+            self.perf.drc_ms = 0.0;
+            self.last_drc_run = Instant::now();
+            self.status = message;
+            return;
+        }
         let started = Instant::now();
         self.violations = run_drc(&self.document, &self.rules);
         self.perf.drc_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -1124,6 +1132,13 @@ impl FabricadApp {
     }
 
     fn rerun_drc_for_dirty_region(&mut self, dirty_region: Option<Rect>) {
+        if let Some(message) = drc_skip_message(&self.document) {
+            self.violations.clear();
+            self.perf.drc_ms = 0.0;
+            self.last_drc_run = Instant::now();
+            self.status = message;
+            return;
+        }
         let Some(dirty_region) = dirty_region else {
             self.rerun_drc();
             return;
@@ -2654,6 +2669,9 @@ impl FabricadApp {
         self.rerun_drc();
         self.reset_3d_camera_to_document();
         self.status = label.to_string();
+        if let Some(message) = drc_skip_message(&self.document) {
+            self.status = format!("{label}; {message}");
+        }
     }
 
     fn load_document(&mut self) {
@@ -7251,6 +7269,12 @@ fn connectivity_report_for_document(
         .unwrap_or_else(|err| ConnectivityReport::skipped(format!("net extraction failed: {err}")))
 }
 
+fn drc_skip_message(document: &Document) -> Option<String> {
+    let object_count = document_object_count(document);
+    (object_count > MAX_DRC_OBJECTS)
+        .then(|| format!("DRC skipped for {object_count} objects; limit is {MAX_DRC_OBJECTS}"))
+}
+
 fn document_object_count(document: &Document) -> usize {
     document.shapes.len()
         + document
@@ -8816,6 +8840,15 @@ mod tests {
         assert!(!dataset.experiment_plan.runs.is_empty());
         assert!(!dataset.process_control.loops.is_empty());
         assert!(dataset.equipment.tools().count() > 0);
+    }
+
+    #[test]
+    fn large_documents_skip_synchronous_drc() {
+        let small = Document::stress(1_000);
+        assert!(drc_skip_message(&small).is_none());
+
+        let large = Document::stress(MAX_DRC_OBJECTS + 1);
+        assert!(drc_skip_message(&large).is_some());
     }
 
     #[test]
