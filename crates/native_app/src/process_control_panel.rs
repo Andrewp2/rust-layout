@@ -20,8 +20,7 @@ pub(crate) struct ProcessControlPanel {
 }
 
 impl ProcessControlPanel {
-    pub(crate) fn new(analysis: &YieldAnalysis) -> Self {
-        let model = ProcessControlModel::from_yield_analysis(analysis);
+    pub(crate) fn from_model(model: ProcessControlModel) -> Self {
         let selected_loop = model
             .loops
             .first()
@@ -39,6 +38,10 @@ impl ProcessControlPanel {
             actor: "process.engineer".to_string(),
             session_started: Instant::now(),
         }
+    }
+
+    pub(crate) fn model(&self) -> &ProcessControlModel {
+        &self.model
     }
 
     pub(crate) fn context_ui(&mut self, ui: &mut egui::Ui, analysis: &YieldAnalysis) {

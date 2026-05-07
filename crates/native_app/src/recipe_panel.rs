@@ -20,9 +20,9 @@ pub(crate) struct RecipeManagerPanel {
 }
 
 impl RecipeManagerPanel {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn from_catalog(catalog: RecipeCatalog) -> Self {
         let mut panel = Self {
-            catalog: RecipeCatalog::sample(),
+            catalog,
             selected_recipe: None,
             selected_version: None,
             compare_version: None,
@@ -31,8 +31,25 @@ impl RecipeManagerPanel {
             actor: "process.engineer".to_string(),
             session_started: Instant::now(),
         };
-        panel.select_recipe(RecipeId::from("SPIN_PR_3000"));
+        if panel
+            .catalog
+            .recipe(&RecipeId::from("SPIN_PR_3000"))
+            .is_some()
+        {
+            panel.select_recipe(RecipeId::from("SPIN_PR_3000"));
+        } else if let Some(recipe_id) = panel
+            .catalog
+            .sorted_recipes()
+            .first()
+            .map(|recipe| recipe.id.clone())
+        {
+            panel.select_recipe(recipe_id);
+        }
         panel
+    }
+
+    pub(crate) fn catalog(&self) -> &RecipeCatalog {
+        &self.catalog
     }
 
     pub(crate) fn ui(&mut self, ui: &mut egui::Ui, status: &mut String) {

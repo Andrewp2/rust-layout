@@ -16,8 +16,7 @@ pub(crate) struct GenealogyPanel {
 }
 
 impl GenealogyPanel {
-    pub(crate) fn new() -> Self {
-        let genealogy = LotGenealogy::sample();
+    pub(crate) fn from_genealogy(genealogy: LotGenealogy) -> Self {
         let selected_lot = genealogy.lot_ids().first().cloned();
         let selected_wafer = selected_lot.as_ref().and_then(|lot_id| {
             genealogy
@@ -31,6 +30,10 @@ impl GenealogyPanel {
             selected_wafer,
             impact_mode: ImpactMode::LatestToolRun,
         }
+    }
+
+    pub(crate) fn genealogy(&self) -> &LotGenealogy {
+        &self.genealogy
     }
 
     pub(crate) fn ui(&mut self, ui: &mut egui::Ui) {

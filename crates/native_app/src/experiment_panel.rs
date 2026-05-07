@@ -4,6 +4,10 @@ use layout_model::experiment::{
     FactorEffect, FactorId, ResponseCaptureError, ResponseSpec, ResponseSpecId, ResponseStats,
     ResponseValue, ResponseValueStatus, format_compact_number,
 };
+use layout_model::{
+    mes::{ProcessRouteId, ProcessStepId},
+    recipe::RecipeBinding,
+};
 
 use crate::ui_chrome::{self, Tone};
 
@@ -16,8 +20,11 @@ pub(crate) struct ExperimentPlannerPanel {
 }
 
 impl ExperimentPlannerPanel {
-    pub(crate) fn new() -> Self {
-        let plan = ExperimentPlan::sample();
+    pub(crate) fn empty() -> Self {
+        Self::from_plan(blank_experiment_plan())
+    }
+
+    pub(crate) fn from_plan(plan: ExperimentPlan) -> Self {
         let selected_run = plan.runs.first().map(|run| run.id.clone());
         let selected_response = plan
             .responses
@@ -31,6 +38,10 @@ impl ExperimentPlannerPanel {
             capture_value: 72.0,
             show_missing_only: false,
         }
+    }
+
+    pub(crate) fn plan(&self) -> &ExperimentPlan {
+        &self.plan
     }
 
     pub(crate) fn dashboard_ui(&mut self, ui: &mut egui::Ui, status: &mut String) {
@@ -48,6 +59,11 @@ impl ExperimentPlannerPanel {
                         self.plan.status.label(),
                     );
                 });
+                if self.is_blank_plan() {
+                    ui_chrome::empty_state(ui, "No experiment plan loaded");
+                    let _ = status;
+                    return;
+                }
                 ui_chrome::muted(ui, &self.plan.objective);
 
                 self.summary_metrics_ui(ui, &analysis);
@@ -70,6 +86,11 @@ impl ExperimentPlannerPanel {
     pub(crate) fn context_ui(&mut self, ui: &mut egui::Ui, status: &mut String) {
         self.ensure_selection();
         ui_chrome::section_label(ui, "DOE Planner");
+        if self.is_blank_plan() {
+            ui_chrome::empty_state(ui, "No experiment plan loaded");
+            let _ = status;
+            return;
+        }
         ui.label(&self.plan.title);
         ui.small(format!("{}  {}", self.plan.id, self.plan.status.label()));
         ui.separator();
@@ -111,12 +132,6 @@ impl ExperimentPlannerPanel {
         }
 
         ui.separator();
-        if ui.button("Reset DOE sample").clicked() {
-            *self = Self::new();
-            *status = "DOE: reset sample experiment plan".to_string();
-        }
-
-        ui.separator();
         for note in &self.plan.notes {
             ui.small(note);
         }
@@ -125,6 +140,11 @@ impl ExperimentPlannerPanel {
     pub(crate) fn response_capture_ui(&mut self, ui: &mut egui::Ui, status: &mut String) {
         self.ensure_selection();
         ui_chrome::section_label(ui, "Response Capture");
+        if self.is_blank_plan() {
+            ui_chrome::empty_state(ui, "No experiment plan loaded");
+            let _ = status;
+            return;
+        }
 
         let run_label = self
             .selected_run
@@ -474,6 +494,30 @@ impl ExperimentPlannerPanel {
             .response(&self.selected_response)
             .map(|response| response.name.clone())
             .unwrap_or_else(|| "primary response".to_string())
+    }
+
+    fn is_blank_plan(&self) -> bool {
+        self.plan.id.as_str().is_empty()
+            && self.plan.factors.is_empty()
+            && self.plan.responses.is_empty()
+            && self.plan.runs.is_empty()
+    }
+}
+
+fn blank_experiment_plan() -> ExperimentPlan {
+    ExperimentPlan {
+        id: Default::default(),
+        title: "No experiment plan loaded".to_string(),
+        objective: String::new(),
+        owner: String::new(),
+        status: layout_model::experiment::ExperimentStatus::Draft,
+        route_id: ProcessRouteId::default(),
+        step_id: ProcessStepId::default(),
+        baseline_recipe: RecipeBinding::new("", 0),
+        factors: Vec::new(),
+        responses: Vec::new(),
+        runs: Vec::new(),
+        notes: Vec::new(),
     }
 }
 

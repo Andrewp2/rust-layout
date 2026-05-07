@@ -29,6 +29,7 @@ layout_model = { path = "../layout_model" }
 pollster.workspace = true
 renderer = { path = "../renderer" }
 router = { path = "../router" }
+serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 web-time.workspace = true

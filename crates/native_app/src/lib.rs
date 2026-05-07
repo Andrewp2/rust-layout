@@ -26,14 +26,19 @@ use layout_model::{
         Tool as EquipmentTool, ToolId as EquipmentToolId, ToolKind as EquipmentToolKind,
         ToolState as EquipmentToolState,
     },
+    experiment::ExperimentPlan,
     gdsii::{export_gdsii, import_gdsii},
+    genealogy::LotGenealogy,
     mes::{
         AuditOutcome, FabMesData, Lot, LotId, OperatorAction, ProcessRoute, ToolId, TravelerState,
         TravelerStatus,
     },
     metrology::{
-        DieCoord, HistogramBin, Measurement, MeasurementKind, MeasurementStatus, WaferMap,
+        DieCoord, FabObjectLinks, HistogramBin, Measurement, MeasurementKind, MeasurementStatus,
+        WaferGeometry, WaferMap,
     },
+    process_control::ProcessControlModel,
+    recipe::RecipeCatalog,
     yield_analysis::{
         CorrelationRecord, DieOutcome, FailureMode, LotComparison, ProcessMeasurement,
         YieldAnalysis, YieldSummary,
@@ -46,6 +51,7 @@ use renderer::gpu::{
     Viewport3dRenderer, Viewport3dUniforms, viewport_3d_target_size,
 };
 use router::{RouteRequest, RouterConfig, route};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use web_time::{Duration, Instant};
 
@@ -69,6 +75,8 @@ use futures_util::{Sink, SinkExt, StreamExt};
 use wasm_bindgen::{JsCast, closure::Closure};
 
 const SAVE_PATH: &str = "examples/fabricad_layout.json";
+const WORKSPACE_PATH: &str = "examples/fabricad_workspace.json";
+const DEMO_WORKSPACE_PATH: &str = "examples/fabricad_demo_workspace.json";
 const GDS_PATH: &str = "examples/fabricad_layout.gds";
 #[cfg(target_arch = "wasm32")]
 const WASM_AUTOSAVE_KEY: &str = "fabricad.autosave.document";
@@ -235,6 +243,54 @@ impl ModuleGroup {
             Self::Engineering => ui_chrome::Tone::Neutral,
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DataSource {
+    Blank,
+    Demo,
+    File(String),
+    Generated(String),
+}
+
+impl DataSource {
+    fn label(&self) -> String {
+        match self {
+            Self::Blank => "blank".to_string(),
+            Self::Demo => "demo".to_string(),
+            Self::File(_) => "file".to_string(),
+            Self::Generated(_) => "generated".to_string(),
+        }
+    }
+
+    fn tone(&self) -> ui_chrome::Tone {
+        match self {
+            Self::Blank => ui_chrome::Tone::Neutral,
+            Self::Demo | Self::Generated(_) => ui_chrome::Tone::Warning,
+            Self::File(_) => ui_chrome::Tone::Success,
+        }
+    }
+
+    fn detail(&self) -> Option<&str> {
+        match self {
+            Self::File(path) | Self::Generated(path) => Some(path.as_str()),
+            Self::Blank | Self::Demo => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct WorkspaceDataset {
+    schema_version: u32,
+    document: Document,
+    mes: FabMesData,
+    yield_analysis: YieldAnalysis,
+    wafer_map: WaferMap,
+    recipe_catalog: RecipeCatalog,
+    genealogy: LotGenealogy,
+    experiment_plan: ExperimentPlan,
+    process_control: ProcessControlModel,
+    equipment: EquipmentSimulator,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -633,6 +689,8 @@ struct SelectedInstanceInfo {
 
 pub struct FabricadApp {
     document: Document,
+    layout_source: DataSource,
+    fabos_source: DataSource,
     index: LayoutIndex,
     yield_analysis: YieldAnalysis,
     selected_yield_lot: String,
@@ -777,6 +835,73 @@ pub fn export_demo_gds(
     Ok(())
 }
 
+impl WorkspaceDataset {
+    fn blank() -> Self {
+        Self {
+            schema_version: 1,
+            document: Document::new("Untitled layout"),
+            mes: empty_mes_data(),
+            yield_analysis: empty_yield_analysis(),
+            wafer_map: empty_wafer_map(),
+            recipe_catalog: RecipeCatalog::default(),
+            genealogy: LotGenealogy::new(),
+            experiment_plan: ExperimentPlannerPanel::empty().plan().clone(),
+            process_control: ProcessControlModel::default(),
+            equipment: EquipmentSimulator::new(Vec::new()),
+        }
+    }
+
+    fn demo() -> Self {
+        let yield_analysis = YieldAnalysis::synthetic();
+        Self {
+            schema_version: 1,
+            document: Document::demo(),
+            mes: FabMesData::sample(),
+            yield_analysis: yield_analysis.clone(),
+            wafer_map: WaferMap::synthetic_demo(),
+            recipe_catalog: RecipeCatalog::sample(),
+            genealogy: LotGenealogy::sample(),
+            experiment_plan: ExperimentPlan::sample(),
+            process_control: ProcessControlModel::from_yield_analysis(&yield_analysis),
+            equipment: EquipmentSimulator::demo_fab(),
+        }
+    }
+}
+
+fn empty_mes_data() -> FabMesData {
+    FabMesData {
+        routes: BTreeMap::new(),
+        lots: BTreeMap::new(),
+        travelers: BTreeMap::new(),
+    }
+}
+
+fn empty_yield_analysis() -> YieldAnalysis {
+    YieldAnalysis {
+        lots: Vec::new(),
+        recipes: Vec::new(),
+        test_results: Vec::new(),
+        process_measurements: Vec::new(),
+        lot_summaries: Vec::new(),
+        wafer_summaries: Vec::new(),
+        lot_comparisons: Vec::new(),
+        correlations: Vec::new(),
+    }
+}
+
+fn empty_wafer_map() -> WaferMap {
+    WaferMap {
+        id: String::new(),
+        name: "No wafer map loaded".to_string(),
+        geometry: WaferGeometry::default(),
+        links: FabObjectLinks::default(),
+        dies: Vec::new(),
+        measurements: Vec::new(),
+        defects: Vec::new(),
+        annotations: Vec::new(),
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 async fn run_offscreen_render_async(
     options: OffscreenRenderOptions,
@@ -808,8 +933,9 @@ fn offscreen_document(scene: &OffscreenScene) -> (String, Document) {
 impl FabricadApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let technologies = builtin_technologies();
-        let document = Document::demo();
-        let yield_analysis = YieldAnalysis::synthetic();
+        let dataset = WorkspaceDataset::blank();
+        let document = dataset.document;
+        let yield_analysis = dataset.yield_analysis;
         let selected_yield_lot = yield_analysis
             .lots
             .first()
@@ -836,17 +962,19 @@ impl FabricadApp {
         let violations = run_drc(&document, &rules);
         let connectivity =
             connectivity_report_for_document(&document, &technologies[active_technology]);
-        let mes = FabMesData::sample();
+        let mes = dataset.mes;
         let selected_mes_lot = mes.lots.keys().next().cloned();
-        let equipment_sim = EquipmentSimulator::demo_fab();
+        let equipment_sim = dataset.equipment;
         let selected_equipment_tool = equipment_sim.tools().next().map(|tool| tool.id.clone());
         let mask_panel = MaskPrepPanel::new(&document, &mes, selected_mes_lot.as_ref());
         let spc_fdc_panel = SpcFdcPanel::new();
-        let process_control_panel = ProcessControlPanel::new(&yield_analysis);
-        let genealogy_panel = GenealogyPanel::new();
-        let experiment_panel = ExperimentPlannerPanel::new();
+        let process_control_panel = ProcessControlPanel::from_model(dataset.process_control);
+        let genealogy_panel = GenealogyPanel::from_genealogy(dataset.genealogy);
+        let experiment_panel = ExperimentPlannerPanel::from_plan(dataset.experiment_plan);
         let mut app = Self {
             document,
+            layout_source: DataSource::Blank,
+            fabos_source: DataSource::Blank,
             index,
             yield_analysis,
             selected_yield_lot,
@@ -868,9 +996,9 @@ impl FabricadApp {
             active_layer,
             tool: Tool::Select,
             view_mode: ViewMode::Layout2d,
-            wafer_map: WaferMap::synthetic_demo(),
+            wafer_map: dataset.wafer_map,
             metrology_kind: MeasurementKind::ThicknessNm,
-            selected_die: Some(DieCoord::new(0, 0)),
+            selected_die: None,
             metrology_failed_only: false,
             zoom: 0.075,
             pan: Vec2::ZERO,
@@ -893,7 +1021,7 @@ impl FabricadApp {
             perf: PerfStats::default(),
             last_drc_run: Instant::now(),
             last_autosave: Instant::now(),
-            status: "ready".to_string(),
+            status: "blank workspace".to_string(),
             user_id,
             loro_log,
             remote_cursors: BTreeMap::new(),
@@ -916,7 +1044,7 @@ impl FabricadApp {
             selected_mes_lot,
             show_mes_panel: true,
             mes_operator: "op.demo".to_string(),
-            recipe_panel: RecipeManagerPanel::new(),
+            recipe_panel: RecipeManagerPanel::from_catalog(dataset.recipe_catalog),
             equipment_sim,
             selected_equipment_tool,
             equipment_recipe_drafts: BTreeMap::new(),
@@ -940,6 +1068,7 @@ impl FabricadApp {
             app.reset_render_cache();
             app.rebuild_indexes();
             app.rerun_drc();
+            app.layout_source = DataSource::Demo;
             app.status = "test scene: hierarchy".to_string();
         } else if let Some(count) = options.stress_count {
             app.document = Document::stress(count);
@@ -953,6 +1082,7 @@ impl FabricadApp {
             app.reset_render_cache();
             app.rebuild_indexes();
             app.rerun_drc();
+            app.layout_source = DataSource::Generated(format!("{count} polygon stress"));
             app.status = format!("test scene: {count} polygons");
         }
         app.reset_3d_camera_to_document();
@@ -2259,6 +2389,145 @@ impl FabricadApp {
         self.status = format!("placed {} at {}, {}", cell.name, location.x, location.y);
     }
 
+    fn current_workspace_dataset(&self) -> WorkspaceDataset {
+        WorkspaceDataset {
+            schema_version: 1,
+            document: self.document.clone(),
+            mes: self.mes.clone(),
+            yield_analysis: self.yield_analysis.clone(),
+            wafer_map: self.wafer_map.clone(),
+            recipe_catalog: self.recipe_panel.catalog().clone(),
+            genealogy: self.genealogy_panel.genealogy().clone(),
+            experiment_plan: self.experiment_panel.plan().clone(),
+            process_control: self.process_control_panel.model().clone(),
+            equipment: self.equipment_sim.clone(),
+        }
+    }
+
+    fn apply_workspace_dataset(
+        &mut self,
+        dataset: WorkspaceDataset,
+        layout_source: DataSource,
+        fabos_source: DataSource,
+        label: &str,
+    ) {
+        self.replace_document(dataset.document, label);
+        self.layout_source = layout_source;
+        self.fabos_source = fabos_source;
+        self.yield_analysis = dataset.yield_analysis;
+        self.reset_yield_selection();
+        self.wafer_map = dataset.wafer_map;
+        self.selected_die = self.wafer_map.dies.first().copied();
+        self.mes = dataset.mes;
+        self.selected_mes_lot = self.mes.lots.keys().next().cloned();
+        self.mask_panel =
+            MaskPrepPanel::new(&self.document, &self.mes, self.selected_mes_lot.as_ref());
+        self.spc_fdc_panel = SpcFdcPanel::new();
+        self.process_control_panel = ProcessControlPanel::from_model(dataset.process_control);
+        self.genealogy_panel = GenealogyPanel::from_genealogy(dataset.genealogy);
+        self.experiment_panel = ExperimentPlannerPanel::from_plan(dataset.experiment_plan);
+        self.recipe_panel = RecipeManagerPanel::from_catalog(dataset.recipe_catalog);
+        self.equipment_sim = dataset.equipment;
+        self.selected_equipment_tool = self
+            .equipment_sim
+            .tools()
+            .next()
+            .map(|tool| tool.id.clone());
+        self.equipment_recipe_drafts.clear();
+        self.last_equipment_tick = Instant::now();
+        self.status = label.to_string();
+    }
+
+    fn reset_yield_selection(&mut self) {
+        self.selected_yield_lot = self
+            .yield_analysis
+            .lots
+            .first()
+            .map(|lot| lot.id.clone())
+            .unwrap_or_default();
+        self.selected_yield_wafer = self
+            .yield_analysis
+            .wafer_ids_for_lot(&self.selected_yield_lot)
+            .first()
+            .cloned()
+            .unwrap_or_default();
+    }
+
+    fn new_blank_workspace(&mut self) {
+        self.apply_workspace_dataset(
+            WorkspaceDataset::blank(),
+            DataSource::Blank,
+            DataSource::Blank,
+            "new blank workspace",
+        );
+    }
+
+    fn save_workspace(&mut self) {
+        let path = PathBuf::from(WORKSPACE_PATH);
+        if let Some(parent) = path.parent()
+            && let Err(err) = fs::create_dir_all(parent)
+        {
+            self.status = format!("workspace save failed: {err}");
+            return;
+        }
+        match serde_json::to_string_pretty(&self.current_workspace_dataset())
+            .and_then(|contents| fs::write(&path, contents).map_err(serde_json::Error::io))
+        {
+            Ok(()) => self.status = format!("saved workspace {WORKSPACE_PATH}"),
+            Err(err) => self.status = format!("workspace save failed: {err}"),
+        }
+    }
+
+    fn load_workspace(&mut self) {
+        match fs::read_to_string(WORKSPACE_PATH)
+            .map_err(serde_json::Error::io)
+            .and_then(|contents| serde_json::from_str::<WorkspaceDataset>(&contents))
+        {
+            Ok(dataset) => self.apply_workspace_dataset(
+                dataset,
+                DataSource::File(WORKSPACE_PATH.to_string()),
+                DataSource::File(WORKSPACE_PATH.to_string()),
+                &format!("loaded workspace {WORKSPACE_PATH}"),
+            ),
+            Err(err) => self.status = format!("workspace load failed: {err}"),
+        }
+    }
+
+    fn load_demo_workspace(&mut self) {
+        let path = PathBuf::from(DEMO_WORKSPACE_PATH);
+        let dataset = match fs::read_to_string(&path)
+            .map_err(serde_json::Error::io)
+            .and_then(|contents| serde_json::from_str::<WorkspaceDataset>(&contents))
+        {
+            Ok(dataset) => dataset,
+            Err(_) => {
+                let dataset = WorkspaceDataset::demo();
+                if let Some(parent) = path.parent()
+                    && let Err(err) = fs::create_dir_all(parent)
+                {
+                    self.status = format!("demo workspace setup failed: {err}");
+                    return;
+                }
+                match serde_json::to_string_pretty(&dataset)
+                    .and_then(|contents| fs::write(&path, contents).map_err(serde_json::Error::io))
+                {
+                    Ok(()) => {}
+                    Err(err) => {
+                        self.status = format!("demo workspace setup failed: {err}");
+                        return;
+                    }
+                }
+                dataset
+            }
+        };
+        self.apply_workspace_dataset(
+            dataset,
+            DataSource::Demo,
+            DataSource::Demo,
+            &format!("loaded demo workspace {DEMO_WORKSPACE_PATH}"),
+        );
+    }
+
     fn save_document(&mut self) {
         let path = PathBuf::from(SAVE_PATH);
         if let Some(parent) = path.parent() {
@@ -2356,7 +2625,10 @@ impl FabricadApp {
                 }
             };
             match serde_json::from_str::<Document>(&contents) {
-                Ok(document) => self.replace_document(document, "restored browser autosave"),
+                Ok(document) => {
+                    self.replace_document(document, "restored browser autosave");
+                    self.layout_source = DataSource::File("browser autosave".to_string());
+                }
                 Err(err) => self.status = format!("restore failed: {err}"),
             }
         }
@@ -2391,6 +2663,7 @@ impl FabricadApp {
         {
             Ok(document) => {
                 self.replace_document(document, &format!("loaded {SAVE_PATH}"));
+                self.layout_source = DataSource::File(SAVE_PATH.to_string());
             }
             Err(err) => self.status = format!("load failed: {err}"),
         }
@@ -2430,6 +2703,7 @@ impl FabricadApp {
         match import_gdsii(&bytes, &technology) {
             Ok(document) => {
                 self.replace_document(document, &format!("imported {GDS_PATH}"));
+                self.layout_source = DataSource::File(GDS_PATH.to_string());
             }
             Err(err) => self.status = format!("GDS import failed: {err}"),
         }
@@ -2448,6 +2722,7 @@ impl FabricadApp {
         self.rebuild_indexes();
         self.rerun_drc();
         self.reset_3d_camera_to_document();
+        self.layout_source = DataSource::Generated(format!("{count} polygon stress"));
         self.status = format!("generated {count} polygons");
     }
 
@@ -2464,6 +2739,7 @@ impl FabricadApp {
         self.rebuild_indexes();
         self.rerun_drc();
         self.reset_3d_camera_to_document();
+        self.layout_source = DataSource::Demo;
         self.status = "generated hierarchy demo".to_string();
     }
 
@@ -2683,6 +2959,17 @@ impl FabricadApp {
 
     fn fab_control_room(&mut self, ui: &mut egui::Ui) {
         let tools = self.equipment_sim.tools().cloned().collect::<Vec<_>>();
+        if tools.is_empty() {
+            ui_chrome::module_header(
+                ui,
+                "Fab operations",
+                "Fab Control Room",
+                "No data loaded",
+                |_| {},
+            );
+            ui_chrome::empty_state(ui, "No equipment dataset loaded");
+            return;
+        }
         if self
             .selected_equipment_tool
             .as_ref()
@@ -3161,6 +3448,24 @@ impl FabricadApp {
                 ui.add_space(4.0);
                 ui.label(RichText::new("Fabricad").heading().strong());
                 ui_chrome::muted(ui, "FabOS workbench");
+                ui.horizontal_wrapped(|ui| {
+                    ui_chrome::status_pill(
+                        ui,
+                        &format!("Layout {}", self.layout_source.label()),
+                        self.layout_source.tone(),
+                    );
+                    ui_chrome::status_pill(
+                        ui,
+                        &format!("FabOS {}", self.fabos_source.label()),
+                        self.fabos_source.tone(),
+                    );
+                });
+                if let Some(detail) = self.layout_source.detail() {
+                    ui_chrome::muted(ui, format!("Layout source: {detail}"));
+                }
+                if let Some(detail) = self.fabos_source.detail() {
+                    ui_chrome::muted(ui, format!("FabOS source: {detail}"));
+                }
                 ui.add_space(8.0);
 
                 egui::ScrollArea::vertical()
@@ -3229,6 +3534,16 @@ impl FabricadApp {
                     ui,
                     self.view_mode.group().label(),
                     self.view_mode.group().tone(),
+                );
+                ui_chrome::status_pill(
+                    ui,
+                    &format!("Layout {}", self.layout_source.label()),
+                    self.layout_source.tone(),
+                );
+                ui_chrome::status_pill(
+                    ui,
+                    &format!("FabOS {}", self.fabos_source.label()),
+                    self.fabos_source.tone(),
                 );
                 ui.label(RichText::new(self.view_mode.title()).strong());
                 ui.label(
@@ -3332,10 +3647,25 @@ impl FabricadApp {
                 });
 
                 ui.menu_button("Document", |ui| {
-                    if ui.button("Save").clicked() {
+                    if ui.button("New Blank Workspace").clicked() {
+                        self.new_blank_workspace();
+                    }
+                    if ui.button("Load Demo Workspace").clicked() {
+                        self.load_demo_workspace();
+                    }
+                    ui.separator();
+                    if ui.button("Save Workspace").clicked() {
+                        self.save_workspace();
+                    }
+                    if ui.button("Load Workspace").clicked() {
+                        self.load_workspace();
+                    }
+                    ui.separator();
+                    ui.label("Layout only");
+                    if ui.button("Save Layout JSON").clicked() {
                         self.save_document();
                     }
-                    if ui.button("Load").clicked() {
+                    if ui.button("Load Layout JSON").clicked() {
                         self.load_document();
                     }
                     ui.separator();
@@ -3361,6 +3691,11 @@ impl FabricadApp {
                 });
 
                 ui.menu_button("Demo Data", |ui| {
+                    if ui.button("Load Full Demo Workspace").clicked() {
+                        self.load_demo_workspace();
+                    }
+                    ui.separator();
+                    ui.label("Layout test scenes");
                     if ui.button("10k stress").clicked() {
                         self.make_stress_document(10_000);
                     }
@@ -3676,6 +4011,9 @@ impl FabricadApp {
             ui.separator();
             ui.vertical(|ui| {
                 action = self.mes_selected_lot_ui(ui);
+                if self.mes.lots.is_empty() {
+                    ui_chrome::empty_state(ui, "No traveler selected");
+                }
             });
         });
         if let Some((lot_id, action)) = action {
@@ -3689,6 +4027,10 @@ impl FabricadApp {
             self.selected_mes_lot = self.mes.lots.keys().next().cloned();
         }
         let lot_ids: Vec<_> = self.mes.lots.keys().cloned().collect();
+        if lot_ids.is_empty() {
+            ui_chrome::empty_state(ui, "No MES lots loaded");
+            return;
+        }
         for lot_id in lot_ids {
             let Some((label, detail)) = self.mes_wip_row(&lot_id) else {
                 continue;
@@ -4091,6 +4433,10 @@ impl FabricadApp {
     }
 
     fn metrology_context_panel(&mut self, ui: &mut egui::Ui) {
+        if self.wafer_map.dies.is_empty() {
+            ui_chrome::empty_state(ui, "No metrology dataset loaded");
+            return;
+        }
         ui.label("FabOS Context");
         ui.label(&self.wafer_map.name);
         ui.separator();
@@ -4131,6 +4477,10 @@ impl FabricadApp {
 
     fn metrology_panel(&mut self, ui: &mut egui::Ui) {
         ui.label("Metrology");
+        if self.wafer_map.dies.is_empty() {
+            ui_chrome::empty_state(ui, "No wafer map loaded");
+            return;
+        }
         let previous_kind = self.metrology_kind;
         egui::ComboBox::from_id_salt("metrology_kind_picker")
             .selected_text(self.metrology_kind.label())
@@ -4862,6 +5212,17 @@ impl FabricadApp {
             .iter()
             .map(|lot| lot.id.clone())
             .collect::<Vec<_>>();
+        if lot_ids.is_empty() {
+            ui_chrome::module_header(
+                ui,
+                "Fab analysis",
+                "Yield Dashboard",
+                "No data loaded",
+                |_| {},
+            );
+            ui_chrome::empty_state(ui, "No yield dataset loaded");
+            return;
+        }
         if self.selected_yield_lot.is_empty() {
             if let Some(lot_id) = lot_ids.first() {
                 self.selected_yield_lot = lot_id.clone();
@@ -5219,6 +5580,16 @@ impl FabricadApp {
         }
 
         painter.rect_filled(canvas, 0.0, Color32::from_rgb(12, 15, 17));
+        if self.wafer_map.dies.is_empty() {
+            painter.text(
+                canvas.center(),
+                Align2::CENTER_CENTER,
+                "no metrology dataset loaded",
+                FontId::proportional(16.0),
+                Color32::from_rgb(190, 198, 196),
+            );
+            return;
+        }
         let side = (canvas.width().min(canvas.height()) - 56.0).max(180.0);
         let wafer_rect = EguiRect::from_center_size(canvas.center(), vec2(side, side));
         let center = wafer_rect.center();
@@ -8413,6 +8784,36 @@ mod tests {
         assert!(!ViewMode::ProcessControl.has_secondary_panel());
         assert!(ViewMode::Traceability.has_inspector_panel());
         assert!(!ViewMode::Traceability.has_secondary_panel());
+    }
+
+    #[test]
+    fn blank_workspace_dataset_has_no_demo_operational_data() {
+        let dataset = WorkspaceDataset::blank();
+
+        assert!(dataset.document.shapes.is_empty());
+        assert!(dataset.mes.lots.is_empty());
+        assert!(dataset.yield_analysis.lots.is_empty());
+        assert!(dataset.wafer_map.dies.is_empty());
+        assert!(dataset.recipe_catalog.recipes.is_empty());
+        assert_eq!(dataset.genealogy.summary().lot_count, 0);
+        assert!(dataset.experiment_plan.runs.is_empty());
+        assert!(dataset.process_control.loops.is_empty());
+        assert_eq!(dataset.equipment.tools().count(), 0);
+    }
+
+    #[test]
+    fn demo_workspace_dataset_is_explicitly_populated() {
+        let dataset = WorkspaceDataset::demo();
+
+        assert!(!dataset.document.shapes.is_empty());
+        assert!(!dataset.mes.lots.is_empty());
+        assert!(!dataset.yield_analysis.lots.is_empty());
+        assert!(!dataset.wafer_map.dies.is_empty());
+        assert!(!dataset.recipe_catalog.recipes.is_empty());
+        assert!(dataset.genealogy.summary().lot_count > 0);
+        assert!(!dataset.experiment_plan.runs.is_empty());
+        assert!(!dataset.process_control.loops.is_empty());
+        assert!(dataset.equipment.tools().count() > 0);
     }
 
     #[test]

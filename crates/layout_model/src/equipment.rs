@@ -525,7 +525,7 @@ impl fmt::Display for ToolTransitionError {
 
 impl Error for ToolTransitionError {}
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SyntheticTool {
     pub tool: Tool,
     run_elapsed_s: u64,
@@ -1022,7 +1022,7 @@ impl SyntheticTool {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EquipmentSimulator {
     tools: BTreeMap<ToolId, SyntheticTool>,
     pub now_s: u64,
