@@ -190,10 +190,14 @@ impl ViewMode {
         matches!(self, Self::Layout2d | Self::Layout3d)
     }
 
-    fn has_contextual_layers(self) -> bool {
-        !matches!(
+    fn has_inspector_panel(self) -> bool {
+        !matches!(self, Self::FabControl | Self::Yield)
+    }
+
+    fn has_secondary_panel(self) -> bool {
+        matches!(
             self,
-            Self::FabControl | Self::SpcFdc | Self::ProcessControl | Self::Traceability
+            Self::Layout2d | Self::Layout3d | Self::Metrology | Self::MaskPrep | Self::Experiment
         )
     }
 }
@@ -3999,10 +4003,7 @@ impl FabricadApp {
                         ViewMode::Experiment => {
                             self.experiment_panel.context_ui(ui, &mut self.status);
                         }
-                        ViewMode::Layout2d
-                        | ViewMode::Layout3d
-                        | ViewMode::FabControl
-                        | ViewMode::Yield => {
+                        ViewMode::Layout2d | ViewMode::Layout3d => {
                             self.technology_panel(ui);
                             ui.separator();
                             self.recipe_panel.ui(ui, &mut self.status);
@@ -4015,6 +4016,7 @@ impl FabricadApp {
                             ui.separator();
                             self.marker_panel(ui);
                         }
+                        ViewMode::FabControl | ViewMode::Yield => {}
                     });
             });
     }
@@ -6630,8 +6632,10 @@ impl eframe::App for FabricadApp {
         self.handle_shortcuts(ctx);
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| self.toolbar(ui));
         self.navigation_panel(ctx);
-        self.inspector_panel(ctx);
-        if self.view_mode.has_contextual_layers() {
+        if self.view_mode.has_inspector_panel() {
+            self.inspector_panel(ctx);
+        }
+        if self.view_mode.has_secondary_panel() {
             self.layers_panel(ctx);
         }
         self.options_window(ctx);
@@ -8382,6 +8386,33 @@ mod tests {
                 ("Engineering", vec!["R2R control", "DOE"]),
             ]
         );
+    }
+
+    #[test]
+    fn side_panels_follow_view_context() {
+        assert!(ViewMode::Layout2d.has_inspector_panel());
+        assert!(ViewMode::Layout2d.has_secondary_panel());
+        assert!(ViewMode::Layout3d.has_inspector_panel());
+        assert!(ViewMode::Layout3d.has_secondary_panel());
+
+        assert!(ViewMode::MaskPrep.has_inspector_panel());
+        assert!(ViewMode::MaskPrep.has_secondary_panel());
+        assert!(ViewMode::Metrology.has_inspector_panel());
+        assert!(ViewMode::Metrology.has_secondary_panel());
+        assert!(ViewMode::Experiment.has_inspector_panel());
+        assert!(ViewMode::Experiment.has_secondary_panel());
+
+        assert!(!ViewMode::Yield.has_inspector_panel());
+        assert!(!ViewMode::Yield.has_secondary_panel());
+        assert!(!ViewMode::FabControl.has_inspector_panel());
+        assert!(!ViewMode::FabControl.has_secondary_panel());
+
+        assert!(ViewMode::SpcFdc.has_inspector_panel());
+        assert!(!ViewMode::SpcFdc.has_secondary_panel());
+        assert!(ViewMode::ProcessControl.has_inspector_panel());
+        assert!(!ViewMode::ProcessControl.has_secondary_panel());
+        assert!(ViewMode::Traceability.has_inspector_panel());
+        assert!(!ViewMode::Traceability.has_secondary_panel());
     }
 
     #[test]
