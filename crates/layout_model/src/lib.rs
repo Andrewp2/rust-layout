@@ -677,12 +677,14 @@ impl LoroCrdtLog {
             };
             if document.cells.contains_key(&instance.cell) {
                 document.next_instance_id = document.next_instance_id.max(instance.id.0 + 1);
-                document
-                    .cells
-                    .entry(parent)
-                    .or_insert_with(|| Cell::new(parent, format!("cell {}", parent.0)))
-                    .instances
-                    .insert(instance.id, instance);
+                if !document.cells.contains_key(&parent) {
+                    document
+                        .cells
+                        .insert(parent, Cell::new(parent, format!("cell {}", parent.0)));
+                }
+                if let Some(parent) = document.cells.get_mut(&parent) {
+                    parent.instances.insert(instance.id, instance);
+                }
             }
         }
         document.ensure_hierarchy();
@@ -831,6 +833,191 @@ pub struct Layer {
     pub gds_texttype: u16,
     pub visible: bool,
     pub locked: bool,
+}
+
+const MAX_DENSE_LAYER_ID_INDEX: usize = 1_000_000;
+
+#[derive(Clone, Debug, Default)]
+pub struct LayerStore {
+    alive: Vec<bool>,
+    ids: Vec<LayerId>,
+    layers: Vec<Layer>,
+    id_to_row: Vec<Option<usize>>,
+    overflow_id_to_row: BTreeMap<LayerId, usize>,
+    len: usize,
+}
+
+impl LayerStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            alive: Vec::with_capacity(capacity),
+            ids: Vec::with_capacity(capacity),
+            layers: Vec::with_capacity(capacity),
+            id_to_row: Vec::new(),
+            overflow_id_to_row: BTreeMap::new(),
+            len: 0,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn clear(&mut self) {
+        self.alive.clear();
+        self.ids.clear();
+        self.layers.clear();
+        self.id_to_row.clear();
+        self.overflow_id_to_row.clear();
+        self.len = 0;
+    }
+
+    pub fn get(&self, id: &LayerId) -> Option<&Layer> {
+        self.row_for_id(*id).map(|row| &self.layers[row])
+    }
+
+    pub fn get_mut(&mut self, id: &LayerId) -> Option<&mut Layer> {
+        let row = self.row_for_id(*id)?;
+        Some(&mut self.layers[row])
+    }
+
+    pub fn contains_key(&self, id: &LayerId) -> bool {
+        self.row_for_id(*id).is_some()
+    }
+
+    pub fn insert(&mut self, id: LayerId, mut layer: Layer) -> Option<Layer> {
+        layer.id = id;
+        if let Some(row) = self.row_for_id(id)
+            && self.alive.get(row).copied().unwrap_or(false)
+        {
+            return Some(std::mem::replace(&mut self.layers[row], layer));
+        }
+
+        let row = self.ids.len();
+        self.set_row_for_id(id, row);
+        self.alive.push(true);
+        self.ids.push(id);
+        self.layers.push(layer);
+        self.len += 1;
+        None
+    }
+
+    pub fn remove(&mut self, id: &LayerId) -> Option<Layer> {
+        let row = self.row_for_id(*id)?;
+        self.clear_row_for_id(*id);
+        if !self.alive.get(row).copied().unwrap_or(false) {
+            return None;
+        }
+        self.alive[row] = false;
+        self.len -= 1;
+        Some(self.layers[row].clone())
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &Layer> {
+        self.alive
+            .iter()
+            .enumerate()
+            .filter(|(_, alive)| **alive)
+            .map(|(row, _)| &self.layers[row])
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &LayerId> {
+        self.ids
+            .iter()
+            .enumerate()
+            .filter(|(row, _)| self.alive.get(*row).copied().unwrap_or(false))
+            .map(|(_, id)| id)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&LayerId, &Layer)> {
+        self.ids
+            .iter()
+            .enumerate()
+            .filter(|(row, _)| self.alive.get(*row).copied().unwrap_or(false))
+            .map(|(row, id)| (id, &self.layers[row]))
+    }
+
+    fn row_for_id(&self, id: LayerId) -> Option<usize> {
+        dense_layer_index(id)
+            .and_then(|index| self.id_to_row.get(index).copied().flatten())
+            .or_else(|| self.overflow_id_to_row.get(&id).copied())
+            .filter(|row| self.alive.get(*row).copied().unwrap_or(false))
+    }
+
+    fn set_row_for_id(&mut self, id: LayerId, row: usize) {
+        if let Some(index) = dense_layer_index(id) {
+            if index >= self.id_to_row.len() {
+                self.id_to_row.resize(index + 1, None);
+            }
+            self.id_to_row[index] = Some(row);
+        } else {
+            self.overflow_id_to_row.insert(id, row);
+        }
+    }
+
+    fn clear_row_for_id(&mut self, id: LayerId) {
+        if let Some(index) = dense_layer_index(id)
+            && let Some(slot) = self.id_to_row.get_mut(index)
+        {
+            *slot = None;
+            return;
+        }
+        self.overflow_id_to_row.remove(&id);
+    }
+}
+
+impl Extend<(LayerId, Layer)> for LayerStore {
+    fn extend<T: IntoIterator<Item = (LayerId, Layer)>>(&mut self, iter: T) {
+        for (id, layer) in iter {
+            self.insert(id, layer);
+        }
+    }
+}
+
+impl FromIterator<(LayerId, Layer)> for LayerStore {
+    fn from_iter<T: IntoIterator<Item = (LayerId, Layer)>>(iter: T) -> Self {
+        let mut store = Self::new();
+        for (id, layer) in iter {
+            store.insert(id, layer);
+        }
+        store
+    }
+}
+
+impl Serialize for LayerStore {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(self.len))?;
+        for (id, layer) in self.iter() {
+            map.serialize_entry(id, layer)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for LayerStore {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let layers = BTreeMap::<LayerId, Layer>::deserialize(deserializer)?;
+        Ok(layers.into_iter().collect())
+    }
+}
+
+fn dense_layer_index(id: LayerId) -> Option<usize> {
+    let index = usize::try_from(id.0).ok()?;
+    (index <= MAX_DENSE_LAYER_ID_INDEX).then_some(index)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1874,6 +2061,191 @@ impl Cell {
     }
 }
 
+const MAX_DENSE_CELL_ID_INDEX: usize = 10_000_000;
+
+#[derive(Clone, Debug, Default)]
+pub struct CellStore {
+    alive: Vec<bool>,
+    ids: Vec<CellId>,
+    cells: Vec<Cell>,
+    id_to_row: Vec<Option<usize>>,
+    overflow_id_to_row: BTreeMap<CellId, usize>,
+    len: usize,
+}
+
+impl CellStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            alive: Vec::with_capacity(capacity),
+            ids: Vec::with_capacity(capacity),
+            cells: Vec::with_capacity(capacity),
+            id_to_row: Vec::new(),
+            overflow_id_to_row: BTreeMap::new(),
+            len: 0,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn clear(&mut self) {
+        self.alive.clear();
+        self.ids.clear();
+        self.cells.clear();
+        self.id_to_row.clear();
+        self.overflow_id_to_row.clear();
+        self.len = 0;
+    }
+
+    pub fn get(&self, id: &CellId) -> Option<&Cell> {
+        self.row_for_id(*id).map(|row| &self.cells[row])
+    }
+
+    pub fn get_mut(&mut self, id: &CellId) -> Option<&mut Cell> {
+        let row = self.row_for_id(*id)?;
+        Some(&mut self.cells[row])
+    }
+
+    pub fn contains_key(&self, id: &CellId) -> bool {
+        self.row_for_id(*id).is_some()
+    }
+
+    pub fn insert(&mut self, id: CellId, mut cell: Cell) -> Option<Cell> {
+        cell.id = id;
+        if let Some(row) = self.row_for_id(id)
+            && self.alive.get(row).copied().unwrap_or(false)
+        {
+            return Some(std::mem::replace(&mut self.cells[row], cell));
+        }
+
+        let row = self.ids.len();
+        self.set_row_for_id(id, row);
+        self.alive.push(true);
+        self.ids.push(id);
+        self.cells.push(cell);
+        self.len += 1;
+        None
+    }
+
+    pub fn remove(&mut self, id: &CellId) -> Option<Cell> {
+        let row = self.row_for_id(*id)?;
+        self.clear_row_for_id(*id);
+        if !self.alive.get(row).copied().unwrap_or(false) {
+            return None;
+        }
+        self.alive[row] = false;
+        self.len -= 1;
+        Some(self.cells[row].clone())
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &Cell> {
+        self.alive
+            .iter()
+            .enumerate()
+            .filter(|(_, alive)| **alive)
+            .map(|(row, _)| &self.cells[row])
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &CellId> {
+        self.ids
+            .iter()
+            .enumerate()
+            .filter(|(row, _)| self.alive.get(*row).copied().unwrap_or(false))
+            .map(|(_, id)| id)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&CellId, &Cell)> {
+        self.ids
+            .iter()
+            .enumerate()
+            .filter(|(row, _)| self.alive.get(*row).copied().unwrap_or(false))
+            .map(|(row, id)| (id, &self.cells[row]))
+    }
+
+    fn row_for_id(&self, id: CellId) -> Option<usize> {
+        dense_cell_index(id)
+            .and_then(|index| self.id_to_row.get(index).copied().flatten())
+            .or_else(|| self.overflow_id_to_row.get(&id).copied())
+            .filter(|row| self.alive.get(*row).copied().unwrap_or(false))
+    }
+
+    fn set_row_for_id(&mut self, id: CellId, row: usize) {
+        if let Some(index) = dense_cell_index(id) {
+            if index >= self.id_to_row.len() {
+                self.id_to_row.resize(index + 1, None);
+            }
+            self.id_to_row[index] = Some(row);
+        } else {
+            self.overflow_id_to_row.insert(id, row);
+        }
+    }
+
+    fn clear_row_for_id(&mut self, id: CellId) {
+        if let Some(index) = dense_cell_index(id)
+            && let Some(slot) = self.id_to_row.get_mut(index)
+        {
+            *slot = None;
+            return;
+        }
+        self.overflow_id_to_row.remove(&id);
+    }
+}
+
+impl Extend<(CellId, Cell)> for CellStore {
+    fn extend<T: IntoIterator<Item = (CellId, Cell)>>(&mut self, iter: T) {
+        for (id, cell) in iter {
+            self.insert(id, cell);
+        }
+    }
+}
+
+impl FromIterator<(CellId, Cell)> for CellStore {
+    fn from_iter<T: IntoIterator<Item = (CellId, Cell)>>(iter: T) -> Self {
+        let mut store = Self::new();
+        for (id, cell) in iter {
+            store.insert(id, cell);
+        }
+        store
+    }
+}
+
+impl Serialize for CellStore {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(self.len))?;
+        for (id, cell) in self.iter() {
+            map.serialize_entry(id, cell)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for CellStore {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let cells = BTreeMap::<CellId, Cell>::deserialize(deserializer)?;
+        Ok(cells.into_iter().collect())
+    }
+}
+
+fn dense_cell_index(id: CellId) -> Option<usize> {
+    let index = usize::try_from(id.0).ok()?;
+    (index <= MAX_DENSE_CELL_ID_INDEX).then_some(index)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CellInstance {
     pub id: InstanceId,
@@ -2377,10 +2749,10 @@ pub struct Document {
     pub next_instance_id: u64,
     #[serde(default = "default_top_cell")]
     pub top_cell: CellId,
-    pub layers: BTreeMap<LayerId, Layer>,
+    pub layers: LayerStore,
     pub shapes: ShapeStore,
     #[serde(default)]
-    pub cells: BTreeMap<CellId, Cell>,
+    pub cells: CellStore,
     #[serde(default)]
     pub marker_states: BTreeMap<String, MarkerState>,
     #[serde(default)]
@@ -2413,9 +2785,9 @@ impl Document {
             next_cell_id: default_next_cell_id(),
             next_instance_id: default_next_instance_id(),
             top_cell: default_top_cell(),
-            layers: BTreeMap::new(),
+            layers: LayerStore::new(),
             shapes: ShapeStore::new(),
-            cells: BTreeMap::new(),
+            cells: CellStore::new(),
             marker_states: BTreeMap::new(),
             crdt_seen: BTreeSet::new(),
             crdt_actor_clocks: BTreeMap::new(),
@@ -2684,9 +3056,10 @@ impl Document {
         if self.top_cell.0 == 0 {
             self.top_cell = default_top_cell();
         }
-        self.cells
-            .entry(self.top_cell)
-            .or_insert_with(|| Cell::new(self.top_cell, "top"));
+        if !self.cells.contains_key(&self.top_cell) {
+            self.cells
+                .insert(self.top_cell, Cell::new(self.top_cell, "top"));
+        }
 
         self.next_cell_id = self
             .cells
