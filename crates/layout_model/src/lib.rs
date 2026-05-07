@@ -15,10 +15,15 @@ use uuid::Uuid;
 
 pub mod connectivity;
 pub mod equipment;
+pub mod experiment;
 pub mod gdsii;
+pub mod genealogy;
+pub mod mask;
 pub mod mes;
 pub mod metrology;
+pub mod process_control;
 pub mod recipe;
+pub mod spc_fdc;
 pub mod yield_analysis;
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 5;

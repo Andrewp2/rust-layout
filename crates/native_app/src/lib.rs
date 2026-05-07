@@ -10,8 +10,8 @@ use std::{
 
 use drc::{DrcViolation, RuleDeck, run_drc, run_drc_incremental};
 use eframe::egui::{
-    self, Align2, Color32, FontId, Key, Painter, PointerButton, Pos2, Rect as EguiRect, Sense,
-    Stroke, StrokeKind, Vec2, vec2,
+    self, Align, Align2, Color32, FontId, Key, Painter, PointerButton, Pos2, Rect as EguiRect,
+    RichText, Sense, Stroke, StrokeKind, Vec2, vec2,
 };
 use geometry_core::{Coord, Point, Rect, Vector, distance_point_to_segment};
 use layout_model::{
@@ -49,8 +49,19 @@ use router::{RouteRequest, RouterConfig, route};
 use uuid::Uuid;
 use web_time::{Duration, Instant};
 
+mod experiment_panel;
+mod genealogy_panel;
+mod mask_panel;
+mod process_control_panel;
 mod recipe_panel;
+mod spc_fdc_panel;
+mod ui_chrome;
+use experiment_panel::ExperimentPlannerPanel;
+use genealogy_panel::GenealogyPanel;
+use mask_panel::MaskPrepPanel;
+use process_control_panel::ProcessControlPanel;
 use recipe_panel::RecipeManagerPanel;
+use spc_fdc_panel::SpcFdcPanel;
 
 #[cfg(not(target_arch = "wasm32"))]
 use futures_util::{Sink, SinkExt, StreamExt};
@@ -85,6 +96,141 @@ enum ViewMode {
     FabControl,
     Metrology,
     Yield,
+    MaskPrep,
+    SpcFdc,
+    ProcessControl,
+    Traceability,
+    Experiment,
+}
+
+impl ViewMode {
+    const ALL: [Self; 10] = [
+        Self::Layout2d,
+        Self::Layout3d,
+        Self::MaskPrep,
+        Self::FabControl,
+        Self::Metrology,
+        Self::Yield,
+        Self::SpcFdc,
+        Self::ProcessControl,
+        Self::Traceability,
+        Self::Experiment,
+    ];
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Layout2d => "Layout Editor",
+            Self::Layout3d => "3D Layout View",
+            Self::FabControl => "Fab Control Room",
+            Self::Metrology => "Metrology Wafer Map",
+            Self::Yield => "Yield Dashboard",
+            Self::MaskPrep => "Mask / Reticle Prep",
+            Self::SpcFdc => "SPC / FDC Monitor",
+            Self::ProcessControl => "Run-to-Run Control",
+            Self::Traceability => "Lot Traceability",
+            Self::Experiment => "DOE Planner",
+        }
+    }
+
+    fn nav_label(self) -> &'static str {
+        match self {
+            Self::Layout2d => "Mask layout",
+            Self::Layout3d => "3D viewport",
+            Self::FabControl => "Equipment",
+            Self::Metrology => "Metrology",
+            Self::Yield => "Yield",
+            Self::MaskPrep => "Reticle prep",
+            Self::SpcFdc => "SPC / FDC",
+            Self::ProcessControl => "R2R control",
+            Self::Traceability => "Traceability",
+            Self::Experiment => "DOE",
+        }
+    }
+
+    fn detail(self) -> &'static str {
+        match self {
+            Self::Layout2d => "Geometry, hierarchy, routing, DRC, and collaboration",
+            Self::Layout3d => "Extruded process stack preview with GPU depth rendering",
+            Self::FabControl => "Tool state, alarms, recipes, runs, and sensor streams",
+            Self::Metrology => "Wafer-level measurements, bins, defects, and outliers",
+            Self::Yield => "Lot, wafer, failure, recipe, and correlation analysis",
+            Self::MaskPrep => "Reticle fields, exposure blocks, layer tone, and mask checks",
+            Self::SpcFdc => "Control charts, fault traces, active alarms, and findings",
+            Self::ProcessControl => "EWMA loops, proposed adjustments, and approval audit",
+            Self::Traceability => "Lot splits, material ancestry, process history, and impact",
+            Self::Experiment => "Factor matrix, run status, response capture, and effects",
+        }
+    }
+
+    fn status_message(self) -> &'static str {
+        match self {
+            Self::Layout2d => "layout editor",
+            Self::Layout3d => "3D flycam view",
+            Self::FabControl => "FabOS equipment control room",
+            Self::Metrology => "metrology wafer map",
+            Self::Yield => "FabOS yield dashboard",
+            Self::MaskPrep => "FabOS mask editor / reticle prep",
+            Self::SpcFdc => "FabOS SPC/FDC monitor",
+            Self::ProcessControl => "FabOS run-to-run process control",
+            Self::Traceability => "FabOS lot genealogy trace",
+            Self::Experiment => "FabOS DOE planner",
+        }
+    }
+
+    fn group(self) -> ModuleGroup {
+        match self {
+            Self::Layout2d | Self::Layout3d | Self::MaskPrep => ModuleGroup::Design,
+            Self::FabControl | Self::Traceability => ModuleGroup::Operations,
+            Self::Metrology | Self::Yield | Self::SpcFdc => ModuleGroup::Analysis,
+            Self::ProcessControl | Self::Experiment => ModuleGroup::Engineering,
+        }
+    }
+
+    fn is_layout(self) -> bool {
+        matches!(self, Self::Layout2d | Self::Layout3d)
+    }
+
+    fn has_contextual_layers(self) -> bool {
+        !matches!(
+            self,
+            Self::FabControl | Self::SpcFdc | Self::ProcessControl | Self::Traceability
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModuleGroup {
+    Design,
+    Operations,
+    Analysis,
+    Engineering,
+}
+
+impl ModuleGroup {
+    const ALL: [Self; 4] = [
+        Self::Design,
+        Self::Operations,
+        Self::Analysis,
+        Self::Engineering,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Design => "Design",
+            Self::Operations => "Operations",
+            Self::Analysis => "Analysis",
+            Self::Engineering => "Engineering",
+        }
+    }
+
+    fn tone(self) -> ui_chrome::Tone {
+        match self {
+            Self::Design => ui_chrome::Tone::Info,
+            Self::Operations => ui_chrome::Tone::Success,
+            Self::Analysis => ui_chrome::Tone::Warning,
+            Self::Engineering => ui_chrome::Tone::Neutral,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -487,6 +633,11 @@ pub struct FabricadApp {
     yield_analysis: YieldAnalysis,
     selected_yield_lot: String,
     selected_yield_wafer: String,
+    mask_panel: MaskPrepPanel,
+    spc_fdc_panel: SpcFdcPanel,
+    process_control_panel: ProcessControlPanel,
+    genealogy_panel: GenealogyPanel,
+    experiment_panel: ExperimentPlannerPanel,
     technologies: Vec<TechnologyFile>,
     active_technology: usize,
     rules: RuleDeck,
@@ -685,12 +836,22 @@ impl FabricadApp {
         let selected_mes_lot = mes.lots.keys().next().cloned();
         let equipment_sim = EquipmentSimulator::demo_fab();
         let selected_equipment_tool = equipment_sim.tools().next().map(|tool| tool.id.clone());
+        let mask_panel = MaskPrepPanel::new(&document, &mes, selected_mes_lot.as_ref());
+        let spc_fdc_panel = SpcFdcPanel::new();
+        let process_control_panel = ProcessControlPanel::new(&yield_analysis);
+        let genealogy_panel = GenealogyPanel::new();
+        let experiment_panel = ExperimentPlannerPanel::new();
         let mut app = Self {
             document,
             index,
             yield_analysis,
             selected_yield_lot,
             selected_yield_wafer,
+            mask_panel,
+            spc_fdc_panel,
+            process_control_panel,
+            genealogy_panel,
+            experiment_panel,
             technologies,
             active_technology,
             rules,
@@ -928,10 +1089,7 @@ impl FabricadApp {
     }
 
     fn apply_theme(&self, ctx: &egui::Context) {
-        match self.settings.theme {
-            EditorTheme::Dark => ctx.set_visuals(egui::Visuals::dark()),
-            EditorTheme::Light => ctx.set_visuals(egui::Visuals::light()),
-        }
+        ui_chrome::apply_workspace_style(ctx, matches!(self.settings.theme, EditorTheme::Dark));
     }
 
     fn maybe_autosave(&mut self) {
@@ -2530,24 +2688,35 @@ impl FabricadApp {
         }
 
         ui.vertical(|ui| {
+            ui_chrome::module_header(
+                ui,
+                "Fab operations",
+                "Fab Control Room",
+                &format!("Sim time: {} s", self.equipment_sim.now_s),
+                |_| {},
+            );
             ui.horizontal_wrapped(|ui| {
-                ui.heading("Fab Control Room");
-                ui.separator();
-                ui.label(format!("Sim time: {} s", self.equipment_sim.now_s));
-                ui.label(format!("Tools: {}", tools.len()));
-                ui.label(format!(
-                    "Running: {}",
+                ui_chrome::metric_tile(ui, "Tools", tools.len(), "");
+                ui_chrome::metric_tile_tone(
+                    ui,
+                    "Running",
                     tools
                         .iter()
                         .filter(|tool| tool.state == EquipmentToolState::Running)
-                        .count()
-                ));
-                ui.colored_label(
-                    equipment_state_color(EquipmentToolState::Alarm),
-                    format!(
-                        "Active alarms: {}",
-                        self.equipment_sim.active_alarms().len()
-                    ),
+                        .count(),
+                    "",
+                    ui_chrome::Tone::Success,
+                );
+                ui_chrome::metric_tile_tone(
+                    ui,
+                    "Active alarms",
+                    self.equipment_sim.active_alarms().len(),
+                    "",
+                    if self.equipment_sim.active_alarms().is_empty() {
+                        ui_chrome::Tone::Neutral
+                    } else {
+                        ui_chrome::Tone::Danger
+                    },
                 );
             });
             ui.separator();
@@ -2573,7 +2742,7 @@ impl FabricadApp {
     }
 
     fn equipment_tool_grid(&mut self, ui: &mut egui::Ui, tools: &[EquipmentTool]) {
-        ui.strong("Tool Grid");
+        ui_chrome::section_label(ui, "Tool Grid");
         let mut pending_command: Option<(EquipmentToolId, HostCommand)> = None;
         egui::ScrollArea::vertical()
             .id_salt("equipment_tool_grid_scroll")
@@ -2941,10 +3110,10 @@ impl FabricadApp {
     }
 
     fn equipment_alarm_panel(&self, ui: &mut egui::Ui) {
-        ui.strong("Active Alarms");
+        ui_chrome::section_label(ui, "Active Alarms");
         let alarms = self.equipment_sim.active_alarms();
         if alarms.is_empty() {
-            ui.label("None");
+            ui_chrome::empty_state(ui, "No active alarms");
         } else {
             for alarm in alarms {
                 ui.horizontal_wrapped(|ui| {
@@ -2960,10 +3129,10 @@ impl FabricadApp {
         }
 
         ui.separator();
-        ui.strong("Fab Run Log");
+        ui_chrome::section_label(ui, "Fab Run Log");
         let recent_runs = self.equipment_sim.recent_runs();
         if recent_runs.is_empty() {
-            ui.label("No logged runs");
+            ui_chrome::empty_state(ui, "No logged runs");
         } else {
             for run in recent_runs.into_iter().take(5) {
                 ui.horizontal_wrapped(|ui| {
@@ -2979,119 +3148,233 @@ impl FabricadApp {
         }
     }
 
+    fn navigation_panel(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::left("app_navigation")
+            .resizable(false)
+            .default_width(ui_chrome::NAV_WIDTH)
+            .show(ctx, |ui| {
+                ui.set_width(ui_chrome::NAV_WIDTH - 18.0);
+                ui.add_space(4.0);
+                ui.label(RichText::new("Fabricad").heading().strong());
+                ui_chrome::muted(ui, "FabOS workbench");
+                ui.add_space(8.0);
+
+                egui::ScrollArea::vertical()
+                    .id_salt("app_navigation_scroll")
+                    .show(ui, |ui| {
+                        for group in ModuleGroup::ALL {
+                            ui_chrome::section_label(ui, group.label());
+                            for mode in ViewMode::ALL
+                                .into_iter()
+                                .filter(|candidate| candidate.group() == group)
+                            {
+                                let selected = self.view_mode == mode;
+                                let label = if selected {
+                                    RichText::new(mode.nav_label()).strong()
+                                } else {
+                                    RichText::new(mode.nav_label())
+                                };
+                                if ui
+                                    .selectable_label(selected, label)
+                                    .on_hover_text(mode.detail())
+                                    .clicked()
+                                {
+                                    self.select_view_mode(mode);
+                                }
+                                if selected {
+                                    ui.indent(("nav_detail", mode.nav_label()), |ui| {
+                                        ui_chrome::muted(ui, mode.detail());
+                                    });
+                                }
+                            }
+                        }
+                    });
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.toggle_value(&mut self.show_mes_panel, "Traveler");
+                    ui_chrome::status_pill(
+                        ui,
+                        if self.show_mes_panel {
+                            "open"
+                        } else {
+                            "hidden"
+                        },
+                        if self.show_mes_panel {
+                            ui_chrome::Tone::Success
+                        } else {
+                            ui_chrome::Tone::Neutral
+                        },
+                    );
+                });
+            });
+    }
+
+    fn select_view_mode(&mut self, mode: ViewMode) {
+        if self.view_mode == mode {
+            return;
+        }
+        self.view_mode = mode;
+        self.status = mode.status_message().to_string();
+    }
+
     fn toolbar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            ui.selectable_value(&mut self.view_mode, ViewMode::Layout2d, "2D");
-            if ui
-                .selectable_value(&mut self.view_mode, ViewMode::Layout3d, "3D")
-                .clicked()
-            {
-                self.status = "3D flycam view".to_string();
-            }
-            if ui
-                .selectable_value(&mut self.view_mode, ViewMode::FabControl, "Fab Control")
-                .clicked()
-            {
-                self.status = "FabOS equipment control room".to_string();
-            }
-            if ui
-                .selectable_value(&mut self.view_mode, ViewMode::Metrology, "Wafer")
-                .clicked()
-            {
-                self.status = "metrology wafer map".to_string();
-            }
-            if ui
-                .selectable_value(&mut self.view_mode, ViewMode::Yield, "Yield")
-                .clicked()
-            {
-                self.status = "FabOS yield dashboard".to_string();
-            }
-            if matches!(self.view_mode, ViewMode::Layout3d) && ui.button("Reset 3D").clicked() {
-                self.reset_3d_camera_to_document();
-            }
-            if matches!(self.view_mode, ViewMode::Layout3d) && ui.button("Up").clicked() {
-                self.nudge_3d_camera_vertical(1.0);
-            }
-            if matches!(self.view_mode, ViewMode::Layout3d) && ui.button("Down").clicked() {
-                self.nudge_3d_camera_vertical(-1.0);
-            }
-            ui.separator();
-            tool_button(ui, &mut self.tool, Tool::Select, "Select");
-            tool_button(ui, &mut self.tool, Tool::Rect, "Rect");
-            tool_button(ui, &mut self.tool, Tool::Polygon, "Poly");
-            tool_button(ui, &mut self.tool, Tool::Path, "Path");
-            tool_button(ui, &mut self.tool, Tool::Via, "Via");
-            tool_button(ui, &mut self.tool, Tool::Measure, "Measure");
-            tool_button(ui, &mut self.tool, Tool::Route, "Route");
-            ui.separator();
-            if ui.button("Undo").clicked() {
-                self.undo();
-            }
-            if ui.button("Redo").clicked() {
-                self.redo();
-            }
-            if ui.button("Copy").clicked() {
-                self.copy_selection();
-            }
-            if ui.button("Paste").clicked() {
-                self.paste_clipboard();
-            }
-            if ui.button("Dup").clicked() {
-                self.duplicate_selection();
-            }
-            if ui.button("Delete").clicked() {
-                self.delete_selection();
-            }
-            if ui.button("Rot90").clicked() {
-                self.rotate_selected_90();
-            }
-            if ui.button("Mirror X").clicked() {
-                self.mirror_selected_x();
-            }
-            if ui.button("Mirror Y").clicked() {
-                self.mirror_selected_y();
-            }
-            if ui.button("DRC").clicked() {
-                self.rerun_drc();
-            }
-            if ui.button("Save").clicked() {
-                self.save_document();
-            }
-            if ui.button("Load").clicked() {
-                self.load_document();
-            }
-            if ui.button("Export GDS").clicked() {
-                self.export_gds_document();
-            }
-            if ui.button("Import GDS").clicked() {
-                self.import_gds_document();
-            }
-            if ui.button("Connect").clicked() {
-                self.connect_collaboration();
-            }
-            if ui.button("Options").clicked() {
-                self.show_options = true;
-            }
-            ui.toggle_value(&mut self.show_mes_panel, "MES");
-            if ui.button("Make Cell").clicked() {
-                self.create_cell_from_selection();
-            }
-            ui.separator();
-            if ui.button("10k").clicked() {
-                self.make_stress_document(10_000);
-            }
-            if ui.button("100k").clicked() {
-                self.make_stress_document(100_000);
-            }
-            if ui.button("1M").clicked() {
-                self.make_stress_document(1_000_000);
-            }
-            if ui.button("Hierarchy").clicked() {
-                self.make_hierarchy_document();
-            }
-            ui.separator();
-            ui.label(format!("User {}", short_user(self.user_id)));
-            ui.label(&self.status);
+        ui.vertical(|ui| {
+            ui.horizontal(|ui| {
+                ui_chrome::status_pill(
+                    ui,
+                    self.view_mode.group().label(),
+                    self.view_mode.group().tone(),
+                );
+                ui.label(RichText::new(self.view_mode.title()).strong());
+                ui.label(
+                    RichText::new(self.view_mode.detail()).color(ui.visuals().weak_text_color()),
+                );
+                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(RichText::new(format!("User {}", short_user(self.user_id))).small());
+                    ui.label(RichText::new(&self.status).color(ui.visuals().weak_text_color()));
+                });
+            });
+            ui.horizontal_wrapped(|ui| {
+                let layout_mode = self.view_mode.is_layout();
+                if layout_mode {
+                    ui.label("Tool");
+                    tool_button(ui, &mut self.tool, Tool::Select, "Select");
+                    tool_button(ui, &mut self.tool, Tool::Rect, "Rect");
+                    tool_button(ui, &mut self.tool, Tool::Polygon, "Poly");
+                    tool_button(ui, &mut self.tool, Tool::Path, "Path");
+                    tool_button(ui, &mut self.tool, Tool::Via, "Via");
+                    tool_button(ui, &mut self.tool, Tool::Measure, "Measure");
+                    tool_button(ui, &mut self.tool, Tool::Route, "Route");
+                    ui.separator();
+                }
+
+                if matches!(self.view_mode, ViewMode::Layout3d) {
+                    if ui.button("Reset 3D").clicked() {
+                        self.reset_3d_camera_to_document();
+                    }
+                    if ui.button("Up").clicked() {
+                        self.nudge_3d_camera_vertical(1.0);
+                    }
+                    if ui.button("Down").clicked() {
+                        self.nudge_3d_camera_vertical(-1.0);
+                    }
+                    ui.separator();
+                }
+
+                ui.menu_button("Edit", |ui| {
+                    if ui
+                        .add_enabled(layout_mode, egui::Button::new("Undo"))
+                        .clicked()
+                    {
+                        self.undo();
+                    }
+                    if ui
+                        .add_enabled(layout_mode, egui::Button::new("Redo"))
+                        .clicked()
+                    {
+                        self.redo();
+                    }
+                    ui.separator();
+                    if ui
+                        .add_enabled(layout_mode, egui::Button::new("Copy"))
+                        .clicked()
+                    {
+                        self.copy_selection();
+                    }
+                    if ui
+                        .add_enabled(layout_mode, egui::Button::new("Paste"))
+                        .clicked()
+                    {
+                        self.paste_clipboard();
+                    }
+                    if ui
+                        .add_enabled(layout_mode, egui::Button::new("Duplicate"))
+                        .clicked()
+                    {
+                        self.duplicate_selection();
+                    }
+                    if ui
+                        .add_enabled(layout_mode, egui::Button::new("Delete"))
+                        .clicked()
+                    {
+                        self.delete_selection();
+                    }
+                    ui.separator();
+                    if ui
+                        .add_enabled(layout_mode, egui::Button::new("Make Cell"))
+                        .clicked()
+                    {
+                        self.create_cell_from_selection();
+                    }
+                    if ui
+                        .add_enabled(layout_mode, egui::Button::new("Rotate 90"))
+                        .clicked()
+                    {
+                        self.rotate_selected_90();
+                    }
+                    if ui
+                        .add_enabled(layout_mode, egui::Button::new("Mirror X"))
+                        .clicked()
+                    {
+                        self.mirror_selected_x();
+                    }
+                    if ui
+                        .add_enabled(layout_mode, egui::Button::new("Mirror Y"))
+                        .clicked()
+                    {
+                        self.mirror_selected_y();
+                    }
+                });
+
+                ui.menu_button("Document", |ui| {
+                    if ui.button("Save").clicked() {
+                        self.save_document();
+                    }
+                    if ui.button("Load").clicked() {
+                        self.load_document();
+                    }
+                    ui.separator();
+                    if ui.button("Export GDS").clicked() {
+                        self.export_gds_document();
+                    }
+                    if ui.button("Import GDS").clicked() {
+                        self.import_gds_document();
+                    }
+                    ui.separator();
+                    if ui.button("Connect collaboration").clicked() {
+                        self.connect_collaboration();
+                    }
+                });
+
+                ui.menu_button("Analyze", |ui| {
+                    if ui.button("Run DRC").clicked() {
+                        self.rerun_drc();
+                    }
+                    if ui.button("Diagnostics").clicked() {
+                        self.show_diagnostics = true;
+                    }
+                });
+
+                ui.menu_button("Demo Data", |ui| {
+                    if ui.button("10k stress").clicked() {
+                        self.make_stress_document(10_000);
+                    }
+                    if ui.button("100k stress").clicked() {
+                        self.make_stress_document(100_000);
+                    }
+                    if ui.button("1M stress").clicked() {
+                        self.make_stress_document(1_000_000);
+                    }
+                    if ui.button("Hierarchy").clicked() {
+                        self.make_hierarchy_document();
+                    }
+                });
+
+                if ui.button("Options").clicked() {
+                    self.show_options = true;
+                }
+            });
         });
     }
 
@@ -3397,7 +3680,7 @@ impl FabricadApp {
     }
 
     fn mes_wip_board_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("MES WIP");
+        ui_chrome::section_label(ui, "MES WIP");
         if self.selected_mes_lot.is_none() {
             self.selected_mes_lot = self.mes.lots.keys().next().cloned();
         }
@@ -3443,7 +3726,7 @@ impl FabricadApp {
         let traveler = self.mes.travelers.get(&lot_id).cloned()?;
         let route = self.mes.routes.get(&lot.route_id).cloned()?;
 
-        ui.heading(format!("Traveler {}", lot.id));
+        ui_chrome::section_label(ui, &format!("Traveler {}", lot.id));
         ui.horizontal_wrapped(|ui| {
             ui.label(format!("Product: {}", lot.product));
             ui.separator();
@@ -3688,14 +3971,38 @@ impl FabricadApp {
     fn inspector_panel(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("inspector")
             .resizable(true)
-            .default_width(250.0)
+            .default_width(ui_chrome::INSPECTOR_WIDTH)
             .show(ctx, |ui| {
+                ui_chrome::section_label(ui, "Context");
                 egui::ScrollArea::vertical()
                     .id_salt("inspector_panel_scroll")
-                    .show(ui, |ui| {
-                        if matches!(self.view_mode, ViewMode::Metrology) {
-                            self.metrology_context_panel(ui);
-                        } else {
+                    .show(ui, |ui| match self.view_mode {
+                        ViewMode::Metrology => self.metrology_context_panel(ui),
+                        ViewMode::MaskPrep => self.mask_panel.context_ui(
+                            ui,
+                            &self.document,
+                            &self.mes,
+                            self.selected_mes_lot.as_ref(),
+                            &mut self.status,
+                        ),
+                        ViewMode::SpcFdc => {
+                            self.spc_fdc_panel.context_ui(
+                                ui,
+                                &self.yield_analysis,
+                                &self.equipment_sim,
+                            );
+                        }
+                        ViewMode::ProcessControl => self
+                            .process_control_panel
+                            .context_ui(ui, &self.yield_analysis),
+                        ViewMode::Traceability => self.genealogy_panel.context_ui(ui),
+                        ViewMode::Experiment => {
+                            self.experiment_panel.context_ui(ui, &mut self.status);
+                        }
+                        ViewMode::Layout2d
+                        | ViewMode::Layout3d
+                        | ViewMode::FabControl
+                        | ViewMode::Yield => {
                             self.technology_panel(ui);
                             ui.separator();
                             self.recipe_panel.ui(ui, &mut self.status);
@@ -3715,13 +4022,22 @@ impl FabricadApp {
     fn layers_panel(&mut self, ctx: &egui::Context) {
         egui::SidePanel::right("layers")
             .resizable(true)
-            .default_width(220.0)
+            .default_width(ui_chrome::LAYERS_WIDTH)
             .show(ctx, |ui| {
                 if matches!(self.view_mode, ViewMode::Metrology) {
                     self.metrology_panel(ui);
                     return;
                 }
-                ui.label("Layers");
+                if matches!(self.view_mode, ViewMode::MaskPrep) {
+                    self.mask_panel.layer_stack_ui(ui);
+                    return;
+                }
+                if matches!(self.view_mode, ViewMode::Experiment) {
+                    self.experiment_panel
+                        .response_capture_ui(ui, &mut self.status);
+                    return;
+                }
+                ui_chrome::section_label(ui, "Layers");
                 let mut visibility_ops = Vec::new();
                 let mut layer_rows: Vec<_> = self
                     .document
@@ -4588,9 +4904,7 @@ impl FabricadApp {
         egui::ScrollArea::vertical()
             .id_salt("yield_dashboard_scroll")
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.heading("FabOS Yield");
-                    ui.separator();
+                ui_chrome::module_header(ui, "Fab analysis", "Yield Dashboard", "", |ui| {
                     ui.label("Lot");
                     egui::ComboBox::from_id_salt("yield_lot_picker")
                         .selected_text(if lot_id.is_empty() {
@@ -4657,7 +4971,7 @@ impl FabricadApp {
 
                 ui.separator();
                 ui.columns(2, |columns| {
-                    columns[0].label(format!("Wafer map {wafer_id}"));
+                    ui_chrome::section_label(&mut columns[0], &format!("Wafer Map {wafer_id}"));
                     draw_yield_wafer_map(&mut columns[0], &die_outcomes);
                     if let Some(summary) = &wafer_summary {
                         columns[0].label(format!(
@@ -4671,10 +4985,10 @@ impl FabricadApp {
                         }
                     }
 
-                    columns[1].label("Wafer yield");
+                    ui_chrome::section_label(&mut columns[1], "Wafer Yield");
                     self.yield_wafer_rows(&mut columns[1], &wafer_rows);
                     columns[1].separator();
-                    columns[1].label("Failure modes");
+                    ui_chrome::section_label(&mut columns[1], "Failure Modes");
                     if let Some(summary) = &lot_summary {
                         failure_breakdown_ui(&mut columns[1], summary);
                     }
@@ -4682,14 +4996,17 @@ impl FabricadApp {
 
                 ui.separator();
                 ui.columns(2, |columns| {
-                    columns[0].label("Lot / recipe comparison");
+                    ui_chrome::section_label(&mut columns[0], "Lot / Recipe Comparison");
                     lot_comparison_ui(&mut columns[0], &comparisons);
-                    columns[1].label("Selected wafer process measurements");
+                    ui_chrome::section_label(
+                        &mut columns[1],
+                        "Selected Wafer Process Measurements",
+                    );
                     wafer_measurements_ui(&mut columns[1], &measurements);
                 });
 
                 ui.separator();
-                ui.label("Measurement correlation");
+                ui_chrome::section_label(ui, "Measurement Correlation");
                 correlation_table_ui(ui, &correlations);
             });
     }
@@ -6312,8 +6629,9 @@ impl eframe::App for FabricadApp {
         self.advance_equipment_simulator();
         self.handle_shortcuts(ctx);
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| self.toolbar(ui));
+        self.navigation_panel(ctx);
         self.inspector_panel(ctx);
-        if !matches!(self.view_mode, ViewMode::FabControl) {
+        if self.view_mode.has_contextual_layers() {
             self.layers_panel(ctx);
         }
         self.options_window(ctx);
@@ -6325,6 +6643,23 @@ impl eframe::App for FabricadApp {
             ViewMode::FabControl => self.fab_control_room(ui),
             ViewMode::Metrology => self.metrology_canvas(ui),
             ViewMode::Yield => self.yield_dashboard(ui),
+            ViewMode::MaskPrep => self.mask_panel.ui(
+                ui,
+                &self.document,
+                &self.mes,
+                &mut self.selected_mes_lot,
+                &mut self.status,
+            ),
+            ViewMode::SpcFdc => {
+                self.spc_fdc_panel
+                    .ui(ui, &self.yield_analysis, &self.equipment_sim);
+            }
+            ViewMode::ProcessControl => {
+                self.process_control_panel
+                    .ui(ui, &self.yield_analysis, &mut self.status);
+            }
+            ViewMode::Traceability => self.genealogy_panel.ui(ui),
+            ViewMode::Experiment => self.experiment_panel.dashboard_ui(ui, &mut self.status),
         });
         ctx.request_repaint();
     }
@@ -6549,12 +6884,7 @@ fn document_object_count(document: &Document) -> usize {
 }
 
 fn yield_metric_ui(ui: &mut egui::Ui, label: &str, value: String, detail: String) {
-    ui.group(|ui| {
-        ui.set_min_width(176.0);
-        ui.label(label);
-        ui.label(egui::RichText::new(value).strong().size(18.0));
-        ui.label(egui::RichText::new(detail).small());
-    });
+    ui_chrome::metric_tile(ui, label, value, &detail);
 }
 
 fn draw_yield_wafer_map(ui: &mut egui::Ui, outcomes: &[DieOutcome]) {
@@ -8009,6 +8339,50 @@ fn remote_user_color(user: Uuid) -> Color32 {
 mod tests {
     use super::*;
     use geometry_core::DBU_PER_MICRON;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn navigation_metadata_covers_every_view_mode_once() {
+        let labels = ViewMode::ALL
+            .iter()
+            .map(|mode| mode.nav_label())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(labels.len(), ViewMode::ALL.len());
+        assert!(ViewMode::ALL.iter().all(|mode| !mode.title().is_empty()));
+        assert!(ViewMode::ALL.iter().all(|mode| !mode.detail().is_empty()));
+        assert!(
+            ModuleGroup::ALL
+                .iter()
+                .all(|group| ViewMode::ALL.iter().any(|mode| mode.group() == *group))
+        );
+    }
+
+    #[test]
+    fn navigation_groups_follow_fab_workflow_order() {
+        let grouped = ModuleGroup::ALL
+            .iter()
+            .map(|group| {
+                (
+                    group.label(),
+                    ViewMode::ALL
+                        .iter()
+                        .filter(|mode| mode.group() == *group)
+                        .map(|mode| mode.nav_label())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            grouped,
+            vec![
+                ("Design", vec!["Mask layout", "3D viewport", "Reticle prep"]),
+                ("Operations", vec!["Equipment", "Traceability"]),
+                ("Analysis", vec!["Metrology", "Yield", "SPC / FDC"]),
+                ("Engineering", vec!["R2R control", "DOE"]),
+            ]
+        );
+    }
 
     #[test]
     fn scale_bar_picks_readable_lengths() {
