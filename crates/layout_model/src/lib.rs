@@ -293,7 +293,7 @@ impl LoroCrdtLog {
                 self.upsert_shape(Some(cell.id), &shape)?;
             }
             for instance in cell.instances.values() {
-                self.upsert_instance(cell.id, instance)?;
+                self.upsert_instance(cell.id, &instance)?;
             }
         }
         self.doc.commit();
@@ -403,7 +403,7 @@ impl LoroCrdtLog {
                     self.upsert_shape(Some(cell.id), &shape)?;
                 }
                 for instance in cell.instances.values() {
-                    self.upsert_instance(cell.id, instance)?;
+                    self.upsert_instance(cell.id, &instance)?;
                 }
             }
             Operation::DeleteCell { id } => {
@@ -1860,7 +1860,7 @@ pub struct Cell {
     pub id: CellId,
     pub name: String,
     pub shapes: ShapeStore,
-    pub instances: BTreeMap<InstanceId, CellInstance>,
+    pub instances: InstanceStore,
 }
 
 impl Cell {
@@ -1869,7 +1869,7 @@ impl Cell {
             id,
             name: name.into(),
             shapes: ShapeStore::new(),
-            instances: BTreeMap::new(),
+            instances: InstanceStore::new(),
         }
     }
 }
@@ -1882,6 +1882,258 @@ pub struct CellInstance {
     pub transform: Transform,
     #[serde(default)]
     pub array: InstanceArray,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct InstanceStore {
+    alive: Vec<bool>,
+    ids: Vec<InstanceId>,
+    names: Vec<Option<String>>,
+    cells: Vec<CellId>,
+    transforms: Vec<Transform>,
+    arrays: Vec<InstanceArray>,
+    id_to_row: Vec<Option<usize>>,
+    overflow_id_to_row: BTreeMap<InstanceId, usize>,
+    len: usize,
+}
+
+pub struct InstanceMut<'a> {
+    store: &'a mut InstanceStore,
+    row: usize,
+    old_id: InstanceId,
+    instance: CellInstance,
+}
+
+impl InstanceStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            alive: Vec::with_capacity(capacity),
+            ids: Vec::with_capacity(capacity),
+            names: Vec::with_capacity(capacity),
+            cells: Vec::with_capacity(capacity),
+            transforms: Vec::with_capacity(capacity),
+            arrays: Vec::with_capacity(capacity),
+            id_to_row: Vec::new(),
+            overflow_id_to_row: BTreeMap::new(),
+            len: 0,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn clear(&mut self) {
+        self.alive.clear();
+        self.ids.clear();
+        self.names.clear();
+        self.cells.clear();
+        self.transforms.clear();
+        self.arrays.clear();
+        self.id_to_row.clear();
+        self.overflow_id_to_row.clear();
+        self.len = 0;
+    }
+
+    pub fn get(&self, id: &InstanceId) -> Option<CellInstance> {
+        self.row_for_id(*id).map(|row| self.materialize_row(row))
+    }
+
+    pub fn get_mut(&mut self, id: &InstanceId) -> Option<InstanceMut<'_>> {
+        let row = self.row_for_id(*id)?;
+        Some(InstanceMut {
+            old_id: *id,
+            instance: self.materialize_row(row),
+            store: self,
+            row,
+        })
+    }
+
+    pub fn contains_key(&self, id: &InstanceId) -> bool {
+        self.get(id).is_some()
+    }
+
+    pub fn insert(&mut self, id: InstanceId, mut instance: CellInstance) -> Option<CellInstance> {
+        instance.id = id;
+        if let Some(row) = self.row_for_id(id)
+            && self.alive.get(row).copied().unwrap_or(false)
+        {
+            let old = self.materialize_row(row);
+            self.write_row(row, instance);
+            return Some(old);
+        }
+
+        let row = self.ids.len();
+        self.set_row_for_id(id, row);
+        self.push_row(instance);
+        self.len += 1;
+        None
+    }
+
+    pub fn remove(&mut self, id: &InstanceId) -> Option<CellInstance> {
+        let row = self.row_for_id(*id)?;
+        self.clear_row_for_id(*id);
+        if !self.alive.get(row).copied().unwrap_or(false) {
+            return None;
+        }
+        let removed = self.materialize_row(row);
+        self.alive[row] = false;
+        self.len -= 1;
+        Some(removed)
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = CellInstance> + '_ {
+        self.alive
+            .iter()
+            .enumerate()
+            .filter(|(_, alive)| **alive)
+            .map(|(row, _)| self.materialize_row(row))
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &InstanceId> {
+        self.ids
+            .iter()
+            .enumerate()
+            .filter(|(row, _)| self.alive.get(*row).copied().unwrap_or(false))
+            .map(|(_, id)| id)
+    }
+
+    fn row_for_id(&self, id: InstanceId) -> Option<usize> {
+        dense_instance_index(id)
+            .and_then(|index| self.id_to_row.get(index).copied().flatten())
+            .or_else(|| self.overflow_id_to_row.get(&id).copied())
+            .filter(|row| self.alive.get(*row).copied().unwrap_or(false))
+    }
+
+    fn set_row_for_id(&mut self, id: InstanceId, row: usize) {
+        if let Some(index) = dense_instance_index(id) {
+            if index >= self.id_to_row.len() {
+                self.id_to_row.resize(index + 1, None);
+            }
+            self.id_to_row[index] = Some(row);
+        } else {
+            self.overflow_id_to_row.insert(id, row);
+        }
+    }
+
+    fn clear_row_for_id(&mut self, id: InstanceId) {
+        if let Some(index) = dense_instance_index(id)
+            && let Some(slot) = self.id_to_row.get_mut(index)
+        {
+            *slot = None;
+            return;
+        }
+        self.overflow_id_to_row.remove(&id);
+    }
+
+    fn push_row(&mut self, instance: CellInstance) {
+        self.alive.push(true);
+        self.ids.push(instance.id);
+        self.names.push(instance.name);
+        self.cells.push(instance.cell);
+        self.transforms.push(instance.transform);
+        self.arrays.push(instance.array);
+    }
+
+    fn materialize_row(&self, row: usize) -> CellInstance {
+        CellInstance {
+            id: self.ids[row],
+            name: self.names[row].clone(),
+            cell: self.cells[row],
+            transform: self.transforms[row],
+            array: self.arrays[row],
+        }
+    }
+
+    fn write_row(&mut self, row: usize, instance: CellInstance) {
+        let old_id = self.ids[row];
+        if old_id != instance.id {
+            self.clear_row_for_id(old_id);
+            self.set_row_for_id(instance.id, row);
+        }
+        self.ids[row] = instance.id;
+        self.names[row] = instance.name;
+        self.cells[row] = instance.cell;
+        self.transforms[row] = instance.transform;
+        self.arrays[row] = instance.array;
+        self.alive[row] = true;
+    }
+}
+
+impl Extend<(InstanceId, CellInstance)> for InstanceStore {
+    fn extend<T: IntoIterator<Item = (InstanceId, CellInstance)>>(&mut self, iter: T) {
+        for (id, instance) in iter {
+            self.insert(id, instance);
+        }
+    }
+}
+
+impl FromIterator<(InstanceId, CellInstance)> for InstanceStore {
+    fn from_iter<T: IntoIterator<Item = (InstanceId, CellInstance)>>(iter: T) -> Self {
+        let mut store = Self::new();
+        for (id, instance) in iter {
+            store.insert(id, instance);
+        }
+        store
+    }
+}
+
+impl Serialize for InstanceStore {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(self.len))?;
+        for instance in self.values() {
+            map.serialize_entry(&instance.id, &instance)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for InstanceStore {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let instances = BTreeMap::<InstanceId, CellInstance>::deserialize(deserializer)?;
+        Ok(instances.into_iter().collect())
+    }
+}
+
+impl std::ops::Deref for InstanceMut<'_> {
+    type Target = CellInstance;
+
+    fn deref(&self) -> &Self::Target {
+        &self.instance
+    }
+}
+
+impl std::ops::DerefMut for InstanceMut<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.instance
+    }
+}
+
+impl Drop for InstanceMut<'_> {
+    fn drop(&mut self) {
+        if self.instance.id != self.old_id {
+            self.store.clear_row_for_id(self.old_id);
+        }
+        self.store.write_row(self.row, self.instance.clone());
+    }
+}
+
+fn dense_instance_index(id: InstanceId) -> Option<usize> {
+    usize::try_from(id.0).ok()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2521,11 +2773,11 @@ impl Document {
         None
     }
 
-    pub fn instance(&self, parent: CellId, id: InstanceId) -> Option<&CellInstance> {
+    pub fn instance(&self, parent: CellId, id: InstanceId) -> Option<CellInstance> {
         self.cells.get(&parent)?.instances.get(&id)
     }
 
-    pub fn instance_mut(&mut self, parent: CellId, id: InstanceId) -> Option<&mut CellInstance> {
+    pub fn instance_mut(&mut self, parent: CellId, id: InstanceId) -> Option<InstanceMut<'_>> {
         self.ensure_hierarchy();
         self.cells.get_mut(&parent)?.instances.get_mut(&id)
     }
@@ -2680,12 +2932,12 @@ impl Document {
                 }
             }
             Operation::RenameInstance { parent, id, name } => {
-                if let Some(instance) = self.instance_mut(*parent, *id) {
+                if let Some(mut instance) = self.instance_mut(*parent, *id) {
                     instance.name = name.clone();
                 }
             }
             Operation::MoveInstance { parent, id, delta } => {
-                if let Some(instance) = self.instance_mut(*parent, *id) {
+                if let Some(mut instance) = self.instance_mut(*parent, *id) {
                     instance.transform = instance
                         .transform
                         .compose(Transform::from_translation(*delta));

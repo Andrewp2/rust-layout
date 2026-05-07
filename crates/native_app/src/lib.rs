@@ -1985,7 +1985,7 @@ impl FabricadApp {
         new_instance: CellInstance,
         label: &str,
     ) {
-        let Some(old_instance) = self.document.instance(parent, id).cloned() else {
+        let Some(old_instance) = self.document.instance(parent, id) else {
             return;
         };
         if old_instance == new_instance {
@@ -2009,7 +2009,7 @@ impl FabricadApp {
         let Some(info) = self.selected_instance_info() else {
             return false;
         };
-        let Some(mut instance) = self.document.instance(info.parent, info.id).cloned() else {
+        let Some(mut instance) = self.document.instance(info.parent, info.id) else {
             return false;
         };
         instance.transform = instance.transform.compose(transform);
@@ -2102,7 +2102,7 @@ impl FabricadApp {
 
     fn delete_selection(&mut self) {
         if let Some(info) = self.selected_instance_info() {
-            let Some(instance) = self.document.instance(info.parent, info.id).cloned() else {
+            let Some(instance) = self.document.instance(info.parent, info.id) else {
                 return;
             };
             let redo = Operation::DeleteInstance {
@@ -4905,7 +4905,7 @@ impl FabricadApp {
             });
             let array = array.normalized();
             if array != info.array {
-                if let Some(mut instance) = self.document.instance(info.parent, info.id).cloned() {
+                if let Some(mut instance) = self.document.instance(info.parent, info.id) {
                     instance.array = array;
                     self.replace_instance(info.parent, info.id, instance, "updated instance array");
                 }
@@ -5102,7 +5102,7 @@ impl FabricadApp {
             return;
         };
         let cell_id = info.target_cell;
-        if let Some(mut instance) = self.document.instance(info.parent, info.id).cloned() {
+        if let Some(mut instance) = self.document.instance(info.parent, info.id) {
             instance.transform = instance.transform.compose(Transform::rotate_cw90());
             instance.array = InstanceArray {
                 columns: 3,
