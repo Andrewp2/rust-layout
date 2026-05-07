@@ -1010,8 +1010,28 @@ impl<'de> Deserialize<'de> for LayerStore {
     where
         D: Deserializer<'de>,
     {
-        let layers = BTreeMap::<LayerId, Layer>::deserialize(deserializer)?;
-        Ok(layers.into_iter().collect())
+        struct LayerStoreVisitor;
+
+        impl<'de> de::Visitor<'de> for LayerStoreVisitor {
+            type Value = LayerStore;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a layer map")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: de::MapAccess<'de>,
+            {
+                let mut store = LayerStore::with_capacity(map.size_hint().unwrap_or(0));
+                while let Some((id, layer)) = map.next_entry::<LayerId, Layer>()? {
+                    store.insert(id, layer);
+                }
+                Ok(store)
+            }
+        }
+
+        deserializer.deserialize_map(LayerStoreVisitor)
     }
 }
 
@@ -1992,8 +2012,32 @@ impl<'de> Deserialize<'de> for ShapeStore {
     where
         D: Deserializer<'de>,
     {
-        let shapes = BTreeMap::<ShapeId, Shape>::deserialize(deserializer)?;
-        Ok(shapes.into_iter().collect())
+        struct ShapeStoreVisitor;
+
+        impl<'de> de::Visitor<'de> for ShapeStoreVisitor {
+            type Value = ShapeStore;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a shape map")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: de::MapAccess<'de>,
+            {
+                let mut store = ShapeStore::with_capacity(map.size_hint().unwrap_or(0));
+                while let Some((id, mut shape)) = map.next_entry::<ShapeId, Shape>()? {
+                    shape.id = id;
+                    let row = store.ids.len();
+                    store.set_row_for_id(id, row);
+                    store.push_row(shape);
+                    store.len += 1;
+                }
+                Ok(store)
+            }
+        }
+
+        deserializer.deserialize_map(ShapeStoreVisitor)
     }
 }
 
@@ -2390,8 +2434,28 @@ impl<'de> Deserialize<'de> for CellStore {
     where
         D: Deserializer<'de>,
     {
-        let cells = BTreeMap::<CellId, Cell>::deserialize(deserializer)?;
-        Ok(cells.into_iter().collect())
+        struct CellStoreVisitor;
+
+        impl<'de> de::Visitor<'de> for CellStoreVisitor {
+            type Value = CellStore;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a cell map")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: de::MapAccess<'de>,
+            {
+                let mut store = CellStore::with_capacity(map.size_hint().unwrap_or(0));
+                while let Some((id, cell)) = map.next_entry::<CellId, Cell>()? {
+                    store.insert(id, cell);
+                }
+                Ok(store)
+            }
+        }
+
+        deserializer.deserialize_map(CellStoreVisitor)
     }
 }
 
@@ -2654,8 +2718,28 @@ impl<'de> Deserialize<'de> for InstanceStore {
     where
         D: Deserializer<'de>,
     {
-        let instances = BTreeMap::<InstanceId, CellInstance>::deserialize(deserializer)?;
-        Ok(instances.into_iter().collect())
+        struct InstanceStoreVisitor;
+
+        impl<'de> de::Visitor<'de> for InstanceStoreVisitor {
+            type Value = InstanceStore;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("an instance map")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: de::MapAccess<'de>,
+            {
+                let mut store = InstanceStore::with_capacity(map.size_hint().unwrap_or(0));
+                while let Some((id, instance)) = map.next_entry::<InstanceId, CellInstance>()? {
+                    store.insert(id, instance);
+                }
+                Ok(store)
+            }
+        }
+
+        deserializer.deserialize_map(InstanceStoreVisitor)
     }
 }
 
