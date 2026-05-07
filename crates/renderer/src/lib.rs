@@ -2,14 +2,14 @@ pub mod gpu;
 pub mod shader;
 
 use std::{
-    borrow::Cow,
     collections::{BTreeMap, BTreeSet, btree_map::Entry},
     hash::{Hash, Hasher},
 };
 
 use geometry_core::{Point, Rect};
 use layout_model::{
-    Document, InstanceId, LayerId, LayoutIndex, Shape, ShapeId, ShapeKind, ShapeOccurrenceId,
+    Document, InstanceId, LayerId, LayoutIndex, Shape, ShapeId, ShapeKind, ShapeKindView,
+    ShapeOccurrenceId, ShapeView, Transform,
 };
 use web_time::Instant;
 
@@ -396,7 +396,6 @@ impl TileCache {
             memory_budget_bytes: options.memory_budget_bytes,
             ..Default::default()
         };
-        let occurrence_shapes = occurrence_shape_map(document);
         let mut visible_occurrences = BTreeSet::new();
         let mut precise_occurrences = BTreeSet::new();
         let mut pick_occurrences = options.include_pick.then(BTreeSet::new);
@@ -425,12 +424,7 @@ impl TileCache {
             if should_use_overview(self.tile_size, tile.occurrences.len(), options) {
                 let tile_bounds = key.bounds(self.tile_size);
                 let overview = tile.overview.get_or_insert_with(|| {
-                    build_overview_tile(
-                        document,
-                        occurrence_shapes.as_ref(),
-                        tile_bounds,
-                        &tile.occurrences,
-                    )
+                    build_overview_tile(document, tile_bounds, &tile.occurrences)
                 });
                 stats.lod_tiles += 1;
                 stats.lod_shapes += overview.shape_count;
@@ -453,12 +447,11 @@ impl TileCache {
         let mut pick = options.include_pick.then(PickBatch::default);
 
         for id in precise_occurrences {
-            let Some(shape) = shape_for_occurrence(document, occurrence_shapes.as_ref(), &id)
-            else {
+            let Some(shape) = document.shape_view_for_occurrence(&id) else {
                 continue;
             };
             if !document
-                .layer(shape.layer)
+                .layer(shape.shape.layer)
                 .is_some_and(|layer| layer.visible)
             {
                 continue;
@@ -470,7 +463,11 @@ impl TileCache {
                 }
                 Entry::Vacant(entry) => {
                     stats.shape_cache_misses += 1;
-                    entry.insert(build_shape_triangles(document, shape.as_ref()))
+                    entry.insert(build_shape_view_triangles(
+                        document,
+                        shape.shape,
+                        shape.transform,
+                    ))
                 }
             };
             let (index_start, index_count) = append_render_batch_with_range(&mut render, geometry);
@@ -487,12 +484,11 @@ impl TileCache {
             let pick_started = Instant::now();
             stats.pick_shapes = pick_occurrences.len();
             for id in pick_occurrences {
-                let Some(shape) = shape_for_occurrence(document, occurrence_shapes.as_ref(), &id)
-                else {
+                let Some(shape) = document.shape_view_for_occurrence(&id) else {
                     continue;
                 };
                 if !document
-                    .layer(shape.layer)
+                    .layer(shape.shape.layer)
                     .is_some_and(|layer| layer.visible)
                 {
                     continue;
@@ -504,7 +500,11 @@ impl TileCache {
                     }
                     Entry::Vacant(entry) => {
                         stats.shape_cache_misses += 1;
-                        entry.insert(build_shape_triangles(document, shape.as_ref()))
+                        entry.insert(build_shape_view_triangles(
+                            document,
+                            shape.shape,
+                            shape.transform,
+                        ))
                     }
                 };
                 append_pick_from_render(pick, id, geometry);
@@ -632,6 +632,16 @@ pub fn build_shape_triangles(document: &Document, shape: &Shape) -> RenderBatch 
     batch
 }
 
+pub fn build_shape_view_triangles(
+    document: &Document,
+    shape: ShapeView<'_>,
+    transform: Transform,
+) -> RenderBatch {
+    let mut batch = RenderBatch::default();
+    append_shape_view_triangles(&mut batch, document, shape, transform);
+    batch
+}
+
 fn should_use_overview(tile_size: i64, shape_count: usize, options: TileFrameOptions) -> bool {
     options.lod.enabled
         && shape_count >= options.lod.min_shapes_per_tile
@@ -654,27 +664,26 @@ fn tile_keys_for_rect(rect: Rect, tile_size: i64) -> Vec<TileKey> {
 
 fn build_overview_tile(
     document: &Document,
-    occurrence_shapes: Option<&BTreeMap<ShapeOccurrenceId, Shape>>,
     tile_bounds: Rect,
     occurrences: &[ShapeOccurrenceId],
 ) -> OverviewTile {
     let mut layers: BTreeMap<LayerId, (Rect, usize)> = BTreeMap::new();
     for id in occurrences {
-        let Some(shape) = shape_for_occurrence(document, occurrence_shapes, id) else {
+        let Some(shape) = document.shape_view_for_occurrence(id) else {
             continue;
         };
         if !document
-            .layer(shape.layer)
+            .layer(shape.shape.layer)
             .is_some_and(|layer| layer.visible)
-            || !is_geometry_shape(&shape.kind)
+            || !is_geometry_shape_view(shape.shape.kind)
         {
             continue;
         }
-        let Some(bounds) = shape.kind.bounds().intersection(tile_bounds) else {
+        let Some(bounds) = shape.bounds.intersection(tile_bounds) else {
             continue;
         };
         layers
-            .entry(shape.layer)
+            .entry(shape.shape.layer)
             .and_modify(|(union, count)| {
                 *union = union.union(bounds);
                 *count += 1;
@@ -693,34 +702,10 @@ fn build_overview_tile(
     OverviewTile { batch, shape_count }
 }
 
-fn occurrence_shape_map(document: &Document) -> Option<BTreeMap<ShapeOccurrenceId, Shape>> {
-    document.has_hierarchy_instances().then(|| {
-        document
-            .visible_flattened_shapes()
-            .into_iter()
-            .map(|shape| (shape.id.clone(), shape.transformed_shape()))
-            .collect()
-    })
-}
-
-fn shape_for_occurrence<'a>(
-    document: &'a Document,
-    occurrence_shapes: Option<&'a BTreeMap<ShapeOccurrenceId, Shape>>,
-    occurrence: &ShapeOccurrenceId,
-) -> Option<Cow<'a, Shape>> {
-    if let Some(shapes) = occurrence_shapes {
-        return shapes.get(occurrence).map(Cow::Borrowed);
-    }
-    document
-        .shapes
-        .get(&occurrence.source_shape_id())
-        .map(Cow::Owned)
-}
-
-fn is_geometry_shape(kind: &ShapeKind) -> bool {
+fn is_geometry_shape_view(kind: ShapeKindView<'_>) -> bool {
     !matches!(
         kind,
-        ShapeKind::Label { .. } | ShapeKind::Measurement { .. }
+        ShapeKindView::Label { .. } | ShapeKindView::Measurement { .. }
     )
 }
 
@@ -750,6 +735,76 @@ fn append_shape_triangles(batch: &mut RenderBatch, document: &Document, shape: &
             );
         }
         ShapeKind::Label { .. } | ShapeKind::Measurement { .. } => {}
+    }
+}
+
+fn append_shape_view_triangles(
+    batch: &mut RenderBatch,
+    document: &Document,
+    shape: ShapeView<'_>,
+    transform: Transform,
+) {
+    let color = document.layer_color(shape.layer);
+    if transform == Transform::IDENTITY {
+        match shape.kind {
+            ShapeKindView::Rectangle(rect) => push_rect(batch, rect, color),
+            ShapeKindView::Polygon(poly) => {
+                if poly.points.len() >= 3 {
+                    push_fan(batch, &poly.points, color);
+                }
+            }
+            ShapeKindView::Path { points, width } => {
+                for window in points.windows(2) {
+                    push_segment_as_rect(batch, window[0], window[1], width, color);
+                }
+            }
+            ShapeKindView::Via { center, size, .. } => {
+                let half = size / 2;
+                push_rect(
+                    batch,
+                    Rect::new(
+                        Point::new(center.x - half, center.y - half),
+                        Point::new(center.x + half, center.y + half),
+                    ),
+                    color,
+                );
+            }
+            ShapeKindView::Label { .. } | ShapeKindView::Measurement { .. } => {}
+        }
+        return;
+    }
+
+    match shape.kind {
+        ShapeKindView::Rectangle(rect) => push_rect(batch, transform.apply_rect(rect), color),
+        ShapeKindView::Polygon(poly) => {
+            if poly.points.len() >= 3 {
+                push_transformed_fan(batch, &poly.points, transform, color);
+            }
+        }
+        ShapeKindView::Path { points, width } => {
+            for window in points.windows(2) {
+                push_segment_as_rect(
+                    batch,
+                    transform.apply_point(window[0]),
+                    transform.apply_point(window[1]),
+                    width,
+                    color,
+                );
+            }
+        }
+        ShapeKindView::Via { center, size, .. } => {
+            let center = transform.apply_point(center);
+            let half = size / 2;
+            push_rect(
+                batch,
+                Rect::new(
+                    Point::new(center.x - half, center.y - half),
+                    Point::new(center.x + half, center.y + half),
+                ),
+                color,
+            );
+        }
+        ShapeKindView::Label { .. } | ShapeKindView::Measurement { .. } => {}
     }
 }
 
@@ -786,6 +841,27 @@ fn push_rect(batch: &mut RenderBatch, rect: Rect, color: [f32; 4]) {
 fn push_fan(batch: &mut RenderBatch, points: &[Point], color: [f32; 4]) {
     let base = batch.vertices.len() as u32;
     for point in points {
+        batch.vertices.push(GpuVertex {
+            position: [point.x as f32, point.y as f32],
+            color,
+        });
+    }
+    for index in 1..points.len().saturating_sub(1) {
+        batch
+            .indices
+            .extend_from_slice(&[base, base + index as u32, base + index as u32 + 1]);
+    }
+}
+
+fn push_transformed_fan(
+    batch: &mut RenderBatch,
+    points: &[Point],
+    transform: Transform,
+    color: [f32; 4],
+) {
+    let base = batch.vertices.len() as u32;
+    for point in points {
+        let point = transform.apply_point(*point);
         batch.vertices.push(GpuVertex {
             position: [point.x as f32, point.y as f32],
             color,

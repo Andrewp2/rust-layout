@@ -1359,6 +1359,67 @@ pub enum ShapeKind {
     },
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct ShapeView<'a> {
+    pub id: ShapeId,
+    pub layer: LayerId,
+    pub net: Option<NetId>,
+    pub kind: ShapeKindView<'a>,
+    pub name: Option<&'a str>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum ShapeKindView<'a> {
+    Rectangle(Rect),
+    Polygon(&'a Polygon),
+    Path {
+        points: &'a [Point],
+        width: Coord,
+    },
+    Via {
+        center: Point,
+        size: Coord,
+        lower: LayerId,
+        upper: LayerId,
+    },
+    Label {
+        position: Point,
+        text: &'a str,
+    },
+    Measurement {
+        a: Point,
+        b: Point,
+        label: &'a str,
+    },
+}
+
+impl ShapeView<'_> {
+    pub fn bounds(self) -> Rect {
+        self.kind.bounds()
+    }
+}
+
+impl ShapeKindView<'_> {
+    pub fn bounds(self) -> Rect {
+        match self {
+            Self::Rectangle(rect) => rect,
+            Self::Polygon(poly) => poly.bounds().unwrap_or_default(),
+            Self::Path { points, width } => Rect::from_points(points)
+                .unwrap_or_default()
+                .expanded(width / 2),
+            Self::Via { center, size, .. } => {
+                let half = size / 2;
+                Rect::new(
+                    Point::new(center.x - half, center.y - half),
+                    Point::new(center.x + half, center.y + half),
+                )
+            }
+            Self::Label { position, .. } => Rect::new(position, position).expanded(80),
+            Self::Measurement { a, b, .. } => Rect::new(a, b).expanded(40),
+        }
+    }
+}
+
 const MAX_DENSE_SHAPE_ID_INDEX: usize = 10_000_000;
 
 #[derive(Clone, Debug, Default)]
@@ -1526,6 +1587,10 @@ impl ShapeStore {
         self.row_for_id(*id).map(|row| self.materialize_row(row))
     }
 
+    pub fn view(&self, id: &ShapeId) -> Option<ShapeView<'_>> {
+        self.row_for_id(*id).map(|row| self.row_view(row))
+    }
+
     pub fn get_mut(&mut self, id: &ShapeId) -> Option<ShapeMut<'_>> {
         let row = self.row_for_id(*id)?;
         Some(ShapeMut {
@@ -1607,6 +1672,16 @@ impl ShapeStore {
 
     fn row_bounds(&self, row: usize) -> Rect {
         self.geometry_bounds(self.geometry[row])
+    }
+
+    fn row_view(&self, row: usize) -> ShapeView<'_> {
+        ShapeView {
+            id: self.ids[row],
+            layer: self.layers[row],
+            net: self.nets[row],
+            kind: self.geometry_view(self.geometry[row]),
+            name: self.names[row].as_deref(),
+        }
     }
 
     fn row_for_id(&self, id: ShapeId) -> Option<usize> {
@@ -1749,6 +1824,44 @@ impl ShapeStore {
                     a: measurement.a,
                     b: measurement.b,
                     label: measurement.label.clone(),
+                }
+            }
+        }
+    }
+
+    fn geometry_view(&self, geometry: ShapeGeometryRef) -> ShapeKindView<'_> {
+        match geometry {
+            ShapeGeometryRef::Rectangle(index) => ShapeKindView::Rectangle(self.rectangles[index]),
+            ShapeGeometryRef::Polygon(index) => ShapeKindView::Polygon(&self.polygons[index]),
+            ShapeGeometryRef::Path(index) => {
+                let path = &self.paths[index];
+                ShapeKindView::Path {
+                    points: &path.points,
+                    width: path.width,
+                }
+            }
+            ShapeGeometryRef::Via(index) => {
+                let via = &self.vias[index];
+                ShapeKindView::Via {
+                    center: via.center,
+                    size: via.size,
+                    lower: via.lower,
+                    upper: via.upper,
+                }
+            }
+            ShapeGeometryRef::Label(index) => {
+                let label = &self.labels[index];
+                ShapeKindView::Label {
+                    position: label.position,
+                    text: &label.text,
+                }
+            }
+            ShapeGeometryRef::Measurement(index) => {
+                let measurement = &self.measurements[index];
+                ShapeKindView::Measurement {
+                    a: measurement.a,
+                    b: measurement.b,
+                    label: &measurement.label,
                 }
             }
         }
@@ -2599,6 +2712,14 @@ pub struct FlattenedShape {
     pub bounds: Rect,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct FlattenedShapeView<'a> {
+    pub shape: ShapeView<'a>,
+    pub source_cell: CellId,
+    pub transform: Transform,
+    pub bounds: Rect,
+}
+
 impl FlattenedShape {
     pub fn source_shape_id(&self) -> ShapeId {
         self.id.source_shape_id()
@@ -3367,6 +3488,67 @@ impl Document {
         self.layer(id)
             .map(|layer| layer.color)
             .unwrap_or([0.8, 0.8, 0.8, 0.35])
+    }
+
+    pub fn shape_view_for_occurrence(
+        &self,
+        occurrence: &ShapeOccurrenceId,
+    ) -> Option<FlattenedShapeView<'_>> {
+        if occurrence.instance_path.is_empty() {
+            if !occurrence.array_path.is_empty() {
+                return None;
+            }
+            if let Some(shape) = self.shapes.view(&occurrence.shape) {
+                return Some(FlattenedShapeView {
+                    shape,
+                    source_cell: self.top_cell,
+                    transform: Transform::IDENTITY,
+                    bounds: shape.bounds(),
+                });
+            }
+            let top = self.cells.get(&self.top_cell)?;
+            let shape = top.shapes.view(&occurrence.shape)?;
+            return Some(FlattenedShapeView {
+                shape,
+                source_cell: top.id,
+                transform: Transform::IDENTITY,
+                bounds: shape.bounds(),
+            });
+        }
+
+        let mut cell = self.cells.get(&self.top_cell)?;
+        let mut transform = Transform::IDENTITY;
+        let mut array_path_index = 0;
+        for instance_id in &occurrence.instance_path {
+            let instance_row = cell.instances.row_for_id(*instance_id)?;
+            let child_cell_id = cell.instances.row_cell(instance_row);
+            let instance_transform = cell.instances.row_transform(instance_row);
+            let array = cell.instances.row_array(instance_row).normalized();
+            let offset = if array.is_single() {
+                Vector::ZERO
+            } else {
+                let array_index = occurrence.array_path.get(array_path_index)?;
+                if array_index.column >= array.columns || array_index.row >= array.rows {
+                    return None;
+                }
+                array_path_index += 1;
+                array.element_offset(array_index.column, array_index.row)
+            };
+            transform =
+                transform.compose(Transform::from_translation(offset).compose(instance_transform));
+            cell = self.cells.get(&child_cell_id)?;
+        }
+        if array_path_index != occurrence.array_path.len() {
+            return None;
+        }
+
+        let shape = cell.shapes.view(&occurrence.shape)?;
+        Some(FlattenedShapeView {
+            shape,
+            source_cell: cell.id,
+            transform,
+            bounds: transform.apply_rect(shape.bounds()),
+        })
     }
 
     pub fn visible_shapes(&self) -> impl Iterator<Item = Shape> + '_ {
