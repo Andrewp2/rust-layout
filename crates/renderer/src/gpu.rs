@@ -1,6 +1,6 @@
-use std::error::Error;
+use std::{error::Error, time::Instant};
 
-use crate::{PickBatch, RenderBatch, RenderBatch3d, shader};
+use crate::{PickBatch, RenderBatch, RenderBatch3d, StressLayout, shader};
 use geometry_core::{Coord, Point, Rect};
 use layout_model::{Document, LayoutIndex, ShapeOccurrenceId};
 
@@ -45,6 +45,16 @@ pub struct OffscreenRenderRequest {
     pub pan: [f32; 2],
 }
 
+#[derive(Clone, Debug)]
+pub struct OffscreenStressRenderRequest {
+    pub scene: String,
+    pub layout: StressLayout,
+    pub width: u32,
+    pub height: u32,
+    pub zoom: f32,
+    pub pan: [f32; 2],
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct OffscreenRenderReport {
     pub scene: String,
@@ -57,6 +67,10 @@ pub struct OffscreenRenderReport {
     pub vertices: usize,
     pub indices: usize,
     pub non_dark_pixels: usize,
+    pub frame_build_ms: f64,
+    pub gpu_upload_ms: f64,
+    pub gpu_draw_ms: f64,
+    pub readback_ms: f64,
 }
 
 pub struct LayoutGpuRenderer {
@@ -170,7 +184,7 @@ impl GpuPickRequest {
 impl OffscreenRenderReport {
     pub fn summary(&self) -> String {
         format!(
-            "offscreen render ok: scene={} size={}x{} backend={} adapter=\"{}\" visible_shapes={} visible_tiles={} vertices={} indices={} non_dark_pixels={}",
+            "offscreen render ok: scene={} size={}x{} backend={} adapter=\"{}\" visible_shapes={} visible_tiles={} vertices={} indices={} non_dark_pixels={} frame_build_ms={:.3} gpu_upload_ms={:.3} gpu_draw_ms={:.3} readback_ms={:.3}",
             self.scene,
             self.width,
             self.height,
@@ -180,7 +194,11 @@ impl OffscreenRenderReport {
             self.visible_tiles,
             self.vertices,
             self.indices,
-            self.non_dark_pixels
+            self.non_dark_pixels,
+            self.frame_build_ms,
+            self.gpu_upload_ms,
+            self.gpu_draw_ms,
+            self.readback_ms
         )
     }
 }
@@ -1143,6 +1161,7 @@ pub async fn render_document_offscreen(
     let width = request.width.max(1);
     let height = request.height.max(1);
     let zoom = request.zoom.clamp(0.001, 32.0);
+    let frame_started = Instant::now();
     let index = build_layout_index(&request.document);
     let viewport = offscreen_viewport(width, height, zoom, request.pan);
     let mut tile_cache = crate::TileCache::default();
@@ -1156,10 +1175,58 @@ pub async fn render_document_offscreen(
             ..Default::default()
         },
     );
+    let frame_build_ms = frame_started.elapsed().as_secs_f64() * 1000.0;
+    render_tiled_frame_offscreen(
+        request.scene,
+        width,
+        height,
+        viewport,
+        frame,
+        frame_build_ms,
+    )
+    .await
+}
+
+pub async fn render_stress_offscreen(
+    request: OffscreenStressRenderRequest,
+) -> Result<OffscreenRenderReport, Box<dyn Error>> {
+    let width = request.width.max(1);
+    let height = request.height.max(1);
+    let zoom = request.zoom.clamp(0.001, 32.0);
+    let frame_started = Instant::now();
+    let viewport = offscreen_viewport(width, height, zoom, request.pan);
+    let frame = crate::build_stress_frame(
+        request.layout,
+        viewport,
+        crate::TileFrameOptions {
+            include_pick: false,
+            zoom,
+            ..Default::default()
+        },
+    );
+    let frame_build_ms = frame_started.elapsed().as_secs_f64() * 1000.0;
+    render_tiled_frame_offscreen(
+        request.scene,
+        width,
+        height,
+        viewport,
+        frame,
+        frame_build_ms,
+    )
+    .await
+}
+
+async fn render_tiled_frame_offscreen(
+    scene: String,
+    width: u32,
+    height: u32,
+    viewport: Rect,
+    frame: crate::TiledFrame,
+    frame_build_ms: f64,
+) -> Result<OffscreenRenderReport, Box<dyn Error>> {
     if frame.render.indices.is_empty() {
         return Err(gpu_error(format!(
-            "offscreen scene {} produced no render indices",
-            request.scene
+            "offscreen scene {scene} produced no render indices"
         )));
     }
 
@@ -1189,13 +1256,16 @@ pub async fn render_document_offscreen(
     let format = wgpu::TextureFormat::Rgba8Unorm;
     let mut resources = LayoutGpuRenderer::new(&device, format)
         .ok_or_else(|| gpu_error("failed to create offscreen layout GPU resources"))?;
+    let upload_started = Instant::now();
     resources.upload(
         &device,
         &queue,
         &frame.render,
         ViewUniforms::from_viewport(viewport),
     );
+    let gpu_upload_ms = upload_started.elapsed().as_secs_f64() * 1000.0;
 
+    let draw_started = Instant::now();
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("Fabricad offscreen texture"),
         size: wgpu::Extent3d {
@@ -1274,7 +1344,9 @@ pub async fn render_document_offscreen(
         submission_index: Some(submission),
         timeout: Some(std::time::Duration::from_secs(30)),
     })?;
+    let gpu_draw_ms = draw_started.elapsed().as_secs_f64() * 1000.0;
 
+    let readback_started = Instant::now();
     let (tx, rx) = std::sync::mpsc::channel();
     readback
         .slice(..)
@@ -1296,12 +1368,13 @@ pub async fn render_document_offscreen(
         padded_bytes_per_row,
     );
     readback.unmap();
+    let readback_ms = readback_started.elapsed().as_secs_f64() * 1000.0;
     if non_dark_pixels == 0 {
         return Err(gpu_error("offscreen render completed but output was blank"));
     }
 
     Ok(OffscreenRenderReport {
-        scene: request.scene,
+        scene,
         backend: format!("{:?}", adapter_info.backend),
         adapter: adapter_info.name,
         width,
@@ -1311,6 +1384,10 @@ pub async fn render_document_offscreen(
         vertices: frame.render.vertices.len(),
         indices: frame.render.indices.len(),
         non_dark_pixels,
+        frame_build_ms,
+        gpu_upload_ms,
+        gpu_draw_ms,
+        readback_ms,
     })
 }
 
