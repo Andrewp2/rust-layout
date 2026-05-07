@@ -1,6 +1,6 @@
 use std::{error::Error, time::Instant};
 
-use crate::{PickBatch, RenderBatch, RenderBatch3d, StressLayout, shader};
+use crate::{PickBatch, RenderBatch, RenderBatch3d, shader};
 use geometry_core::{Coord, Point, Rect};
 use layout_model::{Document, LayoutIndex, ShapeOccurrenceId};
 
@@ -39,16 +39,6 @@ pub struct BufferUploadResult {
 pub struct OffscreenRenderRequest {
     pub scene: String,
     pub document: Document,
-    pub width: u32,
-    pub height: u32,
-    pub zoom: f32,
-    pub pan: [f32; 2],
-}
-
-#[derive(Clone, Debug)]
-pub struct OffscreenStressRenderRequest {
-    pub scene: String,
-    pub layout: StressLayout,
     pub width: u32,
     pub height: u32,
     pub zoom: f32,
@@ -1168,35 +1158,6 @@ pub async fn render_document_offscreen(
     let frame = tile_cache.build_frame_with_options(
         &request.document,
         &index,
-        viewport,
-        crate::TileFrameOptions {
-            include_pick: false,
-            zoom,
-            ..Default::default()
-        },
-    );
-    let frame_build_ms = frame_started.elapsed().as_secs_f64() * 1000.0;
-    render_tiled_frame_offscreen(
-        request.scene,
-        width,
-        height,
-        viewport,
-        frame,
-        frame_build_ms,
-    )
-    .await
-}
-
-pub async fn render_stress_offscreen(
-    request: OffscreenStressRenderRequest,
-) -> Result<OffscreenRenderReport, Box<dyn Error>> {
-    let width = request.width.max(1);
-    let height = request.height.max(1);
-    let zoom = request.zoom.clamp(0.001, 32.0);
-    let frame_started = Instant::now();
-    let viewport = offscreen_viewport(width, height, zoom, request.pan);
-    let frame = crate::build_stress_frame(
-        request.layout,
         viewport,
         crate::TileFrameOptions {
             include_pick: false,

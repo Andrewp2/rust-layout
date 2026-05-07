@@ -9,8 +9,7 @@ use loro::{
     Container, ExportMode, LoroDoc, LoroEncodeError, LoroError, LoroMap, LoroValue, PeerID,
     ValueOrContainer,
 };
-use rstar::{AABB, RTree, RTreeObject};
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de, ser::SerializeMap};
 use uuid::Uuid;
 
 pub mod connectivity;
@@ -1173,6 +1172,222 @@ pub enum ShapeKind {
     },
 }
 
+const MAX_DENSE_SHAPE_ID_INDEX: usize = 10_000_000;
+
+#[derive(Clone, Debug, Default)]
+pub struct ShapeStore {
+    rows: Vec<Option<Shape>>,
+    id_to_row: Vec<Option<usize>>,
+    overflow_id_to_row: BTreeMap<ShapeId, usize>,
+    len: usize,
+}
+
+impl ShapeStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            rows: Vec::with_capacity(capacity),
+            id_to_row: Vec::new(),
+            overflow_id_to_row: BTreeMap::new(),
+            len: 0,
+        }
+    }
+
+    pub fn from_shapes(shapes: impl IntoIterator<Item = Shape>) -> Self {
+        let shapes = shapes.into_iter().collect::<Vec<_>>();
+        let mut store = Self::with_capacity(shapes.len());
+        let dense_len = shapes
+            .iter()
+            .filter_map(|shape| dense_shape_index(shape.id))
+            .max()
+            .map_or(0, |index| index + 1);
+        store.id_to_row.resize(dense_len, None);
+
+        for shape in shapes {
+            let row = store.rows.len();
+            store.set_row_for_id(shape.id, row);
+            store.rows.push(Some(shape));
+            store.len += 1;
+        }
+        store
+    }
+
+    pub fn from_dense_id_range(
+        first_id: ShapeId,
+        count: usize,
+        mut make_shape: impl FnMut(usize, ShapeId) -> Shape,
+    ) -> Self {
+        let mut store = Self::with_capacity(count);
+        if count == 0 {
+            return store;
+        }
+
+        if let Some(last_id) = first_id.0.checked_add(count as u64 - 1)
+            && let Some(last_index) = dense_shape_index(ShapeId(last_id))
+        {
+            store.id_to_row.resize(last_index + 1, None);
+        }
+
+        for index in 0..count {
+            let id = ShapeId(first_id.0 + index as u64);
+            let mut shape = make_shape(index, id);
+            shape.id = id;
+            let row = store.rows.len();
+            store.set_row_for_id(id, row);
+            store.rows.push(Some(shape));
+            store.len += 1;
+        }
+        store
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn clear(&mut self) {
+        self.rows.clear();
+        self.id_to_row.clear();
+        self.overflow_id_to_row.clear();
+        self.len = 0;
+    }
+
+    pub fn get(&self, id: &ShapeId) -> Option<&Shape> {
+        self.row_for_id(*id)
+            .and_then(|row| self.rows.get(row))
+            .and_then(Option::as_ref)
+    }
+
+    pub fn get_mut(&mut self, id: &ShapeId) -> Option<&mut Shape> {
+        let row = self.row_for_id(*id)?;
+        self.rows.get_mut(row).and_then(Option::as_mut)
+    }
+
+    pub fn contains_key(&self, id: &ShapeId) -> bool {
+        self.get(id).is_some()
+    }
+
+    pub fn insert(&mut self, id: ShapeId, mut shape: Shape) -> Option<Shape> {
+        shape.id = id;
+        if let Some(row) = self.row_for_id(id)
+            && let Some(slot) = self.rows.get_mut(row)
+            && slot.is_some()
+        {
+            return slot.replace(shape);
+        }
+
+        let row = self.rows.len();
+        self.set_row_for_id(id, row);
+        self.rows.push(Some(shape));
+        self.len += 1;
+        None
+    }
+
+    pub fn remove(&mut self, id: &ShapeId) -> Option<Shape> {
+        let row = self.row_for_id(*id)?;
+        self.clear_row_for_id(*id);
+        let removed = self.rows.get_mut(row)?.take();
+        if removed.is_some() {
+            self.len -= 1;
+        }
+        removed
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &Shape> {
+        self.rows.iter().filter_map(Option::as_ref)
+    }
+
+    pub fn values_mut(&mut self) -> impl Iterator<Item = &mut Shape> {
+        self.rows.iter_mut().filter_map(Option::as_mut)
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &ShapeId> {
+        self.values().map(|shape| &shape.id)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&ShapeId, &Shape)> {
+        self.values().map(|shape| (&shape.id, shape))
+    }
+
+    fn row_for_id(&self, id: ShapeId) -> Option<usize> {
+        dense_shape_index(id)
+            .and_then(|index| self.id_to_row.get(index).copied().flatten())
+            .or_else(|| self.overflow_id_to_row.get(&id).copied())
+    }
+
+    fn set_row_for_id(&mut self, id: ShapeId, row: usize) {
+        if let Some(index) = dense_shape_index(id) {
+            if index >= self.id_to_row.len() {
+                self.id_to_row.resize(index + 1, None);
+            }
+            self.id_to_row[index] = Some(row);
+        } else {
+            self.overflow_id_to_row.insert(id, row);
+        }
+    }
+
+    fn clear_row_for_id(&mut self, id: ShapeId) {
+        if let Some(index) = dense_shape_index(id)
+            && let Some(slot) = self.id_to_row.get_mut(index)
+        {
+            *slot = None;
+            return;
+        }
+        self.overflow_id_to_row.remove(&id);
+    }
+}
+
+impl Extend<(ShapeId, Shape)> for ShapeStore {
+    fn extend<T: IntoIterator<Item = (ShapeId, Shape)>>(&mut self, iter: T) {
+        for (id, shape) in iter {
+            self.insert(id, shape);
+        }
+    }
+}
+
+impl FromIterator<(ShapeId, Shape)> for ShapeStore {
+    fn from_iter<T: IntoIterator<Item = (ShapeId, Shape)>>(iter: T) -> Self {
+        Self::from_shapes(iter.into_iter().map(|(id, mut shape)| {
+            shape.id = id;
+            shape
+        }))
+    }
+}
+
+impl Serialize for ShapeStore {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(self.len))?;
+        for shape in self.values() {
+            map.serialize_entry(&shape.id, shape)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for ShapeStore {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let shapes = BTreeMap::<ShapeId, Shape>::deserialize(deserializer)?;
+        Ok(shapes.into_iter().collect())
+    }
+}
+
+fn dense_shape_index(id: ShapeId) -> Option<usize> {
+    let index = usize::try_from(id.0).ok()?;
+    (index <= MAX_DENSE_SHAPE_ID_INDEX).then_some(index)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Transform {
     #[serde(default = "identity_transform_matrix")]
@@ -1371,7 +1586,7 @@ impl ShapeKind {
 pub struct Cell {
     pub id: CellId,
     pub name: String,
-    pub shapes: BTreeMap<ShapeId, Shape>,
+    pub shapes: ShapeStore,
     pub instances: BTreeMap<InstanceId, CellInstance>,
 }
 
@@ -1380,7 +1595,7 @@ impl Cell {
         Self {
             id,
             name: name.into(),
-            shapes: BTreeMap::new(),
+            shapes: ShapeStore::new(),
             instances: BTreeMap::new(),
         }
     }
@@ -1638,7 +1853,7 @@ pub struct Document {
     #[serde(default = "default_top_cell")]
     pub top_cell: CellId,
     pub layers: BTreeMap<LayerId, Layer>,
-    pub shapes: BTreeMap<ShapeId, Shape>,
+    pub shapes: ShapeStore,
     #[serde(default)]
     pub cells: BTreeMap<CellId, Cell>,
     #[serde(default)]
@@ -1674,7 +1889,7 @@ impl Document {
             next_instance_id: default_next_instance_id(),
             top_cell: default_top_cell(),
             layers: BTreeMap::new(),
-            shapes: BTreeMap::new(),
+            shapes: ShapeStore::new(),
             cells: BTreeMap::new(),
             marker_states: BTreeMap::new(),
             crdt_seen: BTreeSet::new(),
@@ -1868,18 +2083,28 @@ impl Document {
         .collect();
         let columns = (count as f64).sqrt().ceil() as Coord;
         let pitch = 240;
-        for index in 0..count {
-            let i = index as Coord;
-            let x = (i % columns) * pitch - columns * pitch / 2;
-            let y = (i / columns) * pitch - columns * pitch / 2;
-            let width = 50 + ((index % 7) as Coord) * 10;
-            let height = 40 + ((index % 5) as Coord) * 12;
-            let layer = layers[index % layers.len()];
-            doc.insert_shape(
-                layer,
-                ShapeKind::Rectangle(Rect::from_min_size(Point::new(x, y), width, height)),
-            );
-        }
+        let first_shape_id = doc.next_shape_id;
+        doc.shapes =
+            ShapeStore::from_dense_id_range(ShapeId(first_shape_id), count, |index, id| {
+                let i = index as Coord;
+                let x = (i % columns) * pitch - columns * pitch / 2;
+                let y = (i / columns) * pitch - columns * pitch / 2;
+                let width = 50 + ((index % 7) as Coord) * 10;
+                let height = 40 + ((index % 5) as Coord) * 12;
+                let layer = layers[index % layers.len()];
+                Shape {
+                    id,
+                    layer,
+                    net: None,
+                    kind: ShapeKind::Rectangle(Rect::from_min_size(
+                        Point::new(x, y),
+                        width,
+                        height,
+                    )),
+                    name: None,
+                }
+            });
+        doc.next_shape_id = first_shape_id + count as u64;
         doc
     }
 
@@ -2406,48 +2631,137 @@ pub struct IndexedShape {
     pub bounds: Rect,
 }
 
-impl RTreeObject for IndexedShape {
-    type Envelope = AABB<[f64; 2]>;
+const LAYOUT_INDEX_TILE_SIZE: Coord = 16_384;
 
-    fn envelope(&self) -> Self::Envelope {
-        AABB::from_corners(
-            [self.bounds.min.x as f64, self.bounds.min.y as f64],
-            [self.bounds.max.x as f64, self.bounds.max.y as f64],
-        )
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct LayoutIndexTileKey {
+    x: Coord,
+    y: Coord,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LayoutIndexRef {
+    key: LayoutIndexTileKey,
+    entry: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LayoutIndexBucket {
+    key: LayoutIndexTileKey,
+    start: usize,
+    end: usize,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct LayoutIndex {
-    tree: RTree<IndexedShape>,
+    entries: Vec<IndexedShape>,
+    refs: Vec<LayoutIndexRef>,
+    buckets: Vec<LayoutIndexBucket>,
 }
 
 impl LayoutIndex {
     pub fn rebuild(document: &Document) -> Self {
-        let entries = document
-            .visible_shapes()
-            .map(|shape| IndexedShape {
-                id: ShapeOccurrenceId::top_level(shape.id),
-                bounds: shape.kind.bounds(),
-            })
-            .collect();
-        Self {
-            tree: RTree::bulk_load(entries),
-        }
+        let mut entries = Vec::with_capacity(document.shapes.len());
+        entries.extend(document.visible_shapes().map(|shape| IndexedShape {
+            id: ShapeOccurrenceId::top_level(shape.id),
+            bounds: shape.kind.bounds(),
+        }));
+        Self::bulk_load(entries)
     }
 
     pub fn rebuild_hierarchical(document: &Document) -> Self {
-        let entries = document
-            .visible_flattened_shapes()
-            .into_iter()
-            .map(|shape| IndexedShape {
-                id: shape.id,
-                bounds: shape.bounds,
-            })
-            .collect();
-        Self {
-            tree: RTree::bulk_load(entries),
+        let mut entries = Vec::with_capacity(document.flattened_shape_count_estimate());
+        entries.extend(
+            document
+                .visible_flattened_shapes()
+                .into_iter()
+                .map(|shape| IndexedShape {
+                    id: shape.id,
+                    bounds: shape.bounds,
+                }),
+        );
+        Self::bulk_load(entries)
+    }
+
+    pub fn bulk_load(entries: Vec<IndexedShape>) -> Self {
+        let mut refs = Vec::with_capacity(entries.len());
+        for (entry, shape) in entries.iter().enumerate() {
+            let min_x = shape.bounds.min.x.div_euclid(LAYOUT_INDEX_TILE_SIZE);
+            let max_x = shape.bounds.max.x.div_euclid(LAYOUT_INDEX_TILE_SIZE);
+            let min_y = shape.bounds.min.y.div_euclid(LAYOUT_INDEX_TILE_SIZE);
+            let max_y = shape.bounds.max.y.div_euclid(LAYOUT_INDEX_TILE_SIZE);
+            for y in min_y..=max_y {
+                for x in min_x..=max_x {
+                    refs.push(LayoutIndexRef {
+                        key: LayoutIndexTileKey { x, y },
+                        entry,
+                    });
+                }
+            }
         }
+        refs.sort_unstable_by_key(|reference| reference.key);
+
+        let mut buckets = Vec::new();
+        let mut start = 0;
+        while start < refs.len() {
+            let key = refs[start].key;
+            let mut end = start + 1;
+            while end < refs.len() && refs[end].key == key {
+                end += 1;
+            }
+            buckets.push(LayoutIndexBucket { key, start, end });
+            start = end;
+        }
+
+        Self {
+            entries,
+            refs,
+            buckets,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn query_occurrences_into(&self, rect: Rect, out: &mut Vec<ShapeOccurrenceId>) {
+        let start_len = out.len();
+        let min_x = rect.min.x.div_euclid(LAYOUT_INDEX_TILE_SIZE);
+        let max_x = rect.max.x.div_euclid(LAYOUT_INDEX_TILE_SIZE);
+        let min_y = rect.min.y.div_euclid(LAYOUT_INDEX_TILE_SIZE);
+        let max_y = rect.max.y.div_euclid(LAYOUT_INDEX_TILE_SIZE);
+        for y in min_y..=max_y {
+            for x in min_x..=max_x {
+                let key = LayoutIndexTileKey { x, y };
+                let Ok(bucket_index) = self.buckets.binary_search_by_key(&key, |bucket| bucket.key)
+                else {
+                    continue;
+                };
+                let bucket = self.buckets[bucket_index];
+                for reference in &self.refs[bucket.start..bucket.end] {
+                    let entry = &self.entries[reference.entry];
+                    if entry.bounds.intersects(rect) {
+                        out.push(entry.id.clone());
+                    }
+                }
+            }
+        }
+
+        out[start_len..].sort_unstable();
+        let mut write = start_len;
+        for read in start_len..out.len() {
+            if read == start_len || out[read] != out[write - 1] {
+                if write != read {
+                    out[write] = out[read].clone();
+                }
+                write += 1;
+            }
+        }
+        out.truncate(write);
     }
 
     pub fn query_rect(&self, rect: Rect) -> Vec<ShapeId> {
@@ -2458,14 +2772,9 @@ impl LayoutIndex {
     }
 
     pub fn query_occurrences(&self, rect: Rect) -> Vec<ShapeOccurrenceId> {
-        let envelope = AABB::from_corners(
-            [rect.min.x as f64, rect.min.y as f64],
-            [rect.max.x as f64, rect.max.y as f64],
-        );
-        self.tree
-            .locate_in_envelope_intersecting(&envelope)
-            .map(|entry| entry.id.clone())
-            .collect()
+        let mut out = Vec::new();
+        self.query_occurrences_into(rect, &mut out);
+        out
     }
 
     pub fn hit_test(&self, point: Point, tolerance: Coord) -> Option<ShapeId> {
@@ -2476,6 +2785,41 @@ impl LayoutIndex {
     pub fn hit_test_occurrence(&self, point: Point, tolerance: Coord) -> Option<ShapeOccurrenceId> {
         let query = Rect::new(point, point).expanded(tolerance);
         self.query_occurrences(query).into_iter().next()
+    }
+}
+
+impl Document {
+    pub fn flattened_shape_count_estimate(&self) -> usize {
+        let mut count = self.shapes.len();
+        if let Some(top) = self.cells.get(&self.top_cell) {
+            count += top.shapes.len();
+            count += self.flattened_instance_shape_count_estimate(top, &mut Vec::new());
+        }
+        count
+    }
+
+    fn flattened_instance_shape_count_estimate(
+        &self,
+        parent: &Cell,
+        instance_path: &mut Vec<InstanceId>,
+    ) -> usize {
+        let mut count = 0;
+        for instance in parent.instances.values() {
+            if instance_path.contains(&instance.id) {
+                continue;
+            }
+            let Some(cell) = self.cells.get(&instance.cell) else {
+                continue;
+            };
+            let array = instance.array.normalized();
+            let array_count = array.columns as usize * array.rows as usize;
+            count += cell.shapes.len() * array_count;
+            instance_path.push(instance.id);
+            count +=
+                self.flattened_instance_shape_count_estimate(cell, instance_path) * array_count;
+            instance_path.pop();
+        }
+        count
     }
 }
 
@@ -2607,6 +2951,48 @@ mod tests {
 
         assert!(!flat_index.query_rect(query).contains(&child_shape));
         assert!(hierarchy_index.query_rect(query).contains(&child_shape));
+    }
+
+    #[test]
+    fn tiled_layout_index_deduplicates_shapes_spanning_tiles() {
+        let mut doc = Document::new("wide shape");
+        let metal1 = doc.layer_by_process(ProcessLayer::Metal1).unwrap();
+        let id = doc.insert_shape(
+            metal1,
+            ShapeKind::Rectangle(Rect::from_min_size(Point::new(-20_000, -100), 40_000, 200)),
+        );
+        let index = LayoutIndex::rebuild(&doc);
+
+        let hits = index.query_rect(Rect::from_min_size(
+            Point::new(-30_000, -1_000),
+            60_000,
+            2_000,
+        ));
+
+        assert_eq!(hits, vec![id]);
+    }
+
+    #[test]
+    fn shape_store_serializes_as_legacy_shape_map() {
+        let mut doc = Document::new("shape store serde");
+        let metal1 = doc.layer_by_process(ProcessLayer::Metal1).unwrap();
+        let id = doc.insert_shape(
+            metal1,
+            ShapeKind::Rectangle(Rect::from_min_size(Point::new(0, 0), 10, 10)),
+        );
+
+        let encoded = serde_json::to_value(&doc).unwrap();
+        let shapes = encoded
+            .get("shapes")
+            .and_then(|value| value.as_object())
+            .unwrap();
+        assert!(shapes.contains_key(&id.0.to_string()));
+
+        let restored: Document = serde_json::from_value(encoded).unwrap();
+        assert_eq!(
+            restored.shapes.get(&id).unwrap().kind.bounds(),
+            doc.shapes.get(&id).unwrap().kind.bounds()
+        );
     }
 
     #[test]

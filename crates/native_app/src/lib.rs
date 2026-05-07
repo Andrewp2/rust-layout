@@ -691,7 +691,6 @@ pub struct FabricadApp {
     document: Document,
     layout_source: DataSource,
     fabos_source: DataSource,
-    stress_layout: Option<renderer::StressLayout>,
     index: LayoutIndex,
     yield_analysis: YieldAnalysis,
     selected_yield_lot: String,
@@ -910,19 +909,6 @@ async fn run_offscreen_render_async(
     let width = options.width.max(1);
     let height = options.height.max(1);
     let zoom = options.zoom.clamp(0.001, 32.0);
-    if let OffscreenScene::Stress { count } = options.scene {
-        return renderer::gpu::render_stress_offscreen(
-            renderer::gpu::OffscreenStressRenderRequest {
-                scene: format!("stress:{count}"),
-                layout: renderer::StressLayout::new(count),
-                width,
-                height,
-                zoom,
-                pan: options.pan,
-            },
-        )
-        .await;
-    }
     let (scene_name, document) = offscreen_document(&options.scene);
     renderer::gpu::render_document_offscreen(OffscreenRenderRequest {
         scene: scene_name,
@@ -989,7 +975,6 @@ impl FabricadApp {
             document,
             layout_source: DataSource::Blank,
             fabos_source: DataSource::Blank,
-            stress_layout: None,
             index,
             yield_analysis,
             selected_yield_lot,
@@ -1086,7 +1071,19 @@ impl FabricadApp {
             app.layout_source = DataSource::Demo;
             app.status = "test scene: hierarchy".to_string();
         } else if let Some(count) = options.stress_count {
-            app.make_stress_document(count);
+            app.document = Document::stress(count);
+            app.apply_current_technology_to_document();
+            app.selected.clear();
+            app.selected_occurrence = None;
+            app.undo.clear();
+            app.redo.clear();
+            app.clear_edit_drafts();
+            app.reset_loro_log_from_document();
+            app.reset_render_cache();
+            app.rebuild_indexes();
+            app.rerun_drc();
+            app.layout_source = DataSource::Generated(format!("{count} polygon stress"));
+            app.status = format!("test scene: {count} polygons");
         }
         app.reset_3d_camera_to_document();
         if let Some(zoom) = options.zoom {
@@ -2644,7 +2641,6 @@ impl FabricadApp {
 
     fn replace_document(&mut self, document: Document, label: &str) {
         self.document = document;
-        self.stress_layout = None;
         self.reset_active_layer();
         self.rebuild_rules_from_technology();
         self.undo.clear();
@@ -2715,13 +2711,11 @@ impl FabricadApp {
 
     fn make_stress_document(&mut self, count: usize) {
         self.replace_document(
-            Document::new(format!("Fabricad procedural stress {count}")),
-            &format!("generated procedural stress scene with {count} shapes"),
+            Document::stress(count),
+            &format!("generated {count} polygons"),
         );
-        self.stress_layout = Some(renderer::StressLayout::new(count));
-        self.reset_3d_camera_to_document();
         self.layout_source = DataSource::Generated(format!("{count} polygon stress"));
-        self.status = format!("generated procedural stress scene with {count} shapes");
+        self.status = format!("generated {count} polygons");
     }
 
     fn make_hierarchy_document(&mut self) {
@@ -5437,11 +5431,6 @@ impl FabricadApp {
         let viewport = self.viewport_world(canvas);
         self.last_view_center = self.snap_point(viewport.center());
         self.draw_background(&painter, canvas, viewport);
-        if let Some(stress) = self.stress_layout {
-            self.draw_stress_canvas(frame_start, &painter, canvas, viewport, stress);
-            self.draw_scale_bar(&painter, canvas);
-            return;
-        }
         let query_started = Instant::now();
         let visible_occurrences = self.index.query_occurrences(viewport);
         self.perf.query_ms = query_started.elapsed().as_secs_f64() * 1000.0;
@@ -5543,120 +5532,6 @@ impl FabricadApp {
         self.handle_canvas_input(ui, &response, canvas);
         self.broadcast_selection_if_changed();
         self.perf.frame_ms = frame_start.elapsed().as_secs_f64() * 1000.0;
-    }
-
-    fn draw_stress_canvas(
-        &mut self,
-        frame_start: Instant,
-        painter: &Painter,
-        canvas: EguiRect,
-        viewport: Rect,
-        stress: renderer::StressLayout,
-    ) {
-        let batch_started = Instant::now();
-        let renderer::TiledFrame {
-            render: batch,
-            stats: tile_stats,
-            ..
-        } = renderer::build_stress_frame(
-            stress,
-            viewport,
-            renderer::TileFrameOptions {
-                include_pick: false,
-                zoom: self.zoom,
-                memory_budget_bytes: Some(TILE_MEMORY_BUDGET_BYTES),
-                ..Default::default()
-            },
-        );
-        self.perf.query_ms = 0.0;
-        self.perf.visible_count = tile_stats.visible_shapes;
-        self.perf.gpu_build_ms = batch_started.elapsed().as_secs_f64() * 1000.0;
-        self.perf.gpu_vertices = batch.vertices.len();
-        self.perf.gpu_indices = batch.indices.len();
-        self.perf.gpu_pick_vertices = 0;
-        self.perf.gpu_pick_indices = 0;
-        self.perf.tile_visible_count = tile_stats.visible_tiles;
-        self.perf.tile_resident_count = 0;
-        self.perf.tile_rebuilt_count = tile_stats.rebuilt_tiles;
-        self.perf.tile_evicted_count = 0;
-        self.perf.tile_lod_count = tile_stats.lod_tiles;
-        self.perf.tile_lod_shape_count = tile_stats.lod_shapes;
-        self.perf.tile_precise_shape_count = tile_stats.precise_shapes;
-        self.perf.tile_cached_count = 0;
-        self.perf.tile_shape_count = tile_stats.visible_shapes;
-        self.perf.tile_pick_shape_count = 0;
-        self.perf.shape_cache_hits = 0;
-        self.perf.shape_cache_misses = 0;
-        self.perf.resident_shape_batches = 0;
-        self.perf.evicted_shape_batches = 0;
-        self.perf.draw_range_count = tile_stats.draw_ranges;
-        self.perf.tile_cache_bytes = tile_stats.cache_bytes;
-        self.perf.tile_memory_budget_bytes = tile_stats
-            .memory_budget_bytes
-            .unwrap_or(TILE_MEMORY_BUDGET_BYTES);
-        self.perf.tile_over_budget_bytes = tile_stats.over_budget_bytes;
-        self.perf.pick_build_ms = 0.0;
-        self.perf.batch_bytes = batch.estimate_bytes();
-        self.perf.pick_batch_bytes = 0;
-        if let Ok(upload) = self.gpu_upload_state.lock() {
-            self.perf.gpu_upload_bytes = upload.last_upload_bytes;
-            self.perf.gpu_resident_bytes = upload.resident_bytes;
-            self.perf.gpu_layout_uploads = upload.layout_uploads;
-            self.perf.gpu_layout_skips = upload.layout_skips;
-            self.perf.gpu_pick_uploads = upload.pick_uploads;
-            self.perf.gpu_pick_skips = upload.pick_skips;
-        }
-
-        if let Some(target_format) = self.gpu_target_format {
-            painter.add(egui_wgpu::Callback::new_paint_callback(
-                canvas,
-                LayoutGpuCallback {
-                    batch,
-                    pick_batch: None,
-                    pick_request: None,
-                    pick_state: Arc::clone(&self.gpu_pick_state),
-                    upload_state: Arc::clone(&self.gpu_upload_state),
-                    uniforms: ViewUniforms::from_viewport(viewport),
-                    target_format,
-                },
-            ));
-        } else {
-            self.draw_render_batch_cpu(painter, canvas, &batch);
-        }
-        self.perf.frame_ms = frame_start.elapsed().as_secs_f64() * 1000.0;
-    }
-
-    fn draw_render_batch_cpu(
-        &self,
-        painter: &Painter,
-        canvas: EguiRect,
-        batch: &renderer::RenderBatch,
-    ) {
-        for indices in batch.indices.chunks_exact(6) {
-            let Some(first) = batch.vertices.get(indices[0] as usize) else {
-                continue;
-            };
-            let mut min = Pos2::new(f32::INFINITY, f32::INFINITY);
-            let mut max = Pos2::new(f32::NEG_INFINITY, f32::NEG_INFINITY);
-            for index in indices {
-                let Some(vertex) = batch.vertices.get(*index as usize) else {
-                    continue;
-                };
-                let screen = self.world_to_screen(
-                    Point::new(vertex.position[0] as Coord, vertex.position[1] as Coord),
-                    canvas,
-                );
-                min.x = min.x.min(screen.x);
-                min.y = min.y.min(screen.y);
-                max.x = max.x.max(screen.x);
-                max.y = max.y.max(screen.y);
-            }
-            painter.rect_filled(
-                EguiRect::from_min_max(min, max),
-                0.0,
-                layer_color32(first.color, 1.0),
-            );
-        }
     }
 
     fn canvas_3d(&mut self, ui: &mut egui::Ui) {
@@ -6254,9 +6129,6 @@ impl FabricadApp {
     }
 
     fn layout_bounds(&self) -> Option<Rect> {
-        if let Some(stress) = self.stress_layout {
-            return Some(stress.bounds());
-        }
         self.document
             .visible_flattened_shapes()
             .into_iter()

@@ -125,14 +125,6 @@ pub struct TileFrameOptions {
     pub memory_budget_bytes: Option<usize>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct StressLayout {
-    pub count: usize,
-    pub columns: i64,
-    pub rows: i64,
-    pub pitch: i64,
-}
-
 #[derive(Clone, Copy, Debug)]
 pub struct TileLodConfig {
     pub enabled: bool,
@@ -578,72 +570,6 @@ impl TileCache {
     }
 }
 
-impl StressLayout {
-    pub fn new(count: usize) -> Self {
-        let columns = (count as f64).sqrt().ceil().max(1.0) as i64;
-        let rows = ((count as i64) + columns - 1) / columns;
-        Self {
-            count,
-            columns,
-            rows,
-            pitch: 240,
-        }
-    }
-
-    pub fn bounds(self) -> Rect {
-        let half_width = self.columns * self.pitch / 2;
-        let half_height = self.rows * self.pitch / 2;
-        Rect::new(
-            Point::new(-half_width - 80, -half_height - 80),
-            Point::new(half_width + 80, half_height + 80),
-        )
-    }
-}
-
-pub fn build_stress_frame(
-    layout: StressLayout,
-    viewport: Rect,
-    options: TileFrameOptions,
-) -> TiledFrame {
-    let mut frame = TiledFrame::default();
-    frame.stats.memory_budget_bytes = options.memory_budget_bytes;
-    if layout.count == 0 {
-        return frame;
-    }
-
-    let keys = tile_keys_for_rect(viewport, DEFAULT_TILE_SIZE);
-    frame.stats.visible_tiles = keys.len();
-    let use_overview = options.lod.enabled
-        && (DEFAULT_TILE_SIZE as f32 * options.zoom) <= options.lod.max_tile_screen_px;
-    if use_overview {
-        for key in keys {
-            let tile = key.bounds(DEFAULT_TILE_SIZE);
-            let overview = build_stress_overview_tile(layout, tile);
-            if overview.shape_count == 0 {
-                continue;
-            }
-            frame.stats.lod_tiles += 1;
-            frame.stats.lod_shapes += overview.shape_count;
-            frame.stats.visible_shapes += overview.shape_count;
-            append_render_batch_with_range(&mut frame.render, &overview.batch);
-        }
-    } else {
-        append_stress_rectangles(layout, viewport, &mut frame.render, &mut frame.stats);
-        frame.stats.precise_shapes = frame.stats.visible_shapes;
-    }
-
-    frame.stats.draw_ranges = if frame.render.indices.is_empty() {
-        0
-    } else {
-        1
-    };
-    frame.stats.cache_bytes = frame.render.estimate_bytes();
-    if let Some(budget) = options.memory_budget_bytes {
-        frame.stats.over_budget_bytes = frame.stats.cache_bytes.saturating_sub(budget);
-    }
-    frame
-}
-
 #[derive(Clone, Copy, Debug, Default)]
 struct EvictionStats {
     tiles: usize,
@@ -766,90 +692,6 @@ fn build_overview_tile(
     }
     OverviewTile { batch, shape_count }
 }
-
-fn build_stress_overview_tile(layout: StressLayout, tile_bounds: Rect) -> OverviewTile {
-    let mut layers: BTreeMap<usize, (Rect, usize)> = BTreeMap::new();
-    for (index, rect) in stress_rects_in_viewport(layout, tile_bounds) {
-        let Some(bounds) = rect.intersection(tile_bounds) else {
-            continue;
-        };
-        let layer = index % STRESS_LAYER_COLORS.len();
-        layers
-            .entry(layer)
-            .and_modify(|(union, count)| {
-                *union = union.union(bounds);
-                *count += 1;
-            })
-            .or_insert((bounds, 1));
-    }
-
-    let mut batch = RenderBatch::default();
-    let mut shape_count = 0;
-    for (layer, (bounds, layer_shape_count)) in layers {
-        let mut color = STRESS_LAYER_COLORS[layer];
-        color[3] = (0.16 + (layer_shape_count as f32).ln_1p() * 0.08).min(0.68);
-        push_rect(&mut batch, bounds, color);
-        shape_count += layer_shape_count;
-    }
-    OverviewTile { batch, shape_count }
-}
-
-fn append_stress_rectangles(
-    layout: StressLayout,
-    viewport: Rect,
-    batch: &mut RenderBatch,
-    stats: &mut TileFrameStats,
-) {
-    for (index, rect) in stress_rects_in_viewport(layout, viewport) {
-        push_rect(
-            batch,
-            rect,
-            STRESS_LAYER_COLORS[index % STRESS_LAYER_COLORS.len()],
-        );
-        stats.visible_shapes += 1;
-    }
-}
-
-fn stress_rects_in_viewport(
-    layout: StressLayout,
-    viewport: Rect,
-) -> impl Iterator<Item = (usize, Rect)> {
-    let margin = 96;
-    let min_col = stress_axis_index(viewport.min.x - margin, layout.columns, layout.pitch);
-    let max_col = stress_axis_index(viewport.max.x + margin, layout.columns, layout.pitch);
-    let min_row = stress_axis_index(viewport.min.y - margin, layout.rows, layout.pitch);
-    let max_row = stress_axis_index(viewport.max.y + margin, layout.rows, layout.pitch);
-    let columns = layout.columns;
-    let pitch = layout.pitch;
-    let x_offset = columns * pitch / 2;
-    let y_offset = layout.rows * pitch / 2;
-    (min_row..=max_row).flat_map(move |row| {
-        (min_col..=max_col).filter_map(move |col| {
-            let index = (row * columns + col) as usize;
-            if index >= layout.count {
-                return None;
-            }
-            let x = col * pitch - x_offset;
-            let y = row * pitch - y_offset;
-            let width = 50 + ((index % 7) as i64) * 10;
-            let height = 40 + ((index % 5) as i64) * 12;
-            Some((index, Rect::from_min_size(Point::new(x, y), width, height)))
-        })
-    })
-}
-
-fn stress_axis_index(world: i64, limit: i64, pitch: i64) -> i64 {
-    let offset = limit * pitch / 2;
-    ((world + offset).div_euclid(pitch)).clamp(0, limit.saturating_sub(1))
-}
-
-const STRESS_LAYER_COLORS: [[f32; 4]; 5] = [
-    [0.38, 0.74, 0.50, 0.78],
-    [0.83, 0.58, 0.24, 0.78],
-    [0.36, 0.64, 0.94, 0.78],
-    [0.63, 0.48, 0.88, 0.78],
-    [0.62, 0.70, 0.76, 0.58],
-];
 
 fn occurrence_shape_map(document: &Document) -> Option<BTreeMap<ShapeOccurrenceId, Shape>> {
     document.has_hierarchy_instances().then(|| {
@@ -1258,44 +1100,6 @@ mod tests {
                 .iter()
                 .any(|range| matches!(range.kind, DrawBatchRangeKind::TileOverview { .. }))
         );
-    }
-
-    #[test]
-    fn procedural_stress_frame_limits_one_million_to_viewport() {
-        let layout = StressLayout::new(1_000_000);
-        let viewport = Rect::from_min_size(Point::new(-9_600, -6_133), 19_200, 12_266);
-        let frame = build_stress_frame(
-            layout,
-            viewport,
-            TileFrameOptions {
-                zoom: 0.075,
-                ..Default::default()
-            },
-        );
-
-        assert!(frame.stats.visible_shapes < 8_000);
-        assert_eq!(frame.stats.precise_shapes, frame.stats.visible_shapes);
-        assert_eq!(frame.render.vertices.len(), frame.stats.visible_shapes * 4);
-        assert_eq!(frame.render.indices.len(), frame.stats.visible_shapes * 6);
-    }
-
-    #[test]
-    fn procedural_stress_frame_uses_lod_when_zoomed_out() {
-        let layout = StressLayout::new(1_000_000);
-        let viewport = layout.bounds();
-        let frame = build_stress_frame(
-            layout,
-            viewport,
-            TileFrameOptions {
-                zoom: 0.008,
-                ..Default::default()
-            },
-        );
-
-        assert!(frame.stats.visible_shapes >= 1_000_000);
-        assert!(frame.stats.lod_tiles > 0);
-        assert_eq!(frame.stats.precise_shapes, 0);
-        assert!(frame.render.vertices.len() < 6_000);
     }
 
     #[test]
