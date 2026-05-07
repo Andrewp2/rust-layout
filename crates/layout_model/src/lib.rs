@@ -2378,6 +2378,30 @@ impl InstanceStore {
             .map(|(_, id)| id)
     }
 
+    fn live_rows(&self) -> impl Iterator<Item = usize> + '_ {
+        self.alive
+            .iter()
+            .enumerate()
+            .filter(|(_, alive)| **alive)
+            .map(|(row, _)| row)
+    }
+
+    fn row_id(&self, row: usize) -> InstanceId {
+        self.ids[row]
+    }
+
+    fn row_cell(&self, row: usize) -> CellId {
+        self.cells[row]
+    }
+
+    fn row_transform(&self, row: usize) -> Transform {
+        self.transforms[row]
+    }
+
+    fn row_array(&self, row: usize) -> InstanceArray {
+        self.arrays[row]
+    }
+
     fn row_for_id(&self, id: InstanceId) -> Option<usize> {
         dense_instance_index(id)
             .and_then(|index| self.id_to_row.get(index).copied().flatten())
@@ -3346,10 +3370,9 @@ impl Document {
     }
 
     pub fn visible_shapes(&self) -> impl Iterator<Item = Shape> + '_ {
-        self.shapes.values().filter(|shape| {
-            self.layers
-                .get(&shape.layer)
-                .is_some_and(|layer| layer.visible)
+        self.shapes.live_rows().filter_map(|row| {
+            self.layer_is_visible(self.shapes.row_layer(row))
+                .then(|| self.shapes.materialize_row(row))
         })
     }
 
@@ -3377,9 +3400,10 @@ impl Document {
         let mut stack = Vec::new();
         let mut array_stack = Vec::new();
         if let Some(top) = self.cells.get(&self.top_cell) {
-            for shape in top.shapes.values() {
-                if self.shape_layer_is_visible(&shape) {
-                    let bounds = shape.kind.bounds();
+            for row in top.shapes.live_rows() {
+                if self.layer_is_visible(top.shapes.row_layer(row)) {
+                    let shape = top.shapes.materialize_row(row);
+                    let bounds = top.shapes.row_bounds(row);
                     flattened.push(FlattenedShape {
                         id: ShapeOccurrenceId::top_level(shape.id),
                         shape,
@@ -3403,29 +3427,32 @@ impl Document {
         array_path: &mut Vec<ArrayIndex>,
         flattened: &mut Vec<FlattenedShape>,
     ) {
-        for instance in parent.instances.values() {
-            if instance_path.contains(&instance.id) {
+        for instance_row in parent.instances.live_rows() {
+            let instance_id = parent.instances.row_id(instance_row);
+            if instance_path.contains(&instance_id) {
                 continue;
             }
-            let Some(cell) = self.cells.get(&instance.cell) else {
+            let Some(cell) = self.cells.get(&parent.instances.row_cell(instance_row)) else {
                 continue;
             };
-            let array = instance.array.normalized();
+            let instance_transform = parent.instances.row_transform(instance_row);
+            let array = parent.instances.row_array(instance_row).normalized();
             let include_array_index = !array.is_single();
             for row in 0..array.rows {
                 for column in 0..array.columns {
                     let offset = array.element_offset(column, row);
                     let transform = parent_transform
-                        .compose(Transform::from_translation(offset).compose(instance.transform));
-                    instance_path.push(instance.id);
+                        .compose(Transform::from_translation(offset).compose(instance_transform));
+                    instance_path.push(instance_id);
                     if include_array_index {
                         array_path.push(ArrayIndex { column, row });
                     }
-                    for shape in cell.shapes.values() {
-                        if !self.shape_layer_is_visible(&shape) {
+                    for shape_row in cell.shapes.live_rows() {
+                        if !self.layer_is_visible(cell.shapes.row_layer(shape_row)) {
                             continue;
                         }
-                        let bounds = transform.apply_rect(shape.kind.bounds());
+                        let shape = cell.shapes.materialize_row(shape_row);
+                        let bounds = transform.apply_rect(cell.shapes.row_bounds(shape_row));
                         flattened.push(FlattenedShape {
                             id: ShapeOccurrenceId::from_instance_array_path(
                                 shape.id,
@@ -3449,10 +3476,8 @@ impl Document {
         }
     }
 
-    fn shape_layer_is_visible(&self, shape: &Shape) -> bool {
-        self.layers
-            .get(&shape.layer)
-            .is_some_and(|layer| layer.visible)
+    fn layer_is_visible(&self, layer: LayerId) -> bool {
+        self.layers.get(&layer).is_some_and(|layer| layer.visible)
     }
 }
 
@@ -3578,15 +3603,7 @@ impl LayoutIndex {
 
     pub fn rebuild_hierarchical(document: &Document) -> Self {
         let mut entries = Vec::with_capacity(document.flattened_shape_count_estimate());
-        entries.extend(
-            document
-                .visible_flattened_shapes()
-                .into_iter()
-                .map(|shape| IndexedShape {
-                    id: shape.id,
-                    bounds: shape.bounds,
-                }),
-        );
+        document.append_visible_index_entries(&mut entries);
         Self::bulk_load(entries)
     }
 
@@ -3696,6 +3713,97 @@ impl LayoutIndex {
 }
 
 impl Document {
+    fn append_visible_index_entries(&self, entries: &mut Vec<IndexedShape>) {
+        for row in self.shapes.live_rows() {
+            if !self.layer_is_visible(self.shapes.row_layer(row)) {
+                continue;
+            }
+            entries.push(IndexedShape {
+                id: ShapeOccurrenceId::top_level(self.shapes.row_id(row)),
+                bounds: self.shapes.row_bounds(row),
+            });
+        }
+
+        let identity = Transform::IDENTITY;
+        let mut instance_path = Vec::new();
+        let mut array_path = Vec::new();
+        if let Some(top) = self.cells.get(&self.top_cell) {
+            for row in top.shapes.live_rows() {
+                if !self.layer_is_visible(top.shapes.row_layer(row)) {
+                    continue;
+                }
+                entries.push(IndexedShape {
+                    id: ShapeOccurrenceId::top_level(top.shapes.row_id(row)),
+                    bounds: top.shapes.row_bounds(row),
+                });
+            }
+            self.append_instance_index_entries(
+                top,
+                identity,
+                &mut instance_path,
+                &mut array_path,
+                entries,
+            );
+        }
+    }
+
+    fn append_instance_index_entries(
+        &self,
+        parent: &Cell,
+        parent_transform: Transform,
+        instance_path: &mut Vec<InstanceId>,
+        array_path: &mut Vec<ArrayIndex>,
+        entries: &mut Vec<IndexedShape>,
+    ) {
+        for instance_row in parent.instances.live_rows() {
+            let instance_id = parent.instances.row_id(instance_row);
+            if instance_path.contains(&instance_id) {
+                continue;
+            }
+            let Some(cell) = self.cells.get(&parent.instances.row_cell(instance_row)) else {
+                continue;
+            };
+            let instance_transform = parent.instances.row_transform(instance_row);
+            let array = parent.instances.row_array(instance_row).normalized();
+            let include_array_index = !array.is_single();
+            for row in 0..array.rows {
+                for column in 0..array.columns {
+                    let offset = array.element_offset(column, row);
+                    let transform = parent_transform
+                        .compose(Transform::from_translation(offset).compose(instance_transform));
+                    instance_path.push(instance_id);
+                    if include_array_index {
+                        array_path.push(ArrayIndex { column, row });
+                    }
+                    for shape_row in cell.shapes.live_rows() {
+                        if !self.layer_is_visible(cell.shapes.row_layer(shape_row)) {
+                            continue;
+                        }
+                        entries.push(IndexedShape {
+                            id: ShapeOccurrenceId::from_instance_array_path(
+                                cell.shapes.row_id(shape_row),
+                                instance_path,
+                                array_path,
+                            ),
+                            bounds: transform.apply_rect(cell.shapes.row_bounds(shape_row)),
+                        });
+                    }
+                    self.append_instance_index_entries(
+                        cell,
+                        transform,
+                        instance_path,
+                        array_path,
+                        entries,
+                    );
+                    if include_array_index {
+                        array_path.pop();
+                    }
+                    instance_path.pop();
+                }
+            }
+        }
+    }
+
     pub fn flattened_shape_count_estimate(&self) -> usize {
         let mut count = self.shapes.len();
         if let Some(top) = self.cells.get(&self.top_cell) {
@@ -3711,17 +3819,18 @@ impl Document {
         instance_path: &mut Vec<InstanceId>,
     ) -> usize {
         let mut count = 0;
-        for instance in parent.instances.values() {
-            if instance_path.contains(&instance.id) {
+        for instance_row in parent.instances.live_rows() {
+            let instance_id = parent.instances.row_id(instance_row);
+            if instance_path.contains(&instance_id) {
                 continue;
             }
-            let Some(cell) = self.cells.get(&instance.cell) else {
+            let Some(cell) = self.cells.get(&parent.instances.row_cell(instance_row)) else {
                 continue;
             };
-            let array = instance.array.normalized();
+            let array = parent.instances.row_array(instance_row).normalized();
             let array_count = array.columns as usize * array.rows as usize;
             count += cell.shapes.len() * array_count;
-            instance_path.push(instance.id);
+            instance_path.push(instance_id);
             count +=
                 self.flattened_instance_shape_count_estimate(cell, instance_path) * array_count;
             instance_path.pop();
