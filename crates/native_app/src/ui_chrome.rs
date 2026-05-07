@@ -131,16 +131,46 @@ pub(crate) fn metric_tile_tone(
 }
 
 pub(crate) fn status_pill(ui: &mut egui::Ui, label: &str, tone: Tone) {
-    let color = tone.color();
-    let fill = Color32::from_rgba_premultiplied(color.r(), color.g(), color.b(), 32);
+    let fill = tone.color();
+    let text = readable_text_color(fill);
     egui::Frame::new()
         .fill(fill)
-        .stroke(Stroke::new(1.0, color))
+        .stroke(Stroke::new(1.0, fill))
         .corner_radius(8)
         .inner_margin(Margin::symmetric(8, 3))
         .show(ui, |ui| {
-            ui.label(RichText::new(label).small().strong().color(color));
+            ui.label(RichText::new(label).small().strong().color(text));
         });
+}
+
+pub(crate) fn readable_text_color(background: Color32) -> Color32 {
+    let black = Color32::BLACK;
+    let white = Color32::WHITE;
+    if contrast_ratio(black, background) >= contrast_ratio(white, background) {
+        black
+    } else {
+        white
+    }
+}
+
+fn contrast_ratio(foreground: Color32, background: Color32) -> f32 {
+    let foreground_luminance = relative_luminance(foreground);
+    let background_luminance = relative_luminance(background);
+    let lighter = foreground_luminance.max(background_luminance);
+    let darker = foreground_luminance.min(background_luminance);
+    (lighter + 0.05) / (darker + 0.05)
+}
+
+fn relative_luminance(color: Color32) -> f32 {
+    let channel = |value: u8| {
+        let normalized = value as f32 / 255.0;
+        if normalized <= 0.04045 {
+            normalized / 12.92
+        } else {
+            ((normalized + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * channel(color.r()) + 0.7152 * channel(color.g()) + 0.0722 * channel(color.b())
 }
 
 pub(crate) fn empty_state(ui: &mut egui::Ui, text: &str) {
@@ -173,4 +203,28 @@ pub(crate) fn plot_background(ui: &egui::Ui, rect: egui::Rect) {
 
 pub(crate) fn stable_plot_size(ui: &egui::Ui, height: f32) -> Vec2 {
     vec2(ui.available_width().clamp(260.0, 640.0), height)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tone_status_pills_have_readable_text_contrast() {
+        for tone in [
+            Tone::Neutral,
+            Tone::Info,
+            Tone::Success,
+            Tone::Warning,
+            Tone::Danger,
+        ] {
+            let background = tone.color();
+            let text = readable_text_color(background);
+            assert!(
+                contrast_ratio(text, background) >= 4.5,
+                "{tone:?} contrast was {}",
+                contrast_ratio(text, background)
+            );
+        }
+    }
 }
