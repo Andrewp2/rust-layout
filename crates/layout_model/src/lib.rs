@@ -4031,6 +4031,13 @@ impl LayoutIndex {
         self.len() == 0
     }
 
+    pub fn bounds(&self) -> Option<Rect> {
+        self.entries
+            .iter()
+            .map(|entry| entry.bounds)
+            .reduce(|left, right| left.union(right))
+    }
+
     pub fn query_occurrences_into(&self, rect: Rect, out: &mut Vec<ShapeOccurrenceId>) {
         let start_len = out.len();
         let min_x = rect.min.x.div_euclid(LAYOUT_INDEX_TILE_SIZE);
@@ -4078,6 +4085,51 @@ impl LayoutIndex {
         let mut out = Vec::new();
         self.query_occurrences_into(rect, &mut out);
         out
+    }
+
+    pub fn query_occurrences_limited(&self, rect: Rect, limit: usize) -> Vec<ShapeOccurrenceId> {
+        let mut out = Vec::with_capacity(limit.min(1024));
+        self.query_occurrences_limited_into(rect, limit, &mut out);
+        out
+    }
+
+    pub fn query_occurrences_limited_into(
+        &self,
+        rect: Rect,
+        limit: usize,
+        out: &mut Vec<ShapeOccurrenceId>,
+    ) {
+        if limit == 0 {
+            return;
+        }
+
+        let start_len = out.len();
+        let min_x = rect.min.x.div_euclid(LAYOUT_INDEX_TILE_SIZE);
+        let max_x = rect.max.x.div_euclid(LAYOUT_INDEX_TILE_SIZE);
+        let min_y = rect.min.y.div_euclid(LAYOUT_INDEX_TILE_SIZE);
+        let max_y = rect.max.y.div_euclid(LAYOUT_INDEX_TILE_SIZE);
+        let mut seen_entries = BTreeSet::new();
+        'tiles: for y in min_y..=max_y {
+            for x in min_x..=max_x {
+                let key = LayoutIndexTileKey { x, y };
+                let Ok(bucket_index) = self.buckets.binary_search_by_key(&key, |bucket| bucket.key)
+                else {
+                    continue;
+                };
+                let bucket = self.buckets[bucket_index];
+                for reference in &self.refs[bucket.start..bucket.end] {
+                    let entry = &self.entries[reference.entry];
+                    if entry.bounds.intersects(rect) && seen_entries.insert(reference.entry) {
+                        out.push(entry.id.clone());
+                        if out.len() - start_len >= limit {
+                            break 'tiles;
+                        }
+                    }
+                }
+            }
+        }
+
+        out[start_len..].sort_unstable();
     }
 
     pub fn hit_test(&self, point: Point, tolerance: Coord) -> Option<ShapeId> {
@@ -4365,6 +4417,48 @@ mod tests {
         ));
 
         assert_eq!(hits, vec![id]);
+    }
+
+    #[test]
+    fn layout_index_reports_visible_bounds() {
+        let mut doc = Document::new("index bounds");
+        let metal1 = doc.layer_by_process(ProcessLayer::Metal1).unwrap();
+        doc.insert_shape(
+            metal1,
+            ShapeKind::Rectangle(Rect::from_min_size(Point::new(-100, -50), 40, 20)),
+        );
+        doc.insert_shape(
+            metal1,
+            ShapeKind::Rectangle(Rect::from_min_size(Point::new(200, 300), 80, 60)),
+        );
+        let index = LayoutIndex::rebuild(&doc);
+
+        assert_eq!(
+            index.bounds(),
+            Some(Rect::new(Point::new(-100, -50), Point::new(280, 360)))
+        );
+    }
+
+    #[test]
+    fn limited_layout_index_query_deduplicates_and_caps_results() {
+        let mut doc = Document::new("limited index query");
+        let metal1 = doc.layer_by_process(ProcessLayer::Metal1).unwrap();
+        let wide = doc.insert_shape(
+            metal1,
+            ShapeKind::Rectangle(Rect::from_min_size(Point::new(-20_000, -100), 40_000, 200)),
+        );
+        doc.insert_shape(
+            metal1,
+            ShapeKind::Rectangle(Rect::from_min_size(Point::new(24_000, -100), 100, 100)),
+        );
+        let index = LayoutIndex::rebuild(&doc);
+
+        let hits = index.query_occurrences_limited(
+            Rect::from_min_size(Point::new(-30_000, -1_000), 60_000, 2_000),
+            1,
+        );
+
+        assert_eq!(hits, vec![ShapeOccurrenceId::top_level(wide)]);
     }
 
     #[test]

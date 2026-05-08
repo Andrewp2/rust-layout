@@ -85,6 +85,7 @@ const MAX_CONNECTIVITY_OBJECTS: usize = 50_000;
 const MAX_DRC_OBJECTS: usize = 50_000;
 const TILE_MEMORY_BUDGET_BYTES: usize = 96 * 1024 * 1024;
 const MAX_3D_FACES: usize = 24_000;
+const MAX_3D_SHAPE_CANDIDATES: usize = MAX_3D_FACES;
 const CAMERA_NEAR_PLANE: f32 = 10.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -693,6 +694,7 @@ pub struct FabricadApp {
     layout_source: DataSource,
     fabos_source: DataSource,
     index: LayoutIndex,
+    layout_bounds_cache: Option<Rect>,
     yield_analysis: YieldAnalysis,
     selected_yield_lot: String,
     selected_yield_wafer: String,
@@ -720,6 +722,7 @@ pub struct FabricadApp {
     zoom: f32,
     pan: Vec2,
     camera_3d: Camera3d,
+    flycam_captured: bool,
     settings: EditorSettings,
     show_options: bool,
     show_diagnostics: bool,
@@ -960,6 +963,7 @@ impl FabricadApp {
         let active_technology = 0;
         let rules = rule_deck_for_document(&document, &technologies[active_technology]);
         let index = build_layout_index(&document);
+        let layout_bounds_cache = index.bounds();
         let violations = run_drc(&document, &rules);
         let connectivity =
             connectivity_report_for_document(&document, &technologies[active_technology]);
@@ -977,6 +981,7 @@ impl FabricadApp {
             layout_source: DataSource::Blank,
             fabos_source: DataSource::Blank,
             index,
+            layout_bounds_cache,
             yield_analysis,
             selected_yield_lot,
             selected_yield_wafer,
@@ -1004,6 +1009,7 @@ impl FabricadApp {
             zoom: 0.075,
             pan: Vec2::ZERO,
             camera_3d: Camera3d::default(),
+            flycam_captured: false,
             settings: EditorSettings::default(),
             show_options: false,
             show_diagnostics: false,
@@ -1114,6 +1120,7 @@ impl FabricadApp {
 
     fn rebuild_indexes(&mut self) {
         self.index = build_layout_index(&self.document);
+        self.layout_bounds_cache = self.index.bounds();
         self.rebuild_connectivity();
     }
 
@@ -5210,6 +5217,25 @@ impl FabricadApp {
         self.camera_3d = Camera3d::look_at(position, target, span.max(2_000.0) * 0.85);
     }
 
+    fn set_flycam_capture(&mut self, ctx: &egui::Context, captured: bool) {
+        if self.flycam_captured == captured {
+            return;
+        }
+        self.flycam_captured = captured;
+        let grab = if captured {
+            egui::CursorGrab::Locked
+        } else {
+            egui::CursorGrab::None
+        };
+        ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(grab));
+        ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(!captured));
+        self.status = if captured {
+            "3D flycam captured; press Esc to release mouse".to_string()
+        } else {
+            "3D flycam released".to_string()
+        };
+    }
+
     fn nudge_3d_camera_vertical(&mut self, direction: f32) {
         let amount = (self.camera_3d.speed * 0.18).clamp(120.0, 4_000.0);
         self.camera_3d.position += Vec3f::new(0.0, 0.0, direction.signum() * amount);
@@ -5560,9 +5586,18 @@ impl FabricadApp {
             return;
         }
 
+        if response.clicked_by(PointerButton::Primary) {
+            response.request_focus();
+            self.set_flycam_capture(ui.ctx(), true);
+        }
+        if self.flycam_captured {
+            response.request_focus();
+            ui.ctx().request_repaint();
+        }
+
         self.handle_3d_input(ui, &response);
         let face_count = if let Some(target_format) = self.gpu_target_format {
-            let (batch, face_count) = self.build_3d_render_batch();
+            let (batch, face_count) = self.build_3d_render_batch(canvas);
             painter.add(egui_wgpu::Callback::new_paint_callback(
                 canvas,
                 Viewport3dGpuCallback {
@@ -5732,15 +5767,40 @@ impl FabricadApp {
     }
 
     fn handle_3d_input(&mut self, ui: &egui::Ui, response: &egui::Response) {
-        if response.dragged_by(PointerButton::Primary)
-            || response.dragged_by(PointerButton::Secondary)
-        {
-            let delta = ui.input(|input| input.pointer.delta());
-            self.camera_3d.yaw += delta.x * 0.006;
-            self.camera_3d.pitch = (self.camera_3d.pitch - delta.y * 0.006).clamp(-1.45, 1.45);
+        if self.flycam_captured && ui.input(|input| input.key_pressed(Key::Escape)) {
+            self.set_flycam_capture(ui.ctx(), false);
+            return;
+        }
+        if self.flycam_captured && response.clicked_by(PointerButton::Secondary) {
+            self.set_flycam_capture(ui.ctx(), false);
+            return;
         }
 
-        if !response.hovered() && !response.has_focus() && !response.dragged() {
+        if self.flycam_captured
+            || response.dragged_by(PointerButton::Primary)
+            || response.dragged_by(PointerButton::Secondary)
+        {
+            let delta = ui.input(|input| {
+                if self.flycam_captured {
+                    input
+                        .pointer
+                        .motion()
+                        .unwrap_or_else(|| input.pointer.delta())
+                } else {
+                    input.pointer.delta()
+                }
+            });
+            let sensitivity = if self.flycam_captured { 0.003 } else { 0.006 };
+            self.camera_3d.yaw += delta.x * sensitivity;
+            self.camera_3d.pitch =
+                (self.camera_3d.pitch - delta.y * sensitivity).clamp(-1.45, 1.45);
+        }
+
+        if !self.flycam_captured
+            && !response.hovered()
+            && !response.has_focus()
+            && !response.dragged()
+        {
             return;
         }
 
@@ -5786,17 +5846,9 @@ impl FabricadApp {
         });
     }
 
-    fn build_3d_render_batch(&self) -> (renderer::RenderBatch3d, usize) {
+    fn build_3d_render_batch(&self, canvas: EguiRect) -> (renderer::RenderBatch3d, usize) {
         let mut faces = Vec::new();
-        self.document
-            .visit_visible_flattened_shape_views(|_, flattened| {
-                if faces.len() >= MAX_3D_FACES {
-                    return false;
-                }
-                let shape = flattened.transformed_shape();
-                self.add_shape_3d_faces(&mut faces, &shape);
-                faces.len() < MAX_3D_FACES
-            });
+        self.collect_visible_3d_faces(canvas, &mut faces);
 
         let face_count = faces.len();
         let mut batch = renderer::RenderBatch3d::default();
@@ -5809,15 +5861,7 @@ impl FabricadApp {
 
     fn draw_3d_layout_cpu_fallback(&self, painter: &Painter, canvas: EguiRect) -> usize {
         let mut faces = Vec::new();
-        self.document
-            .visit_visible_flattened_shape_views(|_, flattened| {
-                if faces.len() >= MAX_3D_FACES {
-                    return false;
-                }
-                let shape = flattened.transformed_shape();
-                self.add_shape_3d_faces(&mut faces, &shape);
-                faces.len() < MAX_3D_FACES
-            });
+        self.collect_visible_3d_faces(canvas, &mut faces);
 
         let basis = self.camera_3d.basis();
         let mut projected = Vec::with_capacity(faces.len());
@@ -5854,6 +5898,49 @@ impl FabricadApp {
             ));
         }
         rendered
+    }
+
+    fn collect_visible_3d_faces(&self, canvas: EguiRect, faces: &mut Vec<Face3d>) {
+        let query = self.visible_3d_query_rect(canvas);
+        for occurrence in self
+            .index
+            .query_occurrences_limited(query, MAX_3D_SHAPE_CANDIDATES)
+        {
+            if faces.len() >= MAX_3D_FACES {
+                break;
+            }
+            let Some(flattened) = self.document.shape_view_for_occurrence(&occurrence) else {
+                continue;
+            };
+            if !flattened.bounds.intersects(query) {
+                continue;
+            }
+            let shape = flattened.transformed_shape();
+            self.add_shape_3d_faces(faces, &shape);
+        }
+    }
+
+    fn visible_3d_query_rect(&self, canvas: EguiRect) -> Rect {
+        let fallback = || self.camera_3d_fallback_query_rect();
+        let query = camera_ground_view_rect(self.camera_3d, canvas).unwrap_or_else(fallback);
+        if let Some(bounds) = self.layout_bounds() {
+            if let Some(intersection) = query.intersection(bounds.expanded(self.snap_grid() * 8)) {
+                return intersection.expanded(self.snap_grid() * 4);
+            }
+        }
+        query
+    }
+
+    fn camera_3d_fallback_query_rect(&self) -> Rect {
+        let forward = self.camera_3d.forward();
+        let center =
+            self.camera_3d.position + forward * self.camera_3d.speed.clamp(2_000.0, 250_000.0);
+        let radius = coord_from_f32(self.camera_3d.speed.clamp(16_384.0, 500_000.0));
+        let center = finite_point_from_xy(center.x, center.y).unwrap_or_else(|| Point::new(0, 0));
+        Rect::new(
+            Point::new(center.x - radius, center.y - radius),
+            Point::new(center.x + radius, center.y + radius),
+        )
     }
 
     fn viewport_3d_uniforms(&self, canvas: EguiRect) -> Viewport3dUniforms {
@@ -6151,13 +6238,7 @@ impl FabricadApp {
     }
 
     fn layout_bounds(&self) -> Option<Rect> {
-        let mut bounds = None;
-        self.document
-            .for_each_visible_flattened_shape_view(|_, shape| {
-                bounds =
-                    Some(bounds.map_or(shape.bounds, |current: Rect| current.union(shape.bounds)));
-            });
-        bounds
+        self.layout_bounds_cache
     }
 
     fn draw_background(&self, painter: &Painter, canvas: EguiRect, viewport: Rect) {
@@ -7021,6 +7102,9 @@ impl eframe::App for FabricadApp {
         self.maybe_autosave();
         self.advance_equipment_simulator();
         self.handle_shortcuts(ctx);
+        if !matches!(self.view_mode, ViewMode::Layout3d) {
+            self.set_flycam_capture(ctx, false);
+        }
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| self.toolbar(ui));
         self.navigation_panel(ctx);
         if self.view_mode.has_inspector_panel() {
@@ -7249,6 +7333,55 @@ fn build_layout_index(document: &Document) -> LayoutIndex {
     } else {
         LayoutIndex::rebuild(document)
     }
+}
+
+fn camera_ground_view_rect(camera: Camera3d, canvas: EguiRect) -> Option<Rect> {
+    if canvas.width() <= 1.0 || canvas.height() <= 1.0 {
+        return None;
+    }
+    let basis = camera.basis();
+    let aspect = (canvas.width() / canvas.height()).max(0.001);
+    let tan_y = (camera.fov_y * 0.5).tan();
+    let tan_x = tan_y * aspect;
+    let samples = [
+        (-1.0, -1.0),
+        (1.0, -1.0),
+        (1.0, 1.0),
+        (-1.0, 1.0),
+        (0.0, 0.0),
+    ];
+    let mut bounds = None;
+    for (x, y) in samples {
+        let ray = (basis.forward + basis.right * (x * tan_x) + basis.up * (y * tan_y)).normalized();
+        if ray.z.abs() <= 0.0001 {
+            continue;
+        }
+        let t = -camera.position.z / ray.z;
+        if t <= 0.0 {
+            continue;
+        }
+        let ground = camera.position + ray * t;
+        let Some(point) = finite_point_from_xy(ground.x, ground.y) else {
+            continue;
+        };
+        bounds = Some(bounds.map_or(Rect::new(point, point), |rect: Rect| {
+            rect.union(Rect::new(point, point))
+        }));
+    }
+    let padding = coord_from_f32(camera.speed.clamp(4_000.0, 250_000.0) * 0.25);
+    bounds.map(|rect| rect.expanded(padding.max(1_000)))
+}
+
+fn finite_point_from_xy(x: f32, y: f32) -> Option<Point> {
+    if !x.is_finite() || !y.is_finite() {
+        return None;
+    }
+    Some(Point::new(coord_from_f32(x), coord_from_f32(y)))
+}
+
+fn coord_from_f32(value: f32) -> Coord {
+    let limit = (Coord::MAX / 4) as f32;
+    value.clamp(-limit, limit).round() as Coord
 }
 
 fn rule_deck_for_document(document: &Document, technology: &TechnologyFile) -> RuleDeck {
@@ -8899,6 +9032,19 @@ mod tests {
         assert!(forward.y.abs() < 0.001);
         assert!(forward.z.abs() < 0.001);
         assert!(camera.up().z > 0.999);
+    }
+
+    #[test]
+    fn fly_camera_ground_view_rect_tracks_look_target() {
+        let camera = Camera3d::look_at(
+            Vec3f::new(-1_000.0, -1_000.0, 1_000.0),
+            Vec3f::ZERO,
+            2_000.0,
+        );
+        let canvas = EguiRect::from_min_size(Pos2::ZERO, vec2(1_280.0, 720.0));
+        let rect = camera_ground_view_rect(camera, canvas).expect("camera should hit ground");
+
+        assert!(rect.contains_point(Point::ZERO));
     }
 
     #[test]
