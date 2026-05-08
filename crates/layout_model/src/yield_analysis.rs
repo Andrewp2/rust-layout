@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::ProcessLayer;
 
@@ -79,9 +80,24 @@ impl DieAddress {
 
     pub fn radial_fraction(self, wafer_radius: f64) -> f64 {
         if wafer_radius <= f64::EPSILON {
+            warn!(
+                wafer_radius,
+                "wafer radius is zero or negative; using radial fraction 0"
+            );
             0.0
         } else {
-            (self.radius() / wafer_radius).clamp(0.0, 1.0)
+            let raw_fraction = self.radius() / wafer_radius;
+            let fraction = raw_fraction.clamp(0.0, 1.0);
+            if fraction != raw_fraction {
+                warn!(
+                    column = self.column,
+                    row = self.row,
+                    raw_fraction,
+                    fraction,
+                    "die radial fraction outside [0, 1]; clamping"
+                );
+            }
+            fraction
         }
     }
 }
@@ -285,7 +301,13 @@ impl YieldAnalysis {
             .iter()
             .find(|lot| lot.id == lot_id)
             .map(|lot| lot.wafers.iter().map(|wafer| wafer.id.clone()).collect())
-            .unwrap_or_default()
+            .unwrap_or_else(|| {
+                warn!(
+                    lot_id,
+                    "lot missing from yield dataset; using empty wafer list"
+                );
+                Vec::new()
+            })
     }
 
     pub fn die_outcomes_for_wafer(&self, lot_id: &str, wafer_id: &str) -> Vec<DieOutcome> {
@@ -619,11 +641,15 @@ pub fn classify_spatial_pattern(outcomes: &[DieOutcome]) -> SpatialPattern {
         return SpatialPattern::Sparse;
     }
 
-    let wafer_radius = outcomes
+    let raw_wafer_radius = outcomes
         .iter()
         .map(|outcome| outcome.die.radius())
         .fold(0.0, f64::max)
-        .max(1.0);
+        .max(0.0);
+    let wafer_radius = raw_wafer_radius.max(1.0);
+    if wafer_radius != raw_wafer_radius {
+        warn!("yield spatial classifier had no positive wafer radius; using radius 1");
+    }
     let total_edge = outcomes
         .iter()
         .filter(|outcome| outcome.die.radial_fraction(wafer_radius) >= 0.72)
@@ -634,6 +660,22 @@ pub fn classify_spatial_pattern(outcomes: &[DieOutcome]) -> SpatialPattern {
         .filter(|outcome| outcome.die.radial_fraction(wafer_radius) <= 0.35)
         .count()
         .max(1);
+    if outcomes
+        .iter()
+        .filter(|outcome| outcome.die.radial_fraction(wafer_radius) >= 0.72)
+        .count()
+        == 0
+    {
+        warn!("yield spatial classifier found no edge dies; using denominator 1");
+    }
+    if outcomes
+        .iter()
+        .filter(|outcome| outcome.die.radial_fraction(wafer_radius) <= 0.35)
+        .count()
+        == 0
+    {
+        warn!("yield spatial classifier found no center dies; using denominator 1");
+    }
     let edge_failures = failures
         .iter()
         .filter(|outcome| outcome.die.radial_fraction(wafer_radius) >= 0.72)
@@ -712,6 +754,18 @@ pub fn compare_lots(
         .collect::<BTreeSet<_>>();
     let baseline_total = baseline.total_dies.max(1) as f64;
     let candidate_total = candidate.total_dies.max(1) as f64;
+    if baseline.total_dies == 0 {
+        warn!(
+            baseline_lot_id = %baseline.lot_id,
+            "baseline yield summary has zero dies; using denominator 1"
+        );
+    }
+    if candidate.total_dies == 0 {
+        warn!(
+            candidate_lot_id = %candidate.lot_id,
+            "candidate yield summary has zero dies; using denominator 1"
+        );
+    }
     let mut failure_mode_deltas = modes
         .iter()
         .map(|mode| {
@@ -770,6 +824,12 @@ pub fn correlate_yield_to_measurements(
         BTreeMap::new();
     for ((lot_id, wafer_id), wafer_outcomes) in group_outcomes_by_wafer(&outcomes) {
         let total = wafer_outcomes.len().max(1) as f64;
+        if wafer_outcomes.is_empty() {
+            warn!(
+                lot_id,
+                wafer_id, "wafer has no die outcomes for yield correlation; using denominator 1"
+            );
+        }
         let failing = wafer_outcomes
             .iter()
             .filter(|outcome| !outcome.passed)

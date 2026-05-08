@@ -10,6 +10,7 @@ use loro::{
     ValueOrContainer,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de, ser::SerializeMap};
+use tracing::warn;
 use uuid::Uuid;
 
 pub mod connectivity;
@@ -500,13 +501,27 @@ impl LoroCrdtLog {
         let Some(map) = self.existing_object_map(Self::SHAPES, &shape_key(id))? else {
             return Ok(None);
         };
-        if map_bool(&map, "deleted").unwrap_or(false) {
+        if map_bool(&map, "deleted").unwrap_or_else(|| {
+            warn!(
+                shape_id = id.0,
+                "Loro shape record missing deleted flag; treating as active"
+            );
+            false
+        }) {
             return Ok(None);
         }
         let Some(layer) = map_i64(&map, "layer") else {
+            warn!(
+                shape_id = id.0,
+                "Loro shape record missing layer; shape record skipped"
+            );
             return Ok(None);
         };
         let Some(kind_json) = map_string(&map, "kind_json") else {
+            warn!(
+                shape_id = id.0,
+                "Loro shape record missing kind_json; shape record skipped"
+            );
             return Ok(None);
         };
         Ok(Some(Shape {
@@ -541,10 +556,18 @@ impl LoroCrdtLog {
     }
 
     pub fn cell_is_deleted(&self, id: CellId) -> Result<bool, LoroCrdtError> {
-        Ok(self
-            .existing_object_map(Self::CELLS, &cell_key(id))?
-            .and_then(|map| map_bool(&map, "deleted"))
-            .unwrap_or(false))
+        Ok(
+            match self.existing_object_map(Self::CELLS, &cell_key(id))? {
+                Some(map) => map_bool(&map, "deleted").unwrap_or_else(|| {
+                    warn!(
+                        cell_id = id.0,
+                        "Loro cell record missing deleted flag; treating as active"
+                    );
+                    false
+                }),
+                None => false,
+            },
+        )
     }
 
     fn upsert_instance(
@@ -586,20 +609,46 @@ impl LoroCrdtLog {
         else {
             return Ok(None);
         };
-        if map_bool(&map, "deleted").unwrap_or(false) {
+        if map_bool(&map, "deleted").unwrap_or_else(|| {
+            warn!(
+                parent_cell = parent.0,
+                instance_id = id.0,
+                "Loro instance record missing deleted flag; treating as active"
+            );
+            false
+        }) {
             return Ok(None);
         }
         let Some(cell) = map_i64(&map, "cell") else {
+            warn!(
+                parent_cell = parent.0,
+                instance_id = id.0,
+                "Loro instance record missing target cell; instance skipped"
+            );
             return Ok(None);
         };
-        let transform = map_string(&map, "transform_json")
-            .map(|json| serde_json::from_str(&json).map_err(LoroCrdtError::Decode))
-            .transpose()?
-            .unwrap_or_default();
-        let array = map_string(&map, "array_json")
-            .map(|json| serde_json::from_str(&json).map_err(LoroCrdtError::Decode))
-            .transpose()?
-            .unwrap_or_default();
+        let transform = match map_string(&map, "transform_json") {
+            Some(json) => serde_json::from_str(&json).map_err(LoroCrdtError::Decode)?,
+            None => {
+                warn!(
+                    parent_cell = parent.0,
+                    instance_id = id.0,
+                    "Loro instance record missing transform_json; using identity transform"
+                );
+                Transform::default()
+            }
+        };
+        let array = match map_string(&map, "array_json") {
+            Some(json) => serde_json::from_str(&json).map_err(LoroCrdtError::Decode)?,
+            None => {
+                warn!(
+                    parent_cell = parent.0,
+                    instance_id = id.0,
+                    "Loro instance record missing array_json; using single instance array"
+                );
+                InstanceArray::default()
+            }
+        };
         Ok(Some(CellInstance {
             id,
             name: map_optional_string(&map, "name"),
@@ -610,10 +659,18 @@ impl LoroCrdtLog {
     }
 
     pub fn shape_is_deleted(&self, id: ShapeId) -> Result<bool, LoroCrdtError> {
-        Ok(self
-            .existing_object_map(Self::SHAPES, &shape_key(id))?
-            .and_then(|map| map_bool(&map, "deleted"))
-            .unwrap_or(false))
+        Ok(
+            match self.existing_object_map(Self::SHAPES, &shape_key(id))? {
+                Some(map) => map_bool(&map, "deleted").unwrap_or_else(|| {
+                    warn!(
+                        shape_id = id.0,
+                        "Loro shape record missing deleted flag; treating as active"
+                    );
+                    false
+                }),
+                None => false,
+            },
+        )
     }
 
     pub fn instance_is_deleted(
@@ -621,10 +678,19 @@ impl LoroCrdtLog {
         parent: CellId,
         id: InstanceId,
     ) -> Result<bool, LoroCrdtError> {
-        Ok(self
-            .existing_object_map(Self::INSTANCES, &instance_key(parent, id))?
-            .and_then(|map| map_bool(&map, "deleted"))
-            .unwrap_or(false))
+        Ok(
+            match self.existing_object_map(Self::INSTANCES, &instance_key(parent, id))? {
+                Some(map) => map_bool(&map, "deleted").unwrap_or_else(|| {
+                    warn!(
+                        parent_cell = parent.0,
+                        instance_id = id.0,
+                        "Loro instance record missing deleted flag; treating as active"
+                    );
+                    false
+                }),
+                None => false,
+            },
+        )
     }
 
     pub fn shape_from_store(&self, id: ShapeId) -> Result<Option<Shape>, LoroCrdtError> {
@@ -663,6 +729,12 @@ impl LoroCrdtLog {
                 Some(parent) => {
                     if let Some(cell) = document.cells.get_mut(&parent) {
                         cell.shapes.insert(shape.id, shape);
+                    } else {
+                        warn!(
+                            shape_id = shape.id.0,
+                            parent_cell = parent.0,
+                            "Loro shape parent cell missing; shape skipped"
+                        );
                     }
                 }
                 None => {
@@ -678,6 +750,10 @@ impl LoroCrdtLog {
             if document.cells.contains_key(&instance.cell) {
                 document.next_instance_id = document.next_instance_id.max(instance.id.0 + 1);
                 if !document.cells.contains_key(&parent) {
+                    warn!(
+                        parent_cell = parent.0,
+                        "Loro instance parent cell missing; creating fallback cell"
+                    );
                     document
                         .cells
                         .insert(parent, Cell::new(parent, format!("cell {}", parent.0)));
@@ -695,10 +771,22 @@ impl LoroCrdtLog {
         let Some(map) = self.existing_object_map(Self::CELLS, &cell_key(id))? else {
             return Ok(None);
         };
-        if map_bool(&map, "deleted").unwrap_or(false) {
+        if map_bool(&map, "deleted").unwrap_or_else(|| {
+            warn!(
+                cell_id = id.0,
+                "Loro cell record missing deleted flag; treating as active"
+            );
+            false
+        }) {
             return Ok(None);
         }
-        let name = map_string(&map, "name").unwrap_or_else(|| format!("cell {}", id.0));
+        let name = map_string(&map, "name").unwrap_or_else(|| {
+            warn!(
+                cell_id = id.0,
+                "Loro cell record missing name; using generated fallback cell name"
+            );
+            format!("cell {}", id.0)
+        });
         Ok(Some(Cell::new(id, name)))
     }
 
@@ -706,7 +794,17 @@ impl LoroCrdtLog {
         self.doc
             .get_map(Self::SHAPES)
             .keys()
-            .filter_map(|key| key.parse::<u64>().ok().map(ShapeId))
+            .filter_map(|key| match key.parse::<u64>() {
+                Ok(id) => Some(ShapeId(id)),
+                Err(err) => {
+                    warn!(
+                        key = key.as_ref(),
+                        error = %err,
+                        "Loro shape object key is not a valid ShapeId; object skipped"
+                    );
+                    None
+                }
+            })
             .collect()
     }
 
@@ -714,7 +812,17 @@ impl LoroCrdtLog {
         self.doc
             .get_map(Self::CELLS)
             .keys()
-            .filter_map(|key| key.parse::<u64>().ok().map(CellId))
+            .filter_map(|key| match key.parse::<u64>() {
+                Ok(id) => Some(CellId(id)),
+                Err(err) => {
+                    warn!(
+                        key = key.as_ref(),
+                        error = %err,
+                        "Loro cell object key is not a valid CellId; object skipped"
+                    );
+                    None
+                }
+            })
             .collect()
     }
 
@@ -723,8 +831,36 @@ impl LoroCrdtLog {
             .get_map(Self::INSTANCES)
             .keys()
             .filter_map(|key| {
-                let (parent, id) = key.split_once(':')?;
-                Some((CellId(parent.parse().ok()?), InstanceId(id.parse().ok()?)))
+                let Some((parent, id)) = key.split_once(':') else {
+                    warn!(
+                        key = key.as_ref(),
+                        "Loro instance object key is missing ':'; object skipped"
+                    );
+                    return None;
+                };
+                let parent = match parent.parse::<u64>() {
+                    Ok(parent) => CellId(parent),
+                    Err(err) => {
+                        warn!(
+                            key = key.as_ref(),
+                            error = %err,
+                            "Loro instance parent key is not a valid CellId; object skipped"
+                        );
+                        return None;
+                    }
+                };
+                let id = match id.parse::<u64>() {
+                    Ok(id) => InstanceId(id),
+                    Err(err) => {
+                        warn!(
+                            key = key.as_ref(),
+                            error = %err,
+                            "Loro instance key is not a valid InstanceId; object skipped"
+                        );
+                        return None;
+                    }
+                };
+                Some((parent, id))
             })
             .collect()
     }
@@ -959,6 +1095,11 @@ impl LayerStore {
             }
             self.id_to_row[index] = Some(row);
         } else {
+            warn!(
+                layer_id = id.0,
+                max_dense_layer_id_index = MAX_DENSE_LAYER_ID_INDEX,
+                "layer id exceeded dense store range; using overflow index"
+            );
             self.overflow_id_to_row.insert(id, row);
         }
     }
@@ -1433,9 +1574,15 @@ impl ShapeKindView<'_> {
     pub fn bounds(self) -> Rect {
         match self {
             Self::Rectangle(rect) => rect,
-            Self::Polygon(poly) => poly.bounds().unwrap_or_default(),
+            Self::Polygon(poly) => poly.bounds().unwrap_or_else(|| {
+                warn!("polygon view has no points; using default bounds");
+                Rect::default()
+            }),
             Self::Path { points, width } => Rect::from_points(points)
-                .unwrap_or_default()
+                .unwrap_or_else(|| {
+                    warn!("path view has no points; using default bounds");
+                    Rect::default()
+                })
                 .expanded(width / 2),
             Self::Via { center, size, .. } => {
                 let half = size / 2;
@@ -1759,6 +1906,11 @@ impl ShapeStore {
             }
             self.id_to_row[index] = Some(row);
         } else {
+            warn!(
+                shape_id = id.0,
+                max_dense_shape_id_index = MAX_DENSE_SHAPE_ID_INDEX,
+                "shape id exceeded dense store range; using overflow index"
+            );
             self.overflow_id_to_row.insert(id, row);
         }
     }
@@ -1931,9 +2083,23 @@ impl ShapeStore {
     fn geometry_bounds(&self, geometry: ShapeGeometryRef) -> Rect {
         match geometry {
             ShapeGeometryRef::Rectangle(index) => self.rectangles[index],
-            ShapeGeometryRef::Polygon(index) => self.polygons[index].bounds().unwrap_or_default(),
+            ShapeGeometryRef::Polygon(index) => {
+                self.polygons[index].bounds().unwrap_or_else(|| {
+                    warn!(
+                        polygon_index = index,
+                        "stored polygon has no points; using default bounds"
+                    );
+                    Rect::default()
+                })
+            }
             ShapeGeometryRef::Path(index) => Rect::from_points(&self.paths[index].points)
-                .unwrap_or_default()
+                .unwrap_or_else(|| {
+                    warn!(
+                        path_index = index,
+                        "stored path has no points; using default bounds"
+                    );
+                    Rect::default()
+                })
                 .expanded(self.paths[index].width / 2),
             ShapeGeometryRef::Via(index) => {
                 let via = &self.vias[index];
@@ -2122,8 +2288,10 @@ impl Transform {
 
     pub fn apply_rect(self, rect: Rect) -> Rect {
         let corners = rect.corners().map(|point| self.apply_point(point));
-        Rect::from_points(&corners)
-            .unwrap_or_else(|| Rect::new(self.apply_point(rect.min), self.apply_point(rect.max)))
+        Rect::from_points(&corners).unwrap_or_else(|| {
+            warn!("transformed rectangle corners were empty; using transformed min/max bounds");
+            Rect::new(self.apply_point(rect.min), self.apply_point(rect.max))
+        })
     }
 
     pub fn apply_shape_kind(self, kind: &ShapeKind) -> ShapeKind {
@@ -2190,9 +2358,15 @@ impl ShapeKind {
     pub fn bounds(&self) -> Rect {
         match self {
             Self::Rectangle(rect) => *rect,
-            Self::Polygon(poly) => poly.bounds().unwrap_or_default(),
+            Self::Polygon(poly) => poly.bounds().unwrap_or_else(|| {
+                warn!("polygon has no points; using default bounds");
+                Rect::default()
+            }),
             Self::Path { points, width } => Rect::from_points(points)
-                .unwrap_or_default()
+                .unwrap_or_else(|| {
+                    warn!("path has no points; using default bounds");
+                    Rect::default()
+                })
                 .expanded(*width / 2),
             Self::Via { center, size, .. } => {
                 let half = *size / 2;
@@ -2383,6 +2557,11 @@ impl CellStore {
             }
             self.id_to_row[index] = Some(row);
         } else {
+            warn!(
+                cell_id = id.0,
+                max_dense_cell_id_index = MAX_DENSE_CELL_ID_INDEX,
+                "cell id exceeded dense store range; using overflow index"
+            );
             self.overflow_id_to_row.insert(id, row);
         }
     }
@@ -2634,6 +2813,10 @@ impl InstanceStore {
             }
             self.id_to_row[index] = Some(row);
         } else {
+            warn!(
+                instance_id = id.0,
+                "instance id exceeded usize range; using overflow index"
+            );
             self.overflow_id_to_row.insert(id, row);
         }
     }
@@ -2793,6 +2976,13 @@ impl InstanceArray {
     }
 
     pub fn normalized(self) -> Self {
+        if self.columns == 0 || self.rows == 0 {
+            warn!(
+                columns = self.columns,
+                rows = self.rows,
+                "instance array dimensions were below supported range; using minimum dimension 1"
+            );
+        }
         Self {
             columns: self.columns.max(1),
             rows: self.rows.max(1),
@@ -3090,7 +3280,15 @@ impl Document {
                         technology_layer.name, technology_layer.process
                     ))
                 })?;
-            let id = technology_layer.id.unwrap_or(LayerId(self.next_layer_id));
+            let id = technology_layer.id.unwrap_or_else(|| {
+                let fallback = LayerId(self.next_layer_id);
+                warn!(
+                    layer_name = %technology_layer.name,
+                    fallback_layer_id = fallback.0,
+                    "technology layer missing id; assigning next layer id"
+                );
+                fallback
+            });
             self.next_layer_id = self.next_layer_id.max(id.0 + 1);
             self.layers.insert(
                 id,
@@ -3520,17 +3718,35 @@ impl Document {
                 self.shapes.insert(shape.id, shape.clone());
             }
             Operation::DeleteShape { id } => {
-                self.shapes.remove(id);
+                if self.shapes.remove(id).is_none() {
+                    warn!(
+                        shape_id = id.0,
+                        "delete shape operation skipped missing shape"
+                    );
+                }
             }
             Operation::ReplaceShape { id, shape } => {
                 if self.shapes.contains_key(id) {
                     self.next_shape_id = self.next_shape_id.max(shape.id.0 + 1);
                     self.shapes.insert(*id, shape.clone());
+                } else {
+                    warn!(
+                        shape_id = id.0,
+                        replacement_shape_id = shape.id.0,
+                        "replace shape operation skipped missing shape"
+                    );
                 }
             }
             Operation::MoveShape { id, delta } => {
                 if let Some(mut shape) = self.shapes.get_mut(id) {
                     shape.kind.translate(*delta);
+                } else {
+                    warn!(
+                        shape_id = id.0,
+                        delta_x = delta.dx,
+                        delta_y = delta.dy,
+                        "move shape operation skipped missing shape"
+                    );
                 }
             }
             Operation::AddCell { cell } => {
@@ -3546,12 +3762,18 @@ impl Document {
             }
             Operation::DeleteCell { id } => {
                 if *id != self.top_cell {
-                    self.cells.remove(id);
+                    if self.cells.remove(id).is_none() {
+                        warn!(cell_id = id.0, "delete cell operation skipped missing cell");
+                    }
+                } else {
+                    warn!(cell_id = id.0, "delete cell operation skipped top cell");
                 }
             }
             Operation::RenameCell { id, name } => {
                 if let Some(cell) = self.cells.get_mut(id) {
                     cell.name = name.clone();
+                } else {
+                    warn!(cell_id = id.0, "rename cell operation skipped missing cell");
                 }
             }
             Operation::AddInstance { parent, instance } => {
@@ -3560,7 +3782,19 @@ impl Document {
                     self.next_instance_id = self.next_instance_id.max(instance.id.0 + 1);
                     if let Some(parent) = self.cells.get_mut(parent) {
                         parent.instances.insert(instance.id, instance.clone());
+                    } else {
+                        warn!(
+                            parent_cell_id = parent.0,
+                            instance_id = instance.id.0,
+                            "add instance operation skipped missing parent cell"
+                        );
                     }
+                } else {
+                    warn!(
+                        target_cell_id = instance.cell.0,
+                        instance_id = instance.id.0,
+                        "add instance operation skipped missing target cell"
+                    );
                 }
             }
             Operation::ReplaceInstance {
@@ -3575,16 +3809,42 @@ impl Document {
                     && parent.instances.contains_key(id)
                 {
                     parent.instances.insert(*id, instance.clone());
+                } else {
+                    warn!(
+                        parent_cell_id = parent.0,
+                        instance_id = id.0,
+                        target_cell_id = instance.cell.0,
+                        replacement_instance_id = instance.id.0,
+                        "replace instance operation skipped invalid reference"
+                    );
                 }
             }
             Operation::DeleteInstance { parent, id } => {
                 if let Some(parent) = self.cells.get_mut(parent) {
-                    parent.instances.remove(id);
+                    if parent.instances.remove(id).is_none() {
+                        warn!(
+                            parent_cell_id = parent.id.0,
+                            instance_id = id.0,
+                            "delete instance operation skipped missing instance"
+                        );
+                    }
+                } else {
+                    warn!(
+                        parent_cell_id = parent.0,
+                        instance_id = id.0,
+                        "delete instance operation skipped missing parent cell"
+                    );
                 }
             }
             Operation::RenameInstance { parent, id, name } => {
                 if let Some(mut instance) = self.instance_mut(*parent, *id) {
                     instance.name = name.clone();
+                } else {
+                    warn!(
+                        parent_cell_id = parent.0,
+                        instance_id = id.0,
+                        "rename instance operation skipped missing instance"
+                    );
                 }
             }
             Operation::MoveInstance { parent, id, delta } => {
@@ -3592,6 +3852,14 @@ impl Document {
                     instance.transform = instance
                         .transform
                         .compose(Transform::from_translation(*delta));
+                } else {
+                    warn!(
+                        parent_cell_id = parent.0,
+                        instance_id = id.0,
+                        delta_x = delta.dx,
+                        delta_y = delta.dy,
+                        "move instance operation skipped missing instance"
+                    );
                 }
             }
             Operation::AddLayer { layer } => {
@@ -3601,6 +3869,11 @@ impl Document {
             Operation::SetLayerVisibility { layer, visible } => {
                 if let Some(layer) = self.layers.get_mut(layer) {
                     layer.visible = *visible;
+                } else {
+                    warn!(
+                        layer_id = layer.0,
+                        visible, "set layer visibility operation skipped missing layer"
+                    );
                 }
             }
             Operation::Cursor { .. } => {}
@@ -3618,9 +3891,13 @@ impl Document {
     }
 
     pub fn layer_color(&self, id: LayerId) -> [f32; 4] {
-        self.layer(id)
-            .map(|layer| layer.color)
-            .unwrap_or([0.8, 0.8, 0.8, 0.35])
+        self.layer(id).map(|layer| layer.color).unwrap_or_else(|| {
+            warn!(
+                layer_id = id.0,
+                "layer missing color; using fallback display color"
+            );
+            [0.8, 0.8, 0.8, 0.35]
+        })
     }
 
     pub fn shape_view_for_occurrence(
@@ -4109,6 +4386,7 @@ impl LayoutIndex {
         let min_y = rect.min.y.div_euclid(LAYOUT_INDEX_TILE_SIZE);
         let max_y = rect.max.y.div_euclid(LAYOUT_INDEX_TILE_SIZE);
         let mut seen_entries = BTreeSet::new();
+        let mut limit_reached = false;
         'tiles: for y in min_y..=max_y {
             for x in min_x..=max_x {
                 let key = LayoutIndexTileKey { x, y };
@@ -4122,11 +4400,20 @@ impl LayoutIndex {
                     if entry.bounds.intersects(rect) && seen_entries.insert(reference.entry) {
                         out.push(entry.id.clone());
                         if out.len() - start_len >= limit {
+                            limit_reached = true;
                             break 'tiles;
                         }
                     }
                 }
             }
+        }
+
+        if limit_reached {
+            warn!(
+                limit,
+                returned = out.len() - start_len,
+                "layout index query reached result limit; results were truncated"
+            );
         }
 
         out[start_len..].sort_unstable();

@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
@@ -187,7 +188,17 @@ pub struct WaferGeometry {
 
 impl WaferGeometry {
     pub fn active_radius_mm(self) -> f64 {
-        (self.diameter_mm * 0.5 - self.edge_exclusion_mm).max(0.0)
+        let raw_radius = self.diameter_mm * 0.5 - self.edge_exclusion_mm;
+        let radius = raw_radius.max(0.0);
+        if radius != raw_radius {
+            warn!(
+                diameter_mm = self.diameter_mm,
+                edge_exclusion_mm = self.edge_exclusion_mm,
+                raw_radius,
+                "wafer active radius was negative; clamping to zero"
+            );
+        }
+        radius
     }
 
     pub fn die_center_mm(self, die: DieCoord) -> [f64; 2] {
@@ -293,7 +304,15 @@ impl WaferMap {
 
         for &die in &dies {
             let [x, y] = geometry.die_center_mm(die);
-            let radial = x.hypot(y) / geometry.active_radius_mm().max(1.0);
+            let active_radius = geometry.active_radius_mm();
+            let radial_denominator = active_radius.max(1.0);
+            if radial_denominator != active_radius {
+                warn!(
+                    active_radius,
+                    "metrology active radius below one millimeter; using denominator 1"
+                );
+            }
+            let radial = x.hypot(y) / radial_denominator;
             let thickness = 998.0 + 18.0 * radial * radial + 5.5 * (x * 0.11).sin()
                 - 3.0 * (y * 0.09).cos()
                 + coordinate_noise(die, 11) * 6.5
@@ -342,6 +361,15 @@ impl WaferMap {
 
                 if kind == MeasurementKind::DefectCount && defect_count > 0 {
                     let capped = defect_count.min(4);
+                    if capped != defect_count {
+                        warn!(
+                            die_column = die.column,
+                            die_row = die.row,
+                            defect_count,
+                            capped_defect_count = capped,
+                            "synthetic defect count exceeded per-die defect budget; truncating defects"
+                        );
+                    }
                     for index in 0..capped {
                         let offset_x = (coordinate_unit(die, 101 + index as u64) - 0.5)
                             * geometry.die_size_mm[0];
@@ -511,7 +539,17 @@ impl WaferMap {
             .map(|measurement| measurement.value)
         {
             let mut index = ((value - min) / width).floor() as usize;
-            index = index.min(bin_count - 1);
+            let clamped_index = index.min(bin_count - 1);
+            if clamped_index != index {
+                warn!(
+                    value,
+                    raw_bin_index = index,
+                    clamped_bin_index = clamped_index,
+                    bin_count,
+                    "metrology histogram bin index exceeded bin range; clamping"
+                );
+            }
+            index = clamped_index;
             bins[index].count += 1;
         }
         bins

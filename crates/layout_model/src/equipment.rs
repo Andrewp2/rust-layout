@@ -5,6 +5,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 const MAX_SENSOR_HISTORY: usize = 192;
 const MAX_RUN_LOG: usize = 24;
@@ -233,21 +234,49 @@ impl Recipe {
         duration_s: u64,
         parameters: BTreeMap<String, RecipeParameter>,
     ) -> Self {
+        let version = if version == 0 {
+            warn!("equipment recipe version was zero; using version 1");
+            1
+        } else {
+            version
+        };
+        let duration_s = if duration_s == 0 {
+            warn!("equipment recipe duration was zero; using 1 second");
+            1
+        } else {
+            duration_s
+        };
         Self {
             id: id.into(),
             name: name.into(),
             tool_kind,
-            version: version.max(1),
-            duration_s: duration_s.max(1),
+            version,
+            duration_s,
             parameters,
         }
     }
 
     pub fn number(&self, key: &str, default: f64) -> f64 {
-        self.parameters
-            .get(key)
-            .and_then(RecipeParameter::as_number)
-            .unwrap_or(default)
+        match self.parameters.get(key) {
+            Some(parameter) => parameter.as_number().unwrap_or_else(|| {
+                warn!(
+                    recipe_id = %self.id,
+                    parameter_key = key,
+                    default,
+                    "equipment recipe parameter is not numeric; using default"
+                );
+                default
+            }),
+            None => {
+                warn!(
+                    recipe_id = %self.id,
+                    parameter_key = key,
+                    default,
+                    "equipment recipe parameter missing; using default"
+                );
+                default
+            }
+        }
     }
 }
 
@@ -267,9 +296,15 @@ pub struct RecipeSelection {
 
 impl RecipeSelection {
     pub fn new(recipe_id: impl Into<RecipeId>, recipe_version: u32) -> Self {
+        let recipe_version = if recipe_version == 0 {
+            warn!("equipment recipe selection version was zero; using version 1");
+            1
+        } else {
+            recipe_version
+        };
         Self {
             recipe_id: recipe_id.into(),
-            recipe_version: recipe_version.max(1),
+            recipe_version,
             lot_id: None,
             wafer_id: None,
             process_step_id: None,
@@ -351,9 +386,15 @@ pub struct ToolRun {
 
 impl ToolRun {
     pub fn elapsed_s(&self, now_s: u64) -> u64 {
-        self.completed_at_s
-            .unwrap_or(now_s)
-            .saturating_sub(self.started_at_s)
+        let completed_at_s = self.completed_at_s.unwrap_or_else(|| {
+            warn!(
+                run_id = %self.id,
+                now_s,
+                "tool run has no completed timestamp; using current simulator time for elapsed duration"
+            );
+            now_s
+        });
+        completed_at_s.saturating_sub(self.started_at_s)
     }
 }
 
@@ -575,7 +616,13 @@ impl SyntheticTool {
     }
 
     pub fn with_planned_alarm(mut self, elapsed_s: u64) -> Self {
-        self.planned_alarm_at_s = Some(elapsed_s.max(1));
+        let elapsed_s = if elapsed_s == 0 {
+            warn!("planned alarm elapsed time was zero; using 1 second");
+            1
+        } else {
+            elapsed_s
+        };
+        self.planned_alarm_at_s = Some(elapsed_s);
         self
     }
 
@@ -788,7 +835,13 @@ impl SyntheticTool {
                 .tool
                 .selected_recipe_details()
                 .map(|recipe| recipe.duration_s)
-                .unwrap_or(1);
+                .unwrap_or_else(|| {
+                    warn!(
+                        tool_id = %self.tool.id,
+                        "running tool has no selected recipe details; using 1 second duration"
+                    );
+                    1
+                });
             if self.run_elapsed_s >= duration_s {
                 self.finish_active_run(RunStatus::Completed, at_s, &mut events);
                 self.transition_to(ToolState::Completed, at_s, &mut events);
@@ -836,6 +889,12 @@ impl SyntheticTool {
         self.tool.event_log.push(entry.clone());
         if self.tool.event_log.len() > MAX_EVENT_LOG {
             let overflow = self.tool.event_log.len() - MAX_EVENT_LOG;
+            warn!(
+                tool_id = %self.tool.id,
+                dropped_events = overflow,
+                max_event_log = MAX_EVENT_LOG,
+                "tool event log exceeded retention limit; dropping oldest events"
+            );
             self.tool.event_log.drain(0..overflow);
         }
         events.push(EquipmentEvent::Log { entry });
@@ -844,6 +903,11 @@ impl SyntheticTool {
     fn record_sample(&mut self, sample: SensorSample, events: &mut Vec<EquipmentEvent>) {
         self.tool.recent_sensors.push_back(sample.clone());
         while self.tool.recent_sensors.len() > MAX_SENSOR_HISTORY {
+            warn!(
+                tool_id = %self.tool.id,
+                max_sensor_history = MAX_SENSOR_HISTORY,
+                "tool sensor history exceeded retention limit; dropping oldest sample"
+            );
             self.tool.recent_sensors.pop_front();
         }
         events.push(EquipmentEvent::SensorSample { sample });
@@ -861,6 +925,14 @@ impl SyntheticTool {
         run.completed_at_s = Some(at_s);
         run.status = status;
         self.tool.recent_runs.insert(0, run.clone());
+        if self.tool.recent_runs.len() > MAX_RUN_LOG {
+            warn!(
+                tool_id = %self.tool.id,
+                run_count = self.tool.recent_runs.len(),
+                max_run_log = MAX_RUN_LOG,
+                "tool run log exceeded retention limit; dropping oldest runs"
+            );
+        }
         self.tool.recent_runs.truncate(MAX_RUN_LOG);
         events.push(EquipmentEvent::RunEnded { run });
     }
@@ -907,9 +979,28 @@ impl SyntheticTool {
         let recipe = self.tool.selected_recipe_details();
         let running = self.tool.state == ToolState::Running;
         let elapsed = self.run_elapsed_s as f64;
-        let duration = recipe.map(|recipe| recipe.duration_s).unwrap_or(1).max(1) as f64;
+        let duration = recipe
+            .map(|recipe| recipe.duration_s)
+            .unwrap_or_else(|| {
+                warn!(
+                    tool_id = %self.tool.id,
+                    "sensor model missing selected recipe details; using 1 second duration"
+                );
+                1
+            })
+            .max(1) as f64;
         let progress = if running {
-            (elapsed / duration).clamp(0.0, 1.0)
+            let raw_progress = elapsed / duration;
+            let progress = raw_progress.clamp(0.0, 1.0);
+            if progress != raw_progress {
+                warn!(
+                    tool_id = %self.tool.id,
+                    raw_progress,
+                    progress,
+                    "tool run progress outside [0, 1]; clamping"
+                );
+            }
+            progress
         } else {
             0.0
         };
@@ -917,21 +1008,52 @@ impl SyntheticTool {
             ToolKind::SpinCoater => {
                 let target_rpm = recipe
                     .map(|recipe| recipe.number("rpm", 4000.0))
-                    .unwrap_or(0.0);
+                    .unwrap_or_else(|| {
+                        warn!(
+                            tool_id = %self.tool.id,
+                            "spin coater has no recipe while sampling sensors; using target rpm 0"
+                        );
+                        0.0
+                    });
                 let rpm = if running {
-                    target_rpm * (progress * 1.4).min(1.0) + wave(at_s, 1) * 18.0
+                    let raw_spinup = progress * 1.4;
+                    let spinup = raw_spinup.min(1.0);
+                    if spinup != raw_spinup {
+                        warn!(
+                            tool_id = %self.tool.id,
+                            raw_spinup,
+                            spinup,
+                            "spin coater spinup factor exceeded range; clamping"
+                        );
+                    }
+                    target_rpm * spinup + wave(at_s, 1) * 18.0
                 } else {
                     0.0
                 };
+                let clamped_rpm = rpm.max(0.0);
+                if clamped_rpm != rpm {
+                    warn!(
+                        tool_id = %self.tool.id,
+                        rpm,
+                        clamped_rpm,
+                        "spin coater rpm below zero; clamping"
+                    );
+                }
                 vec![
-                    self.sample(at_s, "chuck_rpm", rpm.max(0.0), "rpm"),
+                    self.sample(at_s, "chuck_rpm", clamped_rpm, "rpm"),
                     self.sample(at_s, "exhaust_pressure", -115.0 + wave(at_s, 2) * 2.5, "Pa"),
                 ]
             }
             ToolKind::HotPlate => {
                 let target_c = recipe
                     .map(|recipe| recipe.number("temperature_c", 95.0))
-                    .unwrap_or(24.0);
+                    .unwrap_or_else(|| {
+                        warn!(
+                            tool_id = %self.tool.id,
+                            "hot plate has no recipe while sampling sensors; using ambient target temperature"
+                        );
+                        24.0
+                    });
                 let temp = if running {
                     24.0 + (target_c - 24.0) * (0.25 + progress * 0.75) + wave(at_s, 3) * 0.4
                 } else if self.tool.state == ToolState::RecipeLoaded {
@@ -946,12 +1068,31 @@ impl SyntheticTool {
             }
             ToolKind::MaskAligner => {
                 let error = if running {
-                    2.6 * (1.0 - progress).max(0.08) + wave(at_s, 7) * 0.03
+                    let raw_decay = 1.0 - progress;
+                    let decay = raw_decay.max(0.08);
+                    if decay != raw_decay {
+                        warn!(
+                            tool_id = %self.tool.id,
+                            raw_decay,
+                            decay,
+                            "mask aligner alignment decay below floor; clamping"
+                        );
+                    }
+                    2.6 * decay + wave(at_s, 7) * 0.03
                 } else {
                     2.8 + wave(at_s, 8) * 0.08
                 };
+                let clamped_error = error.max(0.0);
+                if clamped_error != error {
+                    warn!(
+                        tool_id = %self.tool.id,
+                        alignment_error = error,
+                        clamped_error,
+                        "mask aligner alignment error below zero; clamping"
+                    );
+                }
                 vec![
-                    self.sample(at_s, "alignment_error", error.max(0.0), "um"),
+                    self.sample(at_s, "alignment_error", clamped_error, "um"),
                     self.sample(
                         at_s,
                         "lamp_power",
@@ -963,10 +1104,22 @@ impl SyntheticTool {
             ToolKind::Etcher => {
                 let pressure = recipe
                     .map(|recipe| recipe.number("pressure_mtorr", 80.0))
-                    .unwrap_or(4.0);
+                    .unwrap_or_else(|| {
+                        warn!(
+                            tool_id = %self.tool.id,
+                            "etcher has no recipe while sampling sensors; using idle pressure"
+                        );
+                        4.0
+                    });
                 let rf = recipe
                     .map(|recipe| recipe.number("rf_power_w", 150.0))
-                    .unwrap_or(0.0);
+                    .unwrap_or_else(|| {
+                        warn!(
+                            tool_id = %self.tool.id,
+                            "etcher has no recipe while sampling sensors; using RF power 0"
+                        );
+                        0.0
+                    });
                 vec![
                     self.sample(
                         at_s,
@@ -1055,32 +1208,59 @@ impl EquipmentSimulator {
         let etch = ToolId::new("ETCH-01");
         let microscope = ToolId::new("MET-01");
 
-        let _ = simulator.command(&coat, HostCommand::BringOnline);
-        let _ = simulator.command(
-            &coat,
-            HostCommand::LoadRecipe {
-                selection: simulator.selection_for(&coat, "COAT_PR_4000"),
-            },
+        log_demo_command(
+            simulator.command(&coat, HostCommand::BringOnline),
+            "bring coat tool online",
         );
-        let _ = simulator.command(&coat, HostCommand::Start);
-        let _ = simulator.command(&bake, HostCommand::BringOnline);
-        let _ = simulator.command(
-            &bake,
-            HostCommand::LoadRecipe {
-                selection: simulator.selection_for(&bake, "BAKE_SOFT_095C"),
-            },
+        log_demo_command(
+            simulator.command(
+                &coat,
+                HostCommand::LoadRecipe {
+                    selection: simulator.selection_for(&coat, "COAT_PR_4000"),
+                },
+            ),
+            "load coat recipe",
         );
-        let _ = simulator.command(&align, HostCommand::BringOnline);
-        let _ = simulator.command(&etch, HostCommand::BringOnline);
-        let _ = simulator.command(
-            &etch,
-            HostCommand::TriggerAlarm {
-                code: "VAC-LOW".to_string(),
-                message: "foreline pressure below simulated threshold".to_string(),
-                severity: AlarmSeverity::Warning,
-            },
+        log_demo_command(
+            simulator.command(&coat, HostCommand::Start),
+            "start coat tool",
         );
-        let _ = simulator.command(&microscope, HostCommand::BringOnline);
+        log_demo_command(
+            simulator.command(&bake, HostCommand::BringOnline),
+            "bring bake tool online",
+        );
+        log_demo_command(
+            simulator.command(
+                &bake,
+                HostCommand::LoadRecipe {
+                    selection: simulator.selection_for(&bake, "BAKE_SOFT_095C"),
+                },
+            ),
+            "load bake recipe",
+        );
+        log_demo_command(
+            simulator.command(&align, HostCommand::BringOnline),
+            "bring aligner online",
+        );
+        log_demo_command(
+            simulator.command(&etch, HostCommand::BringOnline),
+            "bring etch tool online",
+        );
+        log_demo_command(
+            simulator.command(
+                &etch,
+                HostCommand::TriggerAlarm {
+                    code: "VAC-LOW".to_string(),
+                    message: "foreline pressure below simulated threshold".to_string(),
+                    severity: AlarmSeverity::Warning,
+                },
+            ),
+            "trigger demo etch alarm",
+        );
+        log_demo_command(
+            simulator.command(&microscope, HostCommand::BringOnline),
+            "bring microscope online",
+        );
         simulator.tick(5);
         simulator
     }
@@ -1142,7 +1322,14 @@ impl EquipmentSimulator {
             .tool(id)
             .and_then(|tool| tool.recipe(&recipe_id))
             .map(|recipe| recipe.version)
-            .unwrap_or(1);
+            .unwrap_or_else(|| {
+                warn!(
+                    tool_id = %id,
+                    recipe_id = %recipe_id,
+                    "equipment recipe missing for selection; using version 1"
+                );
+                1
+            });
         let step = self
             .tool(id)
             .map(|tool| process_step_for_kind(tool.kind).to_string());
@@ -1154,6 +1341,15 @@ impl EquipmentSimulator {
             process_step_id: step,
             operator: Some("sim-host".to_string()),
         }
+    }
+}
+
+fn log_demo_command(
+    result: Result<Vec<EquipmentEvent>, ToolTransitionError>,
+    description: &'static str,
+) {
+    if let Err(err) = result {
+        warn!(error = %err, "demo equipment command failed: {description}");
     }
 }
 

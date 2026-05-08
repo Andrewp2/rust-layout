@@ -27,7 +27,7 @@ use layout_model::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, broadcast};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 const PERSISTED_STATE_VERSION: u32 = 1;
@@ -80,7 +80,13 @@ async fn main() -> anyhow::Result<()> {
         .with_state(state);
 
     let addr: SocketAddr = std::env::var("FABRICAD_SYNC_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:4141".to_string())
+        .unwrap_or_else(|err| {
+            warn!(
+                error = %err,
+                "FABRICAD_SYNC_ADDR missing or invalid Unicode; using default bind address"
+            );
+            "127.0.0.1:4141".to_string()
+        })
         .parse()
         .context("FABRICAD_SYNC_ADDR must be host:port")?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -97,12 +103,13 @@ async fn snapshot(State(state): State<AppState>) -> Json<ServerMessage> {
     let document = state.document.lock().await.clone();
     let cursors = state.cursors.lock().await.clone();
     let selections = state.selections.lock().await.clone();
-    let loro_snapshot = state
-        .loro_log
-        .lock()
-        .await
-        .export_snapshot()
-        .unwrap_or_default();
+    let loro_snapshot = match state.loro_log.lock().await.export_snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            error!("failed to export Loro snapshot for /snapshot; using empty snapshot: {err}");
+            Vec::new()
+        }
+    };
     Json(ServerMessage::Snapshot {
         document,
         cursors,
@@ -122,12 +129,13 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
         let document = state.document.lock().await.clone();
         let cursors = state.cursors.lock().await.clone();
         let selections = state.selections.lock().await.clone();
-        let loro_snapshot = state
-            .loro_log
-            .lock()
-            .await
-            .export_snapshot()
-            .unwrap_or_default();
+        let loro_snapshot = match state.loro_log.lock().await.export_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                error!("failed to export initial Loro snapshot; using empty snapshot: {err}");
+                Vec::new()
+            }
+        };
         ServerMessage::Snapshot {
             document,
             cursors,
@@ -150,9 +158,15 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        let _ = send_json(&mut sender, &ServerMessage::Error {
+                        warn!(
+                            skipped,
+                            "websocket client lagged behind collaboration broadcast channel"
+                        );
+                        if let Err(err) = send_json(&mut sender, &ServerMessage::Error {
                             message: format!("client lagged by {skipped} collaboration messages"),
-                        }).await;
+                        }).await {
+                            warn!("failed to send lag warning to websocket client: {err}");
+                        }
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
@@ -170,9 +184,12 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
                                 }
                             }
                             Err(err) => {
-                                let _ = send_json(&mut sender, &ServerMessage::Error {
+                                error!("invalid collaboration message: {err}");
+                                if let Err(send_err) = send_json(&mut sender, &ServerMessage::Error {
                                     message: format!("invalid collaboration message: {err}"),
-                                }).await;
+                                }).await {
+                                    warn!("failed to send invalid-message error to websocket client: {send_err}");
+                                }
                             }
                         }
                     }
@@ -195,14 +212,18 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
     if let Some(user) = joined_user {
         state.cursors.lock().await.remove(&user);
         state.selections.lock().await.remove(&user);
-        let _ = state.bus.send(ServerMessage::UserLeft { user });
+        if let Err(err) = state.bus.send(ServerMessage::UserLeft { user }) {
+            warn!("failed to broadcast user left event: {err}");
+        }
     }
 }
 
 async fn handle_client_message(state: &AppState, message: ClientMessage) -> Option<Uuid> {
     match message {
         ClientMessage::Join { user } => {
-            let _ = state.bus.send(ServerMessage::UserJoined { user });
+            if let Err(err) = state.bus.send(ServerMessage::UserJoined { user }) {
+                warn!("failed to broadcast user joined event: {err}");
+            }
             Some(user)
         }
         ClientMessage::Operation { user, operation } => {
@@ -230,13 +251,18 @@ async fn handle_client_message(state: &AppState, message: ClientMessage) -> Opti
                 .await
                 .append_operation(user, loro_operation)
             {
-                let _ = state.bus.send(ServerMessage::Error {
-                    message: format!("failed to mirror operation into Loro: {err}"),
-                });
+                let message = format!("failed to mirror operation into Loro: {err}");
+                error!("{message}");
+                if let Err(send_err) = state.bus.send(ServerMessage::Error { message }) {
+                    warn!("failed to broadcast Loro mirror error: {send_err}");
+                }
             }
-            let _ = state
+            if let Err(err) = state
                 .bus
-                .send(ServerMessage::Operation { operation: logged });
+                .send(ServerMessage::Operation { operation: logged })
+            {
+                warn!("failed to broadcast operation: {err}");
+            }
             persist_state(state).await;
             None
         }
@@ -253,12 +279,18 @@ async fn handle_client_message(state: &AppState, message: ClientMessage) -> Opti
                     .await
                     .append_operation(operation.id.actor, operation.clone())
                 {
-                    let _ = state.bus.send(ServerMessage::Error {
-                        message: format!("failed to mirror CRDT operation into Loro: {err}"),
-                    });
+                    let message = format!("failed to mirror CRDT operation into Loro: {err}");
+                    error!("{message}");
+                    if let Err(send_err) = state.bus.send(ServerMessage::Error { message }) {
+                        warn!("failed to broadcast CRDT mirror error: {send_err}");
+                    }
                 }
-                let _ = state.bus.send(ServerMessage::CrdtOperation { operation });
+                if let Err(err) = state.bus.send(ServerMessage::CrdtOperation { operation }) {
+                    warn!("failed to broadcast CRDT operation: {err}");
+                }
                 persist_state(state).await;
+            } else {
+                warn!("incoming CRDT operation was not applied");
             }
             None
         }
@@ -266,9 +298,11 @@ async fn handle_client_message(state: &AppState, message: ClientMessage) -> Opti
             let operations = match state.loro_log.lock().await.import_update(&update) {
                 Ok(operations) => operations,
                 Err(err) => {
-                    let _ = state.bus.send(ServerMessage::Error {
-                        message: format!("failed to import Loro update: {err}"),
-                    });
+                    let message = format!("failed to import Loro update: {err}");
+                    error!("{message}");
+                    if let Err(send_err) = state.bus.send(ServerMessage::Error { message }) {
+                        warn!("failed to broadcast Loro import error: {send_err}");
+                    }
                     return None;
                 }
             };
@@ -279,14 +313,18 @@ async fn handle_client_message(state: &AppState, message: ClientMessage) -> Opti
                         document.apply_crdt_operation(operation);
                     }
                 }
-                let _ = state.bus.send(ServerMessage::LoroUpdate { update });
+                if let Err(err) = state.bus.send(ServerMessage::LoroUpdate { update }) {
+                    warn!("failed to broadcast Loro update: {err}");
+                }
                 persist_state(state).await;
             }
             None
         }
         ClientMessage::Cursor { user, position } => {
             state.cursors.lock().await.insert(user, position);
-            let _ = state.bus.send(ServerMessage::Cursor { user, position });
+            if let Err(err) = state.bus.send(ServerMessage::Cursor { user, position }) {
+                warn!("failed to broadcast cursor update: {err}");
+            }
             None
         }
         ClientMessage::Selection { user, selection } => {
@@ -299,25 +337,32 @@ async fn handle_client_message(state: &AppState, message: ClientMessage) -> Opti
                     .await
                     .insert(user, selection.clone());
             }
-            let _ = state.bus.send(ServerMessage::Selection { user, selection });
+            if let Err(err) = state.bus.send(ServerMessage::Selection { user, selection }) {
+                warn!("failed to broadcast selection update: {err}");
+            }
             None
         }
         ClientMessage::RequestSnapshot => {
             let document = state.document.lock().await.clone();
             let cursors = state.cursors.lock().await.clone();
             let selections = state.selections.lock().await.clone();
-            let loro_snapshot = state
-                .loro_log
-                .lock()
-                .await
-                .export_snapshot()
-                .unwrap_or_default();
-            let _ = state.bus.send(ServerMessage::Snapshot {
+            let loro_snapshot = match state.loro_log.lock().await.export_snapshot() {
+                Ok(snapshot) => snapshot,
+                Err(err) => {
+                    error!(
+                        "failed to export Loro snapshot for snapshot request; using empty snapshot: {err}"
+                    );
+                    Vec::new()
+                }
+            };
+            if let Err(err) = state.bus.send(ServerMessage::Snapshot {
                 document,
                 cursors,
                 selections,
                 loro_snapshot,
-            });
+            }) {
+                warn!("failed to broadcast snapshot response: {err}");
+            }
             None
         }
     }
@@ -328,6 +373,7 @@ async fn send_json(
     message: &ServerMessage,
 ) -> Result<(), axum::Error> {
     let text = serde_json::to_string(message).unwrap_or_else(|err| {
+        error!("failed to serialize server message; sending fallback error message: {err}");
         format!(r#"{{"type":"error","message":"failed to serialize server message: {err}"}}"#)
     });
     sender.send(Message::Text(text.into())).await
@@ -337,7 +383,13 @@ fn persistence_path() -> Option<PathBuf> {
     match std::env::var("FABRICAD_SYNC_STATE") {
         Ok(value) if value.trim().is_empty() || value == "off" || value == "none" => None,
         Ok(value) => Some(PathBuf::from(value)),
-        Err(_) => Some(PathBuf::from("target/fabricad-sync/state.json")),
+        Err(err) => {
+            warn!(
+                error = %err,
+                "FABRICAD_SYNC_STATE missing or invalid Unicode; using default persistence path"
+            );
+            Some(PathBuf::from("target/fabricad-sync/state.json"))
+        }
     }
 }
 
@@ -351,7 +403,7 @@ fn load_or_create_state(
                 format!("failed to read persisted sync state {}", path.display())
             })?;
             if bytes.is_empty() {
-                info!(
+                warn!(
                     "persisted sync state {} is empty; starting from demo document",
                     path.display()
                 );
@@ -373,11 +425,20 @@ fn load_or_create_state(
                     path.display(),
                     persisted.sequence
                 );
-                return Ok((document, loro_log, persisted.sequence.max(1)));
+                let sequence = persisted.sequence.max(1);
+                if sequence != persisted.sequence {
+                    warn!(
+                        persisted_sequence = persisted.sequence,
+                        effective_sequence = sequence,
+                        "persisted sync sequence was below supported range"
+                    );
+                }
+                return Ok((document, loro_log, sequence));
             }
         }
     }
 
+    warn!("no persisted sync state loaded; starting from demo document");
     let document = Document::demo();
     let mut loro_log = LoroCrdtLog::new(server_actor)?;
     loro_log.seed_document_objects(&document)?;

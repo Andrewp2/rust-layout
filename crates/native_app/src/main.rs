@@ -2,6 +2,7 @@ use fabricad_app::{OffscreenRenderOptions, OffscreenScene};
 use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    init_logging();
     let launch = LaunchOptions::from_env_and_args(std::env::args().skip(1))?;
     if launch.help {
         print_usage();
@@ -31,6 +32,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Box::new(|cc| Ok(Box::new(fabricad_app::FabricadApp::new(cc)))),
     )?;
     Ok(())
+}
+
+fn init_logging() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|err| {
+        eprintln!("WARN invalid RUST_LOG filter; using warn: {err}");
+        tracing_subscriber::EnvFilter::new("warn")
+    });
+    if let Err(err) = tracing_subscriber::fmt().with_env_filter(filter).try_init() {
+        eprintln!("WARN logging initialization skipped: {err}");
+    }
 }
 
 #[derive(Debug, PartialEq)]

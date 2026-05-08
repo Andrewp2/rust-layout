@@ -1815,6 +1815,7 @@ dependencies = [
  "rstar",
  "serde",
  "serde_json",
+ "tracing",
  "uuid",
 ]
 
@@ -2222,6 +2223,8 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-tungstenite",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
  "wasm-bindgen",
  "web-sys",
@@ -3135,6 +3138,7 @@ version = "0.1.0"
 dependencies = [
  "geometry_core",
  "layout_model",
+ "tracing",
  "web-time",
  "wgpu",
 ]

@@ -11,6 +11,7 @@ use layout_model::{
     Document, InstanceId, LayerId, LayoutIndex, Shape, ShapeId, ShapeKind, ShapeKindView,
     ShapeOccurrenceId, ShapeView, Transform,
 };
+use tracing::warn;
 use web_time::Instant;
 
 pub const DEFAULT_TILE_SIZE: i64 = 16_384;
@@ -302,8 +303,15 @@ impl TileKey {
 
 impl TileCache {
     pub fn new(tile_size: i64) -> Self {
+        let effective_tile_size = tile_size.max(1);
+        if effective_tile_size != tile_size {
+            warn!(
+                tile_size,
+                effective_tile_size, "tile cache size below one dbu; clamping"
+            );
+        }
         Self {
-            tile_size: tile_size.max(1),
+            tile_size: effective_tile_size,
             tiles: BTreeMap::new(),
             shapes: BTreeMap::new(),
             frame_counter: 0,
@@ -387,7 +395,11 @@ impl TileCache {
         options: TileFrameOptions,
     ) -> TiledFrame {
         let keys = tile_keys_for_rect(viewport, self.tile_size);
-        self.frame_counter = self.frame_counter.wrapping_add(1).max(1);
+        let next_frame = self.frame_counter.wrapping_add(1);
+        if next_frame == 0 {
+            warn!("tile cache frame counter wrapped; restarting at frame 1");
+        }
+        self.frame_counter = next_frame.max(1);
         let frame_id = self.frame_counter;
         let visible_tile_keys = keys.iter().copied().collect::<BTreeSet<_>>();
         let mut stats = TileFrameStats {
@@ -593,7 +605,15 @@ pub fn build_pick_triangles(document: &Document, viewport: Rect) -> PickBatch {
         if !shape.bounds.intersects(viewport) {
             return;
         }
-        let pick_id = (batch.occurrences.len() + 1).min(u32::MAX as usize) as u32;
+        let requested_pick_id = batch.occurrences.len() + 1;
+        if requested_pick_id > u32::MAX as usize {
+            warn!(
+                pick_id = requested_pick_id,
+                max_pick_id = u32::MAX,
+                "pick triangle occurrence count exceeded u32 pick id range; pick ids will be clamped"
+            );
+        }
+        let pick_id = requested_pick_id.min(u32::MAX as usize) as u32;
         batch.occurrences.push(id);
         match shape.shape.kind {
             ShapeKindView::Rectangle(rect) => {
@@ -817,10 +837,27 @@ fn append_shape_view_triangles(
 
 fn append_render_batch_with_range(out: &mut RenderBatch, batch: &RenderBatch) -> (usize, usize) {
     let index_start = out.indices.len();
-    let base = out.vertices.len().min(u32::MAX as usize) as u32;
+    let base_len = out.vertices.len();
+    if base_len > u32::MAX as usize {
+        warn!(
+            vertex_count = base_len,
+            max_indexable_vertices = u32::MAX,
+            "render batch vertex count exceeded u32 index range; indices will be clamped"
+        );
+    }
+    let base = base_len.min(u32::MAX as usize) as u32;
     out.vertices.extend_from_slice(&batch.vertices);
-    out.indices
-        .extend(batch.indices.iter().map(|index| base + *index));
+    out.indices.extend(batch.indices.iter().map(|index| {
+        base.checked_add(*index).unwrap_or_else(|| {
+            warn!(
+                base,
+                index,
+                max_indexable_vertices = u32::MAX,
+                "render batch index exceeded u32 range; clamping"
+            );
+            u32::MAX
+        })
+    }));
     (index_start, out.indices.len() - index_start)
 }
 
@@ -829,16 +866,41 @@ fn append_pick_from_render(
     occurrence: ShapeOccurrenceId,
     batch: &RenderBatch,
 ) {
-    let pick_id = (out.occurrences.len() + 1).min(u32::MAX as usize) as u32;
-    let base = out.vertices.len().min(u32::MAX as usize) as u32;
+    let requested_pick_id = out.occurrences.len() + 1;
+    if requested_pick_id > u32::MAX as usize {
+        warn!(
+            pick_id = requested_pick_id,
+            max_pick_id = u32::MAX,
+            "pick batch occurrence count exceeded u32 pick id range; pick ids will be clamped"
+        );
+    }
+    let pick_id = requested_pick_id.min(u32::MAX as usize) as u32;
+    let base_len = out.vertices.len();
+    if base_len > u32::MAX as usize {
+        warn!(
+            vertex_count = base_len,
+            max_indexable_vertices = u32::MAX,
+            "pick batch vertex count exceeded u32 index range; indices will be clamped"
+        );
+    }
+    let base = base_len.min(u32::MAX as usize) as u32;
     out.occurrences.push(occurrence);
     out.vertices
         .extend(batch.vertices.iter().map(|vertex| PickVertex {
             position: vertex.position,
             pick_id,
         }));
-    out.indices
-        .extend(batch.indices.iter().map(|index| base + *index));
+    out.indices.extend(batch.indices.iter().map(|index| {
+        base.checked_add(*index).unwrap_or_else(|| {
+            warn!(
+                base,
+                index,
+                max_indexable_vertices = u32::MAX,
+                "pick batch index exceeded u32 range; clamping"
+            );
+            u32::MAX
+        })
+    }));
 }
 
 fn push_rect(batch: &mut RenderBatch, rect: Rect, color: [f32; 4]) {
@@ -846,6 +908,15 @@ fn push_rect(batch: &mut RenderBatch, rect: Rect, color: [f32; 4]) {
 }
 
 fn push_fan(batch: &mut RenderBatch, points: &[Point], color: [f32; 4]) {
+    if batch.vertices.len() > u32::MAX as usize - points.len() {
+        warn!(
+            vertex_count = batch.vertices.len(),
+            added_points = points.len(),
+            max_indexable_vertices = u32::MAX,
+            "render fan would exceed u32 index range"
+        );
+        return;
+    }
     let base = batch.vertices.len() as u32;
     for point in points {
         batch.vertices.push(GpuVertex {
@@ -866,6 +937,15 @@ fn push_transformed_fan(
     transform: Transform,
     color: [f32; 4],
 ) {
+    if batch.vertices.len() > u32::MAX as usize - points.len() {
+        warn!(
+            vertex_count = batch.vertices.len(),
+            added_points = points.len(),
+            max_indexable_vertices = u32::MAX,
+            "transformed render fan would exceed u32 index range"
+        );
+        return;
+    }
     let base = batch.vertices.len() as u32;
     for point in points {
         let point = transform.apply_point(*point);
@@ -904,6 +984,15 @@ fn push_pick_rect(batch: &mut PickBatch, rect: Rect, pick_id: u32) {
 }
 
 fn push_pick_fan(batch: &mut PickBatch, points: &[Point], pick_id: u32) {
+    if batch.vertices.len() > u32::MAX as usize - points.len() {
+        warn!(
+            vertex_count = batch.vertices.len(),
+            added_points = points.len(),
+            max_indexable_vertices = u32::MAX,
+            "pick fan would exceed u32 index range"
+        );
+        return;
+    }
     let base = batch.vertices.len() as u32;
     for point in points {
         batch.vertices.push(PickVertex {
@@ -924,6 +1013,15 @@ fn push_transformed_pick_fan(
     transform: Transform,
     pick_id: u32,
 ) {
+    if batch.vertices.len() > u32::MAX as usize - points.len() {
+        warn!(
+            vertex_count = batch.vertices.len(),
+            added_points = points.len(),
+            max_indexable_vertices = u32::MAX,
+            "transformed pick fan would exceed u32 index range"
+        );
+        return;
+    }
     let base = batch.vertices.len() as u32;
     for point in points {
         let point = transform.apply_point(*point);

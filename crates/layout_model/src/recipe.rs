@@ -5,6 +5,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -312,13 +313,24 @@ impl RecipeParameterSpec {
         if let Some(value) = &self.default_value {
             return value.clone();
         }
+        warn!(
+            parameter_key = %self.key,
+            parameter_label = %self.label,
+            "recipe parameter default missing; using type fallback value"
+        );
         match &self.value_type {
             RecipeParameterType::Decimal => RecipeParameterValue::Decimal(0.0),
             RecipeParameterType::Integer => RecipeParameterValue::Integer(0),
             RecipeParameterType::Boolean => RecipeParameterValue::Boolean(false),
             RecipeParameterType::Text => RecipeParameterValue::Text(String::new()),
             RecipeParameterType::Choice { options } => {
-                RecipeParameterValue::Choice(options.first().cloned().unwrap_or_else(String::new))
+                RecipeParameterValue::Choice(options.first().cloned().unwrap_or_else(|| {
+                    warn!(
+                        parameter_key = %self.key,
+                        "choice recipe parameter has no options; using empty string fallback"
+                    );
+                    String::new()
+                }))
             }
         }
     }

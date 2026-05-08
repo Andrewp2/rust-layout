@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, error::Error, fmt};
 
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::{
     ProcessLayer,
@@ -623,10 +624,33 @@ fn trend_points_for_loop(
         .into_iter()
         .enumerate()
         .map(|(index, measurement)| {
-            let run_index = u32::try_from(index + 1).unwrap_or(u32::MAX);
-            let target = measurement.target.unwrap_or(loop_definition.output.target);
+            let run_index = u32::try_from(index + 1).unwrap_or_else(|_| {
+                warn!(
+                    trend_index = index,
+                    max_run_index = u32::MAX,
+                    "control trend run index exceeded u32 range; clamping run index"
+                );
+                u32::MAX
+            });
+            let target = measurement.target.unwrap_or_else(|| {
+                warn!(
+                    measurement_id = %measurement.measurement_id,
+                    loop_id = %loop_definition.id,
+                    fallback_target = loop_definition.output.target,
+                    "process measurement missing target; using control loop target"
+                );
+                loop_definition.output.target
+            });
             let error = target - measurement.value;
             let lambda = loop_definition.ewma_lambda.clamp(0.0, 1.0);
+            if lambda != loop_definition.ewma_lambda {
+                warn!(
+                    loop_id = %loop_definition.id,
+                    requested_lambda = loop_definition.ewma_lambda,
+                    clamped_lambda = lambda,
+                    "control loop EWMA lambda outside range; clamping to [0, 1]"
+                );
+            }
             let smoothed = match ewma_error {
                 Some(previous) => lambda * error + (1.0 - lambda) * previous,
                 None => error,
@@ -643,6 +667,12 @@ fn trend_points_for_loop(
                 error,
                 ewma_error: smoothed,
                 unit: if measurement.unit.is_empty() {
+                    warn!(
+                        measurement_id = %measurement.measurement_id,
+                        loop_id = %loop_definition.id,
+                        fallback_unit = %loop_definition.output.unit,
+                        "process measurement missing unit; using control loop unit"
+                    );
                     loop_definition.output.unit.clone()
                 } else {
                     measurement.unit.clone()
@@ -665,7 +695,14 @@ fn recipe_binding_for_measurement(
         .iter()
         .find(|recipe| recipe.id == measurement.recipe_id)
         .map(|recipe| recipe.version)
-        .unwrap_or(1);
+        .unwrap_or_else(|| {
+            warn!(
+                measurement_id = %measurement.measurement_id,
+                recipe_id = %measurement.recipe_id,
+                "process measurement recipe missing from analysis; using recipe version 1"
+            );
+            1
+        });
     RecipeBinding::new(RecipeId::new(measurement.recipe_id.clone()), version)
 }
 
@@ -676,12 +713,38 @@ fn adjustment_for_parameter(
     if parameter.output_sensitivity.abs() <= f64::EPSILON {
         return None;
     }
+    if parameter.max_delta < 0.0 {
+        warn!(
+            parameter_key = %parameter.key,
+            max_delta = parameter.max_delta,
+            "manipulated parameter max delta was negative; using absolute value"
+        );
+    }
     let max_delta = parameter.max_delta.abs();
     let raw_delta = effective_error / parameter.output_sensitivity * parameter.damping;
     let clamped_delta = raw_delta.clamp(-max_delta, max_delta);
+    if clamped_delta != raw_delta {
+        warn!(
+            parameter_key = %parameter.key,
+            raw_delta,
+            clamped_delta,
+            max_delta,
+            "recipe parameter adjustment exceeded max delta; clamping"
+        );
+    }
     let previous_numeric = parameter
         .current_value
         .clamp(parameter.lower_bound, parameter.upper_bound);
+    if previous_numeric != parameter.current_value {
+        warn!(
+            parameter_key = %parameter.key,
+            current_value = parameter.current_value,
+            clamped_value = previous_numeric,
+            lower_bound = parameter.lower_bound,
+            upper_bound = parameter.upper_bound,
+            "current recipe parameter value outside bounds; clamping"
+        );
+    }
     let proposed_numeric = numeric_recipe_value(
         parameter.value_kind,
         previous_numeric + clamped_delta,
@@ -717,7 +780,17 @@ fn numeric_recipe_value(
     lower_bound: f64,
     upper_bound: f64,
 ) -> f64 {
-    let value = value.clamp(lower_bound, upper_bound);
+    let raw_value = value;
+    let value = raw_value.clamp(lower_bound, upper_bound);
+    if value != raw_value {
+        warn!(
+            raw_value,
+            clamped_value = value,
+            lower_bound,
+            upper_bound,
+            "numeric recipe value outside bounds; clamping"
+        );
+    }
     match value_kind {
         NumericRecipeValueKind::Decimal => round_to(value, 3),
         NumericRecipeValueKind::Integer => value.round(),
@@ -748,9 +821,45 @@ fn recommendation_confidence(
             .mul_add(0.05, 0.0)
             .max(1.0),
     };
-    let error_penalty = (source.ewma_error.abs() / tolerance).min(4.0) * 0.08;
-    let sample_bonus = (trend_len.min(12) as f64) * 0.012;
-    (0.74 + sample_bonus - error_penalty).clamp(0.05, 0.98)
+    if loop_definition.output.lower_spec.is_none() || loop_definition.output.upper_spec.is_none() {
+        warn!(
+            loop_id = %loop_definition.id,
+            fallback_tolerance = tolerance,
+            "control loop missing one or both spec limits; using derived recommendation tolerance"
+        );
+    }
+    let raw_error_penalty = source.ewma_error.abs() / tolerance;
+    let error_penalty_scale = raw_error_penalty.min(4.0);
+    if error_penalty_scale != raw_error_penalty {
+        warn!(
+            loop_id = %loop_definition.id,
+            raw_error_penalty,
+            clamped_error_penalty = error_penalty_scale,
+            "recommendation error penalty exceeded cap; clamping"
+        );
+    }
+    let error_penalty = error_penalty_scale * 0.08;
+    let capped_trend_len = trend_len.min(12);
+    if capped_trend_len != trend_len {
+        warn!(
+            loop_id = %loop_definition.id,
+            trend_len,
+            capped_trend_len,
+            "recommendation sample bonus exceeded cap; clamping"
+        );
+    }
+    let sample_bonus = (capped_trend_len as f64) * 0.012;
+    let confidence = 0.74 + sample_bonus - error_penalty;
+    let clamped_confidence = confidence.clamp(0.05, 0.98);
+    if clamped_confidence != confidence {
+        warn!(
+            loop_id = %loop_definition.id,
+            confidence,
+            clamped_confidence,
+            "recommendation confidence outside range; clamping"
+        );
+    }
+    clamped_confidence
 }
 
 fn valid_transition(from: ControlActionState, to: ControlActionState) -> bool {

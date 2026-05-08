@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, error::Error, fmt};
 
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 macro_rules! string_id {
     ($name:ident) => {
@@ -592,7 +593,13 @@ impl TravelerState {
                     .active_run
                     .as_ref()
                     .map(|run| run.step_id.clone())
-                    .unwrap_or_else(|| ProcessStepId::new("unknown")),
+                    .unwrap_or_else(|| {
+                        warn!(
+                            lot_id = %self.lot_id,
+                            "traveler active run missing after wrong-step check; using unknown expected step"
+                        );
+                        ProcessStepId::new("unknown")
+                    }),
                 got: step_id.clone(),
             });
         }
@@ -634,7 +641,13 @@ impl TravelerState {
                     .pending_signoff
                     .as_ref()
                     .map(|pending| pending.run.step_id.clone())
-                    .unwrap_or_else(|| ProcessStepId::new("unknown")),
+                    .unwrap_or_else(|| {
+                        warn!(
+                            lot_id = %self.lot_id,
+                            "traveler pending signoff missing after wrong-step check; using unknown expected step"
+                        );
+                        ProcessStepId::new("unknown")
+                    }),
                 got: step_id.clone(),
             });
         }

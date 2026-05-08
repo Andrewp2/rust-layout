@@ -5,6 +5,7 @@ use std::{
 };
 
 use geometry_core::{Coord, DBU_PER_MICRON, Point, Polygon, Rect, Vector};
+use tracing::warn;
 
 use crate::{
     Cell, CellId, CellInstance, Document, InstanceArray, LayerId, ProcessLayer, Shape, ShapeId,
@@ -168,7 +169,23 @@ impl ElementBuilder {
             ElementKind::Path => Ok(ParsedElement::Path {
                 layer: self.layer.ok_or(GdsError::MissingField("LAYER"))?,
                 datatype: self.datatype,
-                width: self.width.abs().max(1),
+                width: {
+                    let width = self.width.checked_abs().unwrap_or_else(|| {
+                        warn!(
+                            raw_width = self.width,
+                            "GDS PATH width could not be represented as a positive Coord; using Coord::MAX"
+                        );
+                        Coord::MAX
+                    }).max(1);
+                    if width != self.width {
+                        warn!(
+                            raw_width = self.width,
+                            effective_width = width,
+                            "GDS PATH width was outside supported range"
+                        );
+                    }
+                    width
+                },
                 points: self.points,
             }),
             ElementKind::Text => {
@@ -181,7 +198,10 @@ impl ElementBuilder {
                     layer: self.layer.ok_or(GdsError::MissingField("LAYER"))?,
                     texttype: self.texttype,
                     position,
-                    text: self.text.unwrap_or_default(),
+                    text: self.text.unwrap_or_else(|| {
+                        warn!("GDS TEXT element missing STRING; using empty text");
+                        String::new()
+                    }),
                 })
             }
             ElementKind::Sref => {
@@ -204,12 +224,23 @@ impl ElementBuilder {
                     Vector::new(self.points[1].x - origin.x, self.points[1].y - origin.y);
                 let row_extent =
                     Vector::new(self.points[2].x - origin.x, self.points[2].y - origin.y);
-                let column_step = divide_vector(column_extent, Coord::from(self.columns.max(1)));
-                let row_step = divide_vector(row_extent, Coord::from(self.rows.max(1)));
+                let columns = self.columns.max(1);
+                let rows = self.rows.max(1);
+                if columns != self.columns || rows != self.rows {
+                    warn!(
+                        columns = self.columns,
+                        rows = self.rows,
+                        effective_columns = columns,
+                        effective_rows = rows,
+                        "GDS AREF dimensions were outside supported range"
+                    );
+                }
+                let column_step = divide_vector(column_extent, Coord::from(columns));
+                let row_step = divide_vector(row_extent, Coord::from(rows));
                 Ok(ParsedElement::Aref {
                     name: self.name.ok_or(GdsError::MissingField("SNAME"))?,
-                    columns: self.columns.max(1),
-                    rows: self.rows.max(1),
+                    columns,
+                    rows,
                     origin,
                     column_step,
                     row_step,
@@ -227,6 +258,12 @@ pub fn export_gdsii(document: &Document, technology: &TechnologyFile) -> Result<
     writer.write_i16(BGNLIB, &timestamp_fields())?;
     writer.write_ascii(LIBNAME, &sanitize_gds_name(&document.name, "FABRICAD"))?;
     let dbu_per_micron = technology.dbu_per_micron.max(1) as f64;
+    if technology.dbu_per_micron < 1 {
+        warn!(
+            dbu_per_micron = technology.dbu_per_micron,
+            "technology dbu_per_micron below supported range during GDS export; using 1"
+        );
+    }
     writer.write_real8(UNITS, &[1.0 / dbu_per_micron, 1.0e-6 / dbu_per_micron])?;
 
     let mut cells: Vec<_> = document.cells.values().collect();
@@ -595,7 +632,16 @@ fn parse_gdsii(bytes: &[u8]) -> Result<ParsedLibrary, GdsError> {
                     && user_units_per_dbu.is_finite()
                     && user_units_per_dbu > 0.0
                 {
-                    library.dbu_per_micron = (1.0 / user_units_per_dbu).round().max(1.0) as Coord;
+                    let parsed = (1.0 / user_units_per_dbu).round();
+                    let effective = parsed.max(1.0) as Coord;
+                    if parsed < 1.0 {
+                        warn!(
+                            parsed_dbu_per_micron = parsed,
+                            effective_dbu_per_micron = effective,
+                            "GDS UNITS yielded unsupported dbu_per_micron; using minimum 1"
+                        );
+                    }
+                    library.dbu_per_micron = effective;
                 }
             }
             BGNSTR => {
@@ -664,6 +710,15 @@ fn parse_gdsii(bytes: &[u8]) -> Result<ParsedLibrary, GdsError> {
                     if values.len() >= 2 {
                         element.columns = values[0].max(1);
                         element.rows = values[1].max(1);
+                        if element.columns != values[0] || element.rows != values[1] {
+                            warn!(
+                                columns = values[0],
+                                rows = values[1],
+                                effective_columns = element.columns,
+                                effective_rows = element.rows,
+                                "GDS COLROW values were below supported range"
+                            );
+                        }
                     }
                 }
             }
@@ -962,15 +1017,33 @@ fn scale_vector(
 }
 
 fn scale_coord(value: Coord, source_dbu_per_micron: Coord, target_dbu_per_micron: Coord) -> Coord {
-    let source = i128::from(source_dbu_per_micron.max(1));
-    let target = i128::from(target_dbu_per_micron.max(1));
+    let source_effective = source_dbu_per_micron.max(1);
+    let target_effective = target_dbu_per_micron.max(1);
+    if source_effective != source_dbu_per_micron || target_effective != target_dbu_per_micron {
+        warn!(
+            source_dbu_per_micron,
+            target_dbu_per_micron,
+            source_effective,
+            target_effective,
+            "GDS coordinate scale used out-of-range dbu_per_micron; applying minimum 1"
+        );
+    }
+    let source = i128::from(source_effective);
+    let target = i128::from(target_effective);
     let numerator = i128::from(value) * target;
     let rounded = if numerator >= 0 {
         (numerator + source / 2) / source
     } else {
         (numerator - source / 2) / source
     };
-    rounded.clamp(i128::from(Coord::MIN), i128::from(Coord::MAX)) as Coord
+    let clamped = rounded.clamp(i128::from(Coord::MIN), i128::from(Coord::MAX));
+    if clamped != rounded {
+        warn!(
+            value,
+            rounded, clamped, "scaled GDS coordinate exceeded Coord range"
+        );
+    }
+    clamped as Coord
 }
 
 fn coord_to_i32(value: Coord) -> Result<i32, GdsError> {

@@ -2,6 +2,7 @@ use std::{collections::BTreeMap, fmt};
 
 use geometry_core::{Coord, Point, Rect, Vector};
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::{
     CellId, DEFAULT_TOP_CELL_ID, Document, LayerId, ProcessLayer, ShapeId, ShapeKind,
@@ -81,6 +82,13 @@ impl ReticleSpec {
         let half_width = self.size.width / 2;
         let half_height = self.size.height / 2;
         let clearance = self.edge_clearance.max(0);
+        if clearance != self.edge_clearance {
+            warn!(
+                reticle_id = %self.id,
+                edge_clearance = self.edge_clearance,
+                "reticle edge clearance was negative; clamping to zero"
+            );
+        }
         Rect::new(
             Point::new(-half_width + clearance, -half_height + clearance),
             Point::new(half_width - clearance, half_height - clearance),
@@ -175,7 +183,10 @@ pub struct ReticlePrep {
 
 impl ReticlePrep {
     pub fn from_document(document: &Document) -> Self {
-        let bounds = layout_bounds_for_document(document).unwrap_or_else(default_field_bounds);
+        let bounds = layout_bounds_for_document(document).unwrap_or_else(|| {
+            warn!("document has no layout bounds for reticle prep; using default field bounds");
+            default_field_bounds()
+        });
         let reticle = reticle_for_bounds("RETICLE-UNLINKED", "Unlinked reticle prep", bounds);
         let layer_stack = layer_stack_from_document(document, None);
         let field = ReticleField {
@@ -219,7 +230,13 @@ impl ReticlePrep {
             .steps
             .iter()
             .find(|step| step.required_tool_class == ToolClass::MaskAligner);
-        let bounds = layout_bounds_for_document(document).unwrap_or_else(default_field_bounds);
+        let bounds = layout_bounds_for_document(document).unwrap_or_else(|| {
+            warn!(
+                route_id = %route.id,
+                "document has no layout bounds for routed reticle prep; using default field bounds"
+            );
+            default_field_bounds()
+        });
         let reticle = reticle_for_bounds(
             &format!("{}-RETICLE-A", route.mask_design_id),
             &format!("{} reticle A", route.mask_design_id),
@@ -736,22 +753,55 @@ fn preferred_exposure_layers(layer_stack: &[MaskLayer]) -> Vec<LayerId> {
         .find(|layer| layer.process == ProcessLayer::Poly)
         .or_else(|| layer_stack.iter().find(|layer| layer.critical))
         .map(|layer| vec![layer.layer])
-        .unwrap_or_default()
+        .unwrap_or_else(|| {
+            warn!("mask layer stack has no preferred exposure layer; using empty layer list");
+            Vec::new()
+        })
 }
 
 fn reticle_for_bounds(id: &str, name: &str, field_bounds: Rect) -> ReticleSpec {
     let field_width = field_bounds.width().max(1);
     let field_height = field_bounds.height().max(1);
+    if field_width != field_bounds.width() || field_height != field_bounds.height() {
+        warn!(
+            reticle_id = id,
+            field_width = field_bounds.width(),
+            field_height = field_bounds.height(),
+            clamped_field_width = field_width,
+            clamped_field_height = field_height,
+            "reticle field bounds had non-positive dimensions; clamping to one dbu"
+        );
+    }
     let width = (field_width + 6_000).max(12_000);
     let height = (field_height + 6_000).max(10_000);
+    if width != field_width + 6_000 || height != field_height + 6_000 {
+        warn!(
+            reticle_id = id,
+            requested_width = field_width + 6_000,
+            requested_height = field_height + 6_000,
+            width,
+            height,
+            "reticle size below minimum; clamping to minimum mask size"
+        );
+    }
+    let max_field_width = (width - 2_000).max(1);
+    let max_field_height = (height - 2_000).max(1);
+    if max_field_width != width - 2_000 || max_field_height != height - 2_000 {
+        warn!(
+            reticle_id = id,
+            max_field_width,
+            max_field_height,
+            "reticle max field dimension below one dbu; clamping"
+        );
+    }
     ReticleSpec {
         id: ReticleId::new(id),
         name: name.to_string(),
         size: ReticleSize {
             width,
             height,
-            max_field_width: (width - 2_000).max(1),
-            max_field_height: (height - 2_000).max(1),
+            max_field_width,
+            max_field_height,
         },
         edge_clearance: 800,
         alignment_clearance: 500,

@@ -3,6 +3,7 @@ use std::{error::Error, time::Instant};
 use crate::{PickBatch, RenderBatch, RenderBatch3d, shader};
 use geometry_core::{Coord, Point, Rect};
 use layout_model::{Document, LayoutIndex, ShapeOccurrenceId};
+use tracing::{error, warn};
 
 #[derive(Clone, Copy, Debug)]
 pub struct ViewUniforms {
@@ -407,7 +408,7 @@ impl LayoutGpuRenderer {
             }
             self.render_fingerprint = Some(fingerprint);
         }
-        self.index_count = batch.indices.len().min(u32::MAX as usize) as u32;
+        self.index_count = clamped_index_count(batch.indices.len(), "2D layout mesh");
         BufferUploadResult {
             uploaded: bytes_uploaded > 0,
             skipped: !changed,
@@ -441,7 +442,7 @@ impl LayoutGpuRenderer {
             }
             self.pick_fingerprint = Some(fingerprint);
         }
-        self.pick_index_count = batch.indices.len().min(u32::MAX as usize) as u32;
+        self.pick_index_count = clamped_index_count(batch.indices.len(), "2D pick mesh");
         BufferUploadResult {
             uploaded: bytes_uploaded > 0,
             skipped: !changed,
@@ -473,8 +474,8 @@ impl LayoutGpuRenderer {
             return None;
         }
 
-        let width = (request.canvas_size[0] * pixels_per_point).ceil().max(1.0) as u32;
-        let height = (request.canvas_size[1] * pixels_per_point).ceil().max(1.0) as u32;
+        let width = physical_viewport_extent(request.canvas_size[0], pixels_per_point);
+        let height = physical_viewport_extent(request.canvas_size[1], pixels_per_point);
         if request.pointer_local[0] < 0.0
             || request.pointer_local[1] < 0.0
             || request.pointer_local[0] >= request.canvas_size[0]
@@ -483,10 +484,21 @@ impl LayoutGpuRenderer {
             publish(request, None);
             return None;
         }
-        let pixel_x = ((request.pointer_local[0] * pixels_per_point).floor() as u32)
-            .min(width.saturating_sub(1));
-        let pixel_y = ((request.pointer_local[1] * pixels_per_point).floor() as u32)
-            .min(height.saturating_sub(1));
+        let raw_pixel_x = (request.pointer_local[0] * pixels_per_point).floor() as u32;
+        let raw_pixel_y = (request.pointer_local[1] * pixels_per_point).floor() as u32;
+        let pixel_x = raw_pixel_x.min(width.saturating_sub(1));
+        let pixel_y = raw_pixel_y.min(height.saturating_sub(1));
+        if pixel_x != raw_pixel_x || pixel_y != raw_pixel_y {
+            warn!(
+                raw_pixel_x,
+                raw_pixel_y,
+                pixel_x,
+                pixel_y,
+                width,
+                height,
+                "GPU pick pixel exceeded pick texture bounds; clamping"
+            );
+        }
 
         self.ensure_pick_texture(device, width, height);
         let texture = self.pick_texture.as_ref()?;
@@ -956,8 +968,8 @@ impl Viewport3dRenderer {
             }
             self.render_fingerprint = Some(fingerprint);
         }
-        self.index_count = batch.indices.len().min(u32::MAX as usize) as u32;
-        self.guide_index_count = batch.guide_indices.len().min(u32::MAX as usize) as u32;
+        self.index_count = clamped_index_count(batch.indices.len(), "3D scene mesh");
+        self.guide_index_count = clamped_index_count(batch.guide_indices.len(), "3D guide mesh");
         BufferUploadResult {
             uploaded: bytes_uploaded > 0,
             skipped: !changed,
@@ -1151,6 +1163,27 @@ pub async fn render_document_offscreen(
     let width = request.width.max(1);
     let height = request.height.max(1);
     let zoom = request.zoom.clamp(0.001, 32.0);
+    if width != request.width {
+        warn!(
+            requested_width = request.width,
+            effective_width = width,
+            "offscreen GPU render width was outside supported range"
+        );
+    }
+    if height != request.height {
+        warn!(
+            requested_height = request.height,
+            effective_height = height,
+            "offscreen GPU render height was outside supported range"
+        );
+    }
+    if (zoom - request.zoom).abs() > f32::EPSILON {
+        warn!(
+            requested_zoom = request.zoom,
+            effective_zoom = zoom,
+            "offscreen GPU render zoom was outside supported range"
+        );
+    }
     let frame_started = Instant::now();
     let index = build_layout_index(&request.document);
     let viewport = offscreen_viewport(width, height, zoom, request.pan);
@@ -1192,7 +1225,10 @@ async fn render_tiled_frame_offscreen(
     }
 
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::from_env().unwrap_or(wgpu::Backends::PRIMARY),
+        backends: wgpu::Backends::from_env().unwrap_or_else(|| {
+            warn!("WGPU_BACKEND did not resolve to a backend; using primary backends");
+            wgpu::Backends::PRIMARY
+        }),
         flags: wgpu::InstanceFlags::from_build_config().with_env(),
         backend_options: wgpu::BackendOptions::from_env_or_default(),
         memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
@@ -1312,7 +1348,9 @@ async fn render_tiled_frame_offscreen(
     readback
         .slice(..)
         .map_async(wgpu::MapMode::Read, move |result| {
-            let _ = tx.send(result.map_err(|err| err.to_string()));
+            if let Err(err) = tx.send(result.map_err(|err| err.to_string())) {
+                error!(error = %err, "failed to send GPU readback result");
+            }
         });
     device.poll(wgpu::PollType::Wait {
         submission_index: None,
@@ -1366,12 +1404,31 @@ fn create_upload_buffer(
     size: usize,
     usage: wgpu::BufferUsages,
 ) -> wgpu::Buffer {
+    let effective_size = size.max(4);
+    if effective_size != size {
+        warn!(
+            label,
+            size, effective_size, "GPU upload buffer size below backend minimum; clamping"
+        );
+    }
     device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
-        size: size.max(4) as u64,
+        size: effective_size as u64,
         usage: usage | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     })
+}
+
+fn clamped_index_count(index_count: usize, label: &'static str) -> u32 {
+    if index_count > u32::MAX as usize {
+        warn!(
+            index_count,
+            max_index_count = u32::MAX,
+            label,
+            "GPU index count exceeded u32 draw range; draw count was clamped"
+        );
+    }
+    index_count.min(u32::MAX as usize) as u32
 }
 
 fn next_buffer_capacity(required: usize) -> usize {
@@ -1382,16 +1439,30 @@ fn physical_viewport_extent(logical_points: f32, pixels_per_point: f32) -> u32 {
     let logical_points = if logical_points.is_finite() && logical_points > 0.0 {
         logical_points
     } else {
+        warn!(
+            logical_points,
+            "viewport logical extent was non-finite or non-positive; using zero before target-size clamp"
+        );
         0.0
     };
     let pixels_per_point = if pixels_per_point.is_finite() && pixels_per_point > 0.0 {
         pixels_per_point
     } else {
+        warn!(
+            pixels_per_point,
+            "viewport pixels-per-point was non-finite or non-positive; using 1.0"
+        );
         1.0
     };
-    (logical_points * pixels_per_point)
-        .ceil()
-        .clamp(1.0, u32::MAX as f32) as u32
+    let raw_extent = (logical_points * pixels_per_point).ceil();
+    let clamped_extent = raw_extent.clamp(1.0, u32::MAX as f32);
+    if clamped_extent != raw_extent {
+        warn!(
+            raw_extent,
+            clamped_extent, "viewport physical extent outside u32 range; clamping"
+        );
+    }
+    clamped_extent as u32
 }
 
 fn vertex_bytes(vertices: &[crate::GpuVertex]) -> Vec<u8> {

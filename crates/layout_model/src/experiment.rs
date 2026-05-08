@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, error::Error, fmt};
 
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::{
     ProcessLayer,
@@ -194,9 +195,15 @@ impl ExperimentPlan {
         &self,
         primary_response_id: Option<&ResponseSpecId>,
     ) -> ExperimentAnalysisSummary {
-        let primary_response_id = primary_response_id
-            .cloned()
-            .or_else(|| self.responses.first().map(|response| response.id.clone()));
+        let primary_response_id = primary_response_id.cloned().or_else(|| {
+            let fallback = self.responses.first().map(|response| response.id.clone());
+            if fallback.is_some() {
+                warn!("experiment analysis missing primary response; using first response");
+            } else {
+                warn!("experiment analysis has no responses; primary response remains unset");
+            }
+            fallback
+        });
         let response_stats = self
             .responses
             .iter()
@@ -205,7 +212,10 @@ impl ExperimentPlan {
         let factor_effects = primary_response_id
             .as_ref()
             .and_then(|response_id| self.factor_effects(response_id).ok())
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                warn!("experiment factor effects unavailable; using empty factor-effect list");
+                Vec::new()
+            });
         let best_run_id = primary_response_id.as_ref().and_then(|response_id| {
             self.best_run_for_response(response_id)
                 .map(|run| run.id.clone())
@@ -282,14 +292,28 @@ impl ExperimentPlan {
     pub fn factor_level_label(&self, factor_id: &FactorId, level_id: &FactorLevelId) -> String {
         self.factor_level(factor_id, level_id)
             .map(|level| level.label.clone())
-            .unwrap_or_else(|| level_id.to_string())
+            .unwrap_or_else(|| {
+                warn!(
+                    factor_id = %factor_id,
+                    level_id = %level_id,
+                    "experiment factor level missing; using level id as label"
+                );
+                level_id.to_string()
+            })
     }
 
     pub fn run_factor_label(&self, run: &ExperimentRun, factor: &ExperimentFactor) -> String {
         run.factor_levels
             .get(&factor.id)
             .map(|level_id| self.factor_level_label(&factor.id, level_id))
-            .unwrap_or_else(|| "unassigned".to_string())
+            .unwrap_or_else(|| {
+                warn!(
+                    run_id = %run.id,
+                    factor_id = %factor.id,
+                    "experiment run missing factor assignment; using unassigned label"
+                );
+                "unassigned".to_string()
+            })
     }
 
     fn response_stats(&self, response: &ResponseSpec) -> ResponseStats {
@@ -311,7 +335,16 @@ impl ExperimentPlan {
                     delta * delta
                 })
                 .sum::<f64>()
-                / values.len().max(1) as f64;
+                / {
+                    let denominator = values.len().max(1) as f64;
+                    if values.is_empty() {
+                        warn!(
+                            response_id = %response.id,
+                            "experiment response has no values; using denominator 1 for variance"
+                        );
+                    }
+                    denominator
+                };
             variance.sqrt()
         });
 
@@ -379,7 +412,13 @@ impl ExperimentPlan {
                 response
                     .score_value(left_value)
                     .partial_cmp(&response.score_value(right_value))
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .unwrap_or_else(|| {
+                        warn!(
+                            response_id = %response.id,
+                            "experiment response score comparison returned NaN; treating scores as equal"
+                        );
+                        std::cmp::Ordering::Equal
+                    })
             })
     }
 
@@ -501,7 +540,14 @@ impl ResponseSpec {
             ResponseGoal::Target => self
                 .target
                 .map(|target| (value - target).abs())
-                .unwrap_or(value.abs()),
+                .unwrap_or_else(|| {
+                    warn!(
+                        response_id = %self.id,
+                        value,
+                        "target response missing target; using absolute value score"
+                    );
+                    value.abs()
+                }),
             ResponseGoal::Maximize => -value,
             ResponseGoal::Minimize => value,
         }

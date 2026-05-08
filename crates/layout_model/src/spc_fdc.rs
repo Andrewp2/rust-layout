@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, fmt};
 
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::{
     equipment::{Alarm, AlarmSeverity, SensorSample},
@@ -115,7 +116,14 @@ pub struct ControlLimits {
 
 impl ControlLimits {
     pub fn new(center: f64, lower_control: f64, upper_control: f64) -> Self {
-        let span = (upper_control - lower_control).abs().max(0.000_001);
+        let raw_span = (upper_control - lower_control).abs();
+        let span = raw_span.max(0.000_001);
+        if span != raw_span {
+            warn!(
+                lower_control,
+                upper_control, "SPC control limit span was zero; using epsilon span"
+            );
+        }
         Self {
             center,
             lower_control,
@@ -522,7 +530,10 @@ fn limits_for_measurements(measurements: &[&ProcessMeasurement]) -> ControlLimit
     let center = measurements
         .iter()
         .find_map(|measurement| measurement.target)
-        .unwrap_or_else(|| mean(&values));
+        .unwrap_or_else(|| {
+            warn!("SPC measurements missing target; using measured mean as center");
+            mean(&values)
+        });
     let lower_spec = measurements
         .iter()
         .find_map(|measurement| measurement.lower_spec);
@@ -543,7 +554,19 @@ fn limits_for_measurements(measurements: &[&ProcessMeasurement]) -> ControlLimit
             }
         }
         _ => {
-            let sigma = sample_stddev(&values).max(0.000_001);
+            let raw_sigma = sample_stddev(&values);
+            let sigma = raw_sigma.max(0.000_001);
+            if sigma != raw_sigma {
+                warn!(
+                    raw_sigma,
+                    "SPC calculated sigma was zero; using epsilon sigma"
+                );
+            }
+            if lower_spec.is_none() || upper_spec.is_none() {
+                warn!(
+                    "SPC measurements missing spec limits; deriving control limits from sample sigma"
+                );
+            }
             ControlLimits {
                 center,
                 lower_control: center - sigma * 3.0,
@@ -719,7 +742,10 @@ fn rule_violation(
     representative: &ControlPoint,
     message: String,
 ) -> RuleViolation {
-    let last_index = point_indices.last().copied().unwrap_or(0) + 1;
+    let last_index = point_indices.last().copied().unwrap_or_else(|| {
+        warn!("SPC rule violation has no point indices; using index 0");
+        0
+    }) + 1;
     RuleViolation {
         id: format!(
             "{}:{}:{last_index}",

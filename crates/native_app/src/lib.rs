@@ -52,6 +52,7 @@ use renderer::gpu::{
 };
 use router::{RouteRequest, RouterConfig, route};
 use serde::{Deserialize, Serialize};
+use tracing::{error, warn};
 use uuid::Uuid;
 use web_time::{Duration, Instant};
 
@@ -568,6 +569,7 @@ struct Render3dStats {
     faces: usize,
     capped: bool,
     top_caps_only: bool,
+    cpu_face_capped: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -775,6 +777,9 @@ pub struct FabricadApp {
     selected_equipment_tool: Option<EquipmentToolId>,
     equipment_recipe_drafts: BTreeMap<EquipmentToolId, EquipmentRecipeId>,
     last_equipment_tick: Instant,
+    logged_3d_shape_cap: bool,
+    logged_3d_top_cap_lod: bool,
+    logged_3d_cpu_face_cap: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -922,6 +927,27 @@ async fn run_offscreen_render_async(
     let width = options.width.max(1);
     let height = options.height.max(1);
     let zoom = options.zoom.clamp(0.001, 32.0);
+    if width != options.width {
+        warn!(
+            requested_width = options.width,
+            effective_width = width,
+            "offscreen render width was outside the supported range"
+        );
+    }
+    if height != options.height {
+        warn!(
+            requested_height = options.height,
+            effective_height = height,
+            "offscreen render height was outside the supported range"
+        );
+    }
+    if (zoom - options.zoom).abs() > f32::EPSILON {
+        warn!(
+            requested_zoom = options.zoom,
+            effective_zoom = zoom,
+            "offscreen render zoom was outside the supported range"
+        );
+    }
     let (scene_name, document) = offscreen_document(&options.scene);
     renderer::gpu::render_document_offscreen(OffscreenRenderRequest {
         scene: scene_name,
@@ -954,21 +980,36 @@ impl FabricadApp {
             .first()
             .map(|lot| lot.id.clone())
             .unwrap_or_default();
+        if selected_yield_lot.is_empty() {
+            warn!("no yield lots available at startup; selected yield lot defaults to empty");
+        }
         let selected_yield_wafer = yield_analysis
             .wafer_ids_for_lot(&selected_yield_lot)
             .first()
             .cloned()
             .unwrap_or_default();
+        if selected_yield_wafer.is_empty() {
+            warn!("no yield wafers available at startup; selected yield wafer defaults to empty");
+        }
         let user_id = Uuid::new_v4();
         let mut loro_log = LoroCrdtLog::new(user_id).expect("create Loro CRDT log");
         if document_object_count(&document) <= MAX_LORO_SEED_OBJECTS {
             loro_log
                 .seed_document_objects(&document)
                 .expect("seed Loro object store");
+        } else {
+            warn!(
+                object_count = document_object_count(&document),
+                max_seed_objects = MAX_LORO_SEED_OBJECTS,
+                "document exceeds Loro startup seed budget"
+            );
         }
         let active_layer = document
             .layer_by_process(ProcessLayer::Metal1)
             .unwrap_or(LayerId(1));
+        if document.layer_by_process(ProcessLayer::Metal1).is_none() {
+            warn!("Metal1 layer missing at startup; active layer defaults to LayerId(1)");
+        }
         let active_technology = 0;
         let rules = rule_deck_for_document(&document, &technologies[active_technology]);
         let index = build_layout_index(&document);
@@ -1065,6 +1106,9 @@ impl FabricadApp {
             selected_equipment_tool,
             equipment_recipe_drafts: BTreeMap::new(),
             last_equipment_tick: Instant::now(),
+            logged_3d_shape_cap: false,
+            logged_3d_top_cap_lod: false,
+            logged_3d_cpu_face_cap: false,
         };
         app.reset_3d_camera_to_document();
         app
@@ -1103,7 +1147,15 @@ impl FabricadApp {
         }
         app.reset_3d_camera_to_document();
         if let Some(zoom) = options.zoom {
-            app.zoom = zoom.clamp(0.008, 4.0);
+            let clamped = zoom.clamp(0.008, 4.0);
+            if (clamped - zoom).abs() > f32::EPSILON {
+                warn!(
+                    requested_zoom = zoom,
+                    effective_zoom = clamped,
+                    "startup zoom was outside the supported range"
+                );
+            }
+            app.zoom = clamped;
         }
         if let Some([x, y]) = options.pan {
             app.pan = vec2(x, y);
@@ -1127,6 +1179,18 @@ impl FabricadApp {
         app
     }
 
+    fn set_warn_status(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        warn!("{message}");
+        self.status = message;
+    }
+
+    fn set_error_status(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        error!("{message}");
+        self.status = message;
+    }
+
     fn rebuild_indexes(&mut self) {
         self.index = build_layout_index(&self.document);
         self.layout_bounds_cache = self.index.bounds();
@@ -1135,6 +1199,7 @@ impl FabricadApp {
 
     fn rerun_drc(&mut self) {
         if let Some(message) = drc_skip_message(&self.document) {
+            warn!("{message}");
             self.violations.clear();
             self.perf.drc_ms = 0.0;
             self.last_drc_run = Instant::now();
@@ -1149,6 +1214,7 @@ impl FabricadApp {
 
     fn rerun_drc_for_dirty_region(&mut self, dirty_region: Option<Rect>) {
         if let Some(message) = drc_skip_message(&self.document) {
+            warn!("{message}");
             self.violations.clear();
             self.perf.drc_ms = 0.0;
             self.last_drc_run = Instant::now();
@@ -1205,12 +1271,26 @@ impl FabricadApp {
     }
 
     fn current_technology(&self) -> &TechnologyFile {
-        &self.technologies[self
+        let effective = self
             .active_technology
-            .min(self.technologies.len().saturating_sub(1))]
+            .min(self.technologies.len().saturating_sub(1));
+        if effective != self.active_technology {
+            warn!(
+                active_technology = self.active_technology,
+                effective_technology = effective,
+                "active technology index exceeded available technologies"
+            );
+        }
+        &self.technologies[effective]
     }
 
     fn snap_grid(&self) -> Coord {
+        if self.document.grid < 1 {
+            warn!(
+                document_grid = self.document.grid,
+                "document grid was below supported range; using 1 dbu"
+            );
+        }
         self.document.grid.max(1)
     }
 
@@ -1235,7 +1315,15 @@ impl FabricadApp {
     }
 
     fn set_document_grid(&mut self, grid: Coord) {
-        let grid = grid.clamp(1, 10_000_000);
+        let requested_grid = grid;
+        let grid = requested_grid.clamp(1, 10_000_000);
+        if grid != requested_grid {
+            warn!(
+                requested_grid,
+                effective_grid = grid,
+                "document grid was outside the supported range"
+            );
+        }
         if self.document.grid == grid {
             return;
         }
@@ -1261,7 +1349,15 @@ impl FabricadApp {
         if !self.settings.autosave_enabled {
             return;
         }
-        let interval = Duration::from_secs(self.settings.autosave_interval_seconds.max(5));
+        let effective_interval = self.settings.autosave_interval_seconds.max(5);
+        if effective_interval != self.settings.autosave_interval_seconds {
+            warn!(
+                configured_seconds = self.settings.autosave_interval_seconds,
+                effective_seconds = effective_interval,
+                "autosave interval was below supported range"
+            );
+        }
+        let interval = Duration::from_secs(effective_interval);
         if self.last_autosave.elapsed() >= interval {
             self.autosave_document();
             self.last_autosave = Instant::now();
@@ -1276,23 +1372,35 @@ impl FabricadApp {
             }
             Err(err) => {
                 self.rules = RuleDeck::demo(&self.document);
-                self.status = format!("technology rule load failed: {err}");
+                self.set_error_status(format!(
+                    "technology rule load failed: {err}; using demo rule deck"
+                ));
             }
         }
     }
 
     fn reset_active_layer(&mut self) {
+        let fallback = self
+            .document
+            .layer_by_process(ProcessLayer::Metal1)
+            .is_none();
         self.active_layer = self
             .document
             .layer_by_process(ProcessLayer::Metal1)
             .or_else(|| self.document.layers.keys().next().copied())
             .unwrap_or(LayerId(1));
+        if fallback {
+            warn!(
+                active_layer = self.active_layer.0,
+                "Metal1 layer missing; active layer selected from fallback"
+            );
+        }
     }
 
     fn apply_current_technology_to_document(&mut self) {
         let technology = self.current_technology().clone();
         if let Err(err) = self.document.apply_technology(&technology) {
-            self.status = format!("technology load failed: {err}");
+            self.set_error_status(format!("technology load failed: {err}"));
         }
         self.reset_active_layer();
         self.rebuild_rules_from_technology();
@@ -1300,6 +1408,17 @@ impl FabricadApp {
 
     fn switch_technology(&mut self, index: usize) {
         if index >= self.technologies.len() || index == self.active_technology {
+            if index >= self.technologies.len() {
+                warn!(
+                    requested_index = index,
+                    technology_count = self.technologies.len(),
+                    "requested technology index exceeded available technologies"
+                );
+                self.set_warn_status(format!(
+                    "technology index {index} is out of range for {} technologies",
+                    self.technologies.len()
+                ));
+            }
             return;
         }
         self.active_technology = index;
@@ -1427,10 +1546,16 @@ impl FabricadApp {
 
     fn apply_crdt_operation_without_history(&mut self, operation: CrdtOperation) -> bool {
         if self.document.crdt_has_seen(operation.id) {
+            warn!(
+                actor = %operation.id.actor,
+                counter = operation.id.counter,
+                "ignored duplicate CRDT operation"
+            );
             return false;
         }
         let invalidation = self.render_invalidation_for_operation(&operation.operation);
         if self.document.apply_crdt_operation(operation) != CrdtApplyResult::Applied {
+            warn!("CRDT operation did not apply and was ignored");
             return false;
         }
         self.rebuild_indexes();
@@ -1446,11 +1571,12 @@ impl FabricadApp {
         {
             Ok(update) => update,
             Err(err) => {
-                self.status = format!("failed to append Loro operation: {err}");
+                self.set_error_status(format!("failed to append Loro operation: {err}"));
                 return false;
             }
         };
         if !self.apply_crdt_operation_without_history(operation) {
+            warn!("local operation was not applied after Loro append");
             return false;
         }
         self.broadcast_loro_update(update);
@@ -1462,8 +1588,13 @@ impl FabricadApp {
         if self.collab.is_some() {
             return;
         }
-        let url = std::env::var("FABRICAD_SYNC_URL")
-            .unwrap_or_else(|_| "ws://127.0.0.1:4141/ws".to_string());
+        let url = std::env::var("FABRICAD_SYNC_URL").unwrap_or_else(|err| {
+            warn!(
+                error = %err,
+                "FABRICAD_SYNC_URL missing or invalid Unicode; using local collaboration URL"
+            );
+            "ws://127.0.0.1:4141/ws".to_string()
+        });
         let user = self.user_id;
         let (outbound, mut outbound_rx) = tokio::sync::mpsc::unbounded_channel::<ClientMessage>();
         let (inbound_tx, inbound) = std::sync::mpsc::channel::<ServerMessage>();
@@ -1474,51 +1605,66 @@ impl FabricadApp {
                 .expect("collaboration runtime");
             runtime.block_on(async move {
 				let Ok((socket, _)) = tokio_tungstenite::connect_async(&url).await else {
-					let _ = inbound_tx.send(ServerMessage::Error {
-						message: format!("failed to connect to {url}"),
-					});
+					let message = format!("failed to connect to {url}");
+					error!("{message}");
+					if let Err(err) = inbound_tx.send(ServerMessage::Error { message }) {
+						warn!(error = %err, "failed to report collaboration connection error");
+					}
 					return;
 				};
 				let (mut write, mut read) = socket.split();
 				if send_client_message(&mut write, &ClientMessage::Join { user }).await.is_err() {
+					error!("failed to send collaboration join message");
 					return;
 				}
 				loop {
 					tokio::select! {
 						Some(message) = outbound_rx.recv() => {
 							if send_client_message(&mut write, &message).await.is_err() {
-								let _ = inbound_tx.send(ServerMessage::Error {
+								let error_message = "collaboration socket closed while sending".to_string();
+								error!("{error_message}");
+								if let Err(err) = inbound_tx.send(ServerMessage::Error {
 									message: "collaboration socket closed while sending".to_string(),
-								});
+								}) {
+									warn!(error = %err, "failed to report collaboration send closure");
+								}
 								break;
 							}
 						}
 						incoming = read.next() => {
 							let Some(incoming) = incoming else {
-								let _ = inbound_tx.send(ServerMessage::Error {
-									message: "collaboration socket closed".to_string(),
-								});
+								let message = "collaboration socket closed".to_string();
+								warn!("{message}");
+								if let Err(err) = inbound_tx.send(ServerMessage::Error { message }) {
+									warn!(error = %err, "failed to report collaboration socket closure");
+								}
 								break;
 							};
 							match incoming {
 								Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
 									match serde_json::from_str::<ServerMessage>(&text) {
 										Ok(message) => {
-											let _ = inbound_tx.send(message);
+											if let Err(err) = inbound_tx.send(message) {
+												warn!(error = %err, "failed to enqueue collaboration message");
+											}
 										}
 										Err(err) => {
-											let _ = inbound_tx.send(ServerMessage::Error {
-												message: format!("invalid collaboration message: {err}"),
-											});
+											let message = format!("invalid collaboration message: {err}");
+											error!("{message}");
+											if let Err(err) = inbound_tx.send(ServerMessage::Error { message }) {
+												warn!(error = %err, "failed to report invalid collaboration message");
+											}
 										}
 									}
 								}
 								Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => break,
 								Ok(_) => {}
 								Err(err) => {
-									let _ = inbound_tx.send(ServerMessage::Error {
-										message: format!("collaboration socket error: {err}"),
-									});
+									let message = format!("collaboration socket error: {err}");
+									error!("{message}");
+									if let Err(err) = inbound_tx.send(ServerMessage::Error { message }) {
+										warn!(error = %err, "failed to report collaboration socket error");
+									}
 									break;
 								}
 							}
@@ -1546,7 +1692,7 @@ impl FabricadApp {
         let socket = match web_sys::WebSocket::new(&url) {
             Ok(socket) => socket,
             Err(_) => {
-                self.status = format!("failed to create collaboration socket for {url}");
+                self.set_error_status(format!("failed to create collaboration socket for {url}"));
                 return;
             }
         };
@@ -1575,6 +1721,7 @@ impl FabricadApp {
         let inbound_for_message = Rc::clone(&inbound);
         let on_message = Closure::wrap(Box::new(move |event: web_sys::MessageEvent| {
             let Some(text) = event.data().as_string() else {
+                error!("collaboration server sent a non-text message");
                 inbound_for_message.borrow_mut().push(ServerMessage::Error {
                     message: "collaboration server sent a non-text message".to_string(),
                 });
@@ -1582,15 +1729,19 @@ impl FabricadApp {
             };
             match serde_json::from_str::<ServerMessage>(&text) {
                 Ok(message) => inbound_for_message.borrow_mut().push(message),
-                Err(err) => inbound_for_message.borrow_mut().push(ServerMessage::Error {
-                    message: format!("invalid collaboration message: {err}"),
-                }),
+                Err(err) => {
+                    error!("invalid collaboration message: {err}");
+                    inbound_for_message.borrow_mut().push(ServerMessage::Error {
+                        message: format!("invalid collaboration message: {err}"),
+                    });
+                }
             }
         }) as Box<dyn FnMut(_)>);
         socket.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
 
         let inbound_for_error = Rc::clone(&inbound);
         let on_error = Closure::wrap(Box::new(move |_event: web_sys::ErrorEvent| {
+            error!("collaboration socket error");
             inbound_for_error.borrow_mut().push(ServerMessage::Error {
                 message: "collaboration socket error".to_string(),
             });
@@ -1599,6 +1750,7 @@ impl FabricadApp {
 
         let inbound_for_close = Rc::clone(&inbound);
         let on_close = Closure::wrap(Box::new(move |event: web_sys::CloseEvent| {
+            warn!(code = event.code(), "collaboration socket closed");
             inbound_for_close.borrow_mut().push(ServerMessage::Error {
                 message: format!("collaboration socket closed ({})", event.code()),
             });
@@ -1666,7 +1818,10 @@ impl FabricadApp {
                         } else {
                             log.materialize_objects_into_document(&mut document)
                                 .err()
-                                .map(|err| format!("; materialize failed: {err}"))
+                                .map(|err| {
+                                    error!("failed to materialize Loro snapshot objects: {err}");
+                                    format!("; materialize failed: {err}")
+                                })
                         };
                         self.loro_log = log;
                         format!(
@@ -1675,6 +1830,7 @@ impl FabricadApp {
                         )
                     }
                     Err(err) => {
+                        error!("failed to apply Loro snapshot: {err}");
                         format!("failed to apply Loro snapshot: {err}")
                     }
                 };
@@ -1719,7 +1875,7 @@ impl FabricadApp {
                 let operations = match self.loro_log.import_update(&update) {
                     Ok(operations) => operations,
                     Err(err) => {
-                        self.status = format!("failed to import Loro update: {err}");
+                        self.set_error_status(format!("failed to import Loro update: {err}"));
                         return;
                     }
                 };
@@ -1760,6 +1916,7 @@ impl FabricadApp {
                 self.remote_selections.remove(&user);
             }
             ServerMessage::Error { message } => {
+                error!("{message}");
                 if is_collaboration_disconnect(&message) {
                     self.collab = None;
                     self.last_broadcast_selection.clear();
@@ -1819,7 +1976,9 @@ impl FabricadApp {
     #[cfg(not(target_arch = "wasm32"))]
     fn send_collaboration_message(&self, message: ClientMessage) {
         if let Some(collab) = &self.collab {
-            let _ = collab.outbound.send(message);
+            if let Err(err) = collab.outbound.send(message) {
+                warn!(error = %err, "failed to enqueue outbound collaboration message");
+            }
         }
     }
 
@@ -2476,12 +2635,18 @@ impl FabricadApp {
             .first()
             .map(|lot| lot.id.clone())
             .unwrap_or_default();
+        if self.selected_yield_lot.is_empty() {
+            warn!("yield dataset has no lots; selected yield lot defaults to empty");
+        }
         self.selected_yield_wafer = self
             .yield_analysis
             .wafer_ids_for_lot(&self.selected_yield_lot)
             .first()
             .cloned()
             .unwrap_or_default();
+        if self.selected_yield_wafer.is_empty() {
+            warn!("selected yield lot has no wafers; selected yield wafer defaults to empty");
+        }
     }
 
     fn new_blank_workspace(&mut self) {
@@ -2498,14 +2663,14 @@ impl FabricadApp {
         if let Some(parent) = path.parent()
             && let Err(err) = fs::create_dir_all(parent)
         {
-            self.status = format!("workspace save failed: {err}");
+            self.set_error_status(format!("workspace save failed: {err}"));
             return;
         }
         match serde_json::to_string_pretty(&self.current_workspace_dataset())
             .and_then(|contents| fs::write(&path, contents).map_err(serde_json::Error::io))
         {
             Ok(()) => self.status = format!("saved workspace {WORKSPACE_PATH}"),
-            Err(err) => self.status = format!("workspace save failed: {err}"),
+            Err(err) => self.set_error_status(format!("workspace save failed: {err}")),
         }
     }
 
@@ -2520,7 +2685,7 @@ impl FabricadApp {
                 DataSource::File(WORKSPACE_PATH.to_string()),
                 &format!("loaded workspace {WORKSPACE_PATH}"),
             ),
-            Err(err) => self.status = format!("workspace load failed: {err}"),
+            Err(err) => self.set_error_status(format!("workspace load failed: {err}")),
         }
     }
 
@@ -2531,12 +2696,17 @@ impl FabricadApp {
             .and_then(|contents| serde_json::from_str::<WorkspaceDataset>(&contents))
         {
             Ok(dataset) => dataset,
-            Err(_) => {
+            Err(err) => {
+                warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "demo workspace load failed; regenerating demo workspace"
+                );
                 let dataset = WorkspaceDataset::demo();
                 if let Some(parent) = path.parent()
                     && let Err(err) = fs::create_dir_all(parent)
                 {
-                    self.status = format!("demo workspace setup failed: {err}");
+                    self.set_error_status(format!("demo workspace setup failed: {err}"));
                     return;
                 }
                 match serde_json::to_string_pretty(&dataset)
@@ -2544,7 +2714,7 @@ impl FabricadApp {
                 {
                     Ok(()) => {}
                     Err(err) => {
-                        self.status = format!("demo workspace setup failed: {err}");
+                        self.set_error_status(format!("demo workspace setup failed: {err}"));
                         return;
                     }
                 }
@@ -2563,7 +2733,7 @@ impl FabricadApp {
         let path = PathBuf::from(SAVE_PATH);
         if let Some(parent) = path.parent() {
             if let Err(err) = fs::create_dir_all(parent) {
-                self.status = format!("save failed: {err}");
+                self.set_error_status(format!("save failed: {err}"));
                 return;
             }
         }
@@ -2574,7 +2744,7 @@ impl FabricadApp {
                 self.last_autosave = Instant::now();
                 self.status = format!("saved {SAVE_PATH}");
             }
-            Err(err) => self.status = format!("save failed: {err}"),
+            Err(err) => self.set_error_status(format!("save failed: {err}")),
         }
     }
 
@@ -2582,7 +2752,7 @@ impl FabricadApp {
         let contents = match serde_json::to_string_pretty(&self.document) {
             Ok(contents) => contents,
             Err(err) => {
-                self.status = format!("autosave failed: {err}");
+                self.set_error_status(format!("autosave failed: {err}"));
                 return;
             }
         };
@@ -2590,23 +2760,23 @@ impl FabricadApp {
         #[cfg(target_arch = "wasm32")]
         {
             let Some(window) = web_sys::window() else {
-                self.status = "autosave failed: no browser window".to_string();
+                self.set_error_status("autosave failed: no browser window");
                 return;
             };
             let storage = match window.local_storage() {
                 Ok(Some(storage)) => storage,
                 Ok(None) => {
-                    self.status = "autosave failed: local storage unavailable".to_string();
+                    self.set_error_status("autosave failed: local storage unavailable");
                     return;
                 }
                 Err(_) => {
-                    self.status = "autosave failed: local storage blocked".to_string();
+                    self.set_error_status("autosave failed: local storage blocked");
                     return;
                 }
             };
             match storage.set_item(WASM_AUTOSAVE_KEY, &contents) {
                 Ok(()) => self.status = "autosaved to browser storage".to_string(),
-                Err(_) => self.status = "autosave failed: browser storage write failed".to_string(),
+                Err(_) => self.set_error_status("autosave failed: browser storage write failed"),
             }
         }
 
@@ -2616,12 +2786,12 @@ impl FabricadApp {
             if let Some(parent) = path.parent()
                 && let Err(err) = fs::create_dir_all(parent)
             {
-                self.status = format!("autosave failed: {err}");
+                self.set_error_status(format!("autosave failed: {err}"));
                 return;
             }
             match fs::write(&path, contents) {
                 Ok(()) => self.status = format!("autosaved {SAVE_PATH}"),
-                Err(err) => self.status = format!("autosave failed: {err}"),
+                Err(err) => self.set_error_status(format!("autosave failed: {err}")),
             }
         }
     }
@@ -2630,28 +2800,28 @@ impl FabricadApp {
         #[cfg(target_arch = "wasm32")]
         {
             let Some(window) = web_sys::window() else {
-                self.status = "restore failed: no browser window".to_string();
+                self.set_error_status("restore failed: no browser window");
                 return;
             };
             let storage = match window.local_storage() {
                 Ok(Some(storage)) => storage,
                 Ok(None) => {
-                    self.status = "restore failed: local storage unavailable".to_string();
+                    self.set_error_status("restore failed: local storage unavailable");
                     return;
                 }
                 Err(_) => {
-                    self.status = "restore failed: local storage blocked".to_string();
+                    self.set_error_status("restore failed: local storage blocked");
                     return;
                 }
             };
             let contents = match storage.get_item(WASM_AUTOSAVE_KEY) {
                 Ok(Some(contents)) => contents,
                 Ok(None) => {
-                    self.status = "restore failed: no browser autosave".to_string();
+                    self.set_warn_status("restore failed: no browser autosave");
                     return;
                 }
                 Err(_) => {
-                    self.status = "restore failed: browser storage read failed".to_string();
+                    self.set_error_status("restore failed: browser storage read failed");
                     return;
                 }
             };
@@ -2660,7 +2830,7 @@ impl FabricadApp {
                     self.replace_document(document, "restored browser autosave");
                     self.layout_source = DataSource::File("browser autosave".to_string());
                 }
-                Err(err) => self.status = format!("restore failed: {err}"),
+                Err(err) => self.set_error_status(format!("restore failed: {err}")),
             }
         }
 
@@ -2686,6 +2856,7 @@ impl FabricadApp {
         self.reset_3d_camera_to_document();
         self.status = label.to_string();
         if let Some(message) = drc_skip_message(&self.document) {
+            warn!("{message}");
             self.status = format!("{label}; {message}");
         }
     }
@@ -2699,7 +2870,7 @@ impl FabricadApp {
                 self.replace_document(document, &format!("loaded {SAVE_PATH}"));
                 self.layout_source = DataSource::File(SAVE_PATH.to_string());
             }
-            Err(err) => self.status = format!("load failed: {err}"),
+            Err(err) => self.set_error_status(format!("load failed: {err}")),
         }
     }
 
@@ -2708,20 +2879,20 @@ impl FabricadApp {
         let bytes = match export_gdsii(&self.document, &technology) {
             Ok(bytes) => bytes,
             Err(err) => {
-                self.status = format!("GDS export failed: {err}");
+                self.set_error_status(format!("GDS export failed: {err}"));
                 return;
             }
         };
         let path = PathBuf::from(GDS_PATH);
         if let Some(parent) = path.parent() {
             if let Err(err) = fs::create_dir_all(parent) {
-                self.status = format!("GDS export failed: {err}");
+                self.set_error_status(format!("GDS export failed: {err}"));
                 return;
             }
         }
         match fs::write(&path, bytes) {
             Ok(()) => self.status = format!("exported {GDS_PATH}"),
-            Err(err) => self.status = format!("GDS export failed: {err}"),
+            Err(err) => self.set_error_status(format!("GDS export failed: {err}")),
         }
     }
 
@@ -2730,7 +2901,7 @@ impl FabricadApp {
         let bytes = match fs::read(GDS_PATH) {
             Ok(bytes) => bytes,
             Err(err) => {
-                self.status = format!("GDS import failed: {err}");
+                self.set_error_status(format!("GDS import failed: {err}"));
                 return;
             }
         };
@@ -2739,7 +2910,7 @@ impl FabricadApp {
                 self.replace_document(document, &format!("imported {GDS_PATH}"));
                 self.layout_source = DataSource::File(GDS_PATH.to_string());
             }
-            Err(err) => self.status = format!("GDS import failed: {err}"),
+            Err(err) => self.set_error_status(format!("GDS import failed: {err}")),
         }
     }
 
@@ -4306,6 +4477,7 @@ impl FabricadApp {
     fn mes_action_operator(&self) -> String {
         let operator = self.mes_operator.trim();
         if operator.is_empty() {
+            warn!("MES operator is empty; using demo operator id");
             "op.demo".to_string()
         } else {
             operator.to_string()
@@ -5212,9 +5384,10 @@ impl FabricadApp {
     }
 
     fn reset_3d_camera_to_document(&mut self) {
-        let bounds = self
-            .layout_bounds()
-            .unwrap_or_else(|| Rect::new(Point::new(-5_000, -5_000), Point::new(5_000, 5_000)));
+        let bounds = self.layout_bounds().unwrap_or_else(|| {
+            warn!("3D camera reset found no layout bounds; using default view bounds");
+            Rect::new(Point::new(-5_000, -5_000), Point::new(5_000, 5_000))
+        });
         let center = bounds.center();
         let span = bounds.width().abs().max(bounds.height().abs()).max(1_000) as f32;
         let target = Vec3f::new(center.x as f32, center.y as f32, 360.0);
@@ -5539,9 +5712,13 @@ impl FabricadApp {
         self.perf.evicted_shape_batches = tile_stats.evicted_shape_batches;
         self.perf.draw_range_count = tile_stats.draw_ranges;
         self.perf.tile_cache_bytes = tile_stats.cache_bytes;
-        self.perf.tile_memory_budget_bytes = tile_stats
-            .memory_budget_bytes
-            .unwrap_or(TILE_MEMORY_BUDGET_BYTES);
+        self.perf.tile_memory_budget_bytes = tile_stats.memory_budget_bytes.unwrap_or_else(|| {
+            warn!(
+                default_budget_bytes = TILE_MEMORY_BUDGET_BYTES,
+                "tile frame omitted memory budget; using default tile memory budget"
+            );
+            TILE_MEMORY_BUDGET_BYTES
+        });
         self.perf.tile_over_budget_bytes = tile_stats.over_budget_bytes;
         self.perf.pick_build_ms = tile_stats.pick_build_ms;
         self.perf.batch_bytes = batch.estimate_bytes();
@@ -5622,6 +5799,7 @@ impl FabricadApp {
             self.draw_3d_ground_grid(&painter, canvas);
             self.draw_3d_layout_cpu_fallback(&painter, canvas)
         };
+        self.log_3d_stats_if_needed(stats);
         self.draw_3d_hud(&painter, canvas, stats);
     }
 
@@ -5931,7 +6109,7 @@ impl FabricadApp {
         };
         for occurrence in occurrences {
             if faces.len() >= MAX_3D_CPU_FALLBACK_FACES {
-                stats.capped = true;
+                stats.cpu_face_capped = true;
                 break;
             }
             let Some(flattened) = self.document.shape_view_for_occurrence(&occurrence) else {
@@ -5943,6 +6121,10 @@ impl FabricadApp {
             if faces.len() > before {
                 stats.shapes += 1;
                 stats.faces = faces.len();
+            }
+            if faces.len() >= MAX_3D_CPU_FALLBACK_FACES {
+                stats.cpu_face_capped = true;
+                break;
             }
         }
         stats
@@ -5979,6 +6161,41 @@ impl FabricadApp {
 
     fn max_scene_3d_z(&self) -> f32 {
         self.document.layers.len().max(1) as f32 * 320.0 + 2_000.0
+    }
+
+    fn log_3d_stats_if_needed(&mut self, stats: Render3dStats) {
+        if stats.capped && !self.logged_3d_shape_cap {
+            warn!(
+                rendered_shapes = stats.shapes,
+                shape_budget = MAX_3D_RENDERED_SHAPES,
+                "3D renderer visible shape count exceeded render budget"
+            );
+            self.logged_3d_shape_cap = true;
+        } else if !stats.capped {
+            self.logged_3d_shape_cap = false;
+        }
+
+        if stats.top_caps_only && !self.logged_3d_top_cap_lod {
+            warn!(
+                rendered_shapes = stats.shapes,
+                precise_slab_budget = MAX_3D_PRECISE_SLAB_SHAPES,
+                "3D renderer exceeded precise slab budget; using top-cap LOD"
+            );
+            self.logged_3d_top_cap_lod = true;
+        } else if !stats.top_caps_only {
+            self.logged_3d_top_cap_lod = false;
+        }
+
+        if stats.cpu_face_capped && !self.logged_3d_cpu_face_cap {
+            warn!(
+                rendered_faces = stats.faces,
+                face_budget = MAX_3D_CPU_FALLBACK_FACES,
+                "3D CPU fallback exceeded face budget; truncating rendered faces"
+            );
+            self.logged_3d_cpu_face_cap = true;
+        } else if !stats.cpu_face_capped {
+            self.logged_3d_cpu_face_cap = false;
+        }
     }
 
     fn viewport_3d_uniforms(&self, canvas: EguiRect) -> Viewport3dUniforms {
@@ -6143,9 +6360,10 @@ impl FabricadApp {
         if !self.settings.show_grid_3d {
             return;
         }
-        let bounds = self
-            .layout_bounds()
-            .unwrap_or_else(|| Rect::new(Point::new(-5_000, -5_000), Point::new(5_000, 5_000)));
+        let bounds = self.layout_bounds().unwrap_or_else(|| {
+            warn!("3D ground grid found no layout bounds; using default grid bounds");
+            Rect::new(Point::new(-5_000, -5_000), Point::new(5_000, 5_000))
+        });
         let span = bounds.width().abs().max(bounds.height().abs()).max(1_000);
         let expanded = bounds.expanded(span / 2);
         let step = nice_scale_length_dbu((span as f32 / 10.0).max(self.snap_grid() as f32));
@@ -6186,9 +6404,10 @@ impl FabricadApp {
         if !self.settings.show_grid_3d {
             return;
         }
-        let bounds = self
-            .layout_bounds()
-            .unwrap_or_else(|| Rect::new(Point::new(-5_000, -5_000), Point::new(5_000, 5_000)));
+        let bounds = self.layout_bounds().unwrap_or_else(|| {
+            warn!("3D scene guides found no layout bounds; using default grid bounds");
+            Rect::new(Point::new(-5_000, -5_000), Point::new(5_000, 5_000))
+        });
         let span = bounds.width().abs().max(bounds.height().abs()).max(1_000);
         let expanded = bounds.expanded(span / 2);
         let step = nice_scale_length_dbu((span as f32 / 10.0).max(self.snap_grid() as f32));
@@ -6264,7 +6483,11 @@ impl FabricadApp {
         } else {
             "slabs"
         };
-        let capped = if stats.capped { " capped" } else { "" };
+        let capped = if stats.capped || stats.cpu_face_capped {
+            " capped"
+        } else {
+            ""
+        };
         let text = format!(
             "3D flycam  shapes: {}  faces: {}  {}{}  xyz: {:.0}, {:.0}, {:.0}",
             stats.shapes, stats.faces, mode, capped, position.x, position.y, position.z
@@ -6324,7 +6547,13 @@ impl FabricadApp {
         let index = layer_order
             .iter()
             .position(|(_, id)| *id == layer_id)
-            .unwrap_or(0) as f32;
+            .unwrap_or_else(|| {
+                warn!(
+                    layer_id = layer_id.0,
+                    "3D layer missing from display order; using base layer position"
+                );
+                0
+            }) as f32;
         let base_z = index * 170.0;
         let thickness = match layer.process {
             ProcessLayer::Contact | ProcessLayer::Via1 => 240.0,
@@ -7156,7 +7385,13 @@ impl FabricadApp {
     }
 
     fn gpu_pick_at(&self, pointer: Pos2) -> Option<Option<ShapeOccurrenceId>> {
-        let state = self.gpu_pick_state.lock().ok()?;
+        let state = match self.gpu_pick_state.lock() {
+            Ok(state) => state,
+            Err(err) => {
+                error!(error = %err, "GPU pick state mutex was poisoned");
+                return None;
+            }
+        };
         let result = state.latest.as_ref()?;
         let dx = result.pointer_screen[0] - pointer.x;
         let dy = result.pointer_screen[1] - pointer.y;
@@ -7519,11 +7754,22 @@ fn finite_point_from_xy(x: f32, y: f32) -> Option<Point> {
 
 fn coord_from_f32(value: f32) -> Coord {
     let limit = (Coord::MAX / 4) as f32;
-    value.clamp(-limit, limit).round() as Coord
+    let clamped = value.clamp(-limit, limit);
+    if clamped != value {
+        warn!(
+            value,
+            effective_value = clamped,
+            "f32 coordinate exceeded supported Coord conversion range"
+        );
+    }
+    clamped.round() as Coord
 }
 
 fn rule_deck_for_document(document: &Document, technology: &TechnologyFile) -> RuleDeck {
-    RuleDeck::from_technology(document, technology).unwrap_or_else(|_| RuleDeck::demo(document))
+    RuleDeck::from_technology(document, technology).unwrap_or_else(|err| {
+        error!("technology rule load failed: {err}; using demo rule deck");
+        RuleDeck::demo(document)
+    })
 }
 
 fn connectivity_report_for_document(
@@ -7532,12 +7778,19 @@ fn connectivity_report_for_document(
 ) -> ConnectivityReport {
     let object_count = document_object_count(document);
     if object_count > MAX_CONNECTIVITY_OBJECTS {
+        warn!(
+            object_count,
+            max_connectivity_objects = MAX_CONNECTIVITY_OBJECTS,
+            "net extraction skipped because document exceeds connectivity budget"
+        );
         return ConnectivityReport::skipped(format!(
             "net extraction skipped for {object_count} objects"
         ));
     }
-    extract_connectivity(document, technology)
-        .unwrap_or_else(|err| ConnectivityReport::skipped(format!("net extraction failed: {err}")))
+    extract_connectivity(document, technology).unwrap_or_else(|err| {
+        error!("net extraction failed: {err}");
+        ConnectivityReport::skipped(format!("net extraction failed: {err}"))
+    })
 }
 
 fn drc_skip_message(document: &Document) -> Option<String> {
@@ -8133,7 +8386,10 @@ fn transform_shape_kind(kind: &ShapeKind, center: Point, transform: ShapeTransfo
                 .into_iter()
                 .map(|point| transform_point(point, center, transform))
                 .collect();
-            ShapeKind::Rectangle(Rect::from_points(&points).unwrap_or_default())
+            ShapeKind::Rectangle(Rect::from_points(&points).unwrap_or_else(|| {
+                warn!("rectangle transform produced no points; using default bounds");
+                Rect::default()
+            }))
         }
         ShapeKind::Polygon(poly) => ShapeKind::Polygon(geometry_core::Polygon::new(
             poly.points
@@ -8354,32 +8610,51 @@ where
 
 #[cfg(target_arch = "wasm32")]
 fn send_client_message_wasm(socket: &web_sys::WebSocket, message: &ClientMessage) {
-    let Ok(text) = serde_json::to_string(message) else {
-        return;
+    let text = match serde_json::to_string(message) {
+        Ok(text) => text,
+        Err(err) => {
+            error!("failed to serialize collaboration client message: {err}");
+            return;
+        }
     };
-    let _ = socket.send_with_str(&text);
+    if let Err(err) = socket.send_with_str(&text) {
+        warn!(?err, "failed to send collaboration client message");
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
 fn wasm_collaboration_url() -> String {
     let Some(window) = web_sys::window() else {
+        warn!("browser window missing; using default collaboration URL");
         return "ws://127.0.0.1:4141/ws".to_string();
     };
     let location = window.location();
-    let search = location.search().unwrap_or_default();
+    let search = location.search().unwrap_or_else(|err| {
+        warn!(
+            ?err,
+            "failed to read URL search parameters; using default collaboration URL"
+        );
+        String::new()
+    });
     if let Some(url) = query_param(&search, "sync") {
         return url;
     }
-    let ws_scheme = if location.protocol().unwrap_or_default() == "https:" {
-        "wss"
-    } else {
-        "ws"
-    };
+    let protocol = location.protocol().unwrap_or_else(|err| {
+        warn!(
+            ?err,
+            "failed to read browser protocol; using ws collaboration URL"
+        );
+        String::new()
+    });
+    let ws_scheme = if protocol == "https:" { "wss" } else { "ws" };
     let host = location
         .hostname()
         .ok()
         .filter(|host| !host.is_empty())
-        .unwrap_or_else(|| "127.0.0.1".to_string());
+        .unwrap_or_else(|| {
+            warn!("browser hostname missing; using 127.0.0.1 for collaboration URL");
+            "127.0.0.1".to_string()
+        });
     format!("{ws_scheme}://{host}:4141/ws")
 }
 
@@ -8606,9 +8881,17 @@ fn path_segment_polygon_points(a: Point, b: Point, width: Coord) -> Option<[Poin
     let dy = (b.y - a.y) as f32;
     let length = (dx * dx + dy * dy).sqrt();
     if length <= f32::EPSILON {
+        warn!("3D path segment has zero length; skipping segment");
         return None;
     }
-    let half = width.max(1) as f32 * 0.5;
+    let clamped_width = width.max(1);
+    if clamped_width != width {
+        warn!(
+            width,
+            clamped_width, "3D path segment width below one dbu; clamping"
+        );
+    }
+    let half = clamped_width as f32 * 0.5;
     let nx = -dy / length * half;
     let ny = dx / length * half;
     Some([
