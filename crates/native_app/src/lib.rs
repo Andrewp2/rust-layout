@@ -5901,7 +5901,9 @@ impl FabricadApp {
     }
 
     fn collect_visible_3d_faces(&self, canvas: EguiRect, faces: &mut Vec<Face3d>) {
-        let query = self.visible_3d_query_rect(canvas);
+        let Some(query) = self.visible_3d_query_rect(canvas) else {
+            return;
+        };
         for occurrence in self
             .index
             .query_occurrences_limited(query, MAX_3D_SHAPE_CANDIDATES)
@@ -5920,27 +5922,23 @@ impl FabricadApp {
         }
     }
 
-    fn visible_3d_query_rect(&self, canvas: EguiRect) -> Rect {
-        let fallback = || self.camera_3d_fallback_query_rect();
-        let query = camera_ground_view_rect(self.camera_3d, canvas).unwrap_or_else(fallback);
-        if let Some(bounds) = self.layout_bounds() {
-            if let Some(intersection) = query.intersection(bounds.expanded(self.snap_grid() * 8)) {
-                return intersection.expanded(self.snap_grid() * 4);
-            }
-        }
-        query
+    fn visible_3d_query_rect(&self, canvas: EguiRect) -> Option<Rect> {
+        let query = camera_frustum_xy_rect(
+            self.camera_3d,
+            canvas,
+            CAMERA_NEAR_PLANE,
+            self.camera_3d_far_plane(),
+            0.0,
+            self.max_scene_3d_z(),
+        )
+        .or_else(|| self.layout_bounds())?;
+        self.layout_bounds()
+            .and_then(|bounds| query.intersection(bounds.expanded(self.snap_grid() * 8)))
+            .map(|rect| rect.expanded(self.snap_grid() * 4))
     }
 
-    fn camera_3d_fallback_query_rect(&self) -> Rect {
-        let forward = self.camera_3d.forward();
-        let center =
-            self.camera_3d.position + forward * self.camera_3d.speed.clamp(2_000.0, 250_000.0);
-        let radius = coord_from_f32(self.camera_3d.speed.clamp(16_384.0, 500_000.0));
-        let center = finite_point_from_xy(center.x, center.y).unwrap_or_else(|| Point::new(0, 0));
-        Rect::new(
-            Point::new(center.x - radius, center.y - radius),
-            Point::new(center.x + radius, center.y + radius),
-        )
+    fn max_scene_3d_z(&self) -> f32 {
+        self.document.layers.len().max(1) as f32 * 320.0 + 2_000.0
     }
 
     fn viewport_3d_uniforms(&self, canvas: EguiRect) -> Viewport3dUniforms {
@@ -5991,7 +5989,7 @@ impl FabricadApp {
         let Some(bounds) = self.layout_bounds() else {
             return 100_000.0;
         };
-        let max_layer_z = self.document.layers.len().max(1) as f32 * 320.0 + 2_000.0;
+        let max_layer_z = self.max_scene_3d_z();
         let corners = [
             Vec3f::new(bounds.min.x as f32, bounds.min.y as f32, 0.0),
             Vec3f::new(bounds.max.x as f32, bounds.min.y as f32, 0.0),
@@ -7335,41 +7333,82 @@ fn build_layout_index(document: &Document) -> LayoutIndex {
     }
 }
 
-fn camera_ground_view_rect(camera: Camera3d, canvas: EguiRect) -> Option<Rect> {
+fn camera_frustum_xy_rect(
+    camera: Camera3d,
+    canvas: EguiRect,
+    near_depth: f32,
+    far_depth: f32,
+    min_z: f32,
+    max_z: f32,
+) -> Option<Rect> {
     if canvas.width() <= 1.0 || canvas.height() <= 1.0 {
         return None;
     }
+    let near_depth = near_depth.max(0.001);
+    let far_depth = far_depth.max(near_depth + 1.0);
+    let (min_z, max_z) = if min_z <= max_z {
+        (min_z, max_z)
+    } else {
+        (max_z, min_z)
+    };
     let basis = camera.basis();
     let aspect = (canvas.width() / canvas.height()).max(0.001);
     let tan_y = (camera.fov_y * 0.5).tan();
     let tan_x = tan_y * aspect;
-    let samples = [
-        (-1.0, -1.0),
-        (1.0, -1.0),
-        (1.0, 1.0),
-        (-1.0, 1.0),
-        (0.0, 0.0),
+    let ndc = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)];
+    let mut vertices = Vec::with_capacity(8);
+    for depth in [near_depth, far_depth] {
+        for (x, y) in ndc {
+            let ray = basis.forward + basis.right * (x * tan_x) + basis.up * (y * tan_y);
+            vertices.push(camera.position + ray * depth);
+        }
+    }
+
+    let edges = [
+        (0, 1),
+        (1, 2),
+        (2, 3),
+        (3, 0),
+        (4, 5),
+        (5, 6),
+        (6, 7),
+        (7, 4),
+        (0, 4),
+        (1, 5),
+        (2, 6),
+        (3, 7),
     ];
+    let mut points = Vec::with_capacity(16);
+    for vertex in &vertices {
+        if vertex.z >= min_z && vertex.z <= max_z {
+            points.push(*vertex);
+        }
+    }
+    for (a, b) in edges {
+        let a = vertices[a];
+        let b = vertices[b];
+        for z in [min_z, max_z] {
+            let dz = b.z - a.z;
+            if dz.abs() <= 0.0001 {
+                continue;
+            }
+            let t = (z - a.z) / dz;
+            if (0.0..=1.0).contains(&t) {
+                points.push(a + (b - a) * t);
+            }
+        }
+    }
+
     let mut bounds = None;
-    for (x, y) in samples {
-        let ray = (basis.forward + basis.right * (x * tan_x) + basis.up * (y * tan_y)).normalized();
-        if ray.z.abs() <= 0.0001 {
-            continue;
-        }
-        let t = -camera.position.z / ray.z;
-        if t <= 0.0 {
-            continue;
-        }
-        let ground = camera.position + ray * t;
-        let Some(point) = finite_point_from_xy(ground.x, ground.y) else {
+    for point in points {
+        let Some(point) = finite_point_from_xy(point.x, point.y) else {
             continue;
         };
         bounds = Some(bounds.map_or(Rect::new(point, point), |rect: Rect| {
             rect.union(Rect::new(point, point))
         }));
     }
-    let padding = coord_from_f32(camera.speed.clamp(4_000.0, 250_000.0) * 0.25);
-    bounds.map(|rect| rect.expanded(padding.max(1_000)))
+    bounds
 }
 
 fn finite_point_from_xy(x: f32, y: f32) -> Option<Point> {
@@ -9035,16 +9074,35 @@ mod tests {
     }
 
     #[test]
-    fn fly_camera_ground_view_rect_tracks_look_target() {
+    fn fly_camera_frustum_xy_rect_tracks_look_target() {
         let camera = Camera3d::look_at(
             Vec3f::new(-1_000.0, -1_000.0, 1_000.0),
             Vec3f::ZERO,
             2_000.0,
         );
         let canvas = EguiRect::from_min_size(Pos2::ZERO, vec2(1_280.0, 720.0));
-        let rect = camera_ground_view_rect(camera, canvas).expect("camera should hit ground");
+        let rect =
+            camera_frustum_xy_rect(camera, canvas, CAMERA_NEAR_PLANE, 10_000.0, 0.0, 2_000.0)
+                .expect("camera frustum should intersect scene z range");
 
         assert!(rect.contains_point(Point::ZERO));
+    }
+
+    #[test]
+    fn fly_camera_frustum_xy_rect_includes_horizontal_slab_views() {
+        let camera = Camera3d {
+            position: Vec3f::new(0.0, 0.0, 1_000.0),
+            yaw: 0.0,
+            pitch: 0.0,
+            speed: 2_000.0,
+            fov_y: 58.0_f32.to_radians(),
+        };
+        let canvas = EguiRect::from_min_size(Pos2::ZERO, vec2(1_280.0, 720.0));
+        let rect =
+            camera_frustum_xy_rect(camera, canvas, CAMERA_NEAR_PLANE, 10_000.0, 0.0, 2_000.0)
+                .expect("horizontal frustum should intersect scene z range");
+
+        assert!(rect.contains_point(Point::new(10_000, 0)));
     }
 
     #[test]
