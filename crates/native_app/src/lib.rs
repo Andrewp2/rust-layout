@@ -20,6 +20,7 @@ use layout_model::{
     LoroUpdate, MarkerState, NetId, Operation, ProcessLayer, ServerMessage, Shape, ShapeId,
     ShapeKind, ShapeKindView, ShapeOccurrenceId, TechnologyFile, Transform, builtin_technologies,
     connectivity::{ConnectivityReport, NetComponent, extract_connectivity},
+    environment::CleanroomEnvironment,
     equipment::{
         AlarmSeverity, EquipmentEvent, EquipmentSimulator, HostCommand,
         RecipeId as EquipmentRecipeId, RecipeSelection, RunStatus, SensorSample,
@@ -29,6 +30,8 @@ use layout_model::{
     experiment::ExperimentPlan,
     gdsii::{export_gdsii, import_gdsii},
     genealogy::LotGenealogy,
+    inventory::Inventory,
+    maintenance::MaintenanceModel,
     mes::{
         AuditOutcome, FabMesData, Lot, LotId, OperatorAction, ProcessRoute, ToolId, TravelerState,
         TravelerStatus,
@@ -37,8 +40,12 @@ use layout_model::{
         DieCoord, FabObjectLinks, HistogramBin, Measurement, MeasurementKind, MeasurementStatus,
         WaferGeometry, WaferMap,
     },
+    notebook::LabNotebook,
     process_control::ProcessControlModel,
+    process_flow::ProcessFlowModel,
     recipe::RecipeCatalog,
+    safety::SafetySystem,
+    scheduler::DispatchSchedule,
     yield_analysis::{
         CorrelationRecord, DieOutcome, FailureMode, LotComparison, ProcessMeasurement,
         YieldAnalysis, YieldSummary,
@@ -56,18 +63,36 @@ use tracing::{error, warn};
 use uuid::Uuid;
 use web_time::{Duration, Instant};
 
+mod cross_section_panel;
+mod environment_panel;
 mod experiment_panel;
 mod genealogy_panel;
+mod inventory_panel;
+mod layout_diff_panel;
+mod maintenance_panel;
 mod mask_panel;
+mod notebook_panel;
 mod process_control_panel;
+mod process_flow_panel;
 mod recipe_panel;
+mod safety_panel;
+mod scheduler_panel;
 mod spc_fdc_panel;
 mod ui_chrome;
+use cross_section_panel::CrossSectionPanel;
+use environment_panel::EnvironmentPanel;
 use experiment_panel::ExperimentPlannerPanel;
 use genealogy_panel::GenealogyPanel;
+use inventory_panel::InventoryPanel;
+use layout_diff_panel::LayoutDiffPanel;
+use maintenance_panel::MaintenancePanel;
 use mask_panel::MaskPrepPanel;
+use notebook_panel::LabNotebookPanel;
 use process_control_panel::ProcessControlPanel;
+use process_flow_panel::ProcessFlowPanel;
 use recipe_panel::RecipeManagerPanel;
+use safety_panel::SafetyPanel;
+use scheduler_panel::SchedulerPanel;
 use spc_fdc_panel::SpcFdcPanel;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -111,24 +136,42 @@ enum ViewMode {
     Metrology,
     Yield,
     MaskPrep,
+    LayoutDiff,
+    Inventory,
+    Maintenance,
+    Environment,
+    Scheduler,
+    Safety,
     SpcFdc,
+    ProcessFlow,
     ProcessControl,
+    CrossSection,
     Traceability,
     Experiment,
+    Notebook,
 }
 
 impl ViewMode {
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 19] = [
         Self::Layout2d,
         Self::Layout3d,
         Self::MaskPrep,
+        Self::LayoutDiff,
         Self::FabControl,
+        Self::Inventory,
+        Self::Maintenance,
+        Self::Environment,
+        Self::Scheduler,
+        Self::Safety,
+        Self::Traceability,
         Self::Metrology,
         Self::Yield,
         Self::SpcFdc,
+        Self::ProcessFlow,
         Self::ProcessControl,
-        Self::Traceability,
+        Self::CrossSection,
         Self::Experiment,
+        Self::Notebook,
     ];
 
     fn title(self) -> &'static str {
@@ -139,10 +182,19 @@ impl ViewMode {
             Self::Metrology => "Metrology Wafer Map",
             Self::Yield => "Yield Dashboard",
             Self::MaskPrep => "Mask / Reticle Prep",
+            Self::LayoutDiff => "Layout Diff Review",
+            Self::Inventory => "Inventory Tracker",
+            Self::Maintenance => "Maintenance and Calibration",
+            Self::Environment => "Cleanroom Environment",
+            Self::Scheduler => "Scheduler / Dispatch",
+            Self::Safety => "Safety and Interlock Dashboard",
             Self::SpcFdc => "SPC / FDC Monitor",
+            Self::ProcessFlow => "Process-flow Designer",
             Self::ProcessControl => "Run-to-Run Control",
+            Self::CrossSection => "Process Cross-Section",
             Self::Traceability => "Lot Traceability",
             Self::Experiment => "DOE Planner",
+            Self::Notebook => "Lab Notebook",
         }
     }
 
@@ -154,10 +206,19 @@ impl ViewMode {
             Self::Metrology => "Metrology",
             Self::Yield => "Yield",
             Self::MaskPrep => "Reticle prep",
+            Self::LayoutDiff => "Layout diff",
+            Self::Inventory => "Inventory",
+            Self::Maintenance => "Maintenance",
+            Self::Environment => "Environment",
+            Self::Scheduler => "Dispatch",
+            Self::Safety => "Safety",
             Self::SpcFdc => "SPC / FDC",
+            Self::ProcessFlow => "Process flow",
             Self::ProcessControl => "R2R control",
+            Self::CrossSection => "Cross-section",
             Self::Traceability => "Traceability",
             Self::Experiment => "DOE",
+            Self::Notebook => "Notebook",
         }
     }
 
@@ -169,19 +230,40 @@ impl ViewMode {
             Self::Metrology => "metrology wafer map",
             Self::Yield => "FabOS yield dashboard",
             Self::MaskPrep => "FabOS mask editor / reticle prep",
+            Self::LayoutDiff => "layout diff review",
+            Self::Inventory => "FabOS inventory and materials tracker",
+            Self::Maintenance => "FabOS maintenance and calibration manager",
+            Self::Environment => "FabOS cleanroom environmental monitor",
+            Self::Scheduler => "FabOS scheduler and dispatch",
+            Self::Safety => "FabOS simulated safety interlocks",
             Self::SpcFdc => "FabOS SPC/FDC monitor",
+            Self::ProcessFlow => "FabOS process-flow designer",
             Self::ProcessControl => "FabOS run-to-run process control",
+            Self::CrossSection => "FabOS process cross-section simulator",
             Self::Traceability => "FabOS lot genealogy trace",
             Self::Experiment => "FabOS DOE planner",
+            Self::Notebook => "FabOS linked lab notebook",
         }
     }
 
     fn group(self) -> ModuleGroup {
         match self {
-            Self::Layout2d | Self::Layout3d | Self::MaskPrep => ModuleGroup::Design,
-            Self::FabControl | Self::Traceability => ModuleGroup::Operations,
+            Self::Layout2d | Self::Layout3d | Self::MaskPrep | Self::LayoutDiff => {
+                ModuleGroup::Design
+            }
+            Self::FabControl
+            | Self::Inventory
+            | Self::Maintenance
+            | Self::Environment
+            | Self::Scheduler
+            | Self::Safety
+            | Self::Traceability => ModuleGroup::Operations,
             Self::Metrology | Self::Yield | Self::SpcFdc => ModuleGroup::Analysis,
-            Self::ProcessControl | Self::Experiment => ModuleGroup::Engineering,
+            Self::ProcessFlow
+            | Self::ProcessControl
+            | Self::CrossSection
+            | Self::Experiment
+            | Self::Notebook => ModuleGroup::Engineering,
         }
     }
 
@@ -192,7 +274,13 @@ impl ViewMode {
     fn has_secondary_panel(self) -> bool {
         matches!(
             self,
-            Self::Layout2d | Self::Layout3d | Self::Metrology | Self::MaskPrep | Self::Experiment
+            Self::Layout2d
+                | Self::Layout3d
+                | Self::Metrology
+                | Self::MaskPrep
+                | Self::CrossSection
+                | Self::Experiment
+                | Self::Notebook
         )
     }
 }
@@ -240,8 +328,15 @@ struct WorkspaceDataset {
     wafer_map: WaferMap,
     recipe_catalog: RecipeCatalog,
     genealogy: LotGenealogy,
+    inventory: Inventory,
+    maintenance: MaintenanceModel,
+    environment: CleanroomEnvironment,
+    scheduler: DispatchSchedule,
+    safety: SafetySystem,
     experiment_plan: ExperimentPlan,
     process_control: ProcessControlModel,
+    process_flow: ProcessFlowModel,
+    lab_notebook: LabNotebook,
     equipment: EquipmentSimulator,
 }
 
@@ -767,10 +862,19 @@ pub struct FabricadApp {
     selected_yield_lot: String,
     selected_yield_wafer: String,
     mask_panel: MaskPrepPanel,
+    layout_diff_panel: LayoutDiffPanel,
+    inventory_panel: InventoryPanel,
+    maintenance_panel: MaintenancePanel,
+    environment_panel: EnvironmentPanel,
+    scheduler_panel: SchedulerPanel,
+    safety_panel: SafetyPanel,
     spc_fdc_panel: SpcFdcPanel,
+    process_flow_panel: ProcessFlowPanel,
     process_control_panel: ProcessControlPanel,
+    cross_section_panel: CrossSectionPanel,
     genealogy_panel: GenealogyPanel,
     experiment_panel: ExperimentPlannerPanel,
+    notebook_panel: LabNotebookPanel,
     technologies: Vec<TechnologyFile>,
     active_technology: usize,
     rules: RuleDeck,
@@ -926,8 +1030,15 @@ impl WorkspaceDataset {
             wafer_map: empty_wafer_map(),
             recipe_catalog: RecipeCatalog::default(),
             genealogy: LotGenealogy::new(),
+            inventory: Inventory::default(),
+            maintenance: MaintenanceModel::default(),
+            environment: CleanroomEnvironment::default(),
+            scheduler: SchedulerPanel::empty().schedule().clone(),
+            safety: SafetySystem::default(),
             experiment_plan: ExperimentPlannerPanel::empty().plan().clone(),
             process_control: ProcessControlModel::default(),
+            process_flow: ProcessFlowModel::default(),
+            lab_notebook: LabNotebook::default(),
             equipment: EquipmentSimulator::new(Vec::new()),
         }
     }
@@ -942,8 +1053,15 @@ impl WorkspaceDataset {
             wafer_map: WaferMap::synthetic_demo(),
             recipe_catalog: RecipeCatalog::sample(),
             genealogy: LotGenealogy::sample(),
+            inventory: Inventory::sample(),
+            maintenance: MaintenanceModel::sample(),
+            environment: CleanroomEnvironment::sample(),
+            scheduler: DispatchSchedule::sample(),
+            safety: SafetySystem::simulated_demo(),
             experiment_plan: ExperimentPlan::sample(),
             process_control: ProcessControlModel::from_yield_analysis(&yield_analysis),
+            process_flow: ProcessFlowModel::sample(),
+            lab_notebook: LabNotebook::sample(),
             equipment: EquipmentSimulator::demo_fab(),
         }
     }
@@ -1096,10 +1214,19 @@ impl FabricadApp {
         let equipment_sim = dataset.equipment;
         let selected_equipment_tool = equipment_sim.tools().next().map(|tool| tool.id.clone());
         let mask_panel = MaskPrepPanel::new(&document, &mes, selected_mes_lot.as_ref());
+        let layout_diff_panel = LayoutDiffPanel::default();
+        let inventory_panel = InventoryPanel::from_inventory(dataset.inventory);
+        let maintenance_panel = MaintenancePanel::from_model(dataset.maintenance);
+        let environment_panel = EnvironmentPanel::from_model(dataset.environment);
+        let scheduler_panel = SchedulerPanel::from_schedule(dataset.scheduler);
+        let safety_panel = SafetyPanel::from_model(dataset.safety);
         let spc_fdc_panel = SpcFdcPanel::new();
+        let process_flow_panel = ProcessFlowPanel::from_model(dataset.process_flow);
         let process_control_panel = ProcessControlPanel::from_model(dataset.process_control);
+        let cross_section_panel = CrossSectionPanel::sample();
         let genealogy_panel = GenealogyPanel::from_genealogy(dataset.genealogy);
         let experiment_panel = ExperimentPlannerPanel::from_plan(dataset.experiment_plan);
+        let notebook_panel = LabNotebookPanel::from_notebook(dataset.lab_notebook);
         let mut app = Self {
             document,
             layout_source: DataSource::Blank,
@@ -1110,10 +1237,19 @@ impl FabricadApp {
             selected_yield_lot,
             selected_yield_wafer,
             mask_panel,
+            layout_diff_panel,
+            inventory_panel,
+            maintenance_panel,
+            environment_panel,
+            scheduler_panel,
+            safety_panel,
             spc_fdc_panel,
+            process_flow_panel,
             process_control_panel,
+            cross_section_panel,
             genealogy_panel,
             experiment_panel,
+            notebook_panel,
             technologies,
             active_technology,
             rules,
@@ -2766,8 +2902,15 @@ impl FabricadApp {
             wafer_map: self.wafer_map.clone(),
             recipe_catalog: self.recipe_panel.catalog().clone(),
             genealogy: self.genealogy_panel.genealogy().clone(),
+            inventory: self.inventory_panel.inventory().clone(),
+            maintenance: self.maintenance_panel.model().clone(),
+            environment: self.environment_panel.model().clone(),
+            scheduler: self.scheduler_panel.schedule().clone(),
+            safety: self.safety_panel.model().clone(),
             experiment_plan: self.experiment_panel.plan().clone(),
             process_control: self.process_control_panel.model().clone(),
+            process_flow: self.process_flow_panel.model().clone(),
+            lab_notebook: self.notebook_panel.notebook().clone(),
             equipment: self.equipment_sim.clone(),
         }
     }
@@ -2790,10 +2933,19 @@ impl FabricadApp {
         self.selected_mes_lot = self.mes.lots.keys().next().cloned();
         self.mask_panel =
             MaskPrepPanel::new(&self.document, &self.mes, self.selected_mes_lot.as_ref());
+        self.layout_diff_panel = LayoutDiffPanel::default();
+        self.inventory_panel = InventoryPanel::from_inventory(dataset.inventory);
+        self.maintenance_panel = MaintenancePanel::from_model(dataset.maintenance);
+        self.environment_panel = EnvironmentPanel::from_model(dataset.environment);
+        self.scheduler_panel = SchedulerPanel::from_schedule(dataset.scheduler);
+        self.safety_panel = SafetyPanel::from_model(dataset.safety);
         self.spc_fdc_panel = SpcFdcPanel::new();
+        self.process_flow_panel = ProcessFlowPanel::from_model(dataset.process_flow);
         self.process_control_panel = ProcessControlPanel::from_model(dataset.process_control);
+        self.cross_section_panel = CrossSectionPanel::sample();
         self.genealogy_panel = GenealogyPanel::from_genealogy(dataset.genealogy);
         self.experiment_panel = ExperimentPlannerPanel::from_plan(dataset.experiment_plan);
+        self.notebook_panel = LabNotebookPanel::from_notebook(dataset.lab_notebook);
         self.recipe_panel = RecipeManagerPanel::from_catalog(dataset.recipe_catalog);
         self.equipment_sim = dataset.equipment;
         self.selected_equipment_tool = self
@@ -4618,6 +4770,14 @@ impl FabricadApp {
                             self.selected_mes_lot.as_ref(),
                             &mut self.status,
                         ),
+                        ViewMode::LayoutDiff => {
+                            self.layout_diff_panel.context_ui(ui, &self.document)
+                        }
+                        ViewMode::Inventory => self.inventory_panel.context_ui(ui),
+                        ViewMode::Maintenance => self.maintenance_panel.context_ui(ui),
+                        ViewMode::Environment => self.environment_panel.context_ui(ui),
+                        ViewMode::Scheduler => self.scheduler_panel.context_ui(ui),
+                        ViewMode::Safety => self.safety_panel.context_ui(ui),
                         ViewMode::SpcFdc => {
                             self.spc_fdc_panel.context_ui(
                                 ui,
@@ -4625,13 +4785,18 @@ impl FabricadApp {
                                 &self.equipment_sim,
                             );
                         }
+                        ViewMode::ProcessFlow => {
+                            self.process_flow_panel.context_ui(ui, &mut self.status);
+                        }
                         ViewMode::ProcessControl => self
                             .process_control_panel
                             .context_ui(ui, &self.yield_analysis),
+                        ViewMode::CrossSection => self.cross_section_panel.context_ui(ui),
                         ViewMode::Traceability => self.genealogy_panel.context_ui(ui),
                         ViewMode::Experiment => {
                             self.experiment_panel.context_ui(ui, &mut self.status);
                         }
+                        ViewMode::Notebook => self.notebook_panel.context_ui(ui),
                         ViewMode::Layout2d | ViewMode::Layout3d => {
                             self.technology_panel(ui);
                             ui.separator();
@@ -4666,6 +4831,14 @@ impl FabricadApp {
                 if matches!(self.view_mode, ViewMode::Experiment) {
                     self.experiment_panel
                         .response_capture_ui(ui, &mut self.status);
+                    return;
+                }
+                if matches!(self.view_mode, ViewMode::CrossSection) {
+                    self.cross_section_panel.layer_stack_ui(ui);
+                    return;
+                }
+                if matches!(self.view_mode, ViewMode::Notebook) {
+                    self.notebook_panel.link_filter_ui(ui);
                     return;
                 }
                 ui_chrome::section_label(ui, "Layers");
@@ -7831,16 +8004,27 @@ impl eframe::App for FabricadApp {
                 &mut self.selected_mes_lot,
                 &mut self.status,
             ),
+            ViewMode::LayoutDiff => self.layout_diff_panel.ui(ui, &self.document),
+            ViewMode::Inventory => self.inventory_panel.ui(ui, &mut self.status),
+            ViewMode::Maintenance => self.maintenance_panel.ui(ui, &mut self.status),
+            ViewMode::Environment => self.environment_panel.ui(ui),
+            ViewMode::Scheduler => self.scheduler_panel.ui(ui, &mut self.status),
+            ViewMode::Safety => self.safety_panel.ui(ui, &mut self.status),
             ViewMode::SpcFdc => {
                 self.spc_fdc_panel
                     .ui(ui, &self.yield_analysis, &self.equipment_sim);
+            }
+            ViewMode::ProcessFlow => {
+                self.process_flow_panel.ui(ui, &mut self.status);
             }
             ViewMode::ProcessControl => {
                 self.process_control_panel
                     .ui(ui, &self.yield_analysis, &mut self.status);
             }
+            ViewMode::CrossSection => self.cross_section_panel.ui(ui, &mut self.status),
             ViewMode::Traceability => self.genealogy_panel.ui(ui),
             ViewMode::Experiment => self.experiment_panel.dashboard_ui(ui, &mut self.status),
+            ViewMode::Notebook => self.notebook_panel.ui(ui, &mut self.status),
         });
         phase_times.central += take_elapsed_ms(&mut phase_cursor);
         let update_cpu_ms = update_start.elapsed().as_secs_f64() * 1000.0;
@@ -10090,10 +10274,33 @@ mod tests {
         assert_eq!(
             grouped,
             vec![
-                ("Design", vec!["Mask layout", "3D viewport", "Reticle prep"]),
-                ("Operations", vec!["Equipment", "Traceability"]),
+                (
+                    "Design",
+                    vec!["Mask layout", "3D viewport", "Reticle prep", "Layout diff"]
+                ),
+                (
+                    "Operations",
+                    vec![
+                        "Equipment",
+                        "Inventory",
+                        "Maintenance",
+                        "Environment",
+                        "Dispatch",
+                        "Safety",
+                        "Traceability",
+                    ]
+                ),
                 ("Analysis", vec!["Metrology", "Yield", "SPC / FDC"]),
-                ("Engineering", vec!["R2R control", "DOE"]),
+                (
+                    "Engineering",
+                    vec![
+                        "Process flow",
+                        "R2R control",
+                        "Cross-section",
+                        "DOE",
+                        "Notebook"
+                    ]
+                ),
             ]
         );
     }
@@ -10107,10 +10314,16 @@ mod tests {
 
         assert!(ViewMode::MaskPrep.has_inspector_panel());
         assert!(ViewMode::MaskPrep.has_secondary_panel());
+        assert!(ViewMode::LayoutDiff.has_inspector_panel());
+        assert!(!ViewMode::LayoutDiff.has_secondary_panel());
         assert!(ViewMode::Metrology.has_inspector_panel());
         assert!(ViewMode::Metrology.has_secondary_panel());
+        assert!(ViewMode::CrossSection.has_inspector_panel());
+        assert!(ViewMode::CrossSection.has_secondary_panel());
         assert!(ViewMode::Experiment.has_inspector_panel());
         assert!(ViewMode::Experiment.has_secondary_panel());
+        assert!(ViewMode::Notebook.has_inspector_panel());
+        assert!(ViewMode::Notebook.has_secondary_panel());
 
         assert!(!ViewMode::Yield.has_inspector_panel());
         assert!(!ViewMode::Yield.has_secondary_panel());
@@ -10119,6 +10332,18 @@ mod tests {
 
         assert!(ViewMode::SpcFdc.has_inspector_panel());
         assert!(!ViewMode::SpcFdc.has_secondary_panel());
+        assert!(ViewMode::Inventory.has_inspector_panel());
+        assert!(!ViewMode::Inventory.has_secondary_panel());
+        assert!(ViewMode::Maintenance.has_inspector_panel());
+        assert!(!ViewMode::Maintenance.has_secondary_panel());
+        assert!(ViewMode::Environment.has_inspector_panel());
+        assert!(!ViewMode::Environment.has_secondary_panel());
+        assert!(ViewMode::Scheduler.has_inspector_panel());
+        assert!(!ViewMode::Scheduler.has_secondary_panel());
+        assert!(ViewMode::Safety.has_inspector_panel());
+        assert!(!ViewMode::Safety.has_secondary_panel());
+        assert!(ViewMode::ProcessFlow.has_inspector_panel());
+        assert!(!ViewMode::ProcessFlow.has_secondary_panel());
         assert!(ViewMode::ProcessControl.has_inspector_panel());
         assert!(!ViewMode::ProcessControl.has_secondary_panel());
         assert!(ViewMode::Traceability.has_inspector_panel());
@@ -10135,8 +10360,15 @@ mod tests {
         assert!(dataset.wafer_map.dies.is_empty());
         assert!(dataset.recipe_catalog.recipes.is_empty());
         assert_eq!(dataset.genealogy.summary().lot_count, 0);
+        assert!(dataset.inventory.lots.is_empty());
+        assert!(dataset.maintenance.tools.is_empty());
+        assert!(dataset.environment.sensors.is_empty());
+        assert!(dataset.scheduler.is_empty());
+        assert!(dataset.safety.sensors.is_empty());
         assert!(dataset.experiment_plan.runs.is_empty());
         assert!(dataset.process_control.loops.is_empty());
+        assert!(dataset.process_flow.route.nodes.is_empty());
+        assert!(dataset.lab_notebook.entries.is_empty());
         assert_eq!(dataset.equipment.tools().count(), 0);
     }
 
@@ -10150,8 +10382,17 @@ mod tests {
         assert!(!dataset.wafer_map.dies.is_empty());
         assert!(!dataset.recipe_catalog.recipes.is_empty());
         assert!(dataset.genealogy.summary().lot_count > 0);
+        assert!(!dataset.inventory.lots.is_empty());
+        assert!(!dataset.maintenance.tools.is_empty());
+        assert!(!dataset.environment.sensors.is_empty());
+        assert!(!dataset.scheduler.tools.is_empty());
+        assert!(!dataset.scheduler.lots.is_empty());
+        assert!(!dataset.safety.sensors.is_empty());
+        assert!(dataset.safety.summary().locked_out_tool_count > 0);
         assert!(!dataset.experiment_plan.runs.is_empty());
         assert!(!dataset.process_control.loops.is_empty());
+        assert!(!dataset.process_flow.route.nodes.is_empty());
+        assert!(!dataset.lab_notebook.entries.is_empty());
         assert!(dataset.equipment.tools().count() > 0);
     }
 

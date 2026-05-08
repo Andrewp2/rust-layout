@@ -14,15 +14,24 @@ use tracing::warn;
 use uuid::Uuid;
 
 pub mod connectivity;
+pub mod cross_section;
+pub mod environment;
 pub mod equipment;
 pub mod experiment;
 pub mod gdsii;
 pub mod genealogy;
+pub mod inventory;
+pub mod layout_diff;
+pub mod maintenance;
 pub mod mask;
 pub mod mes;
 pub mod metrology;
+pub mod notebook;
 pub mod process_control;
+pub mod process_flow;
 pub mod recipe;
+pub mod safety;
+pub mod scheduler;
 pub mod spc_fdc;
 pub mod yield_analysis;
 
