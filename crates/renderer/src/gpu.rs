@@ -1,6 +1,6 @@
 use std::{error::Error, time::Instant};
 
-use crate::{PickBatch, RenderBatch, RenderBatch3d, shader};
+use crate::{GpuRectSlabInstance, PickBatch, RenderBatch, RenderBatch3d, shader};
 use geometry_core::{Coord, Point, Rect};
 use layout_model::{Document, LayoutIndex, ShapeOccurrenceId};
 use tracing::{error, warn};
@@ -91,16 +91,20 @@ pub const VIEWPORT_3D_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::D
 #[derive(Clone, Copy, Debug)]
 pub struct Viewport3dUniforms {
     view_projection: [f32; 16],
+    rect_side_faces: [u32; 4],
 }
 
 pub struct Viewport3dRenderer {
     scene_pipeline: wgpu::RenderPipeline,
+    rect_slab_pipeline: wgpu::RenderPipeline,
     guide_pipeline: wgpu::RenderPipeline,
     composite_pipeline: wgpu::RenderPipeline,
     scene_bind_group: wgpu::BindGroup,
     uniform_buffer: wgpu::Buffer,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
+    rect_slab_template_buffer: wgpu::Buffer,
+    rect_slab_instance_buffer: wgpu::Buffer,
     guide_vertex_buffer: wgpu::Buffer,
     guide_index_buffer: wgpu::Buffer,
     composite_bind_group_layout: wgpu::BindGroupLayout,
@@ -113,12 +117,17 @@ pub struct Viewport3dRenderer {
     target_size: [u32; 2],
     vertex_capacity: usize,
     index_capacity: usize,
+    rect_slab_instance_capacity: usize,
     guide_vertex_capacity: usize,
     guide_index_capacity: usize,
     render_fingerprint: Option<crate::BatchFingerprint>,
+    rect_slab_template_faces: Option<[u32; 2]>,
     index_count: u32,
+    rect_slab_instance_count: u32,
     guide_index_count: u32,
 }
+
+const RECT_SLAB_TEMPLATE_VERTEX_COUNT: usize = 18;
 
 impl ViewUniforms {
     pub fn from_viewport(viewport: Rect) -> Self {
@@ -144,13 +153,29 @@ impl ViewUniforms {
 
 impl Viewport3dUniforms {
     pub fn from_view_projection(view_projection: [f32; 16]) -> Self {
-        Self { view_projection }
+        Self {
+            view_projection,
+            rect_side_faces: [1, 2, 0, 0],
+        }
     }
 
-    fn as_bytes(self) -> [u8; 64] {
-        let mut bytes = [0u8; 64];
+    pub fn with_rect_side_faces(mut self, side_faces: [u32; 2]) -> Self {
+        self.rect_side_faces = [side_faces[0], side_faces[1], 0, 0];
+        self
+    }
+
+    fn rect_side_faces(self) -> [u32; 2] {
+        [self.rect_side_faces[0], self.rect_side_faces[1]]
+    }
+
+    fn as_bytes(self) -> [u8; 80] {
+        let mut bytes = [0u8; 80];
         for (index, value) in self.view_projection.into_iter().enumerate() {
             bytes[index * 4..index * 4 + 4].copy_from_slice(&value.to_ne_bytes());
+        }
+        for (index, value) in self.rect_side_faces.into_iter().enumerate() {
+            let offset = 64 + index * 4;
+            bytes[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
         }
         bytes
     }
@@ -672,13 +697,17 @@ impl Viewport3dRenderer {
             label: Some("Fabricad 3D scene shader"),
             source: wgpu::ShaderSource::Wgsl(VIEWPORT_3D_SCENE_SHADER.into()),
         });
+        let rect_slab_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Fabricad 3D rect slab shader"),
+            source: wgpu::ShaderSource::Wgsl(VIEWPORT_3D_RECT_SLAB_SHADER.into()),
+        });
         let composite_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Fabricad 3D composite shader"),
             source: wgpu::ShaderSource::Wgsl(VIEWPORT_3D_COMPOSITE_SHADER.into()),
         });
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Fabricad 3D viewport uniforms"),
-            size: 64,
+            size: 80,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -742,76 +771,79 @@ impl Viewport3dRenderer {
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &scene_vertex_attributes,
         }];
-        let scene_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Fabricad 3D scene pipeline"),
-            layout: Some(&scene_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &scene_shader,
-                entry_point: Some("vertex_main"),
-                buffers: &scene_vertex_buffers,
-                compilation_options: Default::default(),
+        let rect_slab_template_vertex_attributes = [wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32x4,
+            offset: 0,
+            shader_location: 0,
+        }];
+        let rect_slab_instance_vertex_attributes = [
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x4,
+                offset: 0,
+                shader_location: 1,
             },
-            fragment: Some(wgpu::FragmentState {
-                module: &scene_shader,
-                entry_point: Some("fragment_main"),
-                targets: &scene_targets,
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x2,
+                offset: 16,
+                shader_location: 2,
             },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: VIEWPORT_3D_DEPTH_FORMAT,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
-        let guide_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Fabricad 3D guide pipeline"),
-            layout: Some(&scene_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &scene_shader,
-                entry_point: Some("vertex_main"),
-                buffers: &scene_vertex_buffers,
-                compilation_options: Default::default(),
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Unorm8x4,
+                offset: 24,
+                shader_location: 3,
             },
-            fragment: Some(wgpu::FragmentState {
-                module: &scene_shader,
-                entry_point: Some("fragment_main"),
-                targets: &guide_targets,
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::LineList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
+        ];
+        let rect_slab_vertex_buffers = [
+            wgpu::VertexBufferLayout {
+                array_stride: 16,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &rect_slab_template_vertex_attributes,
             },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: VIEWPORT_3D_DEPTH_FORMAT,
-                depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::LessEqual,
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
+            wgpu::VertexBufferLayout {
+                array_stride: 28,
+                step_mode: wgpu::VertexStepMode::Instance,
+                attributes: &rect_slab_instance_vertex_attributes,
+            },
+        ];
+        let scene_pipeline = create_viewport_3d_pipeline(
+            device,
+            "Fabricad 3D scene pipeline",
+            &scene_pipeline_layout,
+            &scene_shader,
+            "vertex_main",
+            &scene_vertex_buffers,
+            &scene_targets,
+            wgpu::PrimitiveTopology::TriangleList,
+            None,
+            true,
+            wgpu::CompareFunction::Less,
+        );
+        let rect_slab_pipeline = create_viewport_3d_pipeline(
+            device,
+            "Fabricad 3D rect slab pipeline",
+            &scene_pipeline_layout,
+            &rect_slab_shader,
+            "vertex_main",
+            &rect_slab_vertex_buffers,
+            &scene_targets,
+            wgpu::PrimitiveTopology::TriangleList,
+            None,
+            true,
+            wgpu::CompareFunction::Less,
+        );
+        let guide_pipeline = create_viewport_3d_pipeline(
+            device,
+            "Fabricad 3D guide pipeline",
+            &scene_pipeline_layout,
+            &scene_shader,
+            "vertex_main",
+            &scene_vertex_buffers,
+            &guide_targets,
+            wgpu::PrimitiveTopology::LineList,
+            None,
+            false,
+            wgpu::CompareFunction::LessEqual,
+        );
 
         let composite_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -830,7 +862,7 @@ impl Viewport3dRenderer {
                     wgpu::BindGroupLayoutEntry {
                         binding: 1,
                         visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
                         count: None,
                     },
                 ],
@@ -843,7 +875,7 @@ impl Viewport3dRenderer {
             });
         let composite_targets = [Some(wgpu::ColorTargetState {
             format: target_format,
-            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+            blend: None,
             write_mask: wgpu::ColorWrites::ALL,
         })];
         let composite_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -877,13 +909,13 @@ impl Viewport3dRenderer {
         });
         let composite_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("Fabricad 3D composite sampler"),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
-
         Self {
             scene_pipeline,
+            rect_slab_pipeline,
             guide_pipeline,
             composite_pipeline,
             scene_bind_group,
@@ -899,6 +931,18 @@ impl Viewport3dRenderer {
                 "Fabricad 3D index buffer",
                 4,
                 wgpu::BufferUsages::INDEX,
+            ),
+            rect_slab_template_buffer: create_upload_buffer(
+                device,
+                "Fabricad 3D rect slab template buffer",
+                RECT_SLAB_TEMPLATE_VERTEX_COUNT * 16,
+                wgpu::BufferUsages::VERTEX,
+            ),
+            rect_slab_instance_buffer: create_upload_buffer(
+                device,
+                "Fabricad 3D rect slab instance buffer",
+                4,
+                wgpu::BufferUsages::VERTEX,
             ),
             guide_vertex_buffer: create_upload_buffer(
                 device,
@@ -922,10 +966,13 @@ impl Viewport3dRenderer {
             target_size: [0, 0],
             vertex_capacity: 4,
             index_capacity: 4,
+            rect_slab_instance_capacity: 4,
             guide_vertex_capacity: 4,
             guide_index_capacity: 4,
             render_fingerprint: None,
+            rect_slab_template_faces: None,
             index_count: 0,
+            rect_slab_instance_count: 0,
             guide_index_count: 0,
         }
     }
@@ -937,17 +984,30 @@ impl Viewport3dRenderer {
         batch: &RenderBatch3d,
         uniforms: Viewport3dUniforms,
     ) -> BufferUploadResult {
+        self.upload_with_fingerprint(device, queue, batch, batch.fingerprint(), uniforms)
+    }
+
+    pub fn upload_with_fingerprint(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        batch: &RenderBatch3d,
+        fingerprint: crate::BatchFingerprint,
+        uniforms: Viewport3dUniforms,
+    ) -> BufferUploadResult {
+        self.update_rect_slab_template(queue, uniforms.rect_side_faces());
         queue.write_buffer(&self.uniform_buffer, 0, &uniforms.as_bytes());
-        let fingerprint = batch.fingerprint();
         let changed = self.render_fingerprint != Some(fingerprint);
         let mut bytes_uploaded = 0;
         if changed {
             let vertex_bytes = vertex_3d_bytes(&batch.vertices);
             let mesh_index_bytes = index_bytes(&batch.indices);
+            let rect_slab_instance_bytes = rect_slab_instance_bytes(&batch.rect_slabs);
             let guide_vertex_bytes = vertex_3d_bytes(&batch.guide_vertices);
             let guide_index_bytes = index_bytes(&batch.guide_indices);
             self.ensure_vertex_capacity(device, vertex_bytes.len());
             self.ensure_index_capacity(device, mesh_index_bytes.len());
+            self.ensure_rect_slab_instance_capacity(device, rect_slab_instance_bytes.len());
             self.ensure_guide_vertex_capacity(device, guide_vertex_bytes.len());
             self.ensure_guide_index_capacity(device, guide_index_bytes.len());
             if !vertex_bytes.is_empty() {
@@ -957,6 +1017,14 @@ impl Viewport3dRenderer {
             if !mesh_index_bytes.is_empty() {
                 queue.write_buffer(&self.index_buffer, 0, &mesh_index_bytes);
                 bytes_uploaded += mesh_index_bytes.len();
+            }
+            if !rect_slab_instance_bytes.is_empty() {
+                queue.write_buffer(
+                    &self.rect_slab_instance_buffer,
+                    0,
+                    &rect_slab_instance_bytes,
+                );
+                bytes_uploaded += rect_slab_instance_bytes.len();
             }
             if !guide_vertex_bytes.is_empty() {
                 queue.write_buffer(&self.guide_vertex_buffer, 0, &guide_vertex_bytes);
@@ -969,6 +1037,8 @@ impl Viewport3dRenderer {
             self.render_fingerprint = Some(fingerprint);
         }
         self.index_count = clamped_index_count(batch.indices.len(), "3D scene mesh");
+        self.rect_slab_instance_count =
+            clamped_index_count(batch.rect_slabs.len(), "3D rect slab instances");
         self.guide_index_count = clamped_index_count(batch.guide_indices.len(), "3D guide mesh");
         BufferUploadResult {
             uploaded: bytes_uploaded > 0,
@@ -1009,7 +1079,7 @@ impl Viewport3dRenderer {
                 view: depth_view,
                 depth_ops: Some(wgpu::Operations {
                     load: wgpu::LoadOp::Clear(1.0),
-                    store: wgpu::StoreOp::Store,
+                    store: wgpu::StoreOp::Discard,
                 }),
                 stencil_ops: None,
             }),
@@ -1022,6 +1092,16 @@ impl Viewport3dRenderer {
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             render_pass.draw_indexed(0..self.index_count, 0, 0..1);
+        }
+        if self.rect_slab_instance_count > 0 {
+            render_pass.set_pipeline(&self.rect_slab_pipeline);
+            render_pass.set_bind_group(0, &self.scene_bind_group, &[]);
+            render_pass.set_vertex_buffer(0, self.rect_slab_template_buffer.slice(..));
+            render_pass.set_vertex_buffer(1, self.rect_slab_instance_buffer.slice(..));
+            render_pass.draw(
+                0..RECT_SLAB_TEMPLATE_VERTEX_COUNT as u32,
+                0..self.rect_slab_instance_count,
+            );
         }
         if self.guide_index_count > 0 {
             render_pass.set_pipeline(&self.guide_pipeline);
@@ -1066,6 +1146,28 @@ impl Viewport3dRenderer {
             self.index_capacity,
             wgpu::BufferUsages::INDEX,
         );
+    }
+
+    fn ensure_rect_slab_instance_capacity(&mut self, device: &wgpu::Device, required: usize) {
+        if required <= self.rect_slab_instance_capacity {
+            return;
+        }
+        self.rect_slab_instance_capacity = next_buffer_capacity(required);
+        self.rect_slab_instance_buffer = create_upload_buffer(
+            device,
+            "Fabricad 3D rect slab instance buffer",
+            self.rect_slab_instance_capacity,
+            wgpu::BufferUsages::VERTEX,
+        );
+    }
+
+    fn update_rect_slab_template(&mut self, queue: &wgpu::Queue, side_faces: [u32; 2]) {
+        if self.rect_slab_template_faces == Some(side_faces) {
+            return;
+        }
+        let bytes = rect_slab_template_bytes(side_faces);
+        queue.write_buffer(&self.rect_slab_template_buffer, 0, &bytes);
+        self.rect_slab_template_faces = Some(side_faces);
     }
 
     fn ensure_guide_vertex_capacity(&mut self, device: &wgpu::Device, required: usize) {
@@ -1398,6 +1500,56 @@ fn build_layout_index(document: &Document) -> LayoutIndex {
     }
 }
 
+fn create_viewport_3d_pipeline(
+    device: &wgpu::Device,
+    label: &'static str,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    vertex_entry: &'static str,
+    vertex_buffers: &[wgpu::VertexBufferLayout<'_>],
+    targets: &[Option<wgpu::ColorTargetState>],
+    topology: wgpu::PrimitiveTopology,
+    cull_mode: Option<wgpu::Face>,
+    depth_write_enabled: bool,
+    depth_compare: wgpu::CompareFunction,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some(vertex_entry),
+            buffers: vertex_buffers,
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fragment_main"),
+            targets,
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: VIEWPORT_3D_DEPTH_FORMAT,
+            depth_write_enabled,
+            depth_compare,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+        cache: None,
+    })
+}
+
 fn create_upload_buffer(
     device: &wgpu::Device,
     label: &'static str,
@@ -1494,6 +1646,91 @@ fn vertex_3d_bytes(vertices: &[crate::GpuVertex3d]) -> Vec<u8> {
     bytes
 }
 
+fn rect_slab_instance_bytes(instances: &[GpuRectSlabInstance]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(instances.len() * 28);
+    for instance in instances {
+        for value in instance.rect {
+            bytes.extend_from_slice(&value.to_ne_bytes());
+        }
+        for value in instance.z_range {
+            bytes.extend_from_slice(&value.to_ne_bytes());
+        }
+        for value in instance.color {
+            bytes.push((value.clamp(0.0, 1.0) * 255.0).round() as u8);
+        }
+    }
+    bytes
+}
+
+fn rect_slab_template_bytes(side_faces: [u32; 2]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(RECT_SLAB_TEMPLATE_VERTEX_COUNT * 16);
+    append_rect_slab_template_face(&mut bytes, 0);
+    append_rect_slab_template_face(&mut bytes, side_faces[0]);
+    append_rect_slab_template_face(&mut bytes, side_faces[1]);
+    bytes
+}
+
+fn append_rect_slab_template_face(bytes: &mut Vec<u8>, face: u32) {
+    let corners: [[f32; 3]; 6] = match face {
+        0 => [
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 1.0],
+            [1.0, 1.0, 1.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 1.0, 1.0],
+            [0.0, 1.0, 1.0],
+        ],
+        1 => [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 0.0, 1.0],
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0],
+        ],
+        2 => [
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [1.0, 1.0, 1.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 1.0],
+            [1.0, 0.0, 1.0],
+        ],
+        3 => [
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 1.0, 1.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 1.0],
+            [1.0, 1.0, 1.0],
+        ],
+        _ => [
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 1.0, 1.0],
+        ],
+    };
+    let shade = rect_slab_face_shade(face);
+    for [x_select, y_select, z_select] in corners {
+        for value in [x_select, y_select, z_select, shade] {
+            bytes.extend_from_slice(&value.to_ne_bytes());
+        }
+    }
+}
+
+fn rect_slab_face_shade(face: u32) -> f32 {
+    match face {
+        0 => 0.9040,
+        1 => 0.4543,
+        2 => 0.4037,
+        3 => 0.3796,
+        _ => 0.4221,
+    }
+}
+
 fn pick_vertex_bytes(vertices: &[crate::PickVertex]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(std::mem::size_of_val(vertices));
     for vertex in vertices {
@@ -1516,6 +1753,7 @@ fn index_bytes(indices: &[u32]) -> Vec<u8> {
 const VIEWPORT_3D_SCENE_SHADER: &str = r#"
 struct Viewport3dUniforms {
     view_projection: mat4x4<f32>,
+    rect_side_faces: vec4<u32>,
 };
 
 @group(0) @binding(0)
@@ -1530,32 +1768,73 @@ struct VertexInput {
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) color: vec4<f32>,
-    @location(1) normal: vec3<f32>,
 };
+
+fn shade_color(color: vec4<f32>, normal: vec3<f32>) -> vec4<f32> {
+    let normal_length_squared = dot(normal, normal);
+    if normal_length_squared < 0.000001 {
+        return color;
+    }
+    let key_light = vec3<f32>(-0.3495, -0.5493, 0.7590);
+    let fill_light = vec3<f32>(0.7635, 0.2776, 0.5830);
+    let diffuse = max(dot(normal, key_light), 0.0);
+    let fill = max(dot(normal, fill_light), 0.0);
+    let upward = clamp(normal.z * 0.5 + 0.5, 0.0, 1.0);
+    let shade = 0.52 + diffuse * 0.26 + fill * 0.08 + upward * 0.14;
+    return vec4<f32>(color.rgb * shade, color.a);
+}
 
 @vertex
 fn vertex_main(input: VertexInput) -> VertexOutput {
     var output: VertexOutput;
     output.position = viewport.view_projection * vec4<f32>(input.position, 1.0);
-    output.color = input.color;
-    output.normal = input.normal;
+    output.color = shade_color(input.color, input.normal);
     return output;
 }
 
 @fragment
 fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    let normal_length = length(input.normal);
-    if normal_length < 0.001 {
-        return input.color;
-    }
-    let normal = normalize(input.normal);
-    let key_light = normalize(vec3<f32>(-0.35, -0.55, 0.76));
-    let fill_light = normalize(vec3<f32>(0.55, 0.2, 0.42));
-    let diffuse = max(dot(normal, key_light), 0.0);
-    let fill = max(dot(normal, fill_light), 0.0);
-    let upward = clamp(normal.z * 0.5 + 0.5, 0.0, 1.0);
-    let shade = 0.52 + diffuse * 0.26 + fill * 0.08 + upward * 0.14;
-    return vec4<f32>(input.color.rgb * shade, input.color.a);
+    return input.color;
+}
+"#;
+
+const VIEWPORT_3D_RECT_SLAB_SHADER: &str = r#"
+struct Viewport3dUniforms {
+    view_projection: mat4x4<f32>,
+    rect_side_faces: vec4<u32>,
+};
+
+@group(0) @binding(0)
+var<uniform> viewport: Viewport3dUniforms;
+
+	struct InstanceInput {
+	    @location(0) corner: vec4<f32>,
+	    @location(1) rect: vec4<f32>,
+	    @location(2) z_range: vec2<f32>,
+	    @location(3) color: vec4<f32>,
+	};
+
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) color: vec4<f32>,
+};
+
+	@vertex
+	fn vertex_main(input: InstanceInput) -> VertexOutput {
+	    let point = vec3<f32>(
+	        input.rect.x + (input.rect.z - input.rect.x) * input.corner.x,
+	        input.rect.y + (input.rect.w - input.rect.y) * input.corner.y,
+	        input.z_range.x + (input.z_range.y - input.z_range.x) * input.corner.z,
+	    );
+	    var output: VertexOutput;
+	    output.position = viewport.view_projection * vec4<f32>(point, 1.0);
+	    output.color = vec4<f32>(input.color.rgb * input.corner.w, input.color.a);
+	    return output;
+	}
+
+@fragment
+fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    return input.color;
 }
 "#;
 

@@ -16,9 +16,9 @@ use eframe::egui::{
 use geometry_core::{Coord, Point, Rect, Vector, distance_point_to_segment};
 use layout_model::{
     Cell, CellId, CellInstance, ClientMessage, CrdtApplyResult, CrdtOperation, Document,
-    InstanceArray, InstanceId, LayerId, LayoutIndex, LoroCrdtLog, LoroUpdate, MarkerState, NetId,
-    Operation, ProcessLayer, ServerMessage, Shape, ShapeId, ShapeKind, ShapeOccurrenceId,
-    TechnologyFile, Transform, builtin_technologies,
+    FlattenedShapeView, InstanceArray, InstanceId, Layer, LayerId, LayoutIndex, LoroCrdtLog,
+    LoroUpdate, MarkerState, NetId, Operation, ProcessLayer, ServerMessage, Shape, ShapeId,
+    ShapeKind, ShapeKindView, ShapeOccurrenceId, TechnologyFile, Transform, builtin_technologies,
     connectivity::{ConnectivityReport, NetComponent, extract_connectivity},
     equipment::{
         AlarmSeverity, EquipmentEvent, EquipmentSimulator, HostCommand,
@@ -86,9 +86,11 @@ const MAX_CONNECTIVITY_OBJECTS: usize = 50_000;
 const MAX_DRC_OBJECTS: usize = 50_000;
 const TILE_MEMORY_BUDGET_BYTES: usize = 96 * 1024 * 1024;
 const MAX_3D_RENDERED_SHAPES: usize = 1_000_000;
-const MAX_3D_PRECISE_SLAB_SHAPES: usize = 50_000;
 const MAX_3D_CPU_FALLBACK_FACES: usize = 24_000;
 const CAMERA_NEAR_PLANE: f32 = 10.0;
+const CAMERA_FAR_PLANE_MIN: f32 = 250_000.0;
+const CAMERA_FAR_PLANE_SPAN_MULTIPLIER: f32 = 4.0;
+const CAMERA_FAR_PLANE_MARGIN_MULTIPLIER: f32 = 1.5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tool {
@@ -159,21 +161,6 @@ impl ViewMode {
         }
     }
 
-    fn detail(self) -> &'static str {
-        match self {
-            Self::Layout2d => "Geometry, hierarchy, routing, DRC, and collaboration",
-            Self::Layout3d => "Extruded process stack preview with GPU depth rendering",
-            Self::FabControl => "Tool state, alarms, recipes, runs, and sensor streams",
-            Self::Metrology => "Wafer-level measurements, bins, defects, and outliers",
-            Self::Yield => "Lot, wafer, failure, recipe, and correlation analysis",
-            Self::MaskPrep => "Reticle fields, exposure blocks, layer tone, and mask checks",
-            Self::SpcFdc => "Control charts, fault traces, active alarms, and findings",
-            Self::ProcessControl => "EWMA loops, proposed adjustments, and approval audit",
-            Self::Traceability => "Lot splits, material ancestry, process history, and impact",
-            Self::Experiment => "Factor matrix, run status, response capture, and effects",
-        }
-    }
-
     fn status_message(self) -> &'static str {
         match self {
             Self::Layout2d => "layout editor",
@@ -196,10 +183,6 @@ impl ViewMode {
             Self::Metrology | Self::Yield | Self::SpcFdc => ModuleGroup::Analysis,
             Self::ProcessControl | Self::Experiment => ModuleGroup::Engineering,
         }
-    }
-
-    fn is_layout(self) -> bool {
-        matches!(self, Self::Layout2d | Self::Layout3d)
     }
 
     fn has_inspector_panel(self) -> bool {
@@ -238,15 +221,6 @@ impl ModuleGroup {
             Self::Engineering => "Engineering",
         }
     }
-
-    fn tone(self) -> ui_chrome::Tone {
-        match self {
-            Self::Design => ui_chrome::Tone::Info,
-            Self::Operations => ui_chrome::Tone::Success,
-            Self::Analysis => ui_chrome::Tone::Warning,
-            Self::Engineering => ui_chrome::Tone::Neutral,
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -255,32 +229,6 @@ enum DataSource {
     Demo,
     File(String),
     Generated(String),
-}
-
-impl DataSource {
-    fn label(&self) -> String {
-        match self {
-            Self::Blank => "blank".to_string(),
-            Self::Demo => "demo".to_string(),
-            Self::File(_) => "file".to_string(),
-            Self::Generated(_) => "generated".to_string(),
-        }
-    }
-
-    fn tone(&self) -> ui_chrome::Tone {
-        match self {
-            Self::Blank => ui_chrome::Tone::Neutral,
-            Self::Demo | Self::Generated(_) => ui_chrome::Tone::Warning,
-            Self::File(_) => ui_chrome::Tone::Success,
-        }
-    }
-
-    fn detail(&self) -> Option<&str> {
-        match self {
-            Self::File(path) | Self::Generated(path) => Some(path.as_str()),
-            Self::Blank | Self::Demo => None,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -572,6 +520,115 @@ struct Render3dStats {
     cpu_face_capped: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct Layer3dStyle {
+    base_z: f32,
+    top_z: f32,
+    color: Color32,
+}
+
+#[derive(Clone, Debug)]
+struct Cached3dScene {
+    batch: Arc<renderer::RenderBatch3d>,
+    fingerprint: renderer::BatchFingerprint,
+    stats: Render3dStats,
+    show_grid_3d: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GpuAdapterSummary {
+    backend: String,
+    device_type: String,
+    name: String,
+}
+
+impl GpuAdapterSummary {
+    fn from_wgpu_info(info: egui_wgpu::wgpu::AdapterInfo) -> Self {
+        Self {
+            backend: format!("{:?}", info.backend),
+            device_type: format!("{:?}", info.device_type),
+            name: info.name,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Benchmark3dOptions {
+    pub frames: usize,
+    pub warmup_frames: usize,
+}
+
+impl Default for Benchmark3dOptions {
+    fn default() -> Self {
+        Self {
+            frames: 180,
+            warmup_frames: 30,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Benchmark3dState {
+    options: Benchmark3dOptions,
+    intervals: Vec<f64>,
+    canvas_cpu_ms: Vec<f64>,
+    update_cpu_ms: Vec<f64>,
+    phase_totals: Benchmark3dPhaseTimes,
+    phase_samples: usize,
+    warmup_seen: usize,
+    gpu_frames: usize,
+    cpu_frames: usize,
+    last_gpu_completed_frames: u64,
+    last_stats: Render3dStats,
+    last_target_size: [u32; 2],
+    completed: bool,
+}
+
+impl Benchmark3dState {
+    fn new(options: Benchmark3dOptions) -> Self {
+        Self {
+            options,
+            intervals: Vec::with_capacity(options.frames),
+            canvas_cpu_ms: Vec::with_capacity(options.frames),
+            update_cpu_ms: Vec::with_capacity(options.frames),
+            phase_totals: Benchmark3dPhaseTimes::default(),
+            phase_samples: 0,
+            warmup_seen: 0,
+            gpu_frames: 0,
+            cpu_frames: 0,
+            last_gpu_completed_frames: 0,
+            last_stats: Render3dStats::default(),
+            last_target_size: [0, 0],
+            completed: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct Benchmark3dPhaseTimes {
+    overhead: f64,
+    toolbar: f64,
+    navigation: f64,
+    inspector: f64,
+    layers: f64,
+    windows: f64,
+    mes: f64,
+    central: f64,
+}
+
+impl Benchmark3dPhaseTimes {
+    fn add(&mut self, other: Self) {
+        self.overhead += other.overhead;
+        self.toolbar += other.toolbar;
+        self.navigation += other.navigation;
+        self.inspector += other.inspector;
+        self.layers += other.layers;
+        self.windows += other.windows;
+        self.mes += other.mes;
+        self.central += other.central;
+    }
+}
+
 #[derive(Clone, Debug)]
 struct UndoEntry {
     undo: Operation,
@@ -761,6 +818,7 @@ pub struct FabricadApp {
     last_broadcast_selection: Vec<ShapeOccurrenceId>,
     last_view_center: Point,
     gpu_target_format: Option<egui_wgpu::wgpu::TextureFormat>,
+    gpu_adapter: Option<GpuAdapterSummary>,
     tile_cache: renderer::TileCache,
     gpu_pick_state: SharedGpuPickState,
     gpu_upload_state: SharedGpuUploadState,
@@ -778,8 +836,12 @@ pub struct FabricadApp {
     equipment_recipe_drafts: BTreeMap<EquipmentToolId, EquipmentRecipeId>,
     last_equipment_tick: Instant,
     logged_3d_shape_cap: bool,
-    logged_3d_top_cap_lod: bool,
     logged_3d_cpu_face_cap: bool,
+    last_3d_ui_frame_at: Option<Instant>,
+    smoothed_3d_ui_frame_ms: Option<f64>,
+    gpu_frame_pacing: SharedGpuFramePacingState,
+    cached_3d_scene: Option<Cached3dScene>,
+    benchmark_3d: Option<Benchmark3dState>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -787,6 +849,7 @@ pub struct StartupOptions {
     pub stress_count: Option<usize>,
     pub hierarchy_demo: bool,
     pub view_3d: bool,
+    pub benchmark_3d: Option<Benchmark3dOptions>,
     pub show_options: bool,
     pub select_first_shape: bool,
     pub move_first_vertex: bool,
@@ -992,6 +1055,17 @@ impl FabricadApp {
             warn!("no yield wafers available at startup; selected yield wafer defaults to empty");
         }
         let user_id = Uuid::new_v4();
+        let gpu_adapter = cc.wgpu_render_state.as_ref().map(|render_state| {
+            let info = render_state.adapter.get_info();
+            if info.device_type == egui_wgpu::wgpu::DeviceType::Cpu {
+                warn!(
+                    backend = ?info.backend,
+                    adapter = %info.name,
+                    "wgpu selected a CPU adapter; 3D benchmark results will not reflect hardware GPU performance"
+                );
+            }
+            GpuAdapterSummary::from_wgpu_info(info)
+        });
         let mut loro_log = LoroCrdtLog::new(user_id).expect("create Loro CRDT log");
         if document_object_count(&document) <= MAX_LORO_SEED_OBJECTS {
             loro_log
@@ -1090,6 +1164,7 @@ impl FabricadApp {
                 .wgpu_render_state
                 .as_ref()
                 .map(|render_state| render_state.target_format),
+            gpu_adapter,
             tile_cache: renderer::TileCache::default(),
             gpu_pick_state: Arc::new(Mutex::new(GpuPickState::default())),
             gpu_upload_state: Arc::new(Mutex::new(GpuUploadStats::default())),
@@ -1107,8 +1182,12 @@ impl FabricadApp {
             equipment_recipe_drafts: BTreeMap::new(),
             last_equipment_tick: Instant::now(),
             logged_3d_shape_cap: false,
-            logged_3d_top_cap_lod: false,
             logged_3d_cpu_face_cap: false,
+            last_3d_ui_frame_at: None,
+            smoothed_3d_ui_frame_ms: None,
+            gpu_frame_pacing: Arc::new(Mutex::new(GpuFramePacingState::default())),
+            cached_3d_scene: None,
+            benchmark_3d: None,
         };
         app.reset_3d_camera_to_document();
         app
@@ -1142,8 +1221,8 @@ impl FabricadApp {
             app.reset_render_cache();
             app.rebuild_indexes();
             app.rerun_drc();
-            app.layout_source = DataSource::Generated(format!("{count} polygon stress"));
-            app.status = format!("test scene: {count} polygons");
+            app.layout_source = DataSource::Generated(format!("{count} layout stress"));
+            app.status = format!("test scene: {count} layout objects");
         }
         app.reset_3d_camera_to_document();
         if let Some(zoom) = options.zoom {
@@ -1176,6 +1255,11 @@ impl FabricadApp {
         if options.show_options {
             app.show_options = true;
         }
+        if let Some(benchmark) = options.benchmark_3d {
+            app.benchmark_3d = Some(Benchmark3dState::new(benchmark));
+            app.show_diagnostics = false;
+            app.show_mes_panel = false;
+        }
         app
     }
 
@@ -1194,6 +1278,7 @@ impl FabricadApp {
     fn rebuild_indexes(&mut self) {
         self.index = build_layout_index(&self.document);
         self.layout_bounds_cache = self.index.bounds();
+        self.cached_3d_scene = None;
         self.rebuild_connectivity();
     }
 
@@ -1233,6 +1318,9 @@ impl FabricadApp {
     }
 
     fn active_marker_count(&self) -> usize {
+        if self.document.marker_states.is_empty() {
+            return self.violations.len();
+        }
         self.violations
             .iter()
             .filter(|violation| {
@@ -1433,6 +1521,7 @@ impl FabricadApp {
 
     fn reset_render_cache(&mut self) {
         self.tile_cache.clear();
+        self.cached_3d_scene = None;
         self.perf.tile_dirty_count = 0;
     }
 
@@ -1509,7 +1598,10 @@ impl FabricadApp {
                         }));
                 }
             }
-            Operation::AddLayer { .. } | Operation::Cursor { .. } => {}
+            Operation::AddLayer { .. } | Operation::DeleteLayer { .. } => {
+                invalidation.clear_all = true;
+            }
+            Operation::Cursor { .. } => {}
         }
         invalidation
     }
@@ -2067,6 +2159,92 @@ impl FabricadApp {
         self.selected.insert(id);
         self.selected_occurrence = Some(ShapeOccurrenceId::top_level(id));
         id
+    }
+
+    fn add_layer_from_ui(&mut self) {
+        let id = LayerId(self.document.next_layer_id);
+        let display_order = self
+            .document
+            .layers
+            .values()
+            .map(|layer| layer.display_order)
+            .max()
+            .unwrap_or(0)
+            + 10;
+        let palette = [
+            [0.18, 0.56, 0.82, 1.0],
+            [0.88, 0.37, 0.25, 1.0],
+            [0.38, 0.68, 0.31, 1.0],
+            [0.86, 0.62, 0.18, 1.0],
+            [0.62, 0.44, 0.78, 1.0],
+            [0.28, 0.68, 0.66, 1.0],
+        ];
+        let layer = Layer {
+            id,
+            name: format!("layer {}", id.0),
+            process: ProcessLayer::Metal1,
+            purpose: "custom".to_string(),
+            color: palette[id.0 as usize % palette.len()],
+            display_order,
+            gds_layer: u16::try_from(id.0).ok(),
+            gds_datatype: 0,
+            gds_texttype: 0,
+            visible: true,
+            locked: false,
+        };
+        let redo = Operation::AddLayer {
+            layer: layer.clone(),
+        };
+        let undo = Operation::DeleteLayer { id };
+        self.apply_with_history(redo, undo);
+        self.active_layer = id;
+        self.status = format!("added {}", layer.name);
+    }
+
+    fn remove_active_layer(&mut self) {
+        if self.document.layers.len() <= 1 {
+            self.status = "cannot remove the last layer".to_string();
+            return;
+        }
+        let id = self.active_layer;
+        let Some(layer) = self.document.layers.get(&id).cloned() else {
+            self.reset_active_layer();
+            self.status = "active layer was missing".to_string();
+            return;
+        };
+        let shapes = self
+            .document
+            .shapes
+            .values()
+            .filter(|shape| shape.layer == id)
+            .collect::<Vec<_>>();
+        let shape_count = shapes.len();
+        let mut undo_operations = Vec::with_capacity(shape_count + 1);
+        undo_operations.push(Operation::AddLayer {
+            layer: layer.clone(),
+        });
+        undo_operations.extend(
+            shapes
+                .into_iter()
+                .map(|shape| Operation::AddShape { shape }),
+        );
+        let redo = Operation::DeleteLayer { id };
+        let undo = Operation::Batch {
+            operations: undo_operations,
+        };
+        self.apply_with_history(redo, undo);
+        self.selected.clear();
+        self.selected_occurrence = None;
+        self.drag_shape = None;
+        self.drag_vertex = None;
+        self.drag_edge = None;
+        self.reset_active_layer();
+        self.status = format!(
+            "removed {} and {} shape{}",
+            layer.name,
+            shape_count,
+            if shape_count == 1 { "" } else { "s" }
+        );
     }
 
     fn move_shape(&mut self, id: ShapeId, delta: Vector) {
@@ -2917,10 +3095,10 @@ impl FabricadApp {
     fn make_stress_document(&mut self, count: usize) {
         self.replace_document(
             Document::stress(count),
-            &format!("generated {count} polygons"),
+            &format!("generated {count} layout objects"),
         );
-        self.layout_source = DataSource::Generated(format!("{count} polygon stress"));
-        self.status = format!("generated {count} polygons");
+        self.layout_source = DataSource::Generated(format!("{count} layout stress"));
+        self.status = format!("generated {count} layout objects");
     }
 
     fn make_hierarchy_document(&mut self) {
@@ -3642,28 +3820,7 @@ impl FabricadApp {
             .default_width(ui_chrome::NAV_WIDTH)
             .show(ctx, |ui| {
                 ui.set_width(ui_chrome::NAV_WIDTH - 18.0);
-                ui.add_space(4.0);
-                ui.label(RichText::new("Fabricad").heading().strong());
-                ui_chrome::muted(ui, "FabOS workbench");
-                ui.horizontal_wrapped(|ui| {
-                    ui_chrome::status_pill(
-                        ui,
-                        &format!("Layout {}", self.layout_source.label()),
-                        self.layout_source.tone(),
-                    );
-                    ui_chrome::status_pill(
-                        ui,
-                        &format!("FabOS {}", self.fabos_source.label()),
-                        self.fabos_source.tone(),
-                    );
-                });
-                if let Some(detail) = self.layout_source.detail() {
-                    ui_chrome::muted(ui, format!("Layout source: {detail}"));
-                }
-                if let Some(detail) = self.fabos_source.detail() {
-                    ui_chrome::muted(ui, format!("FabOS source: {detail}"));
-                }
-                ui.add_space(8.0);
+                ui.add_space(6.0);
 
                 egui::ScrollArea::vertical()
                     .id_salt("app_navigation_scroll")
@@ -3680,39 +3837,12 @@ impl FabricadApp {
                                 } else {
                                     RichText::new(mode.nav_label())
                                 };
-                                if ui
-                                    .selectable_label(selected, label)
-                                    .on_hover_text(mode.detail())
-                                    .clicked()
-                                {
+                                if ui.selectable_label(selected, label).clicked() {
                                     self.select_view_mode(mode);
-                                }
-                                if selected {
-                                    ui.indent(("nav_detail", mode.nav_label()), |ui| {
-                                        ui_chrome::muted(ui, mode.detail());
-                                    });
                                 }
                             }
                         }
                     });
-
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.toggle_value(&mut self.show_mes_panel, "Traveler");
-                    ui_chrome::status_pill(
-                        ui,
-                        if self.show_mes_panel {
-                            "open"
-                        } else {
-                            "hidden"
-                        },
-                        if self.show_mes_panel {
-                            ui_chrome::Tone::Success
-                        } else {
-                            ui_chrome::Tone::Neutral
-                        },
-                    );
-                });
             });
     }
 
@@ -3721,39 +3851,24 @@ impl FabricadApp {
             return;
         }
         self.view_mode = mode;
+        if !matches!(mode, ViewMode::Layout2d) {
+            self.tool = Tool::Select;
+        }
         self.status = mode.status_message().to_string();
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.vertical(|ui| {
             ui.horizontal(|ui| {
-                ui_chrome::status_pill(
-                    ui,
-                    self.view_mode.group().label(),
-                    self.view_mode.group().tone(),
-                );
-                ui_chrome::status_pill(
-                    ui,
-                    &format!("Layout {}", self.layout_source.label()),
-                    self.layout_source.tone(),
-                );
-                ui_chrome::status_pill(
-                    ui,
-                    &format!("FabOS {}", self.fabos_source.label()),
-                    self.fabos_source.tone(),
-                );
                 ui.label(RichText::new(self.view_mode.title()).strong());
-                ui.label(
-                    RichText::new(self.view_mode.detail()).color(ui.visuals().weak_text_color()),
-                );
                 ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                     ui.label(RichText::new(format!("User {}", short_user(self.user_id))).small());
                     ui.label(RichText::new(&self.status).color(ui.visuals().weak_text_color()));
                 });
             });
             ui.horizontal_wrapped(|ui| {
-                let layout_mode = self.view_mode.is_layout();
-                if layout_mode {
+                let editing_mode = matches!(self.view_mode, ViewMode::Layout2d);
+                if editing_mode {
                     ui.label("Tool");
                     tool_button(ui, &mut self.tool, Tool::Select, "Select");
                     tool_button(ui, &mut self.tool, Tool::Rect, "Rect");
@@ -3762,6 +3877,14 @@ impl FabricadApp {
                     tool_button(ui, &mut self.tool, Tool::Via, "Via");
                     tool_button(ui, &mut self.tool, Tool::Measure, "Measure");
                     tool_button(ui, &mut self.tool, Tool::Route, "Route");
+                    let can_delete = self.selected_instance_info().is_some()
+                        || !self.selected_top_level_shapes().is_empty();
+                    if ui
+                        .add_enabled(can_delete, egui::Button::new("Delete"))
+                        .clicked()
+                    {
+                        self.delete_selection();
+                    }
                     ui.separator();
                 }
 
@@ -3769,79 +3892,45 @@ impl FabricadApp {
                     if ui.button("Reset 3D").clicked() {
                         self.reset_3d_camera_to_document();
                     }
-                    if ui.button("Up").clicked() {
-                        self.nudge_3d_camera_vertical(1.0);
-                    }
-                    if ui.button("Down").clicked() {
-                        self.nudge_3d_camera_vertical(-1.0);
-                    }
                     ui.separator();
                 }
 
-                ui.menu_button("Edit", |ui| {
-                    if ui
-                        .add_enabled(layout_mode, egui::Button::new("Undo"))
-                        .clicked()
-                    {
-                        self.undo();
-                    }
-                    if ui
-                        .add_enabled(layout_mode, egui::Button::new("Redo"))
-                        .clicked()
-                    {
-                        self.redo();
-                    }
-                    ui.separator();
-                    if ui
-                        .add_enabled(layout_mode, egui::Button::new("Copy"))
-                        .clicked()
-                    {
-                        self.copy_selection();
-                    }
-                    if ui
-                        .add_enabled(layout_mode, egui::Button::new("Paste"))
-                        .clicked()
-                    {
-                        self.paste_clipboard();
-                    }
-                    if ui
-                        .add_enabled(layout_mode, egui::Button::new("Duplicate"))
-                        .clicked()
-                    {
-                        self.duplicate_selection();
-                    }
-                    if ui
-                        .add_enabled(layout_mode, egui::Button::new("Delete"))
-                        .clicked()
-                    {
-                        self.delete_selection();
-                    }
-                    ui.separator();
-                    if ui
-                        .add_enabled(layout_mode, egui::Button::new("Make Cell"))
-                        .clicked()
-                    {
-                        self.create_cell_from_selection();
-                    }
-                    if ui
-                        .add_enabled(layout_mode, egui::Button::new("Rotate 90"))
-                        .clicked()
-                    {
-                        self.rotate_selected_90();
-                    }
-                    if ui
-                        .add_enabled(layout_mode, egui::Button::new("Mirror X"))
-                        .clicked()
-                    {
-                        self.mirror_selected_x();
-                    }
-                    if ui
-                        .add_enabled(layout_mode, egui::Button::new("Mirror Y"))
-                        .clicked()
-                    {
-                        self.mirror_selected_y();
-                    }
-                });
+                if editing_mode {
+                    ui.menu_button("Edit", |ui| {
+                        if ui.button("Undo").clicked() {
+                            self.undo();
+                        }
+                        if ui.button("Redo").clicked() {
+                            self.redo();
+                        }
+                        ui.separator();
+                        if ui.button("Copy").clicked() {
+                            self.copy_selection();
+                        }
+                        if ui.button("Paste").clicked() {
+                            self.paste_clipboard();
+                        }
+                        if ui.button("Duplicate").clicked() {
+                            self.duplicate_selection();
+                        }
+                        if ui.button("Delete").clicked() {
+                            self.delete_selection();
+                        }
+                        ui.separator();
+                        if ui.button("Make Cell").clicked() {
+                            self.create_cell_from_selection();
+                        }
+                        if ui.button("Rotate 90").clicked() {
+                            self.rotate_selected_90();
+                        }
+                        if ui.button("Mirror X").clicked() {
+                            self.mirror_selected_x();
+                        }
+                        if ui.button("Mirror Y").clicked() {
+                            self.mirror_selected_y();
+                        }
+                    });
+                }
 
                 ui.menu_button("Document", |ui| {
                     if ui.button("New Blank Workspace").clicked() {
@@ -4192,7 +4281,7 @@ impl FabricadApp {
     }
 
     fn mes_panel(&mut self, ctx: &egui::Context) {
-        if !self.show_mes_panel {
+        if !self.show_mes_panel || !matches!(self.view_mode, ViewMode::FabControl) {
             return;
         }
         egui::TopBottomPanel::bottom("mes_traveler")
@@ -4580,6 +4669,20 @@ impl FabricadApp {
                     return;
                 }
                 ui_chrome::section_label(ui, "Layers");
+                ui.horizontal(|ui| {
+                    if ui.button("Add layer").clicked() {
+                        self.add_layer_from_ui();
+                    }
+                    let can_remove = self.document.layers.len() > 1
+                        && self.document.layers.contains_key(&self.active_layer);
+                    if ui
+                        .add_enabled(can_remove, egui::Button::new("Remove"))
+                        .clicked()
+                    {
+                        self.remove_active_layer();
+                    }
+                });
+                ui.add_space(4.0);
                 let mut visibility_ops = Vec::new();
                 let mut layer_rows: Vec<_> = self
                     .document
@@ -4863,19 +4966,25 @@ impl FabricadApp {
         egui::ScrollArea::vertical()
             .id_salt("drc_marker_scroll")
             .max_height(260.0)
-            .show(ui, |ui| {
-                for violation in &self.violations {
-                    let key = drc_marker_key(violation);
-                    let state = self
-                        .document
-                        .marker_states
-                        .get(&key)
-                        .cloned()
-                        .unwrap_or_default();
-                    if state.hidden && !self.show_hidden_markers {
+            .show_rows(ui, 24.0, self.violations.len(), |ui, row_range| {
+                for row in row_range {
+                    let Some(violation) = self.violations.get(row) else {
                         continue;
-                    }
-                    if state.waived && !self.show_waived_markers {
+                    };
+                    let key = drc_marker_key(violation);
+                    let state = if self.document.marker_states.is_empty() {
+                        MarkerState::default()
+                    } else {
+                        self.document
+                            .marker_states
+                            .get(&key)
+                            .cloned()
+                            .unwrap_or_default()
+                    };
+                    if (state.hidden && !self.show_hidden_markers)
+                        || (state.waived && !self.show_waived_markers)
+                    {
+                        ui.add_space(24.0);
                         continue;
                     }
                     ui.horizontal_wrapped(|ui| {
@@ -5418,11 +5527,6 @@ impl FabricadApp {
         };
     }
 
-    fn nudge_3d_camera_vertical(&mut self, direction: f32) {
-        let amount = (self.camera_3d.speed * 0.18).clamp(120.0, 4_000.0);
-        self.camera_3d.position += Vec3f::new(0.0, 0.0, direction.signum() * amount);
-    }
-
     fn yield_dashboard(&mut self, ui: &mut egui::Ui) {
         let lot_ids = self
             .yield_analysis
@@ -5765,12 +5869,14 @@ impl FabricadApp {
     }
 
     fn canvas_3d(&mut self, ui: &mut egui::Ui) {
+        let frame_start = Instant::now();
         let available = ui.available_size_before_wrap();
         let (response, painter) = ui.allocate_painter(available, Sense::click_and_drag());
         let canvas = response.rect;
         if canvas.width() <= 1.0 || canvas.height() <= 1.0 {
             return;
         }
+        let ui_frame_interval_ms = self.record_3d_ui_frame_pacing(frame_start);
 
         if response.clicked_by(PointerButton::Primary) {
             response.request_focus();
@@ -5782,15 +5888,29 @@ impl FabricadApp {
         }
 
         self.handle_3d_input(ui, &response);
+        let used_gpu = self.gpu_target_format.is_some();
+        let target_size = viewport_3d_target_size(
+            [canvas.width(), canvas.height()],
+            ui.ctx().pixels_per_point(),
+        );
+        let view_projection = self.view_projection_3d(canvas);
+        let gpu_frame_pacing = if used_gpu {
+            self.gpu_frame_pacing_snapshot()
+        } else {
+            GpuFramePacingSnapshot::default()
+        };
         let stats = if let Some(target_format) = self.gpu_target_format {
-            let (batch, stats) = self.build_3d_render_batch(canvas);
+            let scene = self.cached_3d_scene();
+            let stats = scene.stats;
             painter.add(egui_wgpu::Callback::new_paint_callback(
                 canvas,
                 Viewport3dGpuCallback {
-                    batch,
-                    uniforms: self.viewport_3d_uniforms(canvas),
+                    batch: scene.batch,
+                    fingerprint: scene.fingerprint,
+                    uniforms: self.viewport_3d_uniforms(view_projection),
                     viewport_size: [canvas.width(), canvas.height()],
                     target_format,
+                    frame_pacing: Arc::clone(&self.gpu_frame_pacing),
                 },
             ));
             stats
@@ -5800,7 +5920,167 @@ impl FabricadApp {
             self.draw_3d_layout_cpu_fallback(&painter, canvas)
         };
         self.log_3d_stats_if_needed(stats);
-        self.draw_3d_hud(&painter, canvas, stats);
+        let canvas_cpu_ms = frame_start.elapsed().as_secs_f64() * 1000.0;
+        self.perf.frame_ms = canvas_cpu_ms;
+        self.draw_3d_hud(&painter, canvas, stats, gpu_frame_pacing.smoothed_frame_ms);
+        self.record_3d_benchmark_frame(
+            ui_frame_interval_ms,
+            gpu_frame_pacing,
+            canvas_cpu_ms,
+            used_gpu,
+            stats,
+            target_size,
+        );
+    }
+
+    fn record_3d_ui_frame_pacing(&mut self, frame_start: Instant) -> Option<f64> {
+        let mut recorded_frame_ms = None;
+        if let Some(previous) = self.last_3d_ui_frame_at {
+            let frame_ms = frame_start.duration_since(previous).as_secs_f64() * 1000.0;
+            if frame_ms.is_finite() && frame_ms > f64::EPSILON {
+                recorded_frame_ms = Some(frame_ms);
+                self.smoothed_3d_ui_frame_ms =
+                    smoothed_frame_interval_ms(self.smoothed_3d_ui_frame_ms, frame_ms);
+            }
+        }
+        self.last_3d_ui_frame_at = Some(frame_start);
+        recorded_frame_ms
+    }
+
+    fn gpu_frame_pacing_snapshot(&self) -> GpuFramePacingSnapshot {
+        self.gpu_frame_pacing
+            .lock()
+            .map(|pacing| pacing.snapshot())
+            .unwrap_or_default()
+    }
+
+    fn record_3d_benchmark_frame(
+        &mut self,
+        ui_frame_ms: Option<f64>,
+        gpu_frame_pacing: GpuFramePacingSnapshot,
+        canvas_cpu_ms: f64,
+        used_gpu: bool,
+        stats: Render3dStats,
+        target_size: [u32; 2],
+    ) {
+        let Some(benchmark) = &mut self.benchmark_3d else {
+            return;
+        };
+        if benchmark.completed {
+            return;
+        }
+        let frame_ms = if used_gpu {
+            if gpu_frame_pacing.completed_frames == benchmark.last_gpu_completed_frames {
+                return;
+            }
+            benchmark.last_gpu_completed_frames = gpu_frame_pacing.completed_frames;
+            let Some(frame_ms) = gpu_frame_pacing.latest_frame_ms else {
+                return;
+            };
+            frame_ms
+        } else {
+            let Some(frame_ms) = ui_frame_ms else {
+                return;
+            };
+            frame_ms
+        };
+        if benchmark.warmup_seen < benchmark.options.warmup_frames {
+            benchmark.warmup_seen += 1;
+            return;
+        }
+        if used_gpu {
+            benchmark.gpu_frames += 1;
+        } else {
+            benchmark.cpu_frames += 1;
+        }
+        benchmark.last_stats = stats;
+        benchmark.last_target_size = target_size;
+        benchmark.intervals.push(frame_ms);
+        benchmark.canvas_cpu_ms.push(canvas_cpu_ms);
+    }
+
+    fn finish_3d_benchmark_update(
+        &mut self,
+        update_cpu_ms: f64,
+        phase_times: Benchmark3dPhaseTimes,
+        ctx: &egui::Context,
+    ) {
+        let gpu_adapter = self.gpu_adapter.clone();
+        let Some(benchmark) = &mut self.benchmark_3d else {
+            return;
+        };
+        if benchmark.completed {
+            return;
+        }
+        if benchmark.update_cpu_ms.len() < benchmark.intervals.len() {
+            benchmark.update_cpu_ms.push(update_cpu_ms);
+            benchmark.phase_totals.add(phase_times);
+            benchmark.phase_samples += 1;
+        }
+        if benchmark.update_cpu_ms.len() >= benchmark.options.frames {
+            benchmark.completed = true;
+            print_3d_benchmark_report(
+                &benchmark.intervals,
+                &benchmark.canvas_cpu_ms,
+                &benchmark.update_cpu_ms,
+                benchmark.phase_totals,
+                benchmark.phase_samples,
+                benchmark.gpu_frames,
+                benchmark.cpu_frames,
+                benchmark.last_stats,
+                benchmark.last_target_size,
+                gpu_adapter.as_ref(),
+            );
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    fn cached_3d_scene(&mut self) -> Cached3dScene {
+        if let Some(scene) = &self.cached_3d_scene
+            && scene.show_grid_3d == self.settings.show_grid_3d
+        {
+            return scene.clone();
+        }
+        let scene = self.build_cached_3d_scene();
+        self.cached_3d_scene = Some(scene.clone());
+        scene
+    }
+
+    fn build_cached_3d_scene(&self) -> Cached3dScene {
+        let mut batch = renderer::RenderBatch3d::default();
+        let styles = self.layer_3d_styles();
+        let object_hint = document_object_count(&self.document);
+        let mesh_object_hint = object_hint.min(1_024);
+        batch
+            .vertices
+            .reserve(mesh_object_hint.saturating_mul(5).saturating_mul(4));
+        batch
+            .indices
+            .reserve(mesh_object_hint.saturating_mul(5).saturating_mul(6));
+        batch.rect_slabs.reserve(object_hint);
+        let mut stats = Render3dStats::default();
+
+        self.document
+            .visit_visible_flattened_shape_views(|_, flattened| {
+                let Some(style) = styles.get(&flattened.shape.layer).copied() else {
+                    return true;
+                };
+                let added_faces = append_shape_view_3d_to_batch(&mut batch, flattened, style, true);
+                if added_faces > 0 {
+                    stats.shapes += 1;
+                    stats.faces += added_faces;
+                }
+                true
+            });
+
+        self.append_3d_scene_guides(&mut batch);
+        let fingerprint = batch.fingerprint();
+        Cached3dScene {
+            batch: Arc::new(batch),
+            fingerprint,
+            stats,
+            show_grid_3d: self.settings.show_grid_3d,
+        }
     }
 
     fn metrology_canvas(&mut self, ui: &mut egui::Ui) {
@@ -6033,32 +6313,6 @@ impl FabricadApp {
         });
     }
 
-    fn build_3d_render_batch(&self, canvas: EguiRect) -> (renderer::RenderBatch3d, Render3dStats) {
-        let mut batch = renderer::RenderBatch3d::default();
-        let (occurrences, capped) = self.visible_3d_occurrences(canvas);
-        let top_caps_only = occurrences.len() > MAX_3D_PRECISE_SLAB_SHAPES;
-        let mut stats = Render3dStats {
-            capped,
-            top_caps_only,
-            ..Default::default()
-        };
-
-        for occurrence in occurrences {
-            let Some(flattened) = self.document.shape_view_for_occurrence(&occurrence) else {
-                continue;
-            };
-            let shape = flattened.transformed_shape();
-            let added_faces = self.append_shape_3d_to_batch(&mut batch, &shape, top_caps_only);
-            if added_faces == 0 {
-                continue;
-            }
-            stats.shapes += 1;
-            stats.faces += added_faces;
-        }
-        self.append_3d_scene_guides(&mut batch);
-        (batch, stats)
-    }
-
     fn draw_3d_layout_cpu_fallback(&self, painter: &Painter, canvas: EguiRect) -> Render3dStats {
         let mut faces = Vec::new();
         let mut stats = self.collect_visible_3d_faces(canvas, &mut faces);
@@ -6175,17 +6429,6 @@ impl FabricadApp {
             self.logged_3d_shape_cap = false;
         }
 
-        if stats.top_caps_only && !self.logged_3d_top_cap_lod {
-            warn!(
-                rendered_shapes = stats.shapes,
-                precise_slab_budget = MAX_3D_PRECISE_SLAB_SHAPES,
-                "3D renderer exceeded precise slab budget; using top-cap LOD"
-            );
-            self.logged_3d_top_cap_lod = true;
-        } else if !stats.top_caps_only {
-            self.logged_3d_top_cap_lod = false;
-        }
-
         if stats.cpu_face_capped && !self.logged_3d_cpu_face_cap {
             warn!(
                 rendered_faces = stats.faces,
@@ -6198,8 +6441,16 @@ impl FabricadApp {
         }
     }
 
-    fn viewport_3d_uniforms(&self, canvas: EguiRect) -> Viewport3dUniforms {
-        Viewport3dUniforms::from_view_projection(self.view_projection_3d(canvas))
+    fn viewport_3d_uniforms(&self, view_projection: [f32; 16]) -> Viewport3dUniforms {
+        Viewport3dUniforms::from_view_projection(view_projection)
+            .with_rect_side_faces(self.rect_slab_side_faces_3d())
+    }
+
+    fn rect_slab_side_faces_3d(&self) -> [u32; 2] {
+        let forward = self.camera_3d.forward();
+        let x_face = if forward.x >= 0.0 { 4 } else { 2 };
+        let y_face = if forward.y >= 0.0 { 1 } else { 3 };
+        [x_face, y_face]
     }
 
     fn view_projection_3d(&self, canvas: EguiRect) -> [f32; 16] {
@@ -6244,9 +6495,10 @@ impl FabricadApp {
 
     fn camera_3d_far_plane(&self) -> f32 {
         let Some(bounds) = self.layout_bounds() else {
-            return 100_000.0;
+            return CAMERA_FAR_PLANE_MIN;
         };
         let max_layer_z = self.max_scene_3d_z();
+        let span = bounds.width().abs().max(bounds.height().abs()).max(1_000) as f32;
         let corners = [
             Vec3f::new(bounds.min.x as f32, bounds.min.y as f32, 0.0),
             Vec3f::new(bounds.max.x as f32, bounds.min.y as f32, 0.0),
@@ -6262,62 +6514,10 @@ impl FabricadApp {
             .into_iter()
             .map(|corner| (corner - self.camera_3d.position).dot(forward))
             .fold(CAMERA_NEAR_PLANE * 4.0, f32::max);
-        let margin =
-            bounds.width().abs().max(bounds.height().abs()).max(1_000) as f32 * 0.15 + max_layer_z;
-        (max_forward_depth + margin).max(50_000.0)
-    }
-
-    fn append_shape_3d_to_batch(
-        &self,
-        batch: &mut renderer::RenderBatch3d,
-        shape: &Shape,
-        top_caps_only: bool,
-    ) -> usize {
-        let Some((base_z, top_z, color)) = self.layer_3d_style(shape.layer) else {
-            return 0;
-        };
-        match &shape.kind {
-            ShapeKind::Rectangle(rect) => {
-                append_rect_slab_to_3d_batch(batch, *rect, base_z, top_z, color, !top_caps_only)
-            }
-            ShapeKind::Polygon(poly) if poly.points.len() >= 3 => {
-                append_slab_to_3d_batch(batch, &poly.points, base_z, top_z, color, !top_caps_only)
-            }
-            ShapeKind::Path { points, width } => {
-                let mut faces = 0;
-                for segment in points.windows(2) {
-                    if let [a, b] = segment {
-                        faces += append_path_segment_to_3d_batch(
-                            batch,
-                            *a,
-                            *b,
-                            *width,
-                            base_z,
-                            top_z,
-                            color,
-                            !top_caps_only,
-                        );
-                    }
-                }
-                faces
-            }
-            ShapeKind::Via { center, size, .. } => {
-                let half = *size / 2;
-                let rect = Rect::new(
-                    Point::new(center.x - half, center.y - half),
-                    Point::new(center.x + half, center.y + half),
-                );
-                append_rect_slab_to_3d_batch(
-                    batch,
-                    rect,
-                    base_z,
-                    top_z + 120.0,
-                    color,
-                    !top_caps_only,
-                )
-            }
-            ShapeKind::Label { .. } | ShapeKind::Measurement { .. } | ShapeKind::Polygon(_) => 0,
-        }
+        let margin = span * CAMERA_FAR_PLANE_MARGIN_MULTIPLIER + max_layer_z * 2.0;
+        let minimum_far =
+            CAMERA_FAR_PLANE_MIN.max(span * CAMERA_FAR_PLANE_SPAN_MULTIPLIER + max_layer_z);
+        (max_forward_depth + margin).max(minimum_far)
     }
 
     fn add_shape_3d_faces(&self, faces: &mut Vec<Face3d>, shape: &Shape) {
@@ -6476,13 +6676,14 @@ impl FabricadApp {
         );
     }
 
-    fn draw_3d_hud(&self, painter: &Painter, canvas: EguiRect, stats: Render3dStats) {
+    fn draw_3d_hud(
+        &self,
+        painter: &Painter,
+        canvas: EguiRect,
+        stats: Render3dStats,
+        gpu_frame_ms: Option<f64>,
+    ) {
         let position = self.camera_3d.position;
-        let mode = if stats.top_caps_only {
-            "top-cap LOD"
-        } else {
-            "slabs"
-        };
         let capped = if stats.capped || stats.cpu_face_capped {
             " capped"
         } else {
@@ -6490,7 +6691,7 @@ impl FabricadApp {
         };
         let text = format!(
             "3D flycam  shapes: {}  faces: {}  {}{}  xyz: {:.0}, {:.0}, {:.0}",
-            stats.shapes, stats.faces, mode, capped, position.x, position.y, position.z
+            stats.shapes, stats.faces, "slabs", capped, position.x, position.y, position.z
         );
         painter.text(
             canvas.left_top() + vec2(12.0, 12.0),
@@ -6499,8 +6700,135 @@ impl FabricadApp {
             FontId::monospace(12.0),
             Color32::from_rgb(220, 232, 228),
         );
+        painter.text(
+            canvas.left_bottom() + vec2(12.0, -12.0),
+            Align2::LEFT_BOTTOM,
+            format_3d_fps_label(gpu_frame_ms, self.smoothed_3d_ui_frame_ms),
+            FontId::monospace(12.0),
+            Color32::from_rgb(220, 232, 228),
+        );
     }
+}
 
+fn format_3d_fps_label(gpu_frame_ms: Option<f64>, _ui_frame_ms: Option<f64>) -> String {
+    match frames_per_second(gpu_frame_ms) {
+        Some(fps) => format!("FPS: {fps:.1}"),
+        None => "FPS: --".to_string(),
+    }
+}
+
+fn frames_per_second(frame_ms: Option<f64>) -> Option<f64> {
+    let frame_ms = frame_ms?;
+    if frame_ms.is_finite() && frame_ms > f64::EPSILON {
+        Some(1000.0 / frame_ms)
+    } else {
+        None
+    }
+}
+
+fn smoothed_frame_interval_ms(previous: Option<f64>, frame_ms: f64) -> Option<f64> {
+    if frame_ms > 1_000.0 {
+        None
+    } else {
+        Some(match previous {
+            Some(previous_ms) if previous_ms.is_finite() => previous_ms * 0.82 + frame_ms * 0.18,
+            _ => frame_ms,
+        })
+    }
+}
+
+fn print_3d_benchmark_report(
+    intervals: &[f64],
+    canvas_cpu_ms: &[f64],
+    update_cpu_ms: &[f64],
+    phase_totals: Benchmark3dPhaseTimes,
+    phase_samples: usize,
+    gpu_frames: usize,
+    cpu_frames: usize,
+    stats: Render3dStats,
+    target_size: [u32; 2],
+    gpu_adapter: Option<&GpuAdapterSummary>,
+) {
+    if intervals.is_empty() {
+        println!("3d benchmark: no frame intervals collected");
+        return;
+    }
+    let mut sorted = intervals.to_vec();
+    sorted.sort_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
+    let average = sorted.iter().sum::<f64>() / sorted.len() as f64;
+    let min = sorted[0];
+    let max = sorted[sorted.len() - 1];
+    let p50 = percentile_sorted(&sorted, 0.50);
+    let p95 = percentile_sorted(&sorted, 0.95);
+    let mut canvas_sorted = canvas_cpu_ms.to_vec();
+    canvas_sorted.sort_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
+    let mut update_sorted = update_cpu_ms.to_vec();
+    update_sorted.sort_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
+    let canvas_average = canvas_sorted.iter().sum::<f64>() / canvas_sorted.len().max(1) as f64;
+    let update_average = update_sorted.iter().sum::<f64>() / update_sorted.len().max(1) as f64;
+    let canvas_p50 = percentile_sorted(&canvas_sorted, 0.50);
+    let update_p50 = percentile_sorted(&update_sorted, 0.50);
+    let phase_divisor = phase_samples.max(1) as f64;
+    let interval_source = match (gpu_frames > 0, cpu_frames > 0) {
+        (true, false) => "gpu_completion",
+        (false, true) => "ui_frame",
+        (true, true) => "mixed",
+        (false, false) => "unknown",
+    };
+    println!(
+        "3d benchmark: frames={} interval_source={} gpu_frames={} cpu_frames={} adapter_backend={} adapter_type={} adapter=\"{}\" target={}x{} shapes={} faces={} top_caps_only={} capped={} cpu_face_capped={} avg_ms={:.3} p50_ms={:.3} p95_ms={:.3} min_ms={:.3} max_ms={:.3} avg_fps={:.1} p50_fps={:.1} canvas_avg_ms={:.3} canvas_p50_ms={:.3} update_avg_ms={:.3} update_p50_ms={:.3} phase_overhead_ms={:.3} phase_toolbar_ms={:.3} phase_navigation_ms={:.3} phase_inspector_ms={:.3} phase_layers_ms={:.3} phase_windows_ms={:.3} phase_mes_ms={:.3} phase_central_ms={:.3}",
+        sorted.len(),
+        interval_source,
+        gpu_frames,
+        cpu_frames,
+        gpu_adapter.map_or("unknown", |adapter| adapter.backend.as_str()),
+        gpu_adapter.map_or("unknown", |adapter| adapter.device_type.as_str()),
+        gpu_adapter.map_or("unknown", |adapter| adapter.name.as_str()),
+        target_size[0],
+        target_size[1],
+        stats.shapes,
+        stats.faces,
+        stats.top_caps_only,
+        stats.capped,
+        stats.cpu_face_capped,
+        average,
+        p50,
+        p95,
+        min,
+        max,
+        1000.0 / average,
+        1000.0 / p50,
+        canvas_average,
+        canvas_p50,
+        update_average,
+        update_p50,
+        phase_totals.overhead / phase_divisor,
+        phase_totals.toolbar / phase_divisor,
+        phase_totals.navigation / phase_divisor,
+        phase_totals.inspector / phase_divisor,
+        phase_totals.layers / phase_divisor,
+        phase_totals.windows / phase_divisor,
+        phase_totals.mes / phase_divisor,
+        phase_totals.central / phase_divisor
+    );
+}
+
+fn percentile_sorted(values: &[f64], percentile: f64) -> f64 {
+    if values.is_empty() {
+        return f64::NAN;
+    }
+    let index = ((values.len() - 1) as f64 * percentile.clamp(0.0, 1.0)).round() as usize;
+    values[index]
+}
+
+fn take_elapsed_ms(cursor: &mut Instant) -> f64 {
+    let now = Instant::now();
+    let elapsed = now.duration_since(*cursor).as_secs_f64() * 1000.0;
+    *cursor = now;
+    elapsed
+}
+
+impl FabricadApp {
     fn camera_space_3d_point(&self, point: Vec3f, basis: CameraBasis) -> CameraPoint3d {
         let relative = point - self.camera_3d.position;
         CameraPoint3d {
@@ -6536,24 +6864,14 @@ impl FabricadApp {
         if !layer.visible || matches!(layer.process, ProcessLayer::Annotation) {
             return None;
         }
-        let mut layer_order: Vec<_> = self
+        let current_key = (layer.display_order, layer.id);
+        let index = self
             .document
             .layers
             .values()
             .filter(|layer| !matches!(layer.process, ProcessLayer::Annotation))
-            .map(|layer| (layer.display_order, layer.id))
-            .collect();
-        layer_order.sort_unstable();
-        let index = layer_order
-            .iter()
-            .position(|(_, id)| *id == layer_id)
-            .unwrap_or_else(|| {
-                warn!(
-                    layer_id = layer_id.0,
-                    "3D layer missing from display order; using base layer position"
-                );
-                0
-            }) as f32;
+            .filter(|layer| (layer.display_order, layer.id) < current_key)
+            .count() as f32;
         let base_z = index * 170.0;
         let thickness = match layer.process {
             ProcessLayer::Contact | ProcessLayer::Via1 => 240.0,
@@ -6561,6 +6879,48 @@ impl FabricadApp {
             _ => 95.0,
         };
         Some((base_z, base_z + thickness, layer_color_3d(layer.color)))
+    }
+
+    fn layer_3d_styles(&self) -> BTreeMap<LayerId, Layer3dStyle> {
+        let mut layer_order: Vec<_> = self
+            .document
+            .layers
+            .values()
+            .filter(|layer| !matches!(layer.process, ProcessLayer::Annotation))
+            .map(|layer| {
+                (
+                    layer.display_order,
+                    layer.id,
+                    layer.process,
+                    layer.color,
+                    layer.visible,
+                )
+            })
+            .collect();
+        layer_order.sort_unstable_by_key(|(display_order, id, _, _, _)| (*display_order, *id));
+        layer_order
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (_, id, process, color, visible))| {
+                if !visible {
+                    return None;
+                }
+                let base_z = index as f32 * 170.0;
+                let thickness = match process {
+                    ProcessLayer::Contact | ProcessLayer::Via1 => 240.0,
+                    ProcessLayer::Oxide => 55.0,
+                    _ => 95.0,
+                };
+                Some((
+                    *id,
+                    Layer3dStyle {
+                        base_z,
+                        top_z: base_z + thickness,
+                        color: layer_color_3d(*color),
+                    },
+                ))
+            })
+            .collect()
     }
 
     fn layout_bounds(&self) -> Option<Rect> {
@@ -7429,6 +7789,9 @@ impl FabricadApp {
 
 impl eframe::App for FabricadApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let update_start = Instant::now();
+        let mut phase_cursor = update_start;
+        let mut phase_times = Benchmark3dPhaseTimes::default();
         self.apply_theme(ctx);
         self.poll_collaboration();
         self.maybe_autosave();
@@ -7437,17 +7800,24 @@ impl eframe::App for FabricadApp {
         if !matches!(self.view_mode, ViewMode::Layout3d) {
             self.set_flycam_capture(ctx, false);
         }
+        phase_times.overhead += take_elapsed_ms(&mut phase_cursor);
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| self.toolbar(ui));
+        phase_times.toolbar += take_elapsed_ms(&mut phase_cursor);
         self.navigation_panel(ctx);
+        phase_times.navigation += take_elapsed_ms(&mut phase_cursor);
         if self.view_mode.has_inspector_panel() {
             self.inspector_panel(ctx);
         }
+        phase_times.inspector += take_elapsed_ms(&mut phase_cursor);
         if self.view_mode.has_secondary_panel() {
             self.layers_panel(ctx);
         }
+        phase_times.layers += take_elapsed_ms(&mut phase_cursor);
         self.options_window(ctx);
         self.diagnostics_window(ctx);
+        phase_times.windows += take_elapsed_ms(&mut phase_cursor);
         self.mes_panel(ctx);
+        phase_times.mes += take_elapsed_ms(&mut phase_cursor);
         egui::CentralPanel::default().show(ctx, |ui| match self.view_mode {
             ViewMode::Layout2d => self.canvas(ui),
             ViewMode::Layout3d => self.canvas_3d(ui),
@@ -7472,6 +7842,9 @@ impl eframe::App for FabricadApp {
             ViewMode::Traceability => self.genealogy_panel.ui(ui),
             ViewMode::Experiment => self.experiment_panel.dashboard_ui(ui, &mut self.status),
         });
+        phase_times.central += take_elapsed_ms(&mut phase_cursor);
+        let update_cpu_ms = update_start.elapsed().as_secs_f64() * 1000.0;
+        self.finish_3d_benchmark_update(update_cpu_ms, phase_times, ctx);
         ctx.request_repaint();
     }
 }
@@ -7492,11 +7865,55 @@ type SharedGpuPickState = Arc<Mutex<GpuPickState>>;
 
 type SharedGpuUploadState = Arc<Mutex<GpuUploadStats>>;
 
+type SharedGpuFramePacingState = Arc<Mutex<GpuFramePacingState>>;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct GpuFramePacingSnapshot {
+    smoothed_frame_ms: Option<f64>,
+    latest_frame_ms: Option<f64>,
+    completed_frames: u64,
+}
+
+#[derive(Debug, Default)]
+struct GpuFramePacingState {
+    completion_pending: bool,
+    last_completed_at: Option<Instant>,
+    smoothed_frame_ms: Option<f64>,
+    latest_frame_ms: Option<f64>,
+    completed_frames: u64,
+}
+
+impl GpuFramePacingState {
+    fn snapshot(&self) -> GpuFramePacingSnapshot {
+        GpuFramePacingSnapshot {
+            smoothed_frame_ms: self.smoothed_frame_ms,
+            latest_frame_ms: self.latest_frame_ms,
+            completed_frames: self.completed_frames,
+        }
+    }
+
+    fn record_completed(&mut self, completed_at: Instant) {
+        self.completion_pending = false;
+        if let Some(previous) = self.last_completed_at {
+            let frame_ms = completed_at.duration_since(previous).as_secs_f64() * 1000.0;
+            if frame_ms.is_finite() && frame_ms > f64::EPSILON {
+                self.latest_frame_ms = Some(frame_ms);
+                self.smoothed_frame_ms =
+                    smoothed_frame_interval_ms(self.smoothed_frame_ms, frame_ms);
+                self.completed_frames += 1;
+            }
+        }
+        self.last_completed_at = Some(completed_at);
+    }
+}
+
 struct Viewport3dGpuCallback {
-    batch: renderer::RenderBatch3d,
+    batch: Arc<renderer::RenderBatch3d>,
+    fingerprint: renderer::BatchFingerprint,
     uniforms: Viewport3dUniforms,
     viewport_size: [f32; 2],
     target_format: egui_wgpu::wgpu::TextureFormat,
+    frame_pacing: SharedGpuFramePacingState,
 }
 
 struct LayoutGpuCallback {
@@ -7522,20 +7939,23 @@ impl egui_wgpu::CallbackTrait for Viewport3dGpuCallback {
             callback_resources.insert(Viewport3dRenderer::new(device, self.target_format));
         }
         if let Some(resources) = callback_resources.get_mut::<Viewport3dRenderer>() {
-            resources.upload(device, queue, &self.batch, self.uniforms);
+            resources.upload_with_fingerprint(
+                device,
+                queue,
+                &self.batch,
+                self.fingerprint,
+                self.uniforms,
+            );
             let target_size =
                 viewport_3d_target_size(self.viewport_size, screen_descriptor.pixels_per_point);
-            resources.render_to_texture(
-                device,
-                egui_encoder,
-                target_size,
-                egui_wgpu::wgpu::Color {
-                    r: 8.0 / 255.0,
-                    g: 11.0 / 255.0,
-                    b: 14.0 / 255.0,
-                    a: 1.0,
-                },
-            );
+            let clear_color = egui_wgpu::wgpu::Color {
+                r: 8.0 / 255.0,
+                g: 11.0 / 255.0,
+                b: 14.0 / 255.0,
+                a: 1.0,
+            };
+            resources.render_to_texture(device, egui_encoder, target_size, clear_color);
+            schedule_3d_gpu_frame_completion(queue, Arc::clone(&self.frame_pacing));
         }
         Vec::new()
     }
@@ -7550,6 +7970,26 @@ impl egui_wgpu::CallbackTrait for Viewport3dGpuCallback {
             resources.paint(render_pass);
         }
     }
+}
+
+fn schedule_3d_gpu_frame_completion(
+    queue: &egui_wgpu::wgpu::Queue,
+    frame_pacing: SharedGpuFramePacingState,
+) {
+    let Ok(mut pacing) = frame_pacing.lock() else {
+        return;
+    };
+    if pacing.completion_pending {
+        return;
+    }
+    pacing.completion_pending = true;
+    drop(pacing);
+
+    queue.on_submitted_work_done(move || {
+        if let Ok(mut pacing) = frame_pacing.lock() {
+            pacing.record_completed(Instant::now());
+        }
+    });
 }
 
 impl egui_wgpu::CallbackTrait for LayoutGpuCallback {
@@ -8719,6 +9159,110 @@ fn tool_button(ui: &mut egui::Ui, active: &mut Tool, value: Tool, label: &str) {
     }
 }
 
+fn append_shape_view_3d_to_batch(
+    batch: &mut renderer::RenderBatch3d,
+    flattened: FlattenedShapeView<'_>,
+    style: Layer3dStyle,
+    include_sides: bool,
+) -> usize {
+    match flattened.shape.kind {
+        ShapeKindView::Rectangle(rect) => append_rect_slab_to_3d_batch(
+            batch,
+            flattened.transform.apply_rect(rect),
+            style.base_z,
+            style.top_z,
+            style.color,
+            include_sides,
+        ),
+        ShapeKindView::Polygon(poly) if poly.points.len() >= 3 => {
+            if flattened.transform == Transform::IDENTITY {
+                append_slab_to_3d_batch(
+                    batch,
+                    &poly.points,
+                    style.base_z,
+                    style.top_z,
+                    style.color,
+                    include_sides,
+                )
+            } else {
+                let points = poly
+                    .points
+                    .iter()
+                    .copied()
+                    .map(|point| flattened.transform.apply_point(point))
+                    .collect::<Vec<_>>();
+                append_slab_to_3d_batch(
+                    batch,
+                    &points,
+                    style.base_z,
+                    style.top_z,
+                    style.color,
+                    include_sides,
+                )
+            }
+        }
+        ShapeKindView::Path { points, width } => {
+            let mut faces = 0;
+            if flattened.transform == Transform::IDENTITY {
+                for segment in points.windows(2) {
+                    if let [a, b] = segment {
+                        faces += append_path_segment_to_3d_batch(
+                            batch,
+                            *a,
+                            *b,
+                            width,
+                            style.base_z,
+                            style.top_z,
+                            style.color,
+                            include_sides,
+                        );
+                    }
+                }
+            } else {
+                let points = points
+                    .iter()
+                    .copied()
+                    .map(|point| flattened.transform.apply_point(point))
+                    .collect::<Vec<_>>();
+                for segment in points.windows(2) {
+                    if let [a, b] = segment {
+                        faces += append_path_segment_to_3d_batch(
+                            batch,
+                            *a,
+                            *b,
+                            width,
+                            style.base_z,
+                            style.top_z,
+                            style.color,
+                            include_sides,
+                        );
+                    }
+                }
+            }
+            faces
+        }
+        ShapeKindView::Via { center, size, .. } => {
+            let center = flattened.transform.apply_point(center);
+            let half = size / 2;
+            let rect = Rect::new(
+                Point::new(center.x - half, center.y - half),
+                Point::new(center.x + half, center.y + half),
+            );
+            append_rect_slab_to_3d_batch(
+                batch,
+                rect,
+                style.base_z,
+                style.top_z + 120.0,
+                style.color,
+                include_sides,
+            )
+        }
+        ShapeKindView::Label { .. }
+        | ShapeKindView::Measurement { .. }
+        | ShapeKindView::Polygon(_) => 0,
+    }
+}
+
 fn append_rect_slab_to_3d_batch(
     batch: &mut renderer::RenderBatch3d,
     rect: Rect,
@@ -8727,6 +9271,10 @@ fn append_rect_slab_to_3d_batch(
     color: Color32,
     include_sides: bool,
 ) -> usize {
+    if include_sides && append_rect_slab_instance_to_3d_batch(batch, rect, base_z, top_z, color) {
+        return 5;
+    }
+
     let points = rect.corners();
     let top = [
         Vec3f::new(points[0].x as f32, points[0].y as f32, top_z),
@@ -8734,10 +9282,10 @@ fn append_rect_slab_to_3d_batch(
         Vec3f::new(points[2].x as f32, points[2].y as f32, top_z),
         Vec3f::new(points[3].x as f32, points[3].y as f32, top_z),
     ];
-    let mut faces = usize::from(append_face_points_to_3d_batch(
+    let mut faces = usize::from(append_quad_to_3d_batch(
         batch,
-        FaceSurface3d::Top,
-        &top,
+        top,
+        Vec3f::new(0.0, 0.0, 1.0),
         color,
     ));
 
@@ -8748,18 +9296,48 @@ fn append_rect_slab_to_3d_batch(
             Vec3f::new(points[2].x as f32, points[2].y as f32, base_z),
             Vec3f::new(points[3].x as f32, points[3].y as f32, base_z),
         ];
+        let side_color = shade_color(color, 0.62);
+        let normals = [
+            Vec3f::new(0.0, -1.0, 0.0),
+            Vec3f::new(1.0, 0.0, 0.0),
+            Vec3f::new(0.0, 1.0, 0.0),
+            Vec3f::new(-1.0, 0.0, 0.0),
+        ];
         for index in 0..points.len() {
             let next = (index + 1) % points.len();
             let side = [bottom[index], bottom[next], top[next], top[index]];
-            faces += usize::from(append_face_points_to_3d_batch(
+            faces += usize::from(append_quad_to_3d_batch(
                 batch,
-                FaceSurface3d::Side,
-                &side,
-                shade_color(color, 0.62),
+                side,
+                normals[index],
+                side_color,
             ));
         }
     }
     faces
+}
+
+fn append_rect_slab_instance_to_3d_batch(
+    batch: &mut renderer::RenderBatch3d,
+    rect: Rect,
+    base_z: f32,
+    top_z: f32,
+    color: Color32,
+) -> bool {
+    if batch.rect_slabs.len() >= u32::MAX as usize {
+        return false;
+    }
+    batch.rect_slabs.push(renderer::GpuRectSlabInstance {
+        rect: [
+            rect.min.x as f32,
+            rect.min.y as f32,
+            rect.max.x as f32,
+            rect.max.y as f32,
+        ],
+        z_range: [base_z, top_z],
+        color: color32_to_gpu(color),
+    });
+    true
 }
 
 fn append_slab_to_3d_batch(
@@ -8773,10 +9351,21 @@ fn append_slab_to_3d_batch(
     if points.len() < 3 {
         return 0;
     }
-    let top: Vec<_> = points
-        .iter()
-        .map(|point| Vec3f::new(point.x as f32, point.y as f32, top_z))
-        .collect();
+    let mut top = Vec::with_capacity(points.len());
+    if polygon_signed_area_twice(points) >= 0 {
+        top.extend(
+            points
+                .iter()
+                .map(|point| Vec3f::new(point.x as f32, point.y as f32, top_z)),
+        );
+    } else {
+        top.extend(
+            points
+                .iter()
+                .rev()
+                .map(|point| Vec3f::new(point.x as f32, point.y as f32, top_z)),
+        );
+    }
     let mut faces = usize::from(append_face_points_to_3d_batch(
         batch,
         FaceSurface3d::Top,
@@ -8785,10 +9374,11 @@ fn append_slab_to_3d_batch(
     ));
 
     if include_sides {
-        let bottom: Vec<_> = points
+        let bottom = top
             .iter()
-            .map(|point| Vec3f::new(point.x as f32, point.y as f32, base_z))
-            .collect();
+            .map(|point| Vec3f::new(point.x, point.y, base_z))
+            .collect::<Vec<_>>();
+        let side_color = shade_color(color, 0.62);
         for index in 0..points.len() {
             let next = (index + 1) % points.len();
             let side = [bottom[index], bottom[next], top[next], top[index]];
@@ -8796,11 +9386,24 @@ fn append_slab_to_3d_batch(
                 batch,
                 FaceSurface3d::Side,
                 &side,
-                shade_color(color, 0.62),
+                side_color,
             ));
         }
     }
     faces
+}
+
+fn polygon_signed_area_twice(points: &[Point]) -> i128 {
+    let Some(first) = points.first() else {
+        return 0;
+    };
+    let mut previous = *first;
+    let mut area = 0i128;
+    for point in &points[1..] {
+        area += previous.x as i128 * point.y as i128 - point.x as i128 * previous.y as i128;
+        previous = *point;
+    }
+    area + previous.x as i128 * first.y as i128 - first.x as i128 * previous.y as i128
 }
 
 fn append_path_segment_to_3d_batch(
@@ -8813,6 +9416,9 @@ fn append_path_segment_to_3d_batch(
     color: Color32,
     include_sides: bool,
 ) -> usize {
+    if let Some(rect) = axis_aligned_path_segment_rect(a, b, width) {
+        return append_rect_slab_to_3d_batch(batch, rect, base_z, top_z, color, include_sides);
+    }
     let Some(points) = path_segment_polygon_points(a, b, width) else {
         return 0;
     };
@@ -8914,6 +9520,24 @@ fn path_segment_polygon_points(a: Point, b: Point, width: Coord) -> Option<[Poin
     ])
 }
 
+fn axis_aligned_path_segment_rect(a: Point, b: Point, width: Coord) -> Option<Rect> {
+    if a == b || (a.x != b.x && a.y != b.y) {
+        return None;
+    }
+    let half = width.max(1) / 2;
+    if a.y == b.y {
+        Some(Rect::new(
+            Point::new(a.x.min(b.x), a.y - half),
+            Point::new(a.x.max(b.x), a.y + half),
+        ))
+    } else {
+        Some(Rect::new(
+            Point::new(a.x - half, a.y.min(b.y)),
+            Point::new(a.x + half, a.y.max(b.y)),
+        ))
+    }
+}
+
 fn push_face(
     faces: &mut Vec<Face3d>,
     surface: FaceSurface3d,
@@ -8956,6 +9580,30 @@ fn append_face_points_to_3d_batch(
             .indices
             .extend_from_slice(&[base, base + index as u32, base + index as u32 + 1]);
     }
+    true
+}
+
+fn append_quad_to_3d_batch(
+    batch: &mut renderer::RenderBatch3d,
+    points: [Vec3f; 4],
+    normal: Vec3f,
+    fill: Color32,
+) -> bool {
+    if batch.vertices.len() > u32::MAX as usize - 4 {
+        return false;
+    }
+    let base = batch.vertices.len() as u32;
+    let color = color32_to_gpu(fill);
+    batch
+        .vertices
+        .extend(points.into_iter().map(|point| renderer::GpuVertex3d {
+            position: [point.x, point.y, point.z],
+            normal: [normal.x, normal.y, normal.z],
+            color,
+        }));
+    batch
+        .indices
+        .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     true
 }
 
@@ -9416,7 +10064,6 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(labels.len(), ViewMode::ALL.len());
         assert!(ViewMode::ALL.iter().all(|mode| !mode.title().is_empty()));
-        assert!(ViewMode::ALL.iter().all(|mode| !mode.detail().is_empty()));
         assert!(
             ModuleGroup::ALL
                 .iter()
@@ -9537,6 +10184,19 @@ mod tests {
     }
 
     #[test]
+    fn fps_label_formats_frame_time() {
+        assert_eq!(
+            format_3d_fps_label(Some(66.666_666), Some(8.333_333)),
+            "FPS: 15.0"
+        );
+        assert_eq!(format_3d_fps_label(Some(16.666_666), None), "FPS: 60.0");
+        assert_eq!(format_3d_fps_label(None, Some(8.333_333)), "FPS: --");
+        assert_eq!(format_3d_fps_label(Some(0.0), None), "FPS: --");
+        assert_eq!(format_3d_fps_label(Some(f64::NAN), None), "FPS: --");
+        assert_eq!(format_3d_fps_label(None, None), "FPS: --");
+    }
+
+    #[test]
     fn length_format_honors_unit_preferences_and_precision() {
         assert_eq!(
             format_physical_length_with_options(500.0, DBU_PER_MICRON, UnitDisplay::Microns, 3,),
@@ -9597,6 +10257,32 @@ mod tests {
                 .expect("horizontal frustum should intersect scene z range");
 
         assert!(rect.contains_point(Point::new(10_000, 0)));
+    }
+
+    #[test]
+    fn camera_3d_far_plane_scales_with_large_layouts() {
+        let cc = eframe::CreationContext::_new_kittest(egui::Context::default());
+        let mut app = FabricadApp::new(&cc);
+        app.layout_bounds_cache = Some(Rect::from_min_size(
+            Point::new(-500_000, -500_000),
+            1_000_000,
+            1_000_000,
+        ));
+        app.camera_3d = Camera3d::look_at(
+            Vec3f::new(-850_000.0, -950_000.0, 620_000.0),
+            Vec3f::new(0.0, 0.0, 360.0),
+            850_000.0,
+        );
+
+        assert!(app.camera_3d_far_plane() >= 4_000_000.0);
+    }
+
+    #[test]
+    fn camera_3d_far_plane_has_large_default_without_layout_bounds() {
+        let cc = eframe::CreationContext::_new_kittest(egui::Context::default());
+        let app = FabricadApp::new(&cc);
+
+        assert_eq!(app.camera_3d_far_plane(), CAMERA_FAR_PLANE_MIN);
     }
 
     #[test]
@@ -9788,6 +10474,47 @@ mod tests {
     }
 
     #[test]
+    fn axis_aligned_path_segments_use_rect_slab_batch() {
+        let mut batch = renderer::RenderBatch3d::default();
+        let faces = append_path_segment_to_3d_batch(
+            &mut batch,
+            Point::new(0, 0),
+            Point::new(100, 0),
+            20,
+            0.0,
+            10.0,
+            Color32::from_rgb(40, 120, 220),
+            true,
+        );
+
+        assert_eq!(faces, 5);
+        assert_eq!(batch.rect_slabs.len(), 1);
+        assert!(batch.vertices.is_empty());
+        assert!(batch.indices.is_empty());
+        assert_eq!(batch.rect_slabs[0].rect, [0.0, -10.0, 100.0, 10.0]);
+    }
+
+    #[test]
+    fn diagonal_path_segments_keep_mesh_batch() {
+        let mut batch = renderer::RenderBatch3d::default();
+        let faces = append_path_segment_to_3d_batch(
+            &mut batch,
+            Point::new(0, 0),
+            Point::new(100, 100),
+            20,
+            0.0,
+            10.0,
+            Color32::from_rgb(40, 120, 220),
+            true,
+        );
+
+        assert_eq!(faces, 5);
+        assert!(batch.rect_slabs.is_empty());
+        assert_eq!(batch.vertices.len(), 20);
+        assert_eq!(batch.indices.len(), 30);
+    }
+
+    #[test]
     fn rect_3d_batch_can_emit_top_only_or_full_slab() {
         let rect = Rect::from_min_size(Point::new(0, 0), 100, 50);
         let color = Color32::from_rgb(64, 128, 255);
@@ -9802,13 +10529,89 @@ mod tests {
         let slab_faces = append_rect_slab_to_3d_batch(&mut full_slab, rect, 0.0, 20.0, color, true);
 
         assert_eq!(slab_faces, 5);
-        assert_eq!(full_slab.vertices.len(), 20);
-        assert_eq!(full_slab.indices.len(), 30);
+        assert_eq!(full_slab.rect_slabs.len(), 1);
+        assert!(full_slab.vertices.is_empty());
+        assert!(full_slab.indices.is_empty());
+    }
+
+    #[test]
+    fn rect_3d_top_cap_winding_matches_normals_for_culling() {
+        let rect = Rect::from_min_size(Point::new(0, 0), 100, 50);
+        let mut batch = renderer::RenderBatch3d::default();
+        append_rect_slab_to_3d_batch(&mut batch, rect, 0.0, 20.0, Color32::WHITE, false);
+
+        assert_triangle_winding_matches_vertex_normals(&batch);
+    }
+
+    #[test]
+    fn slab_3d_batch_rewinds_clockwise_input_for_culling() {
+        let points = [
+            Point::new(0, 10),
+            Point::new(100, 10),
+            Point::new(100, -10),
+            Point::new(0, -10),
+        ];
+        assert!(polygon_signed_area_twice(&points) < 0);
+
+        let mut batch = renderer::RenderBatch3d::default();
+        let faces = append_slab_to_3d_batch(&mut batch, &points, 0.0, 20.0, Color32::WHITE, true);
+
+        assert_eq!(faces, 5);
+        assert_triangle_winding_matches_vertex_normals(&batch);
+        assert!(batch.vertices[0].normal[2] > 0.99);
     }
 
     #[test]
     fn default_3d_shape_budget_covers_million_shape_stress_scene() {
         assert!(MAX_3D_RENDERED_SHAPES >= 1_000_000);
+    }
+
+    #[test]
+    fn ten_k_3d_stress_scene_reuses_cached_gpu_mesh() {
+        let cc = eframe::CreationContext::_new_kittest(egui::Context::default());
+        let mut app = FabricadApp::new_with_options(
+            &cc,
+            StartupOptions {
+                stress_count: Some(10_000),
+                view_3d: true,
+                ..Default::default()
+            },
+        );
+
+        let first = app.cached_3d_scene();
+        assert_eq!(first.stats.shapes, 10_000);
+        assert_eq!(first.stats.faces, 50_000);
+        assert!(!first.stats.capped);
+        assert!(!first.stats.top_caps_only);
+        assert_eq!(first.batch.rect_slabs.len(), 10_000);
+        assert!(first.batch.vertices.is_empty());
+        assert!(first.batch.indices.is_empty());
+
+        let second = app.cached_3d_scene();
+        assert!(Arc::ptr_eq(&first.batch, &second.batch));
+        assert_eq!(first.fingerprint, second.fingerprint);
+    }
+
+    #[test]
+    fn large_3d_stress_scene_uses_full_gpu_slabs() {
+        let cc = eframe::CreationContext::_new_kittest(egui::Context::default());
+        let mut app = FabricadApp::new_with_options(
+            &cc,
+            StartupOptions {
+                stress_count: Some(60_000),
+                view_3d: true,
+                ..Default::default()
+            },
+        );
+
+        let scene = app.cached_3d_scene();
+        assert_eq!(scene.stats.shapes, 60_000);
+        assert_eq!(scene.stats.faces, 300_000);
+        assert!(!scene.stats.capped);
+        assert!(!scene.stats.top_caps_only);
+        assert_eq!(scene.batch.rect_slabs.len(), 60_000);
+        assert!(scene.batch.vertices.is_empty());
+        assert!(scene.batch.indices.is_empty());
     }
 
     #[test]
@@ -10040,5 +10843,23 @@ mod tests {
             panic!("expected path");
         };
         assert_eq!(points, vec![Point::new(100, 0), Point::new(0, 0)]);
+    }
+
+    fn assert_triangle_winding_matches_vertex_normals(batch: &renderer::RenderBatch3d) {
+        for (triangle_index, triangle) in batch.indices.chunks_exact(3).enumerate() {
+            let a = batch.vertices[triangle[0] as usize];
+            let b = batch.vertices[triangle[1] as usize];
+            let c = batch.vertices[triangle[2] as usize];
+            let a_pos = Vec3f::new(a.position[0], a.position[1], a.position[2]);
+            let b_pos = Vec3f::new(b.position[0], b.position[1], b.position[2]);
+            let c_pos = Vec3f::new(c.position[0], c.position[1], c.position[2]);
+            let winding_normal = (b_pos - a_pos).cross(c_pos - a_pos).normalized();
+            let vertex_normal = Vec3f::new(a.normal[0], a.normal[1], a.normal[2]);
+
+            assert!(
+                winding_normal.dot(vertex_normal) > 0.99,
+                "triangle {triangle_index} winding does not match vertex normal"
+            );
+        }
     }
 }

@@ -441,6 +441,7 @@ impl LoroCrdtLog {
                 }
             }
             Operation::AddLayer { .. }
+            | Operation::DeleteLayer { .. }
             | Operation::SetLayerVisibility { .. }
             | Operation::Cursor { .. } => {}
         }
@@ -3110,6 +3111,9 @@ pub enum Operation {
     AddLayer {
         layer: Layer,
     },
+    DeleteLayer {
+        id: LayerId,
+    },
     SetLayerVisibility {
         layer: LayerId,
         visible: bool,
@@ -3443,37 +3447,123 @@ impl Document {
     }
 
     pub fn stress(count: usize) -> Self {
-        let mut doc = Self::new(format!("Fabricad stress {count}"));
-        let layers: Vec<LayerId> = [
-            ProcessLayer::Diffusion,
-            ProcessLayer::Poly,
-            ProcessLayer::Metal1,
-            ProcessLayer::Metal2,
-            ProcessLayer::Oxide,
-        ]
-        .into_iter()
-        .filter_map(|layer| doc.layer_by_process(layer))
-        .collect();
-        let columns = (count as f64).sqrt().ceil() as Coord;
-        let pitch = 240;
+        let mut doc = Self::new(format!("Fabricad realistic stress {count}"));
+        let fallback_layer = doc.layers.keys().next().copied().unwrap_or(LayerId(1));
+        let diffusion = doc
+            .layer_by_process(ProcessLayer::Diffusion)
+            .unwrap_or(fallback_layer);
+        let poly = doc
+            .layer_by_process(ProcessLayer::Poly)
+            .unwrap_or(fallback_layer);
+        let contact = doc
+            .layer_by_process(ProcessLayer::Contact)
+            .unwrap_or(fallback_layer);
+        let metal1 = doc
+            .layer_by_process(ProcessLayer::Metal1)
+            .unwrap_or(fallback_layer);
+        let via1 = doc
+            .layer_by_process(ProcessLayer::Via1)
+            .or_else(|| doc.layer_by_process(ProcessLayer::Contact))
+            .unwrap_or(fallback_layer);
+        let metal2 = doc
+            .layer_by_process(ProcessLayer::Metal2)
+            .unwrap_or(fallback_layer);
+        let oxide = doc
+            .layer_by_process(ProcessLayer::Oxide)
+            .unwrap_or(fallback_layer);
+        let cell_count = count.div_ceil(64).max(1) as Coord;
+        let columns = ((cell_count as f64).sqrt() * 1.65).ceil().max(1.0) as Coord;
+        let rows = ((cell_count + columns - 1) / columns).max(1);
+        let site_pitch_x = 420;
+        let row_pitch_y = 960;
         let first_shape_id = doc.next_shape_id;
         doc.shapes =
             ShapeStore::from_dense_id_range(ShapeId(first_shape_id), count, |index, id| {
-                let i = index as Coord;
-                let x = (i % columns) * pitch - columns * pitch / 2;
-                let y = (i / columns) * pitch - columns * pitch / 2;
-                let width = 50 + ((index % 7) as Coord) * 10;
-                let height = 40 + ((index % 5) as Coord) * 12;
-                let layer = layers[index % layers.len()];
+                let cell = (index / 64) as Coord;
+                let column = cell % columns;
+                let row = cell / columns;
+                let row_stagger = if row % 2 == 0 { 0 } else { site_pitch_x / 2 };
+                let base_x = column * site_pitch_x + row_stagger - columns * site_pitch_x / 2;
+                let base_y = row * row_pitch_y - rows * row_pitch_y / 2;
+                let motif = index % 64;
+                let lane = ((index / 64) % 4) as Coord;
+                let hash = (index as u64)
+                    .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    .rotate_left(17);
+                let jitter_x = ((hash & 0x1f) as Coord - 16) * 2;
+                let jitter_y = (((hash >> 5) & 0x0f) as Coord - 8) * 2;
+                let (layer, origin, width, height, net) = match motif {
+                    0..=13 => (
+                        diffusion,
+                        Point::new(base_x - 160 + jitter_x, base_y - 145 + jitter_y),
+                        280 + ((motif % 4) as Coord) * 34,
+                        150 + (lane % 2) * 34,
+                        None,
+                    ),
+                    14..=23 => (
+                        poly,
+                        Point::new(
+                            base_x - 28 + ((motif as Coord - 18) * 18),
+                            base_y - 310 + jitter_y,
+                        ),
+                        48 + (lane % 2) * 12,
+                        620,
+                        None,
+                    ),
+                    24..=35 => (
+                        metal1,
+                        Point::new(base_x - 190 + jitter_x, base_y - 34 + lane * 72),
+                        330 + ((motif % 3) as Coord) * 120,
+                        66,
+                        Some(NetId((index as u32 % 4093) + 1)),
+                    ),
+                    36..=43 => (
+                        contact,
+                        Point::new(
+                            base_x - 132 + ((motif as Coord - 36) % 4) * 86,
+                            base_y - 94 + ((motif as Coord - 36) / 4) * 176,
+                        ),
+                        82,
+                        82,
+                        Some(NetId((index as u32 % 4093) + 1)),
+                    ),
+                    44..=51 => (
+                        metal2,
+                        Point::new(
+                            base_x - 44 + ((motif as Coord - 44) % 2) * 168,
+                            base_y - 360,
+                        ),
+                        88,
+                        720 + lane * 84,
+                        Some(NetId((index as u32 % 4093) + 1)),
+                    ),
+                    52..=55 => (
+                        via1,
+                        Point::new(base_x - 36 + ((motif as Coord - 52) % 2) * 130, base_y - 36),
+                        72,
+                        72,
+                        Some(NetId((index as u32 % 4093) + 1)),
+                    ),
+                    56..=61 => (
+                        metal1,
+                        Point::new(base_x - 210, base_y - 420 + ((motif as Coord - 56) * 132)),
+                        520,
+                        54,
+                        Some(NetId((index as u32 % 4093) + 1)),
+                    ),
+                    _ => (
+                        oxide,
+                        Point::new(base_x - 185 + jitter_x, base_y + 265 + jitter_y),
+                        130 + (lane * 18),
+                        84,
+                        None,
+                    ),
+                };
                 Shape {
                     id,
                     layer,
-                    net: None,
-                    kind: ShapeKind::Rectangle(Rect::from_min_size(
-                        Point::new(x, y),
-                        width,
-                        height,
-                    )),
+                    net,
+                    kind: ShapeKind::Rectangle(Rect::from_min_size(origin, width, height)),
                     name: None,
                 }
             });
@@ -3865,6 +3955,23 @@ impl Document {
             Operation::AddLayer { layer } => {
                 self.next_layer_id = self.next_layer_id.max(layer.id.0 + 1);
                 self.layers.insert(layer.id, layer.clone());
+            }
+            Operation::DeleteLayer { id } => {
+                if self.layers.remove(id).is_some() {
+                    let shape_ids = self
+                        .shapes
+                        .values()
+                        .filter_map(|shape| (shape.layer == *id).then_some(shape.id))
+                        .collect::<Vec<_>>();
+                    for shape_id in shape_ids {
+                        self.shapes.remove(&shape_id);
+                    }
+                } else {
+                    warn!(
+                        layer_id = id.0,
+                        "delete layer operation skipped missing layer"
+                    );
+                }
             }
             Operation::SetLayerVisibility { layer, visible } => {
                 if let Some(layer) = self.layers.get_mut(layer) {
@@ -4605,6 +4712,27 @@ mod tests {
             technology.layer_for_gds_geometry(4, 0).unwrap().name,
             "metal1"
         );
+    }
+
+    #[test]
+    fn delete_layer_removes_shapes_on_that_layer() {
+        let mut doc = Document::new("delete layer");
+        let metal1 = doc.layer_by_process(ProcessLayer::Metal1).unwrap();
+        let metal2 = doc.layer_by_process(ProcessLayer::Metal2).unwrap();
+        let removed_shape = doc.insert_shape(
+            metal1,
+            ShapeKind::Rectangle(Rect::from_min_size(Point::new(0, 0), 10, 10)),
+        );
+        let kept_shape = doc.insert_shape(
+            metal2,
+            ShapeKind::Rectangle(Rect::from_min_size(Point::new(20, 0), 10, 10)),
+        );
+
+        doc.apply_operation_without_log(&Operation::DeleteLayer { id: metal1 });
+
+        assert!(!doc.layers.contains_key(&metal1));
+        assert!(!doc.shapes.contains_key(&removed_shape));
+        assert!(doc.shapes.contains_key(&kept_shape));
     }
 
     #[test]

@@ -12,3 +12,6 @@ layout_model = { path = "../layout_model" }
 tracing.workspace = true
 web-time.workspace = true
 wgpu.workspace = true
+
+[dev-dependencies]
+pollster.workspace = true

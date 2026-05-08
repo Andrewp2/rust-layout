@@ -3138,6 +3138,7 @@ version = "0.1.0"
 dependencies = [
  "geometry_core",
  "layout_model",
+ "pollster",
  "tracing",
  "web-time",
  "wgpu",
