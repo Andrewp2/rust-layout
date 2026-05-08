@@ -84,8 +84,9 @@ const MAX_LORO_SEED_OBJECTS: usize = 5_000;
 const MAX_CONNECTIVITY_OBJECTS: usize = 50_000;
 const MAX_DRC_OBJECTS: usize = 50_000;
 const TILE_MEMORY_BUDGET_BYTES: usize = 96 * 1024 * 1024;
-const MAX_3D_FACES: usize = 24_000;
-const MAX_3D_SHAPE_CANDIDATES: usize = MAX_3D_FACES;
+const MAX_3D_RENDERED_SHAPES: usize = 1_000_000;
+const MAX_3D_PRECISE_SLAB_SHAPES: usize = 50_000;
+const MAX_3D_CPU_FALLBACK_FACES: usize = 24_000;
 const CAMERA_NEAR_PLANE: f32 = 10.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -559,6 +560,14 @@ struct ProjectedFace {
     points: Vec<Pos2>,
     fill: Color32,
     stroke: Color32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Render3dStats {
+    shapes: usize,
+    faces: usize,
+    capped: bool,
+    top_caps_only: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -5596,8 +5605,8 @@ impl FabricadApp {
         }
 
         self.handle_3d_input(ui, &response);
-        let face_count = if let Some(target_format) = self.gpu_target_format {
-            let (batch, face_count) = self.build_3d_render_batch(canvas);
+        let stats = if let Some(target_format) = self.gpu_target_format {
+            let (batch, stats) = self.build_3d_render_batch(canvas);
             painter.add(egui_wgpu::Callback::new_paint_callback(
                 canvas,
                 Viewport3dGpuCallback {
@@ -5607,13 +5616,13 @@ impl FabricadApp {
                     target_format,
                 },
             ));
-            face_count
+            stats
         } else {
             painter.rect_filled(canvas, 0.0, Color32::from_rgb(8, 11, 14));
             self.draw_3d_ground_grid(&painter, canvas);
             self.draw_3d_layout_cpu_fallback(&painter, canvas)
         };
-        self.draw_3d_hud(&painter, canvas, face_count);
+        self.draw_3d_hud(&painter, canvas, stats);
     }
 
     fn metrology_canvas(&mut self, ui: &mut egui::Ui) {
@@ -5846,22 +5855,35 @@ impl FabricadApp {
         });
     }
 
-    fn build_3d_render_batch(&self, canvas: EguiRect) -> (renderer::RenderBatch3d, usize) {
-        let mut faces = Vec::new();
-        self.collect_visible_3d_faces(canvas, &mut faces);
-
-        let face_count = faces.len();
+    fn build_3d_render_batch(&self, canvas: EguiRect) -> (renderer::RenderBatch3d, Render3dStats) {
         let mut batch = renderer::RenderBatch3d::default();
-        for face in &faces {
-            append_face_to_3d_batch(&mut batch, face);
+        let (occurrences, capped) = self.visible_3d_occurrences(canvas);
+        let top_caps_only = occurrences.len() > MAX_3D_PRECISE_SLAB_SHAPES;
+        let mut stats = Render3dStats {
+            capped,
+            top_caps_only,
+            ..Default::default()
+        };
+
+        for occurrence in occurrences {
+            let Some(flattened) = self.document.shape_view_for_occurrence(&occurrence) else {
+                continue;
+            };
+            let shape = flattened.transformed_shape();
+            let added_faces = self.append_shape_3d_to_batch(&mut batch, &shape, top_caps_only);
+            if added_faces == 0 {
+                continue;
+            }
+            stats.shapes += 1;
+            stats.faces += added_faces;
         }
         self.append_3d_scene_guides(&mut batch);
-        (batch, face_count)
+        (batch, stats)
     }
 
-    fn draw_3d_layout_cpu_fallback(&self, painter: &Painter, canvas: EguiRect) -> usize {
+    fn draw_3d_layout_cpu_fallback(&self, painter: &Painter, canvas: EguiRect) -> Render3dStats {
         let mut faces = Vec::new();
-        self.collect_visible_3d_faces(canvas, &mut faces);
+        let mut stats = self.collect_visible_3d_faces(canvas, &mut faces);
 
         let basis = self.camera_3d.basis();
         let mut projected = Vec::with_capacity(faces.len());
@@ -5897,29 +5919,47 @@ impl FabricadApp {
                 Stroke::new(0.75, face.stroke),
             ));
         }
-        rendered
+        stats.faces = rendered;
+        stats
     }
 
-    fn collect_visible_3d_faces(&self, canvas: EguiRect, faces: &mut Vec<Face3d>) {
-        let Some(query) = self.visible_3d_query_rect(canvas) else {
-            return;
+    fn collect_visible_3d_faces(&self, canvas: EguiRect, faces: &mut Vec<Face3d>) -> Render3dStats {
+        let (occurrences, capped) = self.visible_3d_occurrences(canvas);
+        let mut stats = Render3dStats {
+            capped,
+            ..Default::default()
         };
-        for occurrence in self
-            .index
-            .query_occurrences_limited(query, MAX_3D_SHAPE_CANDIDATES)
-        {
-            if faces.len() >= MAX_3D_FACES {
+        for occurrence in occurrences {
+            if faces.len() >= MAX_3D_CPU_FALLBACK_FACES {
+                stats.capped = true;
                 break;
             }
             let Some(flattened) = self.document.shape_view_for_occurrence(&occurrence) else {
                 continue;
             };
-            if !flattened.bounds.intersects(query) {
-                continue;
-            }
             let shape = flattened.transformed_shape();
+            let before = faces.len();
             self.add_shape_3d_faces(faces, &shape);
+            if faces.len() > before {
+                stats.shapes += 1;
+                stats.faces = faces.len();
+            }
         }
+        stats
+    }
+
+    fn visible_3d_occurrences(&self, canvas: EguiRect) -> (Vec<ShapeOccurrenceId>, bool) {
+        let Some(query) = self.visible_3d_query_rect(canvas) else {
+            return (Vec::new(), false);
+        };
+        let mut occurrences = self
+            .index
+            .query_occurrences_limited(query, MAX_3D_RENDERED_SHAPES.saturating_add(1));
+        let capped = occurrences.len() > MAX_3D_RENDERED_SHAPES;
+        if capped {
+            occurrences.truncate(MAX_3D_RENDERED_SHAPES);
+        }
+        (occurrences, capped)
     }
 
     fn visible_3d_query_rect(&self, canvas: EguiRect) -> Option<Rect> {
@@ -6010,8 +6050,61 @@ impl FabricadApp {
         (max_forward_depth + margin).max(50_000.0)
     }
 
+    fn append_shape_3d_to_batch(
+        &self,
+        batch: &mut renderer::RenderBatch3d,
+        shape: &Shape,
+        top_caps_only: bool,
+    ) -> usize {
+        let Some((base_z, top_z, color)) = self.layer_3d_style(shape.layer) else {
+            return 0;
+        };
+        match &shape.kind {
+            ShapeKind::Rectangle(rect) => {
+                append_rect_slab_to_3d_batch(batch, *rect, base_z, top_z, color, !top_caps_only)
+            }
+            ShapeKind::Polygon(poly) if poly.points.len() >= 3 => {
+                append_slab_to_3d_batch(batch, &poly.points, base_z, top_z, color, !top_caps_only)
+            }
+            ShapeKind::Path { points, width } => {
+                let mut faces = 0;
+                for segment in points.windows(2) {
+                    if let [a, b] = segment {
+                        faces += append_path_segment_to_3d_batch(
+                            batch,
+                            *a,
+                            *b,
+                            *width,
+                            base_z,
+                            top_z,
+                            color,
+                            !top_caps_only,
+                        );
+                    }
+                }
+                faces
+            }
+            ShapeKind::Via { center, size, .. } => {
+                let half = *size / 2;
+                let rect = Rect::new(
+                    Point::new(center.x - half, center.y - half),
+                    Point::new(center.x + half, center.y + half),
+                );
+                append_rect_slab_to_3d_batch(
+                    batch,
+                    rect,
+                    base_z,
+                    top_z + 120.0,
+                    color,
+                    !top_caps_only,
+                )
+            }
+            ShapeKind::Label { .. } | ShapeKind::Measurement { .. } | ShapeKind::Polygon(_) => 0,
+        }
+    }
+
     fn add_shape_3d_faces(&self, faces: &mut Vec<Face3d>, shape: &Shape) {
-        if faces.len() >= MAX_3D_FACES {
+        if faces.len() >= MAX_3D_CPU_FALLBACK_FACES {
             return;
         }
         let Some((base_z, top_z, color)) = self.layer_3d_style(shape.layer) else {
@@ -6029,7 +6122,7 @@ impl FabricadApp {
                     if let [a, b] = segment {
                         add_path_segment_3d_faces(faces, *a, *b, *width, base_z, top_z, color);
                     }
-                    if faces.len() >= MAX_3D_FACES {
+                    if faces.len() >= MAX_3D_CPU_FALLBACK_FACES {
                         break;
                     }
                 }
@@ -6164,11 +6257,17 @@ impl FabricadApp {
         );
     }
 
-    fn draw_3d_hud(&self, painter: &Painter, canvas: EguiRect, face_count: usize) {
+    fn draw_3d_hud(&self, painter: &Painter, canvas: EguiRect, stats: Render3dStats) {
         let position = self.camera_3d.position;
+        let mode = if stats.top_caps_only {
+            "top-cap LOD"
+        } else {
+            "slabs"
+        };
+        let capped = if stats.capped { " capped" } else { "" };
         let text = format!(
-            "3D flycam  faces: {}  xyz: {:.0}, {:.0}, {:.0}",
-            face_count, position.x, position.y, position.z
+            "3D flycam  shapes: {}  faces: {}  {}{}  xyz: {:.0}, {:.0}, {:.0}",
+            stats.shapes, stats.faces, mode, capped, position.x, position.y, position.z
         );
         painter.text(
             canvas.left_top() + vec2(12.0, 12.0),
@@ -8345,6 +8444,106 @@ fn tool_button(ui: &mut egui::Ui, active: &mut Tool, value: Tool, label: &str) {
     }
 }
 
+fn append_rect_slab_to_3d_batch(
+    batch: &mut renderer::RenderBatch3d,
+    rect: Rect,
+    base_z: f32,
+    top_z: f32,
+    color: Color32,
+    include_sides: bool,
+) -> usize {
+    let points = rect.corners();
+    let top = [
+        Vec3f::new(points[0].x as f32, points[0].y as f32, top_z),
+        Vec3f::new(points[1].x as f32, points[1].y as f32, top_z),
+        Vec3f::new(points[2].x as f32, points[2].y as f32, top_z),
+        Vec3f::new(points[3].x as f32, points[3].y as f32, top_z),
+    ];
+    let mut faces = usize::from(append_face_points_to_3d_batch(
+        batch,
+        FaceSurface3d::Top,
+        &top,
+        color,
+    ));
+
+    if include_sides {
+        let bottom = [
+            Vec3f::new(points[0].x as f32, points[0].y as f32, base_z),
+            Vec3f::new(points[1].x as f32, points[1].y as f32, base_z),
+            Vec3f::new(points[2].x as f32, points[2].y as f32, base_z),
+            Vec3f::new(points[3].x as f32, points[3].y as f32, base_z),
+        ];
+        for index in 0..points.len() {
+            let next = (index + 1) % points.len();
+            let side = [bottom[index], bottom[next], top[next], top[index]];
+            faces += usize::from(append_face_points_to_3d_batch(
+                batch,
+                FaceSurface3d::Side,
+                &side,
+                shade_color(color, 0.62),
+            ));
+        }
+    }
+    faces
+}
+
+fn append_slab_to_3d_batch(
+    batch: &mut renderer::RenderBatch3d,
+    points: &[Point],
+    base_z: f32,
+    top_z: f32,
+    color: Color32,
+    include_sides: bool,
+) -> usize {
+    if points.len() < 3 {
+        return 0;
+    }
+    let top: Vec<_> = points
+        .iter()
+        .map(|point| Vec3f::new(point.x as f32, point.y as f32, top_z))
+        .collect();
+    let mut faces = usize::from(append_face_points_to_3d_batch(
+        batch,
+        FaceSurface3d::Top,
+        &top,
+        color,
+    ));
+
+    if include_sides {
+        let bottom: Vec<_> = points
+            .iter()
+            .map(|point| Vec3f::new(point.x as f32, point.y as f32, base_z))
+            .collect();
+        for index in 0..points.len() {
+            let next = (index + 1) % points.len();
+            let side = [bottom[index], bottom[next], top[next], top[index]];
+            faces += usize::from(append_face_points_to_3d_batch(
+                batch,
+                FaceSurface3d::Side,
+                &side,
+                shade_color(color, 0.62),
+            ));
+        }
+    }
+    faces
+}
+
+fn append_path_segment_to_3d_batch(
+    batch: &mut renderer::RenderBatch3d,
+    a: Point,
+    b: Point,
+    width: Coord,
+    base_z: f32,
+    top_z: f32,
+    color: Color32,
+    include_sides: bool,
+) -> usize {
+    let Some(points) = path_segment_polygon_points(a, b, width) else {
+        return 0;
+    };
+    append_slab_to_3d_batch(batch, &points, base_z, top_z, color, include_sides)
+}
+
 fn add_slab_faces(
     faces: &mut Vec<Face3d>,
     points: &[Point],
@@ -8352,7 +8551,7 @@ fn add_slab_faces(
     top_z: f32,
     color: Color32,
 ) {
-    if points.len() < 3 || faces.len() >= MAX_3D_FACES {
+    if points.len() < 3 || faces.len() >= MAX_3D_CPU_FALLBACK_FACES {
         return;
     }
     let top: Vec<_> = points
@@ -8372,7 +8571,7 @@ fn add_slab_faces(
     );
 
     for index in 0..points.len() {
-        if faces.len() >= MAX_3D_FACES {
+        if faces.len() >= MAX_3D_CPU_FALLBACK_FACES {
             return;
         }
         let next = (index + 1) % points.len();
@@ -8396,16 +8595,23 @@ fn add_path_segment_3d_faces(
     top_z: f32,
     color: Color32,
 ) {
+    let Some(points) = path_segment_polygon_points(a, b, width) else {
+        return;
+    };
+    add_slab_faces(faces, &points, base_z, top_z, color);
+}
+
+fn path_segment_polygon_points(a: Point, b: Point, width: Coord) -> Option<[Point; 4]> {
     let dx = (b.x - a.x) as f32;
     let dy = (b.y - a.y) as f32;
     let length = (dx * dx + dy * dy).sqrt();
     if length <= f32::EPSILON {
-        return;
+        return None;
     }
     let half = width.max(1) as f32 * 0.5;
     let nx = -dy / length * half;
     let ny = dx / length * half;
-    let points = [
+    Some([
         Point::new(
             (a.x as f32 + nx).round() as Coord,
             (a.y as f32 + ny).round() as Coord,
@@ -8422,8 +8628,7 @@ fn add_path_segment_3d_faces(
             (a.x as f32 - nx).round() as Coord,
             (a.y as f32 - ny).round() as Coord,
         ),
-    ];
-    add_slab_faces(faces, &points, base_z, top_z, color);
+    ])
 }
 
 fn push_face(
@@ -8433,7 +8638,7 @@ fn push_face(
     fill: Color32,
     stroke: Color32,
 ) {
-    if faces.len() < MAX_3D_FACES {
+    if faces.len() < MAX_3D_CPU_FALLBACK_FACES {
         faces.push(Face3d {
             surface,
             order: faces.len(),
@@ -8444,25 +8649,31 @@ fn push_face(
     }
 }
 
-fn append_face_to_3d_batch(batch: &mut renderer::RenderBatch3d, face: &Face3d) {
-    if face.points.len() < 3 {
-        return;
+fn append_face_points_to_3d_batch(
+    batch: &mut renderer::RenderBatch3d,
+    surface: FaceSurface3d,
+    points: &[Vec3f],
+    fill: Color32,
+) -> bool {
+    if points.len() < 3 || batch.vertices.len() > u32::MAX as usize - points.len() {
+        return false;
     }
-    let base = batch.vertices.len().min(u32::MAX as usize) as u32;
-    let color = color32_to_gpu(face.fill);
-    let normal = face_normal(face);
+    let base = batch.vertices.len() as u32;
+    let color = color32_to_gpu(fill);
+    let normal = face_points_normal(surface, points);
     batch
         .vertices
-        .extend(face.points.iter().map(|point| renderer::GpuVertex3d {
+        .extend(points.iter().map(|point| renderer::GpuVertex3d {
             position: [point.x, point.y, point.z],
             normal: [normal.x, normal.y, normal.z],
             color,
         }));
-    for index in 1..face.points.len().saturating_sub(1) {
+    for index in 1..points.len().saturating_sub(1) {
         batch
             .indices
             .extend_from_slice(&[base, base + index as u32, base + index as u32 + 1]);
     }
+    true
 }
 
 fn append_guide_line_to_3d_batch(
@@ -8492,9 +8703,9 @@ fn append_guide_line_to_3d_batch(
     batch.guide_indices.extend_from_slice(&[base, base + 1]);
 }
 
-fn face_normal(face: &Face3d) -> Vec3f {
-    let normal = polygon_normal_3d(&face.points);
-    if face.surface == FaceSurface3d::Top && normal.z < 0.0 {
+fn face_points_normal(surface: FaceSurface3d, points: &[Vec3f]) -> Vec3f {
+    let normal = polygon_normal_3d(points);
+    if surface == FaceSurface3d::Top && normal.z < 0.0 {
         normal * -1.0
     } else {
         normal
@@ -9294,21 +9505,44 @@ mod tests {
     }
 
     #[test]
+    fn rect_3d_batch_can_emit_top_only_or_full_slab() {
+        let rect = Rect::from_min_size(Point::new(0, 0), 100, 50);
+        let color = Color32::from_rgb(64, 128, 255);
+        let mut top_only = renderer::RenderBatch3d::default();
+        let top_faces = append_rect_slab_to_3d_batch(&mut top_only, rect, 0.0, 20.0, color, false);
+
+        assert_eq!(top_faces, 1);
+        assert_eq!(top_only.vertices.len(), 4);
+        assert_eq!(top_only.indices.len(), 6);
+
+        let mut full_slab = renderer::RenderBatch3d::default();
+        let slab_faces = append_rect_slab_to_3d_batch(&mut full_slab, rect, 0.0, 20.0, color, true);
+
+        assert_eq!(slab_faces, 5);
+        assert_eq!(full_slab.vertices.len(), 20);
+        assert_eq!(full_slab.indices.len(), 30);
+    }
+
+    #[test]
+    fn default_3d_shape_budget_covers_million_shape_stress_scene() {
+        assert!(MAX_3D_RENDERED_SHAPES >= 1_000_000);
+    }
+
+    #[test]
     fn face_3d_gpu_batch_keeps_world_depth_coordinates() {
-        let face = Face3d {
-            surface: FaceSurface3d::Top,
-            order: 0,
-            points: vec![
-                Vec3f::new(0.0, 0.0, 20.0),
-                Vec3f::new(100.0, 0.0, 20.0),
-                Vec3f::new(100.0, 100.0, 20.0),
-                Vec3f::new(0.0, 100.0, 20.0),
-            ],
-            fill: Color32::from_rgb(64, 128, 255),
-            stroke: Color32::WHITE,
-        };
+        let points = [
+            Vec3f::new(0.0, 0.0, 20.0),
+            Vec3f::new(100.0, 0.0, 20.0),
+            Vec3f::new(100.0, 100.0, 20.0),
+            Vec3f::new(0.0, 100.0, 20.0),
+        ];
         let mut batch = renderer::RenderBatch3d::default();
-        append_face_to_3d_batch(&mut batch, &face);
+        append_face_points_to_3d_batch(
+            &mut batch,
+            FaceSurface3d::Top,
+            &points,
+            Color32::from_rgb(64, 128, 255),
+        );
 
         assert_eq!(batch.vertices.len(), 4);
         assert_eq!(batch.indices, vec![0, 1, 2, 0, 2, 3]);
