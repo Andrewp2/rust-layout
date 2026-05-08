@@ -949,7 +949,7 @@ pub fn sample_fab_data() -> FabMesData {
                 step_id: first_step.clone(),
                 tool_id: ToolId::new("TRACK-01"),
                 tool_class: ToolClass::LithographyTrack,
-                recipe_id: RecipeId::new("LITHO_COAT_PR_001"),
+                recipe_id: RecipeId::new("SPIN_PR_3000"),
                 operator: "op.martinez".to_string(),
             },
         )
@@ -992,7 +992,7 @@ pub fn demo_process_route() -> ProcessRoute {
                 name: "Coat PR and soft bake".to_string(),
                 area: "lithography".to_string(),
                 required_tool_class: ToolClass::LithographyTrack,
-                required_recipe: RecipeId::new("LITHO_COAT_PR_001"),
+                required_recipe: RecipeId::new("SPIN_PR_3000"),
                 eligible_tools: vec![ToolId::new("TRACK-01"), ToolId::new("TRACK-02")],
                 signoff_required: false,
                 rework_allowed: true,
@@ -1025,7 +1025,7 @@ pub fn demo_process_route() -> ProcessRoute {
                 name: "Poly plasma etch".to_string(),
                 area: "etch".to_string(),
                 required_tool_class: ToolClass::PlasmaEtcher,
-                required_recipe: RecipeId::new("ETCH_POLY_CF4_001"),
+                required_recipe: RecipeId::new("ETCH_CF4_POLY_001"),
                 eligible_tools: vec![ToolId::new("ETCH-01")],
                 signoff_required: true,
                 rework_allowed: false,
@@ -1082,7 +1082,7 @@ mod tests {
                     step_id: etch.clone(),
                     tool_id: ToolId::new("ETCH-01"),
                     tool_class: ToolClass::PlasmaEtcher,
-                    recipe_id: RecipeId::new("ETCH_POLY_CF4_001"),
+                    recipe_id: RecipeId::new("ETCH_CF4_POLY_001"),
                     operator: "op.test".to_string(),
                 },
             )
@@ -1139,7 +1139,7 @@ mod tests {
                     step_id: expose.clone(),
                     tool_id: ToolId::new("ALIGNER-01"),
                     tool_class: ToolClass::MaskAligner,
-                    recipe_id: RecipeId::new("ETCH_POLY_CF4_001"),
+                    recipe_id: RecipeId::new("ETCH_CF4_POLY_001"),
                     operator: "op.test".to_string(),
                 },
             )
@@ -1148,7 +1148,7 @@ mod tests {
             wrong_recipe,
             TravelerTransitionError::RecipeMismatch {
                 expected: RecipeId::new("LITHO_POLY_EXPOSE_001"),
-                got: RecipeId::new("ETCH_POLY_CF4_001"),
+                got: RecipeId::new("ETCH_CF4_POLY_001"),
             }
         );
 

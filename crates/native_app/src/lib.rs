@@ -79,6 +79,7 @@ mod safety_panel;
 mod scheduler_panel;
 mod spc_fdc_panel;
 mod ui_chrome;
+mod workflow_panel;
 use cross_section_panel::CrossSectionPanel;
 use environment_panel::EnvironmentPanel;
 use experiment_panel::ExperimentPlannerPanel;
@@ -94,6 +95,7 @@ use recipe_panel::RecipeManagerPanel;
 use safety_panel::SafetyPanel;
 use scheduler_panel::SchedulerPanel;
 use spc_fdc_panel::SpcFdcPanel;
+use workflow_panel::{WorkflowData, WorkflowDestination, WorkflowPanel};
 
 #[cfg(not(target_arch = "wasm32"))]
 use futures_util::{Sink, SinkExt, StreamExt};
@@ -130,6 +132,7 @@ enum Tool {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ViewMode {
+    Workflow,
     Layout2d,
     Layout3d,
     FabControl,
@@ -152,7 +155,8 @@ enum ViewMode {
 }
 
 impl ViewMode {
-    const ALL: [Self; 19] = [
+    const ALL: [Self; 20] = [
+        Self::Workflow,
         Self::Layout2d,
         Self::Layout3d,
         Self::MaskPrep,
@@ -176,6 +180,7 @@ impl ViewMode {
 
     fn title(self) -> &'static str {
         match self {
+            Self::Workflow => "Fab Workflow",
             Self::Layout2d => "Layout Editor",
             Self::Layout3d => "3D Layout View",
             Self::FabControl => "Fab Control Room",
@@ -200,6 +205,7 @@ impl ViewMode {
 
     fn nav_label(self) -> &'static str {
         match self {
+            Self::Workflow => "Workflow",
             Self::Layout2d => "Mask layout",
             Self::Layout3d => "3D viewport",
             Self::FabControl => "Equipment",
@@ -224,6 +230,7 @@ impl ViewMode {
 
     fn status_message(self) -> &'static str {
         match self {
+            Self::Workflow => "integrated FabOS workflow",
             Self::Layout2d => "layout editor",
             Self::Layout3d => "3D flycam view",
             Self::FabControl => "FabOS equipment control room",
@@ -251,7 +258,8 @@ impl ViewMode {
             Self::Layout2d | Self::Layout3d | Self::MaskPrep | Self::LayoutDiff => {
                 ModuleGroup::Design
             }
-            Self::FabControl
+            Self::Workflow
+            | Self::FabControl
             | Self::Inventory
             | Self::Maintenance
             | Self::Environment
@@ -861,6 +869,7 @@ pub struct FabricadApp {
     yield_analysis: YieldAnalysis,
     selected_yield_lot: String,
     selected_yield_wafer: String,
+    workflow_panel: WorkflowPanel,
     mask_panel: MaskPrepPanel,
     layout_diff_panel: LayoutDiffPanel,
     inventory_panel: InventoryPanel,
@@ -1213,6 +1222,7 @@ impl FabricadApp {
         let selected_mes_lot = mes.lots.keys().next().cloned();
         let equipment_sim = dataset.equipment;
         let selected_equipment_tool = equipment_sim.tools().next().map(|tool| tool.id.clone());
+        let workflow_panel = WorkflowPanel::default();
         let mask_panel = MaskPrepPanel::new(&document, &mes, selected_mes_lot.as_ref());
         let layout_diff_panel = LayoutDiffPanel::default();
         let inventory_panel = InventoryPanel::from_inventory(dataset.inventory);
@@ -1236,6 +1246,7 @@ impl FabricadApp {
             yield_analysis,
             selected_yield_lot,
             selected_yield_wafer,
+            workflow_panel,
             mask_panel,
             layout_diff_panel,
             inventory_panel,
@@ -1261,7 +1272,7 @@ impl FabricadApp {
             selected_occurrence: None,
             active_layer,
             tool: Tool::Select,
-            view_mode: ViewMode::Layout2d,
+            view_mode: ViewMode::Workflow,
             wafer_map: dataset.wafer_map,
             metrology_kind: MeasurementKind::ThicknessNm,
             selected_die: None,
@@ -2931,6 +2942,7 @@ impl FabricadApp {
         self.selected_die = self.wafer_map.dies.first().copied();
         self.mes = dataset.mes;
         self.selected_mes_lot = self.mes.lots.keys().next().cloned();
+        self.workflow_panel = WorkflowPanel::default();
         self.mask_panel =
             MaskPrepPanel::new(&self.document, &self.mes, self.selected_mes_lot.as_ref());
         self.layout_diff_panel = LayoutDiffPanel::default();
@@ -4009,6 +4021,24 @@ impl FabricadApp {
         self.status = mode.status_message().to_string();
     }
 
+    fn open_workflow_destination(&mut self, destination: WorkflowDestination) {
+        let mode = match destination {
+            WorkflowDestination::Layout => ViewMode::Layout2d,
+            WorkflowDestination::ProcessFlow => ViewMode::ProcessFlow,
+            WorkflowDestination::Inventory => ViewMode::Inventory,
+            WorkflowDestination::Scheduler => ViewMode::Scheduler,
+            WorkflowDestination::FabControl => ViewMode::FabControl,
+            WorkflowDestination::Maintenance => ViewMode::Maintenance,
+            WorkflowDestination::Environment => ViewMode::Environment,
+            WorkflowDestination::Safety => ViewMode::Safety,
+            WorkflowDestination::Metrology => ViewMode::Metrology,
+            WorkflowDestination::Yield => ViewMode::Yield,
+            WorkflowDestination::Notebook => ViewMode::Notebook,
+            WorkflowDestination::Traceability => ViewMode::Traceability,
+        };
+        self.select_view_mode(mode);
+    }
+
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.vertical(|ui| {
             ui.horizontal(|ui| {
@@ -4762,6 +4792,24 @@ impl FabricadApp {
                 egui::ScrollArea::vertical()
                     .id_salt("inspector_panel_scroll")
                     .show(ui, |ui| match self.view_mode {
+                        ViewMode::Workflow => {
+                            let data = WorkflowData {
+                                document: &self.document,
+                                process_flow: self.process_flow_panel.model(),
+                                recipes: self.recipe_panel.catalog(),
+                                mes: &self.mes,
+                                inventory: self.inventory_panel.inventory(),
+                                maintenance: self.maintenance_panel.model(),
+                                environment: self.environment_panel.model(),
+                                scheduler: self.scheduler_panel.schedule(),
+                                safety: self.safety_panel.model(),
+                                equipment: &self.equipment_sim,
+                                wafer_map: &self.wafer_map,
+                                yield_analysis: &self.yield_analysis,
+                                notebook: self.notebook_panel.notebook(),
+                            };
+                            self.workflow_panel.context_ui(ui, data);
+                        }
                         ViewMode::Metrology => self.metrology_context_panel(ui),
                         ViewMode::MaskPrep => self.mask_panel.context_ui(
                             ui,
@@ -7992,6 +8040,26 @@ impl eframe::App for FabricadApp {
         self.mes_panel(ctx);
         phase_times.mes += take_elapsed_ms(&mut phase_cursor);
         egui::CentralPanel::default().show(ctx, |ui| match self.view_mode {
+            ViewMode::Workflow => {
+                let data = WorkflowData {
+                    document: &self.document,
+                    process_flow: self.process_flow_panel.model(),
+                    recipes: self.recipe_panel.catalog(),
+                    mes: &self.mes,
+                    inventory: self.inventory_panel.inventory(),
+                    maintenance: self.maintenance_panel.model(),
+                    environment: self.environment_panel.model(),
+                    scheduler: self.scheduler_panel.schedule(),
+                    safety: self.safety_panel.model(),
+                    equipment: &self.equipment_sim,
+                    wafer_map: &self.wafer_map,
+                    yield_analysis: &self.yield_analysis,
+                    notebook: self.notebook_panel.notebook(),
+                };
+                if let Some(destination) = self.workflow_panel.ui(ui, data) {
+                    self.open_workflow_destination(destination);
+                }
+            }
             ViewMode::Layout2d => self.canvas(ui),
             ViewMode::Layout3d => self.canvas_3d(ui),
             ViewMode::FabControl => self.fab_control_room(ui),
@@ -10281,6 +10349,7 @@ mod tests {
                 (
                     "Operations",
                     vec![
+                        "Workflow",
                         "Equipment",
                         "Inventory",
                         "Maintenance",
@@ -10311,6 +10380,8 @@ mod tests {
         assert!(ViewMode::Layout2d.has_secondary_panel());
         assert!(ViewMode::Layout3d.has_inspector_panel());
         assert!(ViewMode::Layout3d.has_secondary_panel());
+        assert!(ViewMode::Workflow.has_inspector_panel());
+        assert!(!ViewMode::Workflow.has_secondary_panel());
 
         assert!(ViewMode::MaskPrep.has_inspector_panel());
         assert!(ViewMode::MaskPrep.has_secondary_panel());
@@ -10394,6 +10465,62 @@ mod tests {
         assert!(!dataset.process_flow.route.nodes.is_empty());
         assert!(!dataset.lab_notebook.entries.is_empty());
         assert!(dataset.equipment.tools().count() > 0);
+    }
+
+    #[test]
+    fn demo_workspace_links_focus_lot_across_workflow() {
+        let dataset = WorkspaceDataset::demo();
+        let focus_lot = "L-00042";
+
+        assert!(dataset.mes.lots.contains_key(&LotId::new(focus_lot)));
+        assert_eq!(
+            dataset.process_flow.route.mes_route_id,
+            "ROUTE-DEMO-INVERTER-POLY-A"
+        );
+        for binding in dataset
+            .process_flow
+            .route
+            .nodes
+            .iter()
+            .filter_map(|node| node.recipe.as_ref())
+        {
+            assert!(
+                dataset
+                    .recipe_catalog
+                    .recipe(&layout_model::recipe::RecipeId::from(
+                        binding.recipe_id.as_str()
+                    ))
+                    .is_some(),
+                "missing recipe {}",
+                binding.recipe_id
+            );
+        }
+        assert!(
+            dataset
+                .scheduler
+                .lots
+                .iter()
+                .any(|lot| lot.id.as_str() == focus_lot)
+        );
+        assert!(dataset.inventory.lots.values().any(|material| {
+            material.usage.iter().any(|usage| {
+                usage.links.iter().any(|link| {
+                    matches!(
+                        link,
+                        layout_model::inventory::FabObjectLink::Lot { lot_id }
+                            if lot_id == focus_lot
+                    )
+                })
+            })
+        }));
+        assert!(dataset.yield_analysis.lot_summary(focus_lot).is_some());
+        assert!(
+            dataset
+                .lab_notebook
+                .entries
+                .iter()
+                .any(|entry| { entry.links.lots.iter().any(|lot| lot.as_str() == focus_lot) })
+        );
     }
 
     #[test]

@@ -2,7 +2,7 @@
   "schema_version": 1,
   "document": {
     "schema_version": 5,
-    "id": "40386e56-b0f5-4964-80af-6755ee41abc8",
+    "id": "c7df9788-9e78-46a5-b97d-a3e02f52337b",
     "name": "Fabricad demo inverter",
     "grid": 10,
     "next_shape_id": 9,
@@ -98316,6 +98316,1569 @@
     ],
     "next_sequence": 109
   },
+  "inventory": {
+    "lots": {
+      "MAT-DEV-0012": {
+        "id": "MAT-DEV-0012",
+        "material_name": "AZ 300 MIF developer",
+        "category": "developer",
+        "stock": {
+          "amount": 1.8,
+          "unit": "liter"
+        },
+        "reorder_threshold": {
+          "amount": 0.5,
+          "unit": "liter"
+        },
+        "location": {
+          "area": "Chem bay",
+          "cabinet": "Base cabinet",
+          "bin": "Bin 4",
+          "temperature": "Ambient"
+        },
+        "expires_on": 20260420,
+        "supplier": {
+          "supplier": "Kayaku Advanced Materials",
+          "supplier_lot": "KAM-MIF-8820",
+          "certificate_id": "COA-MIF-8820",
+          "certificate_url": "fabos://certificates/COA-MIF-8820",
+          "received_by": "materials.owner",
+          "received_date": 20260112
+        },
+        "usage": [
+          {
+            "timestamp": 20260428,
+            "actor": "op.demo",
+            "quantity": {
+              "amount": 120.0,
+              "unit": "milliliter"
+            },
+            "links": [
+              {
+                "kind": "lot",
+                "lot_id": "L-00042"
+              }
+            ],
+            "note": "Developed poly lithography monitor wafers"
+          }
+        ],
+        "notes": "Expired material retained for non-product training only."
+      },
+      "MAT-GAS-0003": {
+        "id": "MAT-GAS-0003",
+        "material_name": "CF4 etch gas cylinder",
+        "category": "gas",
+        "stock": {
+          "amount": 18.0,
+          "unit": "sccm_hour"
+        },
+        "reorder_threshold": {
+          "amount": 12.0,
+          "unit": "sccm_hour"
+        },
+        "location": {
+          "area": "Gas bunker",
+          "cabinet": "Rack 1",
+          "bin": "Position CF4-2",
+          "temperature": "Ambient"
+        },
+        "expires_on": 20270115,
+        "supplier": {
+          "supplier": "Airgas",
+          "supplier_lot": "AG-CF4-2190",
+          "certificate_id": "CERT-CF4-2190",
+          "certificate_url": "fabos://certificates/CERT-CF4-2190",
+          "received_by": "materials.owner",
+          "received_date": 20260222
+        },
+        "usage": [
+          {
+            "timestamp": 20260429,
+            "actor": "etch.owner",
+            "quantity": {
+              "amount": 2.5,
+              "unit": "sccm_hour"
+            },
+            "links": [
+              {
+                "kind": "tool_run",
+                "run_id": "RUN-ETCH-00051"
+              }
+            ],
+            "note": "Poly etch qualification"
+          }
+        ],
+        "notes": "Cylinder connected to etcher ETCH-01."
+      },
+      "MAT-PR-0007": {
+        "id": "MAT-PR-0007",
+        "material_name": "AZ1512 positive photoresist",
+        "category": "photoresist",
+        "stock": {
+          "amount": 85.0,
+          "unit": "milliliter"
+        },
+        "reorder_threshold": {
+          "amount": 100.0,
+          "unit": "milliliter"
+        },
+        "location": {
+          "area": "Chem bay",
+          "cabinet": "Fridge A",
+          "bin": "Shelf 2",
+          "temperature": "4 C"
+        },
+        "expires_on": 20260601,
+        "supplier": {
+          "supplier": "MicroChem",
+          "supplier_lot": "MC-AZ1512-4421",
+          "certificate_id": "COA-AZ1512-4421",
+          "certificate_url": "fabos://certificates/COA-AZ1512-4421",
+          "received_by": "materials.owner",
+          "received_date": 20260410
+        },
+        "usage": [
+          {
+            "timestamp": 20260428,
+            "actor": "op.demo",
+            "quantity": {
+              "amount": 30.0,
+              "unit": "milliliter"
+            },
+            "links": [
+              {
+                "kind": "lot",
+                "lot_id": "L-00042"
+              },
+              {
+                "kind": "tool_run",
+                "run_id": "RUN-SPIN-00042"
+              }
+            ],
+            "note": "Coated demo inverter split"
+          },
+          {
+            "timestamp": 20260503,
+            "actor": "process.engineer",
+            "quantity": {
+              "amount": 15.0,
+              "unit": "milliliter"
+            },
+            "links": [
+              {
+                "kind": "wafer",
+                "lot_id": "L-00042",
+                "wafer_id": "W07"
+              }
+            ],
+            "note": "DOE focus wafer coating"
+          }
+        ],
+        "notes": "Opened bottle; nitrogen blanket after each dispense."
+      },
+      "MAT-WAF-0100": {
+        "id": "MAT-WAF-0100",
+        "material_name": "100 mm p-type silicon wafers",
+        "category": "substrate",
+        "stock": {
+          "amount": 42.0,
+          "unit": "wafer"
+        },
+        "reorder_threshold": {
+          "amount": 25.0,
+          "unit": "wafer"
+        },
+        "location": {
+          "area": "Stockroom",
+          "cabinet": "Wafer cabinet",
+          "bin": "Cassette P100",
+          "temperature": "Ambient N2"
+        },
+        "expires_on": null,
+        "supplier": {
+          "supplier": "University Wafer",
+          "supplier_lot": "UW-P100-7712",
+          "certificate_id": "COC-P100-7712",
+          "certificate_url": "fabos://certificates/COC-P100-7712",
+          "received_by": "materials.owner",
+          "received_date": 20260302
+        },
+        "usage": [
+          {
+            "timestamp": 20260426,
+            "actor": "op.demo",
+            "quantity": {
+              "amount": 25.0,
+              "unit": "wafer"
+            },
+            "links": [
+              {
+                "kind": "lot",
+                "lot_id": "L-00042"
+              }
+            ],
+            "note": "Started demo lot L-00042"
+          }
+        ],
+        "notes": "Primary substrate stock for demo CMOS route."
+      }
+    }
+  },
+  "maintenance": {
+    "today": {
+      "year": 2026,
+      "month": 5,
+      "day": 8
+    },
+    "tools": [
+      {
+        "tool_id": "ETCH-01",
+        "tool_name": "Reactive Ion Etcher 01",
+        "run_count": 138,
+        "schedules": [
+          {
+            "id": "pm-etch-01",
+            "tool_id": "ETCH-01",
+            "task": "Quarterly PM",
+            "kind": "PreventiveMaintenance",
+            "interval_days": 90,
+            "interval_runs": null,
+            "last_completed": {
+              "year": 2026,
+              "month": 2,
+              "day": 20
+            },
+            "last_completed_run_count": 96,
+            "next_due": {
+              "year": 2026,
+              "month": 5,
+              "day": 20
+            },
+            "checklist": [
+              "Inspect RF match",
+              "Leak check chamber",
+              "Verify endpoint optics"
+            ]
+          },
+          {
+            "id": "clean-etch-01",
+            "tool_id": "ETCH-01",
+            "task": "Chamber clean",
+            "kind": "ChamberClean",
+            "interval_days": 14,
+            "interval_runs": 50,
+            "last_completed": {
+              "year": 2026,
+              "month": 5,
+              "day": 3
+            },
+            "last_completed_run_count": 122,
+            "next_due": {
+              "year": 2026,
+              "month": 5,
+              "day": 17
+            },
+            "checklist": [
+              "Vent chamber",
+              "Replace shield kit",
+              "Particle check"
+            ]
+          },
+          {
+            "id": "cal-etch-01",
+            "tool_id": "ETCH-01",
+            "task": "RF power calibration",
+            "kind": "Calibration",
+            "interval_days": 30,
+            "interval_runs": null,
+            "last_completed": {
+              "year": 2026,
+              "month": 4,
+              "day": 25
+            },
+            "last_completed_run_count": 132,
+            "next_due": {
+              "year": 2026,
+              "month": 5,
+              "day": 25
+            },
+            "checklist": [
+              "Connect power meter",
+              "Verify 50 W",
+              "Verify 150 W"
+            ]
+          }
+        ]
+      },
+      {
+        "tool_id": "ALIGN-01",
+        "tool_name": "Mask Aligner 01",
+        "run_count": 91,
+        "schedules": [
+          {
+            "id": "cal-align-01",
+            "tool_id": "ALIGN-01",
+            "task": "Alignment calibration",
+            "kind": "Calibration",
+            "interval_days": 21,
+            "interval_runs": null,
+            "last_completed": {
+              "year": 2026,
+              "month": 4,
+              "day": 18
+            },
+            "last_completed_run_count": 88,
+            "next_due": {
+              "year": 2026,
+              "month": 5,
+              "day": 9
+            },
+            "checklist": [
+              "Clean stage",
+              "Verify theta",
+              "Expose qualification wafer"
+            ]
+          }
+        ]
+      },
+      {
+        "tool_id": "MET-01",
+        "tool_name": "Inspection Microscope 01",
+        "run_count": 47,
+        "schedules": [
+          {
+            "id": "pm-met-01",
+            "tool_id": "MET-01",
+            "task": "Objective and stage PM",
+            "kind": "PreventiveMaintenance",
+            "interval_days": 30,
+            "interval_runs": null,
+            "last_completed": {
+              "year": 2026,
+              "month": 3,
+              "day": 28
+            },
+            "last_completed_run_count": 44,
+            "next_due": {
+              "year": 2026,
+              "month": 4,
+              "day": 27
+            },
+            "checklist": [
+              "Clean optics",
+              "Verify stage repeatability"
+            ]
+          }
+        ]
+      }
+    ],
+    "calibration_records": [
+      {
+        "id": "cal-rec-1",
+        "tool_id": "ETCH-01",
+        "performed_at": {
+          "year": 2026,
+          "month": 4,
+          "day": 25
+        },
+        "instrument": "RF power meter PM-118",
+        "parameter": "RF power",
+        "measured_value": 149.4,
+        "tolerance": "+/- 2.0 W",
+        "outcome": "Passed",
+        "technician": "maintenance.tech"
+      },
+      {
+        "id": "cal-rec-2",
+        "tool_id": "ALIGN-01",
+        "performed_at": {
+          "year": 2026,
+          "month": 4,
+          "day": 18
+        },
+        "instrument": "Overlay grid OG-12",
+        "parameter": "Alignment error",
+        "measured_value": 0.18,
+        "tolerance": "<= 0.25 um",
+        "outcome": "Passed",
+        "technician": "maintenance.tech"
+      },
+      {
+        "id": "cal-rec-3",
+        "tool_id": "MET-01",
+        "performed_at": {
+          "year": 2026,
+          "month": 4,
+          "day": 27
+        },
+        "instrument": "Stage artifact ST-03",
+        "parameter": "Stage repeatability",
+        "measured_value": 0.42,
+        "tolerance": "<= 0.30 um",
+        "outcome": "Failed",
+        "technician": "maintenance.tech"
+      }
+    ],
+    "qualification_results": [
+      {
+        "id": "qual-1",
+        "tool_id": "ETCH-01",
+        "wafer_id": "QW-ETCH-0507",
+        "performed_at": {
+          "year": 2026,
+          "month": 5,
+          "day": 7
+        },
+        "recipe_id": "ETCH_OXIDE_DESCUM",
+        "metric": "etch rate sigma",
+        "value": 2.1,
+        "spec": "<= 3.0%",
+        "outcome": "Passed"
+      },
+      {
+        "id": "qual-2",
+        "tool_id": "ALIGN-01",
+        "wafer_id": "QW-ALIGN-0506",
+        "performed_at": {
+          "year": 2026,
+          "month": 5,
+          "day": 6
+        },
+        "recipe_id": "ALIGN_POLY_EXPOSE",
+        "metric": "overlay P95",
+        "value": 0.21,
+        "spec": "<= 0.30 um",
+        "outcome": "Passed"
+      },
+      {
+        "id": "qual-3",
+        "tool_id": "MET-01",
+        "wafer_id": "QW-MET-0427",
+        "performed_at": {
+          "year": 2026,
+          "month": 4,
+          "day": 27
+        },
+        "recipe_id": "MICRO_CRITICAL_DIM",
+        "metric": "CD bias",
+        "value": 0.09,
+        "spec": "<= 0.05 um",
+        "outcome": "Failed"
+      }
+    ],
+    "downtime": [
+      {
+        "id": "down-1",
+        "tool_id": "MET-01",
+        "started_at": {
+          "year": 2026,
+          "month": 5,
+          "day": 7
+        },
+        "ended_at": null,
+        "reason": "stage calibration failure",
+        "owner": "maintenance.tech"
+      },
+      {
+        "id": "down-2",
+        "tool_id": "ETCH-01",
+        "started_at": {
+          "year": 2026,
+          "month": 5,
+          "day": 3
+        },
+        "ended_at": {
+          "year": 2026,
+          "month": 5,
+          "day": 3
+        },
+        "reason": "scheduled chamber clean",
+        "owner": "etch.owner"
+      }
+    ],
+    "spare_parts": [
+      {
+        "id": "part-1",
+        "tool_id": "ETCH-01",
+        "used_at": {
+          "year": 2026,
+          "month": 5,
+          "day": 3
+        },
+        "part_number": "SHIELD-ETCH-200",
+        "description": "chamber shield kit",
+        "quantity": 1,
+        "unit_cost": 820.0
+      },
+      {
+        "id": "part-2",
+        "tool_id": "MET-01",
+        "used_at": {
+          "year": 2026,
+          "month": 5,
+          "day": 7
+        },
+        "part_number": "STAGE-BELT-04",
+        "description": "stage drive belt",
+        "quantity": 2,
+        "unit_cost": 64.0
+      }
+    ]
+  },
+  "environment": {
+    "sensors": [
+      {
+        "id": "temp-litho",
+        "name": "Litho bay temperature",
+        "zone": "Lithography",
+        "kind": "Temperature",
+        "unit": "C",
+        "thresholds": {
+          "warning_low": 20.8,
+          "warning_high": 21.8,
+          "critical_low": 20.4,
+          "critical_high": 22.2
+        },
+        "process_tags": [
+          "overlay",
+          "resist coat"
+        ]
+      },
+      {
+        "id": "rh-litho",
+        "name": "Litho bay humidity",
+        "zone": "Lithography",
+        "kind": "Humidity",
+        "unit": "%RH",
+        "thresholds": {
+          "warning_low": 43.0,
+          "warning_high": 47.0,
+          "critical_low": 40.0,
+          "critical_high": 50.0
+        },
+        "process_tags": [
+          "photoresist"
+        ]
+      },
+      {
+        "id": "particle-cmp",
+        "name": "CMP particle counter",
+        "zone": "CMP",
+        "kind": "ParticleCount",
+        "unit": "ct/m3",
+        "thresholds": {
+          "warning_low": null,
+          "warning_high": 120.0,
+          "critical_low": null,
+          "critical_high": 180.0
+        },
+        "process_tags": [
+          "scratch risk",
+          "post CMP clean"
+        ]
+      },
+      {
+        "id": "vibe-stepper",
+        "name": "Stepper slab vibration",
+        "zone": "Lithography",
+        "kind": "Vibration",
+        "unit": "um/s",
+        "thresholds": {
+          "warning_low": null,
+          "warning_high": 1.8,
+          "critical_low": null,
+          "critical_high": 2.5
+        },
+        "process_tags": [
+          "overlay",
+          "CD variation"
+        ]
+      },
+      {
+        "id": "di-water",
+        "name": "DI loop resistivity",
+        "zone": "Wet bench",
+        "kind": "DiWaterResistivity",
+        "unit": "Mohm-cm",
+        "thresholds": {
+          "warning_low": 17.8,
+          "warning_high": null,
+          "critical_low": 17.2,
+          "critical_high": null
+        },
+        "process_tags": [
+          "wet clean"
+        ]
+      },
+      {
+        "id": "exhaust-acid",
+        "name": "Acid exhaust flow",
+        "zone": "Wet bench",
+        "kind": "ExhaustFlow",
+        "unit": "m3/min",
+        "thresholds": {
+          "warning_low": 480.0,
+          "warning_high": null,
+          "critical_low": 430.0,
+          "critical_high": null
+        },
+        "process_tags": [
+          "chemical safety"
+        ]
+      }
+    ],
+    "readings": [
+      {
+        "sensor_id": "temp-litho",
+        "timestamp_min": 480,
+        "value": 21.05
+      },
+      {
+        "sensor_id": "temp-litho",
+        "timestamp_min": 495,
+        "value": 21.1
+      },
+      {
+        "sensor_id": "temp-litho",
+        "timestamp_min": 510,
+        "value": 21.18
+      },
+      {
+        "sensor_id": "temp-litho",
+        "timestamp_min": 525,
+        "value": 21.34
+      },
+      {
+        "sensor_id": "temp-litho",
+        "timestamp_min": 540,
+        "value": 21.52
+      },
+      {
+        "sensor_id": "temp-litho",
+        "timestamp_min": 555,
+        "value": 21.74
+      },
+      {
+        "sensor_id": "temp-litho",
+        "timestamp_min": 570,
+        "value": 21.91
+      },
+      {
+        "sensor_id": "temp-litho",
+        "timestamp_min": 585,
+        "value": 22.31
+      },
+      {
+        "sensor_id": "rh-litho",
+        "timestamp_min": 480,
+        "value": 45.0
+      },
+      {
+        "sensor_id": "rh-litho",
+        "timestamp_min": 495,
+        "value": 45.2
+      },
+      {
+        "sensor_id": "rh-litho",
+        "timestamp_min": 510,
+        "value": 45.5
+      },
+      {
+        "sensor_id": "rh-litho",
+        "timestamp_min": 525,
+        "value": 46.0
+      },
+      {
+        "sensor_id": "rh-litho",
+        "timestamp_min": 540,
+        "value": 46.5
+      },
+      {
+        "sensor_id": "rh-litho",
+        "timestamp_min": 555,
+        "value": 47.4
+      },
+      {
+        "sensor_id": "rh-litho",
+        "timestamp_min": 570,
+        "value": 48.1
+      },
+      {
+        "sensor_id": "rh-litho",
+        "timestamp_min": 585,
+        "value": 48.4
+      },
+      {
+        "sensor_id": "particle-cmp",
+        "timestamp_min": 480,
+        "value": 82.0
+      },
+      {
+        "sensor_id": "particle-cmp",
+        "timestamp_min": 495,
+        "value": 90.0
+      },
+      {
+        "sensor_id": "particle-cmp",
+        "timestamp_min": 510,
+        "value": 98.0
+      },
+      {
+        "sensor_id": "particle-cmp",
+        "timestamp_min": 525,
+        "value": 121.0
+      },
+      {
+        "sensor_id": "particle-cmp",
+        "timestamp_min": 540,
+        "value": 156.0
+      },
+      {
+        "sensor_id": "particle-cmp",
+        "timestamp_min": 555,
+        "value": 192.0
+      },
+      {
+        "sensor_id": "particle-cmp",
+        "timestamp_min": 570,
+        "value": 174.0
+      },
+      {
+        "sensor_id": "particle-cmp",
+        "timestamp_min": 585,
+        "value": 138.0
+      },
+      {
+        "sensor_id": "vibe-stepper",
+        "timestamp_min": 480,
+        "value": 1.1
+      },
+      {
+        "sensor_id": "vibe-stepper",
+        "timestamp_min": 495,
+        "value": 1.18
+      },
+      {
+        "sensor_id": "vibe-stepper",
+        "timestamp_min": 510,
+        "value": 1.25
+      },
+      {
+        "sensor_id": "vibe-stepper",
+        "timestamp_min": 525,
+        "value": 1.36
+      },
+      {
+        "sensor_id": "vibe-stepper",
+        "timestamp_min": 540,
+        "value": 1.58
+      },
+      {
+        "sensor_id": "vibe-stepper",
+        "timestamp_min": 555,
+        "value": 1.92
+      },
+      {
+        "sensor_id": "vibe-stepper",
+        "timestamp_min": 570,
+        "value": 2.14
+      },
+      {
+        "sensor_id": "vibe-stepper",
+        "timestamp_min": 585,
+        "value": 2.62
+      },
+      {
+        "sensor_id": "di-water",
+        "timestamp_min": 480,
+        "value": 18.2
+      },
+      {
+        "sensor_id": "di-water",
+        "timestamp_min": 495,
+        "value": 18.1
+      },
+      {
+        "sensor_id": "di-water",
+        "timestamp_min": 510,
+        "value": 18.0
+      },
+      {
+        "sensor_id": "di-water",
+        "timestamp_min": 525,
+        "value": 17.9
+      },
+      {
+        "sensor_id": "di-water",
+        "timestamp_min": 540,
+        "value": 17.7
+      },
+      {
+        "sensor_id": "di-water",
+        "timestamp_min": 555,
+        "value": 17.5
+      },
+      {
+        "sensor_id": "di-water",
+        "timestamp_min": 570,
+        "value": 17.4
+      },
+      {
+        "sensor_id": "di-water",
+        "timestamp_min": 585,
+        "value": 17.6
+      },
+      {
+        "sensor_id": "exhaust-acid",
+        "timestamp_min": 480,
+        "value": 512.0
+      },
+      {
+        "sensor_id": "exhaust-acid",
+        "timestamp_min": 495,
+        "value": 505.0
+      },
+      {
+        "sensor_id": "exhaust-acid",
+        "timestamp_min": 510,
+        "value": 498.0
+      },
+      {
+        "sensor_id": "exhaust-acid",
+        "timestamp_min": 525,
+        "value": 486.0
+      },
+      {
+        "sensor_id": "exhaust-acid",
+        "timestamp_min": 540,
+        "value": 474.0
+      },
+      {
+        "sensor_id": "exhaust-acid",
+        "timestamp_min": 555,
+        "value": 452.0
+      },
+      {
+        "sensor_id": "exhaust-acid",
+        "timestamp_min": 570,
+        "value": 428.0
+      },
+      {
+        "sensor_id": "exhaust-acid",
+        "timestamp_min": 585,
+        "value": 441.0
+      }
+    ],
+    "alarms": [
+      {
+        "id": "env-temp-litho-585",
+        "sensor_id": "temp-litho",
+        "severity": "Critical",
+        "timestamp_min": 585,
+        "value": 22.31,
+        "message": "Litho bay temperature in Lithography measured 22.31 C, outside 20.80..21.80 C",
+        "active": true,
+        "correlation_labels": [
+          "Overlay excursion candidate"
+        ]
+      },
+      {
+        "id": "env-vibe-stepper-585",
+        "sensor_id": "vibe-stepper",
+        "severity": "Critical",
+        "timestamp_min": 585,
+        "value": 2.62,
+        "message": "Stepper slab vibration in Lithography measured 2.62 um/s, outside <= 1.80 um/s",
+        "active": true,
+        "correlation_labels": [
+          "Overlay excursion candidate"
+        ]
+      },
+      {
+        "id": "env-exhaust-acid-570",
+        "sensor_id": "exhaust-acid",
+        "severity": "Critical",
+        "timestamp_min": 570,
+        "value": 428.0,
+        "message": "Acid exhaust flow in Wet bench measured 428.00 m3/min, outside >= 480.00 m3/min",
+        "active": false,
+        "correlation_labels": [
+          "Wet clean process risk"
+        ]
+      },
+      {
+        "id": "env-particle-cmp-555",
+        "sensor_id": "particle-cmp",
+        "severity": "Critical",
+        "timestamp_min": 555,
+        "value": 192.0,
+        "message": "CMP particle counter in CMP measured 192.00 ct/m3, outside <= 120.00 ct/m3",
+        "active": false,
+        "correlation_labels": [
+          "Post-CMP defectivity candidate"
+        ]
+      },
+      {
+        "id": "env-rh-litho-585",
+        "sensor_id": "rh-litho",
+        "severity": "Warning",
+        "timestamp_min": 585,
+        "value": 48.4,
+        "message": "Litho bay humidity in Lithography measured 48.40 %RH, outside 43.00..47.00 %RH",
+        "active": true,
+        "correlation_labels": []
+      },
+      {
+        "id": "env-particle-cmp-585",
+        "sensor_id": "particle-cmp",
+        "severity": "Warning",
+        "timestamp_min": 585,
+        "value": 138.0,
+        "message": "CMP particle counter in CMP measured 138.00 ct/m3, outside <= 120.00 ct/m3",
+        "active": true,
+        "correlation_labels": [
+          "Post-CMP defectivity candidate"
+        ]
+      },
+      {
+        "id": "env-di-water-585",
+        "sensor_id": "di-water",
+        "severity": "Warning",
+        "timestamp_min": 585,
+        "value": 17.6,
+        "message": "DI loop resistivity in Wet bench measured 17.60 Mohm-cm, outside >= 17.80 Mohm-cm",
+        "active": true,
+        "correlation_labels": [
+          "Wet clean process risk"
+        ]
+      },
+      {
+        "id": "env-exhaust-acid-585",
+        "sensor_id": "exhaust-acid",
+        "severity": "Warning",
+        "timestamp_min": 585,
+        "value": 441.0,
+        "message": "Acid exhaust flow in Wet bench measured 441.00 m3/min, outside >= 480.00 m3/min",
+        "active": true,
+        "correlation_labels": [
+          "Wet clean process risk"
+        ]
+      },
+      {
+        "id": "env-temp-litho-570",
+        "sensor_id": "temp-litho",
+        "severity": "Warning",
+        "timestamp_min": 570,
+        "value": 21.91,
+        "message": "Litho bay temperature in Lithography measured 21.91 C, outside 20.80..21.80 C",
+        "active": false,
+        "correlation_labels": [
+          "Overlay excursion candidate"
+        ]
+      },
+      {
+        "id": "env-rh-litho-570",
+        "sensor_id": "rh-litho",
+        "severity": "Warning",
+        "timestamp_min": 570,
+        "value": 48.1,
+        "message": "Litho bay humidity in Lithography measured 48.10 %RH, outside 43.00..47.00 %RH",
+        "active": false,
+        "correlation_labels": []
+      },
+      {
+        "id": "env-particle-cmp-570",
+        "sensor_id": "particle-cmp",
+        "severity": "Warning",
+        "timestamp_min": 570,
+        "value": 174.0,
+        "message": "CMP particle counter in CMP measured 174.00 ct/m3, outside <= 120.00 ct/m3",
+        "active": false,
+        "correlation_labels": [
+          "Post-CMP defectivity candidate"
+        ]
+      },
+      {
+        "id": "env-vibe-stepper-570",
+        "sensor_id": "vibe-stepper",
+        "severity": "Warning",
+        "timestamp_min": 570,
+        "value": 2.14,
+        "message": "Stepper slab vibration in Lithography measured 2.14 um/s, outside <= 1.80 um/s",
+        "active": false,
+        "correlation_labels": [
+          "Overlay excursion candidate"
+        ]
+      },
+      {
+        "id": "env-di-water-570",
+        "sensor_id": "di-water",
+        "severity": "Warning",
+        "timestamp_min": 570,
+        "value": 17.4,
+        "message": "DI loop resistivity in Wet bench measured 17.40 Mohm-cm, outside >= 17.80 Mohm-cm",
+        "active": false,
+        "correlation_labels": [
+          "Wet clean process risk"
+        ]
+      },
+      {
+        "id": "env-rh-litho-555",
+        "sensor_id": "rh-litho",
+        "severity": "Warning",
+        "timestamp_min": 555,
+        "value": 47.4,
+        "message": "Litho bay humidity in Lithography measured 47.40 %RH, outside 43.00..47.00 %RH",
+        "active": false,
+        "correlation_labels": []
+      },
+      {
+        "id": "env-vibe-stepper-555",
+        "sensor_id": "vibe-stepper",
+        "severity": "Warning",
+        "timestamp_min": 555,
+        "value": 1.92,
+        "message": "Stepper slab vibration in Lithography measured 1.92 um/s, outside <= 1.80 um/s",
+        "active": false,
+        "correlation_labels": [
+          "Overlay excursion candidate"
+        ]
+      },
+      {
+        "id": "env-di-water-555",
+        "sensor_id": "di-water",
+        "severity": "Warning",
+        "timestamp_min": 555,
+        "value": 17.5,
+        "message": "DI loop resistivity in Wet bench measured 17.50 Mohm-cm, outside >= 17.80 Mohm-cm",
+        "active": false,
+        "correlation_labels": [
+          "Wet clean process risk"
+        ]
+      },
+      {
+        "id": "env-exhaust-acid-555",
+        "sensor_id": "exhaust-acid",
+        "severity": "Warning",
+        "timestamp_min": 555,
+        "value": 452.0,
+        "message": "Acid exhaust flow in Wet bench measured 452.00 m3/min, outside >= 480.00 m3/min",
+        "active": false,
+        "correlation_labels": [
+          "Wet clean process risk"
+        ]
+      },
+      {
+        "id": "env-particle-cmp-540",
+        "sensor_id": "particle-cmp",
+        "severity": "Warning",
+        "timestamp_min": 540,
+        "value": 156.0,
+        "message": "CMP particle counter in CMP measured 156.00 ct/m3, outside <= 120.00 ct/m3",
+        "active": false,
+        "correlation_labels": [
+          "Post-CMP defectivity candidate"
+        ]
+      },
+      {
+        "id": "env-di-water-540",
+        "sensor_id": "di-water",
+        "severity": "Warning",
+        "timestamp_min": 540,
+        "value": 17.7,
+        "message": "DI loop resistivity in Wet bench measured 17.70 Mohm-cm, outside >= 17.80 Mohm-cm",
+        "active": false,
+        "correlation_labels": [
+          "Wet clean process risk"
+        ]
+      },
+      {
+        "id": "env-exhaust-acid-540",
+        "sensor_id": "exhaust-acid",
+        "severity": "Warning",
+        "timestamp_min": 540,
+        "value": 474.0,
+        "message": "Acid exhaust flow in Wet bench measured 474.00 m3/min, outside >= 480.00 m3/min",
+        "active": false,
+        "correlation_labels": [
+          "Wet clean process risk"
+        ]
+      },
+      {
+        "id": "env-particle-cmp-525",
+        "sensor_id": "particle-cmp",
+        "severity": "Warning",
+        "timestamp_min": 525,
+        "value": 121.0,
+        "message": "CMP particle counter in CMP measured 121.00 ct/m3, outside <= 120.00 ct/m3",
+        "active": false,
+        "correlation_labels": [
+          "Post-CMP defectivity candidate"
+        ]
+      }
+    ],
+    "correlations": [
+      {
+        "id": "overlay-correlation",
+        "label": "Overlay excursion candidate",
+        "process_area": "Lithography",
+        "description": "Temperature or vibration drift can correlate with overlay residuals.",
+        "sensor_ids": [
+          "temp-litho",
+          "vibe-stepper"
+        ]
+      },
+      {
+        "id": "post-cmp-defectivity",
+        "label": "Post-CMP defectivity candidate",
+        "process_area": "CMP",
+        "description": "Particle excursions are tagged for defectivity and scratch Pareto review.",
+        "sensor_ids": [
+          "particle-cmp"
+        ]
+      },
+      {
+        "id": "wet-clean-risk",
+        "label": "Wet clean process risk",
+        "process_area": "Wet bench",
+        "description": "DI water and exhaust degradation can put wet-process lots on hold.",
+        "sensor_ids": [
+          "di-water",
+          "exhaust-acid"
+        ]
+      }
+    ],
+    "events": [
+      {
+        "timestamp_min": 495,
+        "zone": "Lithography",
+        "kind": "Maintenance",
+        "title": "Make-up air handler filter swap",
+        "detail": "Facilities completed filter swap on AHU-2; litho temperature began drifting upward.",
+        "linked_alarm_id": null
+      },
+      {
+        "timestamp_min": 555,
+        "zone": "CMP",
+        "kind": "Excursion",
+        "title": "Particle burst near CMP chase",
+        "detail": "Particle counter exceeded warning threshold during pad conditioner service.",
+        "linked_alarm_id": "env-particle-cmp-555"
+      },
+      {
+        "timestamp_min": 585,
+        "zone": "Wet bench",
+        "kind": "ProcessHold",
+        "title": "Wet bench lots held for facility review",
+        "detail": "DI water resistivity and acid exhaust remained near limits.",
+        "linked_alarm_id": "env-exhaust-acid-585"
+      },
+      {
+        "timestamp_min": 605,
+        "zone": "CMP",
+        "kind": "Recovery",
+        "title": "CMP particle counter returning to baseline",
+        "detail": "Follow-up readings dropped below critical after chase cleanup.",
+        "linked_alarm_id": "env-particle-cmp-585"
+      }
+    ]
+  },
+  "scheduler": {
+    "now_minute": 480,
+    "tools": [
+      {
+        "id": "TRACK-01",
+        "name": "Litho track 01",
+        "class": "LithographyTrack",
+        "state": "available",
+        "compatible_recipes": [
+          "LITHO-A",
+          "LITHO-B"
+        ],
+        "maintenance_windows": [
+          {
+            "start_minute": 660,
+            "end_minute": 705,
+            "reason": "coat cup clean"
+          }
+        ]
+      },
+      {
+        "id": "ALIGN-02",
+        "name": "Mask aligner 02",
+        "class": "MaskAligner",
+        "state": "available",
+        "compatible_recipes": [
+          "ALIGN-248"
+        ],
+        "maintenance_windows": []
+      },
+      {
+        "id": "ETCH-03",
+        "name": "Etch chamber 03",
+        "class": "PlasmaEtcher",
+        "state": "available",
+        "compatible_recipes": [
+          "ETCH-OX",
+          "ETCH-SI"
+        ],
+        "maintenance_windows": [
+          {
+            "start_minute": 620,
+            "end_minute": 655,
+            "reason": "seasoning run"
+          }
+        ]
+      },
+      {
+        "id": "CDSEM-01",
+        "name": "CD-SEM 01",
+        "class": "CdMetrology",
+        "state": "available",
+        "compatible_recipes": [
+          "CD-POLY",
+          "CD-VIA"
+        ],
+        "maintenance_windows": []
+      }
+    ],
+    "lots": [
+      {
+        "id": "LOT-2201",
+        "product": "demo logic",
+        "priority": 5,
+        "fifo_sequence": 1,
+        "ready_at_minute": 480,
+        "due_at_minute": 780,
+        "step_id": "STEP-01",
+        "step_name": "lithography track",
+        "required_tool_class": "LithographyTrack",
+        "recipe_id": "LITHO-A",
+        "process_minutes": 82,
+        "wafer_count": 25
+      },
+      {
+        "id": "LOT-2202",
+        "product": "sensor",
+        "priority": 3,
+        "fifo_sequence": 2,
+        "ready_at_minute": 490,
+        "due_at_minute": 750,
+        "step_id": "STEP-02",
+        "step_name": "plasma etcher",
+        "required_tool_class": "PlasmaEtcher",
+        "recipe_id": "ETCH-OX",
+        "process_minutes": 74,
+        "wafer_count": 25
+      },
+      {
+        "id": "LOT-2203",
+        "product": "demo logic",
+        "priority": 4,
+        "fifo_sequence": 3,
+        "ready_at_minute": 505,
+        "due_at_minute": 840,
+        "step_id": "STEP-03",
+        "step_name": "mask aligner",
+        "required_tool_class": "MaskAligner",
+        "recipe_id": "ALIGN-248",
+        "process_minutes": 58,
+        "wafer_count": 25
+      },
+      {
+        "id": "LOT-2204",
+        "product": "memory shuttle",
+        "priority": 2,
+        "fifo_sequence": 4,
+        "ready_at_minute": 540,
+        "due_at_minute": 900,
+        "step_id": "STEP-04",
+        "step_name": "lithography track",
+        "required_tool_class": "LithographyTrack",
+        "recipe_id": "LITHO-B",
+        "process_minutes": 96,
+        "wafer_count": 25
+      },
+      {
+        "id": "LOT-2205",
+        "product": "sensor",
+        "priority": 5,
+        "fifo_sequence": 5,
+        "ready_at_minute": 555,
+        "due_at_minute": 720,
+        "step_id": "STEP-05",
+        "step_name": "CD metrology",
+        "required_tool_class": "CdMetrology",
+        "recipe_id": "CD-POLY",
+        "process_minutes": 34,
+        "wafer_count": 25
+      },
+      {
+        "id": "LOT-2206",
+        "product": "demo logic",
+        "priority": 1,
+        "fifo_sequence": 6,
+        "ready_at_minute": 570,
+        "due_at_minute": 960,
+        "step_id": "STEP-06",
+        "step_name": "plasma etcher",
+        "required_tool_class": "PlasmaEtcher",
+        "recipe_id": "ETCH-SI",
+        "process_minutes": 88,
+        "wafer_count": 25
+      }
+    ],
+    "assignments": [
+      {
+        "lot_id": "LOT-2201",
+        "tool_id": "TRACK-01",
+        "start_minute": 480,
+        "finish_minute": 562,
+        "due_at_minute": 780,
+        "priority": 5,
+        "wait_minutes": 0,
+        "tardy_minutes": 0
+      },
+      {
+        "lot_id": "LOT-2205",
+        "tool_id": "CDSEM-01",
+        "start_minute": 555,
+        "finish_minute": 589,
+        "due_at_minute": 720,
+        "priority": 5,
+        "wait_minutes": 0,
+        "tardy_minutes": 0
+      },
+      {
+        "lot_id": "LOT-2203",
+        "tool_id": "ALIGN-02",
+        "start_minute": 505,
+        "finish_minute": 563,
+        "due_at_minute": 840,
+        "priority": 4,
+        "wait_minutes": 0,
+        "tardy_minutes": 0
+      },
+      {
+        "lot_id": "LOT-2202",
+        "tool_id": "ETCH-03",
+        "start_minute": 490,
+        "finish_minute": 564,
+        "due_at_minute": 750,
+        "priority": 3,
+        "wait_minutes": 0,
+        "tardy_minutes": 0
+      },
+      {
+        "lot_id": "LOT-2204",
+        "tool_id": "TRACK-01",
+        "start_minute": 562,
+        "finish_minute": 658,
+        "due_at_minute": 900,
+        "priority": 2,
+        "wait_minutes": 22,
+        "tardy_minutes": 0
+      },
+      {
+        "lot_id": "LOT-2206",
+        "tool_id": "ETCH-03",
+        "start_minute": 655,
+        "finish_minute": 743,
+        "due_at_minute": 960,
+        "priority": 1,
+        "wait_minutes": 85,
+        "tardy_minutes": 0
+      }
+    ]
+  },
+  "safety": {
+    "sensors": [
+      {
+        "id": "gas-h2-ppm",
+        "name": "Hydrogen cabinet ppm",
+        "domain": "gas",
+        "tool_id": "ETCH-01",
+        "state": "warning",
+        "severity": "warning",
+        "value": 18.0,
+        "unit": "ppm",
+        "limit": {
+          "lower": 0.0,
+          "upper": 10.0
+        },
+        "required_for_interlock": true,
+        "last_seen_s": 142,
+        "message": "simulated high gas reading"
+      },
+      {
+        "id": "exhaust-etch-pa",
+        "name": "Etch exhaust static pressure",
+        "domain": "exhaust",
+        "tool_id": "ETCH-01",
+        "state": "warning",
+        "severity": "critical",
+        "value": -62.0,
+        "unit": "Pa",
+        "limit": {
+          "lower": null,
+          "upper": -80.0
+        },
+        "required_for_interlock": true,
+        "last_seen_s": 144,
+        "message": "simulated exhaust flow below threshold"
+      },
+      {
+        "id": "door-litho-bay",
+        "name": "Lithography bay door",
+        "domain": "door",
+        "tool_id": "ALIGN-01",
+        "state": "normal",
+        "severity": "normal",
+        "value": 0.0,
+        "unit": "closed=0",
+        "limit": {
+          "lower": 0.0,
+          "upper": 0.0
+        },
+        "required_for_interlock": true,
+        "last_seen_s": 145,
+        "message": "closed"
+      },
+      {
+        "id": "chem-solvent-voc",
+        "name": "Solvent bench VOC",
+        "domain": "chemical",
+        "tool_id": "COAT-01",
+        "state": "normal",
+        "severity": "advisory",
+        "value": 34.0,
+        "unit": "ppm",
+        "limit": {
+          "lower": 0.0,
+          "upper": 50.0
+        },
+        "required_for_interlock": true,
+        "last_seen_s": 145,
+        "message": "within simulated process envelope"
+      },
+      {
+        "id": "estop-main",
+        "name": "Main emergency stop chain",
+        "domain": "emergency_stop",
+        "tool_id": null,
+        "state": "normal",
+        "severity": "normal",
+        "value": 0.0,
+        "unit": "active=1",
+        "limit": {
+          "lower": 0.0,
+          "upper": 0.0
+        },
+        "required_for_interlock": true,
+        "last_seen_s": 145,
+        "message": "clear"
+      }
+    ],
+    "alarm_routes": [
+      {
+        "domain": "gas",
+        "minimum_severity": "warning",
+        "target": "safety_officer",
+        "channel": "simulated-page:safety"
+      },
+      {
+        "domain": "exhaust",
+        "minimum_severity": "warning",
+        "target": "facilities",
+        "channel": "simulated-ticket:facilities"
+      },
+      {
+        "domain": "emergency_stop",
+        "minimum_severity": "critical",
+        "target": "equipment_host",
+        "channel": "simulated-host-interlock"
+      }
+    ],
+    "tool_interlocks": [
+      {
+        "tool_id": "ETCH-01",
+        "tool_name": "ICP etcher",
+        "required_sensors": [
+          "gas-h2-ppm",
+          "exhaust-etch-pa",
+          "estop-main"
+        ]
+      },
+      {
+        "tool_id": "ALIGN-01",
+        "tool_name": "Mask aligner",
+        "required_sensors": [
+          "door-litho-bay",
+          "estop-main"
+        ]
+      },
+      {
+        "tool_id": "COAT-01",
+        "tool_name": "Spin coater",
+        "required_sensors": [
+          "chem-solvent-voc",
+          "estop-main"
+        ]
+      }
+    ],
+    "incidents": [
+      {
+        "id": "INC-SIM-0007",
+        "opened_at": "2026-05-08T09:18:00Z",
+        "status": "open",
+        "severity": "critical",
+        "domain": "exhaust",
+        "sensor_id": "exhaust-etch-pa",
+        "tool_id": "ETCH-01",
+        "summary": "Simulated etch exhaust interlock forced tool lockout",
+        "routed_to": [
+          "facilities",
+          "equipment_host"
+        ]
+      },
+      {
+        "id": "INC-SIM-0006",
+        "opened_at": "2026-05-08T08:51:00Z",
+        "status": "contained",
+        "severity": "warning",
+        "domain": "gas",
+        "sensor_id": "gas-h2-ppm",
+        "tool_id": "ETCH-01",
+        "summary": "Simulated gas cabinet warning routed for review",
+        "routed_to": [
+          "safety_officer"
+        ]
+      }
+    ],
+    "audit_events": [
+      {
+        "sequence": 44,
+        "timestamp": "2026-05-08T09:18:03Z",
+        "actor": "safety.simulator",
+        "kind": "tool_locked_out",
+        "message": "ETCH-01 locked out by simulated exhaust and gas conditions"
+      },
+      {
+        "sequence": 43,
+        "timestamp": "2026-05-08T09:18:00Z",
+        "actor": "safety.simulator",
+        "kind": "incident_opened",
+        "message": "Opened INC-SIM-0007 for exhaust interlock"
+      },
+      {
+        "sequence": 42,
+        "timestamp": "2026-05-08T09:17:57Z",
+        "actor": "safety.simulator",
+        "kind": "alarm_routed",
+        "message": "Routed exhaust alarm to facilities"
+      }
+    ]
+  },
   "experiment_plan": {
     "id": "DOE-POLY-CD-0042",
     "title": "Poly lithography CD split",
@@ -99179,6 +100742,377 @@
         "from_state": null,
         "to_state": "proposed",
         "note": "initial synthetic recommendation"
+      }
+    ]
+  },
+  "process_flow": {
+    "route": {
+      "id": "FLOW-DEMO-INVERTER-POLY-A",
+      "version": 3,
+      "name": "Demo inverter poly module",
+      "owner": "process.engineer",
+      "mes_route_id": "ROUTE-DEMO-INVERTER-POLY-A",
+      "mask_design_id": "FABRICAD-DEMO-INVERTER",
+      "layout_revision": "layout_model:demo-inverter@rev-5",
+      "nodes": [
+        {
+          "id": "START",
+          "name": "Lot released",
+          "kind": "start",
+          "area": "MES",
+          "allowed_tool_classes": [],
+          "eligible_tools": [],
+          "recipe": null,
+          "expected_inputs": [
+            "25 wafer lot"
+          ],
+          "expected_outputs": [
+            "traveler active"
+          ],
+          "hold_point": false,
+          "measurement_checkpoint": null,
+          "notes": "Route starts after mask revision check"
+        },
+        {
+          "id": "COAT",
+          "name": "Coat PR and soft bake",
+          "kind": "operation",
+          "area": "lithography",
+          "allowed_tool_classes": [
+            "spin_coater",
+            "furnace_hotplate"
+          ],
+          "eligible_tools": [
+            "TRACK-01",
+            "TRACK-02"
+          ],
+          "recipe": {
+            "recipe_id": "SPIN_PR_3000",
+            "version": 1
+          },
+          "expected_inputs": [
+            "clean wafer"
+          ],
+          "expected_outputs": [
+            "1.2 um photoresist"
+          ],
+          "hold_point": false,
+          "measurement_checkpoint": null,
+          "notes": "Soft bake runs inline on the track"
+        },
+        {
+          "id": "EXPOSE",
+          "name": "Align and expose poly mask",
+          "kind": "operation",
+          "area": "lithography",
+          "allowed_tool_classes": [
+            "lithography_exposure"
+          ],
+          "eligible_tools": [
+            "ALIGNER-01"
+          ],
+          "recipe": {
+            "recipe_id": "LITHO_POLY_EXPOSE_001",
+            "version": 1
+          },
+          "expected_inputs": [
+            "coated wafer",
+            "poly reticle"
+          ],
+          "expected_outputs": [
+            "latent poly image"
+          ],
+          "hold_point": true,
+          "measurement_checkpoint": null,
+          "notes": "Engineer signoff required before expose"
+        },
+        {
+          "id": "DEVELOP",
+          "name": "Develop and inspect resist",
+          "kind": "measurement",
+          "area": "lithography",
+          "allowed_tool_classes": [
+            "spin_coater"
+          ],
+          "eligible_tools": [
+            "TRACK-01",
+            "TRACK-02"
+          ],
+          "recipe": {
+            "recipe_id": "LITHO_DEVELOP_001",
+            "version": 1
+          },
+          "expected_inputs": [
+            "exposed resist"
+          ],
+          "expected_outputs": [
+            "developed resist image"
+          ],
+          "hold_point": false,
+          "measurement_checkpoint": {
+            "measurement_name": "post-develop inspection",
+            "target": "no scum, no bridge defects",
+            "sample_plan": "5 die per wafer on first and last wafer"
+          },
+          "notes": "Failing inspection branches to strip and recoat"
+        },
+        {
+          "id": "ETCH",
+          "name": "Poly plasma etch",
+          "kind": "operation",
+          "area": "etch",
+          "allowed_tool_classes": [
+            "plasma_etcher"
+          ],
+          "eligible_tools": [
+            "ETCH-01"
+          ],
+          "recipe": {
+            "recipe_id": "ETCH_CF4_POLY_001",
+            "version": 1
+          },
+          "expected_inputs": [
+            "developed resist image"
+          ],
+          "expected_outputs": [
+            "etched poly gate"
+          ],
+          "hold_point": true,
+          "measurement_checkpoint": null,
+          "notes": "Critical etch step; no rework after completion"
+        },
+        {
+          "id": "CD_METRO",
+          "name": "Poly CD metrology",
+          "kind": "measurement",
+          "area": "metrology",
+          "allowed_tool_classes": [
+            "lithography_exposure"
+          ],
+          "eligible_tools": [
+            "CDSEM-01"
+          ],
+          "recipe": {
+            "recipe_id": "METRO_POLY_CD_001",
+            "version": 1
+          },
+          "expected_inputs": [
+            "etched poly gate"
+          ],
+          "expected_outputs": [
+            "CD distribution"
+          ],
+          "hold_point": false,
+          "measurement_checkpoint": {
+            "measurement_name": "poly gate CD",
+            "target": "45 nm +/- 4 nm",
+            "sample_plan": "9 site wafer map on slots 1, 13, 25"
+          },
+          "notes": "Feeds run-to-run etch endpoint tuning"
+        },
+        {
+          "id": "END",
+          "name": "Module complete",
+          "kind": "end",
+          "area": "MES",
+          "allowed_tool_classes": [],
+          "eligible_tools": [],
+          "recipe": null,
+          "expected_inputs": [
+            "accepted CD data"
+          ],
+          "expected_outputs": [
+            "lot released to next module"
+          ],
+          "hold_point": false,
+          "measurement_checkpoint": null,
+          "notes": ""
+        }
+      ],
+      "edges": [
+        {
+          "id": "E010",
+          "from": "START",
+          "to": "COAT",
+          "kind": "sequence",
+          "condition": ""
+        },
+        {
+          "id": "E020",
+          "from": "COAT",
+          "to": "EXPOSE",
+          "kind": "sequence",
+          "condition": ""
+        },
+        {
+          "id": "E030",
+          "from": "EXPOSE",
+          "to": "DEVELOP",
+          "kind": "sequence",
+          "condition": ""
+        },
+        {
+          "id": "E040",
+          "from": "DEVELOP",
+          "to": "ETCH",
+          "kind": "branch",
+          "condition": "inspection passes"
+        },
+        {
+          "id": "E041",
+          "from": "DEVELOP",
+          "to": "COAT",
+          "kind": "rework",
+          "condition": "strip and recoat if post-develop inspection fails"
+        },
+        {
+          "id": "E050",
+          "from": "ETCH",
+          "to": "CD_METRO",
+          "kind": "sequence",
+          "condition": ""
+        },
+        {
+          "id": "E060",
+          "from": "CD_METRO",
+          "to": "END",
+          "kind": "sequence",
+          "condition": "CD in spec"
+        }
+      ]
+    },
+    "versions": [
+      {
+        "version": 1,
+        "author": "process.engineer",
+        "timestamp": "2026-05-01T15:20:00Z",
+        "change_note": "initial lithography and etch flow",
+        "node_count": 5,
+        "edge_count": 4
+      },
+      {
+        "version": 2,
+        "author": "integration.owner",
+        "timestamp": "2026-05-03T18:10:00Z",
+        "change_note": "added post-develop inspection branch",
+        "node_count": 6,
+        "edge_count": 6
+      },
+      {
+        "version": 3,
+        "author": "process.engineer",
+        "timestamp": "2026-05-06T13:30:00Z",
+        "change_note": "linked CD metrology to R2R control",
+        "node_count": 7,
+        "edge_count": 7
+      }
+    ]
+  },
+  "lab_notebook": {
+    "entries": [
+      {
+        "id": "E-0042",
+        "title": "Reduce poly etch residue",
+        "author": "process.eng",
+        "created_at": "2026-04-22T13:30:00Z",
+        "updated_at": "2026-04-22T16:10:00Z",
+        "body_markdown": "## Goal\nReduce post-etch poly residue without moving CD outside spec.\n\n## Result\nResidue reduced after switching from the baseline etch recipe. Line width shifted by 15 nm and needs follow-up metrology on the next split lot.",
+        "tags": [
+          "poly",
+          "etch",
+          "residue"
+        ],
+        "links": {
+          "lots": [
+            "L-00100",
+            "L-00101"
+          ],
+          "wafers": [
+            "L-00100-W07",
+            "L-00101-W11"
+          ],
+          "recipes": [
+            "ETCH_CF4_POLY_001",
+            "POLY_ETCH_004"
+          ],
+          "tool_runs": [
+            "RUN-ETCH-0012"
+          ],
+          "metrology": [
+            {
+              "id": "MET-CD-8841",
+              "kind": "CriticalDimensionNm",
+              "lot_id": "L-00101",
+              "wafer_id": "L-00101-W11",
+              "summary": "CD mean shifted +15 nm after residue cleanup split"
+            }
+          ],
+          "images": [
+            {
+              "id": "IMG-ETCH-0042-A",
+              "label": "post-etch SEM residue comparison",
+              "uri": "images/sem/poly_residue_e0042.png"
+            }
+          ]
+        }
+      },
+      {
+        "id": "E-0043",
+        "title": "Photoresist coat uniformity check",
+        "author": "litho.owner",
+        "created_at": "2026-04-23T09:05:00Z",
+        "updated_at": "2026-04-23T10:20:00Z",
+        "body_markdown": "Thickness map shows a mild edge bead after the track bowl clean. Keep the new dispense delay and re-check after two production lots.",
+        "tags": [
+          "lithography",
+          "coat"
+        ],
+        "links": {
+          "lots": [
+            "L-00042"
+          ],
+          "wafers": [
+            "L-00042-W03"
+          ],
+          "recipes": [
+            "SPIN_PR_3000"
+          ],
+          "tool_runs": [
+            "RUN-SPIN-0007"
+          ],
+          "metrology": [
+            {
+              "id": "MET-THK-7719",
+              "kind": "ThicknessNm",
+              "lot_id": "L-00042",
+              "wafer_id": "L-00042-W03",
+              "summary": "Edge thickness +2.1 percent versus center"
+            }
+          ],
+          "images": []
+        }
+      },
+      {
+        "id": "SHIFT-121",
+        "title": "Night shift handoff",
+        "author": "shift.lead",
+        "created_at": "2026-04-24T06:00:00Z",
+        "updated_at": "2026-04-24T06:05:00Z",
+        "body_markdown": "ETCH-02 completed qualification wafers. Watch first product lot for endpoint drift and attach the FDC trace if alarm margin tightens.",
+        "tags": [
+          "handoff",
+          "qualification"
+        ],
+        "links": {
+          "lots": [],
+          "wafers": [],
+          "recipes": [],
+          "tool_runs": [
+            "RUN-ETCH-0012"
+          ],
+          "metrology": [],
+          "images": []
+        }
       }
     ]
   },

@@ -165,6 +165,7 @@ pub enum RecipeUnit {
     Volt,
     Percent,
     Milliliter,
+    Count,
 }
 
 impl RecipeUnit {
@@ -185,6 +186,7 @@ impl RecipeUnit {
             Self::Volt => "V",
             Self::Percent => "%",
             Self::Milliliter => "mL",
+            Self::Count => "count",
         }
     }
 }
@@ -1023,6 +1025,8 @@ pub fn sample_recipe_catalog() -> RecipeCatalog {
         sample_plasma_etcher_recipe(),
         sample_thermal_recipe(),
         sample_lithography_recipe(),
+        sample_develop_recipe(),
+        sample_cd_metrology_recipe(),
     ] {
         recipes.insert(recipe.id.clone(), recipe);
     }
@@ -1378,6 +1382,77 @@ fn sample_thermal_recipe() -> Recipe {
     }
 }
 
+fn sample_develop_recipe() -> Recipe {
+    let id = RecipeId::from("LITHO_DEVELOP_001");
+    Recipe {
+        id: id.clone(),
+        name: "Poly resist develop".to_string(),
+        tool_class: ToolClass::SpinCoater,
+        owner: "Lithography".to_string(),
+        description: "Developer puddle and rinse after poly exposure.".to_string(),
+        parameter_specs: specs([
+            choice_spec(
+                "developer",
+                "Developer",
+                10,
+                ["AZ 300 MIF", "MF-319", "TMAH 2.38%"],
+                "AZ 300 MIF",
+            ),
+            decimal_spec(
+                "develop_time_s",
+                "Develop time",
+                20,
+                RecipeUnit::Second,
+                10.0,
+                180.0,
+                60.0,
+            ),
+            decimal_spec(
+                "rinse_time_s",
+                "Rinse time",
+                30,
+                RecipeUnit::Second,
+                5.0,
+                120.0,
+                30.0,
+            ),
+            integer_spec("dry_rpm", "Dry spin", 40, RecipeUnit::Rpm, 500, 5000, 2500),
+        ]),
+        versions: vec![RecipeVersion {
+            recipe_id: id.clone(),
+            version: RecipeVersionNumber(1),
+            name: "Baseline develop".to_string(),
+            change_summary: "Qualified puddle develop for the demo poly mask.".to_string(),
+            author: "litho.process".to_string(),
+            created_at: "2026-04-03T10:00:00Z".to_string(),
+            approval_state: ApprovalState::Approved,
+            approved_by: Some("lead.process.eng".to_string()),
+            approved_at: Some("2026-04-04T15:30:00Z".to_string()),
+            parameters: parameters([
+                (
+                    "developer",
+                    RecipeParameterValue::Choice("AZ 300 MIF".to_string()),
+                ),
+                ("develop_time_s", RecipeParameterValue::Decimal(60.0)),
+                ("rinse_time_s", RecipeParameterValue::Decimal(30.0)),
+                ("dry_rpm", RecipeParameterValue::Integer(2500)),
+            ]),
+            dependencies: vec![RecipeDependency {
+                recipe_id: RecipeId::from("LITHO_POLY_EXPOSE_001"),
+                version: Some(RecipeVersionNumber(1)),
+                reason: "Develop is qualified against the poly exposure dose.".to_string(),
+            }],
+            approval_history: vec![approved_event()],
+        }],
+        usage_references: vec![route_usage(
+            "LITHO_DEVELOP_001",
+            1,
+            "develop_resist",
+            "Process traveler develop step",
+        )],
+    }
+}
+
 fn sample_lithography_recipe() -> Recipe {
     let id = RecipeId::from("LITHO_POLY_EXPOSE_001");
     Recipe {
@@ -1501,6 +1576,70 @@ fn sample_lithography_recipe() -> Recipe {
             1,
             "expose_poly",
             "Process traveler exposure step",
+        )],
+    }
+}
+
+fn sample_cd_metrology_recipe() -> Recipe {
+    let id = RecipeId::from("METRO_POLY_CD_001");
+    Recipe {
+        id: id.clone(),
+        name: "Poly CD metrology".to_string(),
+        tool_class: ToolClass::LithographyExposure,
+        owner: "Metrology".to_string(),
+        description: "Nine-site critical-dimension measurement after poly etch.".to_string(),
+        parameter_specs: specs([
+            text_spec("target_feature", "Target feature", 10, "poly gate"),
+            integer_spec(
+                "sites_per_wafer",
+                "Sites per wafer",
+                20,
+                RecipeUnit::Count,
+                1,
+                49,
+                9,
+            ),
+            decimal_spec(
+                "target_cd_nm",
+                "Target CD",
+                30,
+                RecipeUnit::Nanometer,
+                10.0,
+                500.0,
+                45.0,
+            ),
+        ]),
+        versions: vec![RecipeVersion {
+            recipe_id: id.clone(),
+            version: RecipeVersionNumber(1),
+            name: "Baseline poly CD map".to_string(),
+            change_summary: "Initial nine-site CD sampling plan for the demo poly module."
+                .to_string(),
+            author: "metrology.process".to_string(),
+            created_at: "2026-04-05T09:45:00Z".to_string(),
+            approval_state: ApprovalState::Approved,
+            approved_by: Some("lead.process.eng".to_string()),
+            approved_at: Some("2026-04-05T16:00:00Z".to_string()),
+            parameters: parameters([
+                (
+                    "target_feature",
+                    RecipeParameterValue::Text("poly gate".to_string()),
+                ),
+                ("sites_per_wafer", RecipeParameterValue::Integer(9)),
+                ("target_cd_nm", RecipeParameterValue::Decimal(45.0)),
+            ]),
+            dependencies: vec![RecipeDependency {
+                recipe_id: RecipeId::from("ETCH_CF4_POLY_001"),
+                version: Some(RecipeVersionNumber(1)),
+                reason: "Measurement validates the poly etch step.".to_string(),
+            }],
+            approval_history: vec![approved_event()],
+        }],
+        usage_references: vec![route_usage(
+            "METRO_POLY_CD_001",
+            1,
+            "poly_cd_metrology",
+            "Process traveler CD metrology step",
         )],
     }
 }
