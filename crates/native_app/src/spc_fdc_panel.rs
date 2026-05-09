@@ -1,7 +1,10 @@
-use eframe::egui::{self, Align2, Color32, FontId, Pos2, Sense, Stroke, vec2};
+use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, vec2};
 use layout_model::{
     equipment::{Alarm, EquipmentSimulator, SensorSample},
-    spc_fdc::{ControlChart, MonitorFinding, MonitorSeverity, SensorTrace, SpcFdcMonitor},
+    spc_fdc::{
+        ControlChart, ControlRule, FindingSource, MonitorFinding, MonitorSeverity, RuleViolation,
+        SensorLimit, SensorTrace, SensorViolation, SpcFdcMonitor,
+    },
     yield_analysis::YieldAnalysis,
 };
 
@@ -10,6 +13,69 @@ use crate::ui_chrome::{self, Tone};
 pub(crate) struct SpcFdcPanel {
     selected_chart: String,
     selected_trace: String,
+    severity_filter: SeverityFilter,
+    source_filter: SourceFilter,
+    context_filter: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SeverityFilter {
+    All,
+    Critical,
+    Warning,
+    Advisory,
+}
+
+impl SeverityFilter {
+    const ALL: [Self; 4] = [Self::All, Self::Critical, Self::Warning, Self::Advisory];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "All severities",
+            Self::Critical => "Critical",
+            Self::Warning => "Warning",
+            Self::Advisory => "Advisory",
+        }
+    }
+
+    fn matches(self, severity: MonitorSeverity) -> bool {
+        match self {
+            Self::All => true,
+            Self::Critical => severity == MonitorSeverity::Critical,
+            Self::Warning => severity == MonitorSeverity::Warning,
+            Self::Advisory => severity == MonitorSeverity::Advisory,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SourceFilter {
+    All,
+    Spc,
+    Fdc,
+    Alarm,
+}
+
+impl SourceFilter {
+    const ALL: [Self; 4] = [Self::All, Self::Spc, Self::Fdc, Self::Alarm];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "All sources",
+            Self::Spc => "SPC",
+            Self::Fdc => "FDC",
+            Self::Alarm => "Alarm",
+        }
+    }
+
+    fn matches(self, source: FindingSource) -> bool {
+        match self {
+            Self::All => true,
+            Self::Spc => source == FindingSource::SpcRule,
+            Self::Fdc => source == FindingSource::FdcTrace,
+            Self::Alarm => source == FindingSource::EquipmentAlarm,
+        }
+    }
 }
 
 impl SpcFdcPanel {
@@ -17,6 +83,9 @@ impl SpcFdcPanel {
         Self {
             selected_chart: String::new(),
             selected_trace: String::new(),
+            severity_filter: SeverityFilter::All,
+            source_filter: SourceFilter::All,
+            context_filter: String::new(),
         }
     }
 
@@ -32,25 +101,44 @@ impl SpcFdcPanel {
         egui::ScrollArea::vertical()
             .id_salt("spc_fdc_dashboard")
             .show(ui, |ui| {
-                let detail = format!("{} active finding(s)", monitor.findings.len());
+                let detail = format!(
+                    "{} active finding(s) across {} chart(s), {} trace(s)",
+                    monitor.findings.len(),
+                    monitor.charts.len(),
+                    monitor.traces.len()
+                );
                 ui_chrome::module_header(ui, "Process monitor", "SPC / FDC", &detail, |_| {});
 
                 monitor_metrics_ui(ui, &monitor);
 
                 ui.separator();
-                if ui.available_width() < 760.0 {
+                triage_summary_ui(ui, &monitor);
+
+                ui.separator();
+                let available_width = ui.available_width();
+                if available_width < 780.0 {
                     self.spc_section(ui, &monitor);
                     ui.separator();
                     self.fdc_section(ui, &monitor);
-                } else {
+                    ui.separator();
+                    self.context_section(ui, &monitor);
+                } else if available_width < 1120.0 {
                     ui.columns(2, |columns| {
                         self.spc_section(&mut columns[0], &monitor);
                         self.fdc_section(&mut columns[1], &monitor);
                     });
+                    ui.separator();
+                    self.context_section(ui, &monitor);
+                } else {
+                    ui.columns(3, |columns| {
+                        self.spc_section(&mut columns[0], &monitor);
+                        self.fdc_section(&mut columns[1], &monitor);
+                        self.context_section(&mut columns[2], &monitor);
+                    });
                 }
 
                 ui.separator();
-                findings_ui(ui, &monitor.findings);
+                self.findings_ui(ui, &monitor.findings);
             });
     }
 
@@ -64,6 +152,10 @@ impl SpcFdcPanel {
         self.ensure_selection(&monitor);
 
         ui_chrome::section_label(ui, "SPC / FDC");
+        ui.horizontal_wrapped(|ui| {
+            ui_chrome::status_pill(ui, monitor_risk_label(&monitor), monitor_tone(&monitor));
+            ui.label(format!("{} finding(s)", monitor.findings.len()));
+        });
         ui.label(format!("SPC charts: {}", monitor.charts.len()));
         ui.label(format!("FDC traces: {}", monitor.traces.len()));
         ui.label(format!(
@@ -92,6 +184,15 @@ impl SpcFdcPanel {
                 monitor.finding_count_by_severity(MonitorSeverity::Advisory)
             ),
         );
+
+        ui.separator();
+        ui_chrome::section_label(ui, "Top Action");
+        if let Some(finding) = monitor.findings.first() {
+            finding_row(ui, finding);
+            ui_chrome::muted(ui, next_action_for_finding(finding));
+        } else {
+            ui_chrome::empty_state(ui, "No active SPC/FDC actions");
+        }
 
         ui.separator();
         ui_chrome::section_label(ui, "Latest Findings");
@@ -130,7 +231,32 @@ impl SpcFdcPanel {
     }
 
     fn spc_section(&mut self, ui: &mut egui::Ui, monitor: &SpcFdcMonitor) {
-        ui_chrome::section_label(ui, "SPC Control Chart");
+        ui_chrome::section_label(ui, "SPC Control Charts");
+        if monitor.charts.is_empty() {
+            ui_chrome::empty_state(ui, "No process measurements are available");
+            return;
+        }
+
+        ui.horizontal_wrapped(|ui| {
+            for chart in &monitor.charts {
+                let selected = chart.id.as_str() == self.selected_chart;
+                let label = format!(
+                    "{} ({})",
+                    chart.metric.replace('_', " "),
+                    chart.violations.len()
+                );
+                let color = chart
+                    .highest_severity()
+                    .map(severity_color)
+                    .unwrap_or_else(|| ui.visuals().weak_text_color());
+                let response = ui.selectable_label(selected, RichText::new(label).color(color));
+                if response.clicked() {
+                    self.selected_chart = chart.id.to_string();
+                }
+                response.on_hover_text(chart_hover_text(chart));
+            }
+        });
+
         let selected_text = monitor
             .charts
             .iter()
@@ -159,47 +285,34 @@ impl SpcFdcPanel {
             return;
         };
 
-        if let Some(point) = chart.latest_point() {
-            ui.label(format!(
-                "Latest {} {} on {} {}",
-                compact_number(point.value),
-                chart.unit,
-                point.lot_id,
-                point.wafer_id
-            ));
-        }
-        ui.label(format!(
-            "Limits: {}..{} {}",
-            compact_number(chart.limits.lower_control),
-            compact_number(chart.limits.upper_control),
-            chart.unit
-        ));
+        chart_summary_ui(ui, chart);
         draw_chart(ui, chart);
-
-        if chart.violations.is_empty() {
-            ui_chrome::status_pill(ui, "No SPC rule violations", Tone::Success);
-        } else {
-            egui::Grid::new("spc_rule_violations")
-                .striped(true)
-                .min_col_width(70.0)
-                .show(ui, |ui| {
-                    ui.strong("Rule");
-                    ui.strong("Severity");
-                    ui.end_row();
-                    for violation in &chart.violations {
-                        ui.label(violation.rule.label());
-                        ui.colored_label(
-                            severity_color(violation.severity),
-                            violation.severity.label(),
-                        );
-                        ui.end_row();
-                    }
-                });
-        }
+        spc_violation_table(ui, chart);
     }
 
     fn fdc_section(&mut self, ui: &mut egui::Ui, monitor: &SpcFdcMonitor) {
-        ui_chrome::section_label(ui, "FDC Sensor Trace");
+        ui_chrome::section_label(ui, "FDC Sensor Traces");
+        if monitor.traces.is_empty() {
+            ui_chrome::empty_state(ui, "No equipment sensor samples are available");
+            return;
+        }
+
+        ui.horizontal_wrapped(|ui| {
+            for trace in &monitor.traces {
+                let selected = trace.id == self.selected_trace;
+                let severity = trace_highest_severity(monitor, trace);
+                let label = format!("{} ({})", trace.display_name(), trace.violations.len());
+                let color = severity
+                    .map(severity_color)
+                    .unwrap_or_else(|| ui.visuals().weak_text_color());
+                let response = ui.selectable_label(selected, RichText::new(label).color(color));
+                if response.clicked() {
+                    self.selected_trace = trace.id.clone();
+                }
+                response.on_hover_text(trace_hover_text(monitor, trace));
+            }
+        });
+
         let selected_text = monitor
             .traces
             .iter()
@@ -228,42 +341,99 @@ impl SpcFdcPanel {
             return;
         };
 
-        if let Some(point) = trace.latest_point() {
-            ui.label(format!(
-                "Latest {} {} at t+{}s",
-                compact_number(point.value),
-                trace.unit,
-                point.at_s
-            ));
-        }
-        ui.label(limit_label(trace));
+        trace_summary_ui(ui, monitor, trace);
         draw_trace(ui, trace);
+        fdc_violation_table(ui, trace);
+    }
 
-        if trace.violations.is_empty() {
-            ui_chrome::status_pill(ui, "No FDC excursions", Tone::Success);
+    fn context_section(&self, ui: &mut egui::Ui, monitor: &SpcFdcMonitor) {
+        ui_chrome::section_label(ui, "Sensor / Fault Context");
+
+        let selected_trace = monitor
+            .traces
+            .iter()
+            .find(|trace| trace.id == self.selected_trace);
+        if let Some(trace) = selected_trace {
+            ui.strong(trace.display_name());
+            egui::Grid::new("selected_trace_fault_context")
+                .num_columns(2)
+                .spacing([10.0, 4.0])
+                .show(ui, |ui| {
+                    ui_chrome::muted(ui, "Tool");
+                    ui.label(&trace.tool_id);
+                    ui.end_row();
+
+                    ui_chrome::muted(ui, "Sensor");
+                    ui.label(trace.sensor_name.replace('_', " "));
+                    ui.end_row();
+
+                    ui_chrome::muted(ui, "Samples");
+                    ui.label(trace.samples.len().to_string());
+                    ui.end_row();
+
+                    ui_chrome::muted(ui, "Tool alarms");
+                    ui.label(same_tool_alarm_count(monitor, &trace.tool_id).to_string());
+                    ui.end_row();
+                });
+
+            let tool_alarm_findings = monitor
+                .findings
+                .iter()
+                .filter(|finding| {
+                    finding.source == FindingSource::EquipmentAlarm
+                        && finding.tool_id.as_deref() == Some(trace.tool_id.as_str())
+                })
+                .take(3)
+                .collect::<Vec<_>>();
+            if !tool_alarm_findings.is_empty() {
+                ui.add_space(4.0);
+                ui_chrome::muted(ui, "Correlated active alarms");
+                for finding in tool_alarm_findings {
+                    finding_row(ui, finding);
+                }
+            }
         } else {
-            egui::Grid::new("fdc_violations")
+            ui_chrome::empty_state(ui, "Select a sensor trace for tool context");
+        }
+
+        ui.add_space(8.0);
+        ui_chrome::section_label(ui, "Alarm Summary");
+        if monitor.alarm_summary.active_count == 0 {
+            ui_chrome::status_pill(ui, "No active equipment alarms", Tone::Success);
+        } else {
+            ui.horizontal_wrapped(|ui| {
+                for (severity, count) in &monitor.alarm_summary.by_severity {
+                    ui_chrome::status_pill(
+                        ui,
+                        &format!("{count} {severity}"),
+                        alarm_tone(severity),
+                    );
+                }
+            });
+            egui::Grid::new("spc_fdc_alarm_by_tool")
                 .striped(true)
                 .min_col_width(70.0)
                 .show(ui, |ui| {
-                    ui.strong("Time");
-                    ui.strong("Value");
-                    ui.strong("Finding");
+                    ui.strong("Tool");
+                    ui.strong("Active alarms");
                     ui.end_row();
-                    for violation in &trace.violations {
-                        ui.label(format!("{}s", violation.at_s));
-                        ui.label(format!(
-                            "{} {}",
-                            compact_number(violation.value),
-                            violation.unit
-                        ));
-                        ui.colored_label(
-                            severity_color(violation.severity),
-                            violation.severity.label(),
-                        );
+                    for (tool_id, count) in &monitor.alarm_summary.by_tool {
+                        ui.label(tool_id);
+                        ui.label(count.to_string());
                         ui.end_row();
                     }
                 });
+        }
+
+        if let Some(alarm) = &monitor.alarm_summary.latest_alarm {
+            ui.add_space(4.0);
+            ui_chrome::muted(
+                ui,
+                format!(
+                    "Latest fault: {} {} at t+{}s",
+                    alarm.tool_id, alarm.code, alarm.occurred_at_s
+                ),
+            );
         }
     }
 }
@@ -284,6 +454,17 @@ fn monitor_from_fab_context(
 }
 
 fn monitor_metrics_ui(ui: &mut egui::Ui, monitor: &SpcFdcMonitor) {
+    let chart_violation_count = monitor
+        .charts
+        .iter()
+        .map(|chart| chart.violations.len())
+        .sum::<usize>();
+    let excursion_count = monitor
+        .traces
+        .iter()
+        .map(|trace| trace.violations.len())
+        .sum::<usize>();
+
     ui_chrome::metric_tiles(
         ui,
         &[
@@ -312,55 +493,429 @@ fn monitor_metrics_ui(ui: &mut egui::Ui, monitor: &SpcFdcMonitor) {
                 },
             ),
             (
-                "SPC charts",
-                monitor.charts.len().to_string(),
-                "",
-                Tone::Neutral,
+                "SPC violations",
+                chart_violation_count.to_string(),
+                "rules",
+                if chart_violation_count > 0 {
+                    Tone::Warning
+                } else {
+                    Tone::Neutral
+                },
             ),
             (
-                "FDC traces",
-                monitor.traces.len().to_string(),
-                "",
-                Tone::Neutral,
+                "FDC excursions",
+                excursion_count.to_string(),
+                "samples",
+                if excursion_count > 0 {
+                    Tone::Warning
+                } else {
+                    Tone::Neutral
+                },
             ),
             (
                 "Active alarms",
                 monitor.alarm_summary.active_count.to_string(),
-                "",
-                Tone::Neutral,
+                "tools",
+                if monitor.alarm_summary.active_count > 0 {
+                    Tone::Warning
+                } else {
+                    Tone::Neutral
+                },
             ),
         ],
     );
 }
 
-fn findings_ui(ui: &mut egui::Ui, findings: &[MonitorFinding]) {
-    ui_chrome::section_label(ui, "Monitor Findings");
-    if findings.is_empty() {
-        ui_chrome::empty_state(ui, "No active SPC/FDC findings");
+impl SpcFdcPanel {
+    fn findings_ui(&mut self, ui: &mut egui::Ui, findings: &[MonitorFinding]) {
+        ui_chrome::section_label(ui, "Monitor Findings");
+        ui.horizontal_wrapped(|ui| {
+            egui::ComboBox::from_id_salt("spc_fdc_severity_filter")
+                .selected_text(self.severity_filter.label())
+                .show_ui(ui, |ui| {
+                    for filter in SeverityFilter::ALL {
+                        ui.selectable_value(&mut self.severity_filter, filter, filter.label());
+                    }
+                });
+
+            egui::ComboBox::from_id_salt("spc_fdc_source_filter")
+                .selected_text(self.source_filter.label())
+                .show_ui(ui, |ui| {
+                    for filter in SourceFilter::ALL {
+                        ui.selectable_value(&mut self.source_filter, filter, filter.label());
+                    }
+                });
+
+            ui.add_sized(
+                [200.0, 22.0],
+                egui::TextEdit::singleline(&mut self.context_filter)
+                    .hint_text("lot / wafer / tool / recipe"),
+            );
+            if !self.context_filter.is_empty() && ui.button("Clear").clicked() {
+                self.context_filter.clear();
+            }
+        });
+
+        if findings.is_empty() {
+            ui_chrome::empty_state(ui, "No active SPC/FDC findings");
+            return;
+        }
+
+        let filtered = findings
+            .iter()
+            .filter(|finding| self.finding_matches_filter(finding))
+            .collect::<Vec<_>>();
+        ui_chrome::muted(
+            ui,
+            format!(
+                "Showing {} of {} finding(s)",
+                filtered.len(),
+                findings.len()
+            ),
+        );
+        if filtered.is_empty() {
+            ui_chrome::empty_state(ui, "No findings match the current filters");
+            return;
+        }
+
+        egui::ScrollArea::horizontal()
+            .id_salt("spc_fdc_findings_horizontal")
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                egui::Grid::new("spc_fdc_findings")
+                    .striped(true)
+                    .min_col_width(72.0)
+                    .show(ui, |ui| {
+                        ui.strong("Severity");
+                        ui.strong("Source");
+                        ui.strong("Finding");
+                        ui.strong("Detail");
+                        ui.strong("Context");
+                        ui.strong("Next action");
+                        ui.end_row();
+                        for finding in filtered {
+                            ui.colored_label(
+                                severity_color(finding.severity),
+                                finding.severity.label(),
+                            );
+                            ui.label(finding.source.label());
+                            ui.add(egui::Label::new(finding.title.as_str()).wrap());
+                            ui.add(egui::Label::new(finding.detail.as_str()).wrap());
+                            ui.label(finding_context(finding));
+                            ui.add(egui::Label::new(next_action_for_finding(finding)).wrap());
+                            ui.end_row();
+                        }
+                    });
+            });
+    }
+
+    fn finding_matches_filter(&self, finding: &MonitorFinding) -> bool {
+        if !self.severity_filter.matches(finding.severity)
+            || !self.source_filter.matches(finding.source)
+        {
+            return false;
+        }
+
+        let needle = self.context_filter.trim().to_ascii_lowercase();
+        if needle.is_empty() {
+            return true;
+        }
+
+        let haystack = format!(
+            "{} {} {} {} {} {}",
+            finding.title,
+            finding.detail,
+            finding_context(finding),
+            finding.source.label(),
+            finding.severity.label(),
+            next_action_for_finding(finding)
+        )
+        .to_ascii_lowercase();
+        haystack.contains(&needle)
+    }
+}
+
+fn triage_summary_ui(ui: &mut egui::Ui, monitor: &SpcFdcMonitor) {
+    ui_chrome::section_label(ui, "Actionable Triage");
+    if monitor.findings.is_empty() {
+        ui.horizontal_wrapped(|ui| {
+            ui_chrome::status_pill(ui, "Process in control", Tone::Success);
+            ui_chrome::muted(
+                ui,
+                "No active SPC rules, FDC excursions, or equipment alarms",
+            );
+        });
         return;
     }
 
+    let top = &monitor.findings[0];
+    ui.horizontal_wrapped(|ui| {
+        ui_chrome::status_pill(ui, monitor_risk_label(monitor), monitor_tone(monitor));
+        ui.strong(&top.title);
+    });
+    ui.add(egui::Label::new(top.detail.as_str()).wrap());
+    ui_chrome::muted(ui, next_action_for_finding(top));
+
+    if monitor.findings.len() > 1 {
+        ui.add_space(4.0);
+        egui::Grid::new("spc_fdc_triage_queue")
+            .striped(true)
+            .min_col_width(76.0)
+            .show(ui, |ui| {
+                ui.strong("Priority");
+                ui.strong("Context");
+                ui.strong("Action");
+                ui.end_row();
+                for finding in monitor.findings.iter().skip(1).take(3) {
+                    ui.colored_label(severity_color(finding.severity), finding.severity.label());
+                    ui.label(finding_context(finding));
+                    ui.add(egui::Label::new(next_action_for_finding(finding)).wrap());
+                    ui.end_row();
+                }
+            });
+    }
+}
+
+fn chart_summary_ui(ui: &mut egui::Ui, chart: &ControlChart) {
+    let latest = chart.latest_point();
+    let status = latest
+        .map(|point| {
+            if chart.limits.contains(point.value) {
+                "inside control limits"
+            } else {
+                "outside control limits"
+            }
+        })
+        .unwrap_or("no samples");
+    let tone = chart
+        .highest_severity()
+        .map(severity_tone)
+        .unwrap_or(Tone::Success);
+
+    ui.horizontal_wrapped(|ui| {
+        ui_chrome::status_pill(ui, status, tone);
+        ui_chrome::muted(
+            ui,
+            format!(
+                "{} point(s), {} rule violation(s)",
+                chart.points.len(),
+                chart.violations.len()
+            ),
+        );
+    });
+
+    egui::Grid::new(("spc_chart_summary", chart.id.as_str()))
+        .num_columns(2)
+        .spacing([10.0, 4.0])
+        .show(ui, |ui| {
+            ui_chrome::muted(ui, "Latest");
+            ui.label(
+                latest
+                    .map(|point| {
+                        format!(
+                            "{} {} on {} {}",
+                            compact_number(point.value),
+                            chart.unit,
+                            point.lot_id,
+                            point.wafer_id
+                        )
+                    })
+                    .unwrap_or_else(|| "n/a".to_string()),
+            );
+            ui.end_row();
+
+            ui_chrome::muted(ui, "Center / sigma");
+            ui.label(format!(
+                "{} / {} {}",
+                compact_number(chart.limits.center),
+                compact_number(chart.limits.one_sigma),
+                chart.unit
+            ));
+            ui.end_row();
+
+            ui_chrome::muted(ui, "Limits");
+            ui.label(format!(
+                "{}..{} {}",
+                compact_number(chart.limits.lower_control),
+                compact_number(chart.limits.upper_control),
+                chart.unit
+            ));
+            ui.end_row();
+
+            ui_chrome::muted(ui, "Capability");
+            ui.label(
+                chart_cpk(chart)
+                    .map(|cpk| format!("Cpk {}", compact_number(cpk)))
+                    .unwrap_or_else(|| "Cpk n/a".to_string()),
+            );
+            ui.end_row();
+
+            ui_chrome::muted(ui, "Trend");
+            ui.label(chart_trend_label(chart));
+            ui.end_row();
+
+            ui_chrome::muted(ui, "Recipe context");
+            ui.label(
+                latest
+                    .map(|point| point.recipe_id.clone())
+                    .unwrap_or_else(|| "n/a".to_string()),
+            );
+            ui.end_row();
+        });
+}
+
+fn trace_summary_ui(ui: &mut egui::Ui, monitor: &SpcFdcMonitor, trace: &SensorTrace) {
+    let latest = trace.latest_point();
+    let latest_status = latest
+        .map(|point| {
+            if trace.limit.contains(point.value) {
+                "inside configured limits"
+            } else {
+                "outside configured limits"
+            }
+        })
+        .unwrap_or("no samples");
+    let tone = trace_highest_severity(monitor, trace)
+        .map(severity_tone)
+        .unwrap_or(Tone::Success);
+
+    ui.horizontal_wrapped(|ui| {
+        ui_chrome::status_pill(ui, latest_status, tone);
+        ui_chrome::muted(
+            ui,
+            format!(
+                "{} sample(s), {} excursion(s)",
+                trace.samples.len(),
+                trace.violations.len()
+            ),
+        );
+    });
+
+    egui::Grid::new(("fdc_trace_summary", trace.id.as_str()))
+        .num_columns(2)
+        .spacing([10.0, 4.0])
+        .show(ui, |ui| {
+            ui_chrome::muted(ui, "Latest");
+            ui.label(
+                latest
+                    .map(|point| {
+                        format!(
+                            "{} {} at t+{}s",
+                            compact_number(point.value),
+                            trace.unit,
+                            point.at_s
+                        )
+                    })
+                    .unwrap_or_else(|| "n/a".to_string()),
+            );
+            ui.end_row();
+
+            ui_chrome::muted(ui, "Limits");
+            ui.label(limit_label(trace));
+            ui.end_row();
+
+            ui_chrome::muted(ui, "Observed range");
+            ui.label(trace_range_label(trace));
+            ui.end_row();
+
+            ui_chrome::muted(ui, "Tool alarms");
+            ui.label(same_tool_alarm_count(monitor, &trace.tool_id).to_string());
+            ui.end_row();
+
+            ui_chrome::muted(ui, "Last excursion");
+            ui.label(
+                trace
+                    .violations
+                    .last()
+                    .map(|violation| {
+                        format!(
+                            "t+{}s, {}",
+                            violation.at_s,
+                            sensor_delta_label(violation.value, &violation.limit, &violation.unit)
+                        )
+                    })
+                    .unwrap_or_else(|| "none".to_string()),
+            );
+            ui.end_row();
+        });
+}
+
+fn spc_violation_table(ui: &mut egui::Ui, chart: &ControlChart) {
+    if chart.violations.is_empty() {
+        ui_chrome::status_pill(ui, "No SPC rule violations", Tone::Success);
+        return;
+    }
+
+    ui.add_space(4.0);
+    ui_chrome::muted(ui, "SPC rule violations");
     egui::ScrollArea::horizontal()
-        .id_salt("spc_fdc_findings_horizontal")
+        .id_salt(("spc_rule_violations_scroll", chart.id.as_str()))
         .auto_shrink([false, true])
         .show(ui, |ui| {
-            egui::Grid::new("spc_fdc_findings")
+            egui::Grid::new(("spc_rule_violations", chart.id.as_str()))
                 .striped(true)
-                .min_col_width(72.0)
+                .min_col_width(76.0)
                 .show(ui, |ui| {
+                    ui.strong("Rule");
                     ui.strong("Severity");
-                    ui.strong("Source");
-                    ui.strong("Finding");
+                    ui.strong("Point(s)");
                     ui.strong("Context");
+                    ui.strong("Next action");
                     ui.end_row();
-                    for finding in findings {
+                    for violation in &chart.violations {
+                        ui.label(violation.rule.label());
                         ui.colored_label(
-                            severity_color(finding.severity),
-                            finding.severity.label(),
+                            severity_color(violation.severity),
+                            violation.severity.label(),
                         );
-                        ui.label(finding.source.label());
-                        ui.label(&finding.title);
-                        ui.label(finding_context(finding));
+                        ui.label(violation_points_label(chart, violation));
+                        ui.label(violation_context(violation));
+                        ui.add(egui::Label::new(spc_action_for_violation(violation)).wrap());
+                        ui.end_row();
+                    }
+                });
+        });
+}
+
+fn fdc_violation_table(ui: &mut egui::Ui, trace: &SensorTrace) {
+    if trace.violations.is_empty() {
+        ui_chrome::status_pill(ui, "No FDC excursions", Tone::Success);
+        return;
+    }
+
+    ui.add_space(4.0);
+    ui_chrome::muted(ui, "FDC excursions");
+    egui::ScrollArea::horizontal()
+        .id_salt(("fdc_violations_scroll", trace.id.as_str()))
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            egui::Grid::new(("fdc_violations", trace.id.as_str()))
+                .striped(true)
+                .min_col_width(70.0)
+                .show(ui, |ui| {
+                    ui.strong("Time");
+                    ui.strong("Value");
+                    ui.strong("Delta");
+                    ui.strong("Severity");
+                    ui.strong("Next action");
+                    ui.end_row();
+                    for violation in &trace.violations {
+                        ui.label(format!("t+{}s", violation.at_s));
+                        ui.label(format!(
+                            "{} {}",
+                            compact_number(violation.value),
+                            violation.unit
+                        ));
+                        ui.label(sensor_delta_label(
+                            violation.value,
+                            &violation.limit,
+                            &violation.unit,
+                        ));
+                        ui.colored_label(
+                            severity_color(violation.severity),
+                            violation.severity.label(),
+                        );
+                        ui.add(egui::Label::new(fdc_action_for_violation(violation)).wrap());
                         ui.end_row();
                     }
                 });
@@ -375,7 +930,7 @@ fn finding_row(ui: &mut egui::Ui, finding: &MonitorFinding) {
 }
 
 fn finding_context(finding: &MonitorFinding) -> String {
-    [
+    let context = [
         finding.tool_id.as_deref(),
         finding.lot_id.as_deref(),
         finding.wafer_id.as_deref(),
@@ -384,7 +939,308 @@ fn finding_context(finding: &MonitorFinding) -> String {
     .into_iter()
     .flatten()
     .collect::<Vec<_>>()
-    .join(" / ")
+    .join(" / ");
+    if context.is_empty() {
+        "n/a".to_string()
+    } else {
+        context
+    }
+}
+
+fn monitor_tone(monitor: &SpcFdcMonitor) -> Tone {
+    if monitor.finding_count_by_severity(MonitorSeverity::Critical) > 0 {
+        Tone::Danger
+    } else if monitor.finding_count_by_severity(MonitorSeverity::Warning) > 0 {
+        Tone::Warning
+    } else if monitor.finding_count_by_severity(MonitorSeverity::Advisory) > 0 {
+        Tone::Info
+    } else {
+        Tone::Success
+    }
+}
+
+fn monitor_risk_label(monitor: &SpcFdcMonitor) -> &'static str {
+    if monitor.finding_count_by_severity(MonitorSeverity::Critical) > 0 {
+        "Immediate containment"
+    } else if monitor.finding_count_by_severity(MonitorSeverity::Warning) > 0 {
+        "Investigate before release"
+    } else if monitor.finding_count_by_severity(MonitorSeverity::Advisory) > 0 {
+        "Watch trend"
+    } else {
+        "Stable"
+    }
+}
+
+fn severity_tone(severity: MonitorSeverity) -> Tone {
+    match severity {
+        MonitorSeverity::Advisory => Tone::Info,
+        MonitorSeverity::Warning => Tone::Warning,
+        MonitorSeverity::Critical => Tone::Danger,
+    }
+}
+
+fn alarm_tone(severity: &str) -> Tone {
+    match severity {
+        "Critical" => Tone::Danger,
+        "Warning" => Tone::Warning,
+        "Advisory" => Tone::Info,
+        _ => Tone::Neutral,
+    }
+}
+
+fn chart_hover_text(chart: &ControlChart) -> String {
+    let latest = chart
+        .latest_point()
+        .map(|point| {
+            format!(
+                "Latest {} {} on {} {}",
+                compact_number(point.value),
+                chart.unit,
+                point.lot_id,
+                point.wafer_id
+            )
+        })
+        .unwrap_or_else(|| "No samples".to_string());
+    format!(
+        "{}\n{} point(s)\n{} rule violation(s)\n{}",
+        chart.name,
+        chart.points.len(),
+        chart.violations.len(),
+        latest
+    )
+}
+
+fn trace_hover_text(monitor: &SpcFdcMonitor, trace: &SensorTrace) -> String {
+    let latest = trace
+        .latest_point()
+        .map(|point| {
+            format!(
+                "Latest {} {} at t+{}s",
+                compact_number(point.value),
+                trace.unit,
+                point.at_s
+            )
+        })
+        .unwrap_or_else(|| "No samples".to_string());
+    format!(
+        "{}\n{} sample(s)\n{} excursion(s)\n{} correlated alarm(s)\n{}",
+        trace.display_name(),
+        trace.samples.len(),
+        trace.violations.len(),
+        same_tool_alarm_count(monitor, &trace.tool_id),
+        latest
+    )
+}
+
+fn chart_cpk(chart: &ControlChart) -> Option<f64> {
+    if chart.points.is_empty() || chart.limits.one_sigma <= 0.0 {
+        return None;
+    }
+    let mean =
+        chart.points.iter().map(|point| point.value).sum::<f64>() / chart.points.len() as f64;
+    let lower = chart
+        .limits
+        .lower_spec
+        .unwrap_or(chart.limits.lower_control);
+    let upper = chart
+        .limits
+        .upper_spec
+        .unwrap_or(chart.limits.upper_control);
+    let denominator = 3.0 * chart.limits.one_sigma;
+    Some(((upper - mean).min(mean - lower)) / denominator)
+}
+
+fn chart_trend_label(chart: &ControlChart) -> String {
+    let Some(latest) = chart.points.last() else {
+        return "n/a".to_string();
+    };
+    let Some(previous) = chart.points.iter().rev().nth(1) else {
+        return "single point".to_string();
+    };
+    let delta = latest.value - previous.value;
+    let direction = if delta.abs() <= chart.limits.one_sigma * 0.05 {
+        "flat"
+    } else if delta > 0.0 {
+        "rising"
+    } else {
+        "falling"
+    };
+    let signed_delta = if delta >= 0.0 {
+        format!("+{}", compact_number(delta))
+    } else {
+        compact_number(delta)
+    };
+    format!("{direction} ({signed_delta} {})", chart.unit)
+}
+
+fn trace_range_label(trace: &SensorTrace) -> String {
+    let Some(first) = trace.samples.first() else {
+        return "n/a".to_string();
+    };
+    let (min_value, max_value) = trace.samples.iter().fold(
+        (first.value, first.value),
+        |(min_value, max_value), sample| (min_value.min(sample.value), max_value.max(sample.value)),
+    );
+    format!(
+        "{}..{} {}",
+        compact_number(min_value),
+        compact_number(max_value),
+        trace.unit
+    )
+}
+
+fn sensor_delta_label(value: f64, limit: &SensorLimit, unit: &str) -> String {
+    if let Some(upper) = limit.upper
+        && value > upper
+    {
+        return format!("+{} {} above upper", compact_number(value - upper), unit);
+    }
+    if let Some(lower) = limit.lower
+        && value < lower
+    {
+        return format!("{} {} below lower", compact_number(value - lower), unit);
+    }
+    "within limits".to_string()
+}
+
+fn same_tool_alarm_count(monitor: &SpcFdcMonitor, tool_id: &str) -> usize {
+    monitor
+        .findings
+        .iter()
+        .filter(|finding| {
+            finding.source == FindingSource::EquipmentAlarm
+                && finding.tool_id.as_deref() == Some(tool_id)
+        })
+        .count()
+}
+
+fn trace_highest_severity(monitor: &SpcFdcMonitor, trace: &SensorTrace) -> Option<MonitorSeverity> {
+    let trace_severities = trace.violations.iter().map(|violation| violation.severity);
+    let alarm_severities = monitor
+        .findings
+        .iter()
+        .filter(|finding| {
+            finding.source == FindingSource::EquipmentAlarm
+                && finding.tool_id.as_deref() == Some(trace.tool_id.as_str())
+        })
+        .map(|finding| finding.severity);
+    trace_severities.chain(alarm_severities).max()
+}
+
+fn violation_points_label(chart: &ControlChart, violation: &RuleViolation) -> String {
+    let points = violation
+        .point_indices
+        .iter()
+        .filter_map(|index| chart.points.get(*index))
+        .collect::<Vec<_>>();
+    match points.as_slice() {
+        [] => "n/a".to_string(),
+        [point] => format!("#{} {}", point.sequence, point.wafer_id),
+        [first, .., last] => format!(
+            "#{}-#{} {} -> {}",
+            first.sequence, last.sequence, first.wafer_id, last.wafer_id
+        ),
+    }
+}
+
+fn violation_context(violation: &RuleViolation) -> String {
+    let context = [
+        violation.tool_id.as_deref(),
+        violation.lot_id.as_deref(),
+        violation.wafer_id.as_deref(),
+        violation.recipe_id.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" / ");
+    if context.is_empty() {
+        "n/a".to_string()
+    } else {
+        context
+    }
+}
+
+fn spc_action_for_violation(violation: &RuleViolation) -> &'static str {
+    match violation.rule {
+        ControlRule::OutsideControlLimit => {
+            "Hold affected lot, verify metrology, and block release until dispositioned."
+        }
+        ControlRule::TwoOfThreeBeyondTwoSigma => {
+            "Compare the last three wafers against recipe/tool drift before release."
+        }
+        ControlRule::SixPointTrend => {
+            "Check for recipe or tool drift and re-center before the next run."
+        }
+        ControlRule::EightOnOneSide => {
+            "Review target calibration and re-center the process window."
+        }
+    }
+}
+
+fn fdc_action_for_violation(violation: &SensorViolation) -> &'static str {
+    match violation.sensor_name.as_str() {
+        "chamber_pressure" | "exhaust_pressure" => {
+            "Check vacuum and exhaust path, then hold affected run until pressure recovers."
+        }
+        "surface_temp" | "zone_delta" | "chuck_temp" => {
+            "Verify thermal control and requalify the tool before the next wafer."
+        }
+        "chuck_rpm" => "Inspect spindle speed control and recipe load before continuing.",
+        "alignment_error" | "focus_z" | "illumination" | "lamp_power" => {
+            "Requalify optics or alignment setup before exposing more wafers."
+        }
+        "rf_power" | "endpoint_signal" => {
+            "Review plasma endpoint and RF stability before releasing the lot."
+        }
+        "contact_resistance" => "Reprobe affected wafer and clean probe contacts.",
+        _ => "Review the trace around the excursion and disposition affected WIP.",
+    }
+}
+
+fn next_action_for_finding(finding: &MonitorFinding) -> &'static str {
+    match finding.source {
+        FindingSource::SpcRule => match finding.severity {
+            MonitorSeverity::Critical => {
+                "Contain lot/wafer immediately and validate measurement before release."
+            }
+            MonitorSeverity::Warning => "Investigate drift and hold release if the trend persists.",
+            MonitorSeverity::Advisory => "Watch the next run and confirm the process re-centers.",
+        },
+        FindingSource::FdcTrace => match finding.severity {
+            MonitorSeverity::Critical => {
+                "Stop the affected tool and inspect the failed sensor path."
+            }
+            MonitorSeverity::Warning => {
+                "Check correlated tool state and rerun qualification if needed."
+            }
+            MonitorSeverity::Advisory => "Track the trace on the next run for recurrence.",
+        },
+        FindingSource::EquipmentAlarm => match finding.severity {
+            MonitorSeverity::Critical => {
+                "Stop WIP on the tool until the alarm is cleared and qualified."
+            }
+            MonitorSeverity::Warning => {
+                "Clear or acknowledge the alarm before releasing affected WIP."
+            }
+            MonitorSeverity::Advisory => "Log the alarm context and watch for repeat faults.",
+        },
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PlotGuide {
+    value: f64,
+    label: &'static str,
+    color: Color32,
+    width: f32,
+}
+
+#[derive(Clone, Copy)]
+struct PlotHighlight {
+    start_x: f32,
+    end_x: f32,
+    severity: MonitorSeverity,
 }
 
 fn draw_chart(ui: &mut egui::Ui, chart: &ControlChart) {
@@ -395,16 +1251,74 @@ fn draw_chart(ui: &mut egui::Ui, chart: &ControlChart) {
             (
                 point.sequence as f32,
                 point.value,
-                point.value > chart.limits.upper_control
-                    || point.value < chart.limits.lower_control,
+                !chart.limits.contains(point.value),
             )
         })
         .collect::<Vec<_>>();
-    draw_plot(
-        ui,
-        &values,
-        Some((chart.limits.lower_control, chart.limits.upper_control)),
-    );
+
+    let guide_color = Color32::from_rgb(130, 145, 160);
+    let center_color = Color32::from_rgb(93, 168, 232);
+    let two_sigma_color = Color32::from_rgb(220, 176, 72);
+    let spec_color = Color32::from_rgb(226, 96, 96);
+    let mut guides = vec![
+        PlotGuide {
+            value: chart.limits.upper_control,
+            label: "UCL",
+            color: guide_color,
+            width: 1.2,
+        },
+        PlotGuide {
+            value: chart.limits.lower_control,
+            label: "LCL",
+            color: guide_color,
+            width: 1.2,
+        },
+        PlotGuide {
+            value: chart.limits.center,
+            label: "CL",
+            color: center_color,
+            width: 1.0,
+        },
+        PlotGuide {
+            value: chart.limits.two_sigma_high(),
+            label: "+2s",
+            color: two_sigma_color,
+            width: 0.8,
+        },
+        PlotGuide {
+            value: chart.limits.two_sigma_low(),
+            label: "-2s",
+            color: two_sigma_color,
+            width: 0.8,
+        },
+    ];
+    if let Some(upper_spec) = chart.limits.upper_spec
+        && (upper_spec - chart.limits.upper_control).abs() > f64::EPSILON
+    {
+        guides.push(PlotGuide {
+            value: upper_spec,
+            label: "USL",
+            color: spec_color,
+            width: 1.0,
+        });
+    }
+    if let Some(lower_spec) = chart.limits.lower_spec
+        && (lower_spec - chart.limits.lower_control).abs() > f64::EPSILON
+    {
+        guides.push(PlotGuide {
+            value: lower_spec,
+            label: "LSL",
+            color: spec_color,
+            width: 1.0,
+        });
+    }
+
+    let highlights = chart
+        .violations
+        .iter()
+        .filter_map(|violation| chart_highlight(chart, violation))
+        .collect::<Vec<_>>();
+    draw_plot(ui, &values, &guides, &highlights, 220.0);
 }
 
 fn draw_trace(ui: &mut egui::Ui, trace: &SensorTrace) {
@@ -416,15 +1330,50 @@ fn draw_trace(ui: &mut egui::Ui, trace: &SensorTrace) {
             (point.at_s as f32, point.value, outside)
         })
         .collect::<Vec<_>>();
-    let limits = match (trace.limit.lower, trace.limit.upper) {
-        (Some(lower), Some(upper)) => Some((lower, upper)),
-        _ => None,
-    };
-    draw_plot(ui, &values, limits);
+
+    let guide_color = Color32::from_rgb(130, 145, 160);
+    let mut guides = Vec::new();
+    if let Some(lower) = trace.limit.lower {
+        guides.push(PlotGuide {
+            value: lower,
+            label: "LOW",
+            color: guide_color,
+            width: 1.2,
+        });
+    }
+    if let Some(upper) = trace.limit.upper {
+        guides.push(PlotGuide {
+            value: upper,
+            label: "HIGH",
+            color: guide_color,
+            width: 1.2,
+        });
+    }
+
+    let span = trace_sample_span(trace);
+    let highlights = trace
+        .violations
+        .iter()
+        .map(|violation| {
+            let x = violation.at_s as f32;
+            PlotHighlight {
+                start_x: x - span * 0.35,
+                end_x: x + span * 0.35,
+                severity: violation.severity,
+            }
+        })
+        .collect::<Vec<_>>();
+    draw_plot(ui, &values, &guides, &highlights, 220.0);
 }
 
-fn draw_plot(ui: &mut egui::Ui, values: &[(f32, f64, bool)], limits: Option<(f64, f64)>) {
-    let (rect, _) = ui.allocate_exact_size(ui_chrome::stable_plot_size(ui, 190.0), Sense::hover());
+fn draw_plot(
+    ui: &mut egui::Ui,
+    values: &[(f32, f64, bool)],
+    guides: &[PlotGuide],
+    highlights: &[PlotHighlight],
+    height: f32,
+) {
+    let (rect, _) = ui.allocate_exact_size(ui_chrome::stable_plot_size(ui, height), Sense::hover());
     let painter = ui.painter_at(rect);
     ui_chrome::plot_background(ui, rect);
 
@@ -447,9 +1396,9 @@ fn draw_plot(ui: &mut egui::Ui, values: &[(f32, f64, bool)], limits: Option<(f64
         .iter()
         .map(|(_, value, _)| *value)
         .fold(f64::NEG_INFINITY, f64::max);
-    if let Some((lower, upper)) = limits {
-        min_value = min_value.min(lower);
-        max_value = max_value.max(upper);
+    for guide in guides {
+        min_value = min_value.min(guide.value);
+        max_value = max_value.max(guide.value);
     }
     let padding = ((max_value - min_value) * 0.12).max(0.5);
     min_value -= padding;
@@ -457,7 +1406,7 @@ fn draw_plot(ui: &mut egui::Ui, values: &[(f32, f64, bool)], limits: Option<(f64
 
     let min_x = values.first().map(|point| point.0).unwrap_or(0.0);
     let max_x = values.last().map(|point| point.0).unwrap_or(min_x + 1.0);
-    let plot = rect.shrink2(vec2(30.0, 18.0));
+    let plot = rect.shrink2(vec2(38.0, 24.0));
     let x_at = |x: f32| {
         let span = (max_x - min_x).max(1.0);
         plot.left() + ((x - min_x) / span).clamp(0.0, 1.0) * plot.width()
@@ -468,22 +1417,66 @@ fn draw_plot(ui: &mut egui::Ui, values: &[(f32, f64, bool)], limits: Option<(f64
         plot.bottom() - fraction.clamp(0.0, 1.0) * plot.height()
     };
 
-    if let Some((lower, upper)) = limits {
-        let lower_y = y_at(lower);
-        let upper_y = y_at(upper);
-        painter.line_segment(
-            [
-                Pos2::new(plot.left(), lower_y),
-                Pos2::new(plot.right(), lower_y),
-            ],
-            Stroke::new(1.0, Color32::from_rgb(130, 145, 160)),
+    for highlight in highlights {
+        let left = x_at(highlight.start_x);
+        let right = x_at(highlight.end_x);
+        let highlight_rect = Rect::from_min_max(
+            Pos2::new(left.min(right), plot.top()),
+            Pos2::new(left.max(right), plot.bottom()),
         );
+        painter.rect_filled(
+            highlight_rect,
+            0.0,
+            translucent(severity_color(highlight.severity), 38),
+        );
+    }
+
+    let label_font = FontId::proportional(10.0);
+    let weak_color = ui.visuals().weak_text_color();
+    painter.text(
+        Pos2::new(rect.left() + 6.0, plot.top()),
+        Align2::LEFT_TOP,
+        compact_number(max_value),
+        label_font.clone(),
+        weak_color,
+    );
+    painter.text(
+        Pos2::new(rect.left() + 6.0, plot.bottom()),
+        Align2::LEFT_BOTTOM,
+        compact_number(min_value),
+        label_font.clone(),
+        weak_color,
+    );
+    painter.text(
+        Pos2::new(plot.left(), rect.bottom() - 4.0),
+        Align2::LEFT_BOTTOM,
+        compact_axis(min_x),
+        label_font.clone(),
+        weak_color,
+    );
+    painter.text(
+        Pos2::new(plot.right(), rect.bottom() - 4.0),
+        Align2::RIGHT_BOTTOM,
+        compact_axis(max_x),
+        label_font.clone(),
+        weak_color,
+    );
+
+    for guide in guides {
+        let guide_y = y_at(guide.value);
         painter.line_segment(
             [
-                Pos2::new(plot.left(), upper_y),
-                Pos2::new(plot.right(), upper_y),
+                Pos2::new(plot.left(), guide_y),
+                Pos2::new(plot.right(), guide_y),
             ],
-            Stroke::new(1.0, Color32::from_rgb(130, 145, 160)),
+            Stroke::new(guide.width, guide.color),
+        );
+        painter.text(
+            Pos2::new(plot.right() - 2.0, guide_y - 2.0),
+            Align2::RIGHT_BOTTOM,
+            guide.label,
+            label_font.clone(),
+            guide.color,
         );
     }
 
@@ -495,16 +1488,91 @@ fn draw_plot(ui: &mut egui::Ui, values: &[(f32, f64, bool)], limits: Option<(f64
             Stroke::new(2.0, Color32::from_rgb(82, 156, 219)),
         );
     }
-    for (x, value, outside) in values {
+    for (index, (x, value, outside)) in values.iter().enumerate() {
+        let is_latest = index + 1 == values.len();
         painter.circle_filled(
             Pos2::new(x_at(*x), y_at(*value)),
-            4.0,
+            if is_latest { 5.0 } else { 3.8 },
             if *outside {
                 Color32::LIGHT_RED
             } else {
                 Color32::LIGHT_GREEN
             },
         );
+    }
+
+    if let Some((x, value, _)) = values.last() {
+        let point = Pos2::new(x_at(*x), y_at(*value));
+        let right_side = point.x > plot.center().x;
+        painter.text(
+            Pos2::new(
+                if right_side {
+                    point.x - 7.0
+                } else {
+                    point.x + 7.0
+                },
+                point.y,
+            ),
+            if right_side {
+                Align2::RIGHT_CENTER
+            } else {
+                Align2::LEFT_CENTER
+            },
+            compact_number(*value),
+            FontId::proportional(11.0),
+            ui.visuals().text_color(),
+        );
+    }
+}
+
+fn chart_highlight(chart: &ControlChart, violation: &RuleViolation) -> Option<PlotHighlight> {
+    let mut points = violation
+        .point_indices
+        .iter()
+        .filter_map(|index| chart.points.get(*index));
+    let first = points.next()?;
+    let mut start_x = first.sequence as f32;
+    let mut end_x = start_x;
+    for point in points {
+        let x = point.sequence as f32;
+        start_x = start_x.min(x);
+        end_x = end_x.max(x);
+    }
+    let padding = if (end_x - start_x).abs() < f32::EPSILON {
+        0.35
+    } else {
+        0.2
+    };
+    Some(PlotHighlight {
+        start_x: start_x - padding,
+        end_x: end_x + padding,
+        severity: violation.severity,
+    })
+}
+
+fn trace_sample_span(trace: &SensorTrace) -> f32 {
+    let span = trace
+        .samples
+        .windows(2)
+        .filter_map(|pair| {
+            let span = pair[1].at_s.saturating_sub(pair[0].at_s);
+            (span > 0).then_some(span as f32)
+        })
+        .fold(f32::INFINITY, f32::min);
+    if span.is_finite() { span.max(1.0) } else { 1.0 }
+}
+
+fn translucent(color: Color32, alpha: u8) -> Color32 {
+    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
+}
+
+fn compact_axis(value: f32) -> String {
+    if value.abs() >= 100.0 {
+        format!("{value:.0}")
+    } else if value.abs() >= 10.0 {
+        format!("{value:.1}")
+    } else {
+        format!("{value:.2}")
     }
 }
 
