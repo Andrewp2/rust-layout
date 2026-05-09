@@ -1,8 +1,8 @@
-use eframe::egui::{self, Color32};
+use eframe::egui::{self, Color32, RichText};
 use layout_model::experiment::{
-    ExperimentAnalysisSummary, ExperimentPlan, ExperimentRun, ExperimentRunId, ExperimentRunStatus,
-    FactorEffect, FactorId, ResponseCaptureError, ResponseSpec, ResponseSpecId, ResponseStats,
-    ResponseValue, ResponseValueStatus, format_compact_number,
+    ExperimentAnalysisSummary, ExperimentFactor, ExperimentPlan, ExperimentRun, ExperimentRunId,
+    ExperimentRunStatus, FactorEffect, FactorId, ResponseCaptureError, ResponseSpec,
+    ResponseSpecId, ResponseStats, ResponseValue, ResponseValueStatus, format_compact_number,
 };
 use layout_model::{
     mes::{ProcessRouteId, ProcessStepId},
@@ -204,52 +204,51 @@ impl ExperimentPlannerPanel {
     }
 
     fn summary_metrics_ui(&self, ui: &mut egui::Ui, analysis: &ExperimentAnalysisSummary) {
-        ui.horizontal_wrapped(|ui| {
-            experiment_metric_ui(
-                ui,
-                "Runs",
-                format!(
-                    "{} / {} complete",
-                    analysis.completed_runs, analysis.run_count
+        ui_chrome::metric_tiles(
+            ui,
+            &[
+                (
+                    "Runs",
+                    format!(
+                        "{} / {} complete",
+                        analysis.completed_runs, analysis.run_count
+                    ),
+                    &format!("{} pending values", analysis.missing_response_count),
+                    Tone::Info,
                 ),
-                format!("{} pending values", analysis.missing_response_count),
-            );
-            experiment_metric_ui(
-                ui,
-                "Matrix",
-                format!("{} factors", self.plan.factors.len()),
-                format!("{} responses", self.plan.responses.len()),
-            );
-            experiment_metric_ui(
-                ui,
-                "Best run",
-                analysis
-                    .best_run_id
-                    .as_ref()
-                    .map(ToString::to_string)
-                    .unwrap_or_else(|| "pending".to_string()),
-                self.selected_response_label(),
-            );
-        });
+                (
+                    "Matrix",
+                    format!("{} factors", self.plan.factors.len()),
+                    &format!("{} responses", self.plan.responses.len()),
+                    Tone::Info,
+                ),
+                (
+                    "Best run",
+                    analysis
+                        .best_run_id
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| "pending".to_string()),
+                    &self.selected_response_label(),
+                    Tone::Info,
+                ),
+            ],
+        );
     }
 
     fn factor_overview_ui(&self, ui: &mut egui::Ui) {
         ui_chrome::section_label(ui, "Factor Split");
-        ui.horizontal_wrapped(|ui| {
+        if ui.available_width() < 520.0 {
             for factor in &self.plan.factors {
-                ui.group(|ui| {
-                    ui.strong(&factor.name);
-                    ui.small(factor.source.label());
-                    for level in &factor.levels {
-                        ui.label(format!(
-                            "{} {}",
-                            level.label,
-                            factor.unit.as_deref().unwrap_or("")
-                        ));
-                    }
-                });
+                factor_card_ui(ui, factor, ui.available_width());
             }
-        });
+        } else {
+            ui.horizontal_wrapped(|ui| {
+                for factor in &self.plan.factors {
+                    factor_card_ui(ui, factor, 260.0);
+                }
+            });
+        }
     }
 
     fn run_matrix_ui(&mut self, ui: &mut egui::Ui) {
@@ -262,49 +261,99 @@ impl ExperimentPlannerPanel {
             .collect::<Vec<_>>();
 
         ui_chrome::section_label(ui, "Run Matrix");
-        egui::Grid::new("doe_run_matrix")
-            .striped(true)
-            .min_col_width(68.0)
+        if ui.available_width() < 520.0 {
+            for row in rows {
+                ui.group(|ui| {
+                    ui.set_width(ui.available_width().clamp(220.0, 420.0));
+                    ui.horizontal_wrapped(|ui| {
+                        if ui
+                            .selectable_label(row.selected, &row.run_id)
+                            .on_hover_text("Select run for response capture")
+                            .clicked()
+                        {
+                            self.selected_run = Some(ExperimentRunId::new(row.run_id.clone()));
+                        }
+                        ui.colored_label(row.status_color, &row.status);
+                    });
+                    ui.small(format!("Wafer {}", row.assignment));
+                    for (factor_name, factor_value) in factor_names.iter().zip(&row.factor_values) {
+                        ui.add(egui::Label::new(format!("{factor_name}: {factor_value}")).wrap());
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Primary");
+                        ui.colored_label(row.primary_color, &row.primary_value);
+                    });
+                });
+            }
+            return;
+        }
+        egui::ScrollArea::horizontal()
+            .id_salt("doe_run_matrix_x")
+            .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.strong("Run");
-                ui.strong("Wafer");
-                for factor_name in &factor_names {
-                    ui.strong(factor_name);
-                }
-                ui.strong("Status");
-                ui.strong("Primary");
-                ui.end_row();
+                egui::Grid::new("doe_run_matrix")
+                    .striped(true)
+                    .min_col_width(68.0)
+                    .show(ui, |ui| {
+                        ui.strong("Run");
+                        ui.strong("Wafer");
+                        for factor_name in &factor_names {
+                            ui.strong(factor_name);
+                        }
+                        ui.strong("Status");
+                        ui.strong("Primary");
+                        ui.end_row();
 
-                for row in rows {
-                    if ui
-                        .selectable_label(row.selected, &row.run_id)
-                        .on_hover_text("Select run for response capture")
-                        .clicked()
-                    {
-                        self.selected_run = Some(ExperimentRunId::new(row.run_id.clone()));
-                    }
-                    ui.label(row.assignment);
-                    for factor_value in row.factor_values {
-                        ui.label(factor_value);
-                    }
-                    ui.colored_label(row.status_color, row.status);
-                    ui.colored_label(row.primary_color, row.primary_value);
-                    ui.end_row();
-                }
+                        for row in rows {
+                            if ui
+                                .selectable_label(row.selected, &row.run_id)
+                                .on_hover_text("Select run for response capture")
+                                .clicked()
+                            {
+                                self.selected_run = Some(ExperimentRunId::new(row.run_id.clone()));
+                            }
+                            ui.label(row.assignment);
+                            for factor_value in row.factor_values {
+                                ui.label(factor_value);
+                            }
+                            ui.colored_label(row.status_color, row.status);
+                            ui.colored_label(row.primary_color, row.primary_value);
+                            ui.end_row();
+                        }
+                    });
             });
     }
 
     fn analysis_ui(&self, ui: &mut egui::Ui, analysis: &ExperimentAnalysisSummary) {
-        ui.columns(2, |columns| {
-            ui_chrome::section_label(&mut columns[0], "Response Summary");
-            response_stats_ui(&mut columns[0], &self.plan, &analysis.response_stats);
-
+        if ui.available_width() < 760.0 {
+            ui_chrome::section_label(ui, "Response Summary");
+            egui::ScrollArea::horizontal()
+                .id_salt("doe_response_stats_x")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    response_stats_ui(ui, &self.plan, &analysis.response_stats)
+                });
+            ui.separator();
             ui_chrome::section_label(
-                &mut columns[1],
+                ui,
                 &format!("Main Effects: {}", self.selected_response_label()),
             );
-            factor_effects_ui(&mut columns[1], &analysis.factor_effects);
-        });
+            egui::ScrollArea::horizontal()
+                .id_salt("doe_factor_effects_x")
+                .auto_shrink([false, false])
+                .show(ui, |ui| factor_effects_ui(ui, &analysis.factor_effects));
+        } else {
+            ui.columns(2, |columns| {
+                ui_chrome::section_label(&mut columns[0], "Response Summary");
+                response_stats_ui(&mut columns[0], &self.plan, &analysis.response_stats);
+
+                ui_chrome::section_label(
+                    &mut columns[1],
+                    &format!("Main Effects: {}", self.selected_response_label()),
+                );
+                factor_effects_ui(&mut columns[1], &analysis.factor_effects);
+            });
+        }
 
         if !analysis.notes.is_empty() {
             ui.separator();
@@ -313,7 +362,6 @@ impl ExperimentPlannerPanel {
             }
         }
     }
-
     fn selected_run_detail_ui(&self, ui: &mut egui::Ui) {
         let Some(run) = self
             .selected_run
@@ -532,8 +580,29 @@ struct RunMatrixRow {
     primary_color: Color32,
 }
 
-fn experiment_metric_ui(ui: &mut egui::Ui, label: &str, value: String, detail: String) {
-    ui_chrome::metric_tile_tone(ui, label, value, &detail, Tone::Info);
+fn factor_card_ui(ui: &mut egui::Ui, factor: &ExperimentFactor, width: f32) {
+    ui.group(|ui| {
+        ui.set_width(width.clamp(160.0, 300.0));
+        ui.add(egui::Label::new(RichText::new(&factor.name).strong()).wrap());
+        ui.add(
+            egui::Label::new(
+                RichText::new(factor.source.label())
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+            )
+            .wrap(),
+        );
+        for level in &factor.levels {
+            ui.add(
+                egui::Label::new(format!(
+                    "{}: {}",
+                    level.label,
+                    level.value_label(factor.unit.as_deref())
+                ))
+                .wrap(),
+            );
+        }
+    });
 }
 
 fn response_stats_ui(ui: &mut egui::Ui, plan: &ExperimentPlan, stats: &[ResponseStats]) {

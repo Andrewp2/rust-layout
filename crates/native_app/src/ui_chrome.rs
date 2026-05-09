@@ -1,8 +1,11 @@
 use eframe::egui::{self, Color32, Margin, RichText, Stroke, StrokeKind, Vec2, vec2};
 
-pub(crate) const NAV_WIDTH: f32 = 196.0;
+pub(crate) const NAV_WIDTH: f32 = 108.0;
 pub(crate) const INSPECTOR_WIDTH: f32 = 268.0;
 pub(crate) const LAYERS_WIDTH: f32 = 228.0;
+pub(crate) const INLINE_SIDE_PANEL_MIN_WIDTH: f32 = 980.0;
+pub(crate) const COMPACT_MENU_WIDTH: f32 = 720.0;
+pub(crate) const COMPACT_TOOL_STRIP_WIDTH: f32 = 620.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Tone {
@@ -67,7 +70,8 @@ pub(crate) fn module_header(
     detail: &str,
     actions: impl FnOnce(&mut egui::Ui),
 ) {
-    ui.horizontal_wrapped(|ui| {
+    let compact = ui.available_width() < 640.0;
+    let title_block = |ui: &mut egui::Ui| {
         ui.vertical(|ui| {
             ui.label(
                 RichText::new(eyebrow.to_uppercase())
@@ -79,10 +83,21 @@ pub(crate) fn module_header(
                 ui.label(RichText::new(detail).color(ui.visuals().weak_text_color()));
             }
         });
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.horizontal(actions);
+    };
+
+    if compact {
+        ui.vertical(|ui| {
+            title_block(ui);
+            ui.horizontal_wrapped(actions);
         });
-    });
+    } else {
+        ui.horizontal_wrapped(|ui| {
+            title_block(ui);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.horizontal(actions);
+            });
+        });
+    }
     ui.add_space(4.0);
 }
 
@@ -98,6 +113,35 @@ pub(crate) fn muted(ui: &mut egui::Ui, text: impl ToString) {
 
 pub(crate) fn metric_tile(ui: &mut egui::Ui, label: &str, value: impl ToString, detail: &str) {
     metric_tile_tone(ui, label, value, detail, Tone::Neutral);
+}
+
+pub(crate) fn metric_tiles(ui: &mut egui::Ui, metrics: &[(&str, String, &str, Tone)]) {
+    let available_width = ui.available_width().min(ui.ctx().content_rect().width());
+    if available_width < 360.0 {
+        ui.vertical(|ui| {
+            for (label, value, detail, tone) in metrics {
+                metric_tile_tone(ui, label, value, detail, *tone);
+            }
+        });
+    } else if available_width < 900.0 {
+        egui::Grid::new(ui.next_auto_id())
+            .num_columns(2)
+            .spacing([8.0, 6.0])
+            .show(ui, |ui| {
+                for (index, (label, value, detail, tone)) in metrics.iter().enumerate() {
+                    metric_tile_tone(ui, label, value, detail, *tone);
+                    if index % 2 == 1 {
+                        ui.end_row();
+                    }
+                }
+            });
+    } else {
+        ui.horizontal_wrapped(|ui| {
+            for (label, value, detail, tone) in metrics {
+                metric_tile_tone(ui, label, value, detail, *tone);
+            }
+        });
+    }
 }
 
 pub(crate) fn metric_tile_tone(
@@ -116,17 +160,28 @@ pub(crate) fn metric_tile_tone(
         .corner_radius(6)
         .inner_margin(Margin::symmetric(10, 8))
         .show(ui, |ui| {
-            ui.set_min_width(132.0);
-            ui.set_max_width(210.0);
-            ui.label(
-                RichText::new(label)
-                    .small()
-                    .color(ui.visuals().weak_text_color()),
-            );
-            ui.label(RichText::new(value.to_string()).strong().size(18.0));
-            if !detail.is_empty() {
-                ui.label(RichText::new(detail).small().color(tone.color()));
-            }
+            let width = ui.available_width().clamp(108.0, 260.0);
+            ui.set_min_width(width.min(180.0));
+            ui.set_max_width(width);
+            ui.vertical(|ui| {
+                ui.set_max_width(width);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(label)
+                            .small()
+                            .color(ui.visuals().weak_text_color()),
+                    )
+                    .wrap(),
+                );
+                ui.add(
+                    egui::Label::new(RichText::new(value.to_string()).strong().size(18.0)).wrap(),
+                );
+                if !detail.is_empty() {
+                    ui.add(
+                        egui::Label::new(RichText::new(detail).small().color(tone.color())).wrap(),
+                    );
+                }
+            });
         });
 }
 

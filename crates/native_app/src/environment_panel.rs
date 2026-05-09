@@ -88,16 +88,28 @@ impl EnvironmentPanel {
                 self.metric_tiles(ui);
 
                 ui.separator();
-                ui.columns(2, |columns| {
-                    self.selected_sensor_trend(&mut columns[0]);
-                    self.alarm_panel(&mut columns[1]);
-                });
+                if ui.available_width() < 720.0 {
+                    self.selected_sensor_trend(ui);
+                    ui.separator();
+                    self.alarm_panel(ui);
+                } else {
+                    ui.columns(2, |columns| {
+                        self.selected_sensor_trend(&mut columns[0]);
+                        self.alarm_panel(&mut columns[1]);
+                    });
+                }
 
                 ui.separator();
-                ui.columns(2, |columns| {
-                    self.zone_dashboard(&mut columns[0]);
-                    self.facility_timeline(&mut columns[1]);
-                });
+                if ui.available_width() < 720.0 {
+                    self.zone_dashboard(ui);
+                    ui.separator();
+                    self.facility_timeline(ui);
+                } else {
+                    ui.columns(2, |columns| {
+                        self.zone_dashboard(&mut columns[0]);
+                        self.facility_timeline(&mut columns[1]);
+                    });
+                }
             });
     }
 
@@ -142,37 +154,37 @@ impl EnvironmentPanel {
     }
 
     fn metric_tiles(&self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            ui_chrome::metric_tile(
-                ui,
+        let metrics = [
+            (
                 "Sensors online",
-                self.model.sensors.len(),
+                self.model.sensors.len().to_string(),
                 "facility monitor",
-            );
-            ui_chrome::metric_tile_tone(
-                ui,
+                Tone::Neutral,
+            ),
+            (
                 "Active alarms",
-                self.model.active_alarms().len(),
+                self.model.active_alarms().len().to_string(),
                 "latest samples",
                 if self.model.active_alarms().is_empty() {
                     Tone::Success
                 } else {
                     Tone::Danger
                 },
-            );
-            ui_chrome::metric_tile(
-                ui,
+            ),
+            (
                 "Zones covered",
-                self.zone_count(),
+                self.zone_count().to_string(),
                 "litho, CMP, wet bench",
-            );
-            ui_chrome::metric_tile(
-                ui,
+                Tone::Neutral,
+            ),
+            (
                 "Correlation labels",
-                self.model.correlations.len(),
+                self.model.correlations.len().to_string(),
                 "process excursion tags",
-            );
-        });
+                Tone::Neutral,
+            ),
+        ];
+        ui_chrome::metric_tiles(ui, &metrics);
     }
 
     fn selected_sensor_trend(&self, ui: &mut egui::Ui) {

@@ -124,10 +124,16 @@ impl MaintenancePanel {
 
                 self.metric_row(ui, today);
                 ui.separator();
-                ui.columns(2, |columns| {
-                    self.due_work_ui(&mut columns[0], today);
-                    self.selected_tool_ui(&mut columns[1], today);
-                });
+                if ui.available_width() < 720.0 {
+                    self.due_work_ui(ui, today);
+                    ui.separator();
+                    self.selected_tool_ui(ui, today);
+                } else {
+                    ui.columns(2, |columns| {
+                        self.due_work_ui(&mut columns[0], today);
+                        self.selected_tool_ui(&mut columns[1], today);
+                    });
+                }
 
                 ui.separator();
                 self.audit_ui(ui);
@@ -163,34 +169,37 @@ impl MaintenancePanel {
             .filter(|record| record.ended_at.is_none())
             .count();
 
-        ui.horizontal_wrapped(|ui| {
-            ui_chrome::metric_tile_tone(
-                ui,
+        let metrics = [
+            (
                 "Overdue",
-                overdue,
+                overdue.to_string(),
                 "blocks release",
                 if overdue > 0 {
                     ui_chrome::Tone::Danger
                 } else {
                     ui_chrome::Tone::Neutral
                 },
-            );
-            ui_chrome::metric_tile_tone(
-                ui,
+            ),
+            (
                 "Due now",
-                due_today,
+                due_today.to_string(),
                 "calendar or run count",
                 ui_chrome::Tone::Warning,
-            );
-            ui_chrome::metric_tile_tone(
-                ui,
+            ),
+            (
                 "Locked",
-                locked,
+                locked.to_string(),
                 "not production released",
                 ui_chrome::Tone::Danger,
-            );
-            ui_chrome::metric_tile(ui, "Open downtime", open_downtime, "active events");
-        });
+            ),
+            (
+                "Open downtime",
+                open_downtime.to_string(),
+                "active events",
+                ui_chrome::Tone::Neutral,
+            ),
+        ];
+        ui_chrome::metric_tiles(ui, &metrics);
     }
 
     fn due_work_ui(&mut self, ui: &mut egui::Ui, today: FabDate) {
@@ -293,6 +302,43 @@ impl MaintenancePanel {
 
     fn audit_ui(&self, ui: &mut egui::Ui) {
         ui_chrome::section_label(ui, "Records / Audit");
+        if ui.available_width() < 780.0 {
+            ui_chrome::section_label(ui, "Downtime");
+            for record in &self.model.downtime {
+                ui.label(format!("{} {}", record.tool_id, record.reason));
+                ui.small(format!(
+                    "{} to {}",
+                    record.started_at,
+                    record
+                        .ended_at
+                        .map(|date| date.to_string())
+                        .unwrap_or_else(|| "open".to_string())
+                ));
+            }
+
+            ui.separator();
+            ui_chrome::section_label(ui, "Spare Parts");
+            for part in &self.model.spare_parts {
+                ui.label(format!(
+                    "{} x{} {}",
+                    part.tool_id, part.quantity, part.part_number
+                ));
+                ui.small(format!("{} ${:.0}", part.description, part.unit_cost));
+            }
+
+            ui.separator();
+            ui_chrome::section_label(ui, "Release");
+            let today = self.today();
+            for tool in &self.model.tools {
+                let release = self.model.release_for_tool(&tool.tool_id, today);
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(release_state_color(release.state), release.state.label());
+                    ui.label(&tool.tool_id.0);
+                });
+            }
+            return;
+        }
+
         ui.columns(3, |columns| {
             ui_chrome::section_label(&mut columns[0], "Downtime");
             for record in &self.model.downtime {

@@ -18,6 +18,7 @@ pub mod cross_section;
 pub mod environment;
 pub mod equipment;
 pub mod experiment;
+pub mod fab_ref;
 pub mod gdsii;
 pub mod genealogy;
 pub mod inventory;

@@ -57,6 +57,12 @@ pub(crate) enum WorkflowDestination {
     Traceability,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorkflowAction {
+    Open(WorkflowDestination),
+    LoadDemoWorkspace,
+}
+
 impl Default for WorkflowPanel {
     fn default() -> Self {
         Self {
@@ -66,26 +72,58 @@ impl Default for WorkflowPanel {
 }
 
 impl WorkflowPanel {
+    pub(crate) fn focus_lot(&self) -> &str {
+        &self.focus_lot
+    }
+
+    pub(crate) fn set_focus_lot(&mut self, lot_id: impl Into<String>) {
+        self.focus_lot = lot_id.into();
+    }
+
     pub(crate) fn ui(
         &mut self,
         ui: &mut egui::Ui,
         data: WorkflowData<'_>,
-    ) -> Option<WorkflowDestination> {
+    ) -> Option<WorkflowAction> {
         self.ensure_focus_lot(&data);
+        let has_workspace_data = workflow_has_data(&data);
         let mut destination = None;
+        let mut load_demo = false;
 
         egui::ScrollArea::vertical()
             .id_salt("fab_workflow_dashboard")
             .show(ui, |ui| {
                 ui_chrome::module_header(
                     ui,
-                    "Integrated demo",
+                    if has_workspace_data {
+                        "Workspace workflow"
+                    } else {
+                        "Blank workspace"
+                    },
                     "Fab Workflow",
-                    &format!("Focus lot {}", self.focus_lot),
+                    if self.focus_lot.is_empty() {
+                        "No lot selected"
+                    } else {
+                        ""
+                    },
                     |ui| {
-                        self.lot_picker(ui, &data);
+                        if has_workspace_data {
+                            self.lot_picker(ui, &data);
+                        } else if ui.button("Load demo workspace").clicked() {
+                            load_demo = true;
+                        }
                     },
                 );
+
+                if !has_workspace_data {
+                    ui_chrome::empty_state(ui, "No workspace data loaded");
+                    return;
+                }
+
+                if !self.focus_lot.is_empty() {
+                    ui_chrome::muted(ui, format!("Focus lot {}", self.focus_lot));
+                    ui.add_space(4.0);
+                }
 
                 self.metric_row(ui, &data);
                 ui.separator();
@@ -94,13 +132,21 @@ impl WorkflowPanel {
                 self.cross_link_ui(ui, &data, &mut destination);
             });
 
-        destination
+        if load_demo {
+            Some(WorkflowAction::LoadDemoWorkspace)
+        } else {
+            destination.map(WorkflowAction::Open)
+        }
     }
 
     pub(crate) fn context_ui(&mut self, ui: &mut egui::Ui, data: WorkflowData<'_>) {
         self.ensure_focus_lot(&data);
         ui_chrome::section_label(ui, "Workflow");
-        self.lot_picker(ui, &data);
+        if workflow_lot_ids(&data).is_empty() {
+            ui_chrome::muted(ui, "No lot loaded");
+        } else {
+            self.lot_picker(ui, &data);
+        }
         ui.separator();
 
         let recipe_links = linked_recipe_ids(data.process_flow);
@@ -129,49 +175,59 @@ impl WorkflowPanel {
             .map(|summary| format!("{:.1}%", summary.yield_fraction * 100.0))
             .unwrap_or_else(|| "n/a".to_string());
 
-        ui.horizontal_wrapped(|ui| {
-            ui_chrome::metric_tile(
-                ui,
+        let metrics = [
+            (
                 "Layout",
-                data.document.shapes.len(),
+                data.document.shapes.len().to_string(),
                 "shapes in workspace",
-            );
-            ui_chrome::metric_tile_tone(
-                ui,
+                Tone::Neutral,
+            ),
+            (
                 "Route",
-                data.process_flow.route.nodes.len(),
+                data.process_flow.route.nodes.len().to_string(),
                 "process steps",
                 if data.process_flow.route.nodes.is_empty() {
                     Tone::Neutral
                 } else {
                     Tone::Success
                 },
-            );
-            ui_chrome::metric_tile_tone(
-                ui,
+            ),
+            (
                 "Recipes",
-                recipe_links.len().saturating_sub(missing_recipes.len()),
+                recipe_links
+                    .len()
+                    .saturating_sub(missing_recipes.len())
+                    .to_string(),
                 "linked and found",
-                if missing_recipes.is_empty() {
+                if recipe_links.is_empty() {
+                    Tone::Neutral
+                } else if missing_recipes.is_empty() {
                     Tone::Success
                 } else {
                     Tone::Warning
                 },
-            );
-            ui_chrome::metric_tile(ui, "Materials", material_count, "linked lots");
-            ui_chrome::metric_tile_tone(
-                ui,
+            ),
+            (
+                "Materials",
+                material_count.to_string(),
+                "linked lots",
+                Tone::Neutral,
+            ),
+            (
                 "Safety",
-                safety_summary.locked_out_tool_count,
+                safety_summary.locked_out_tool_count.to_string(),
                 "tool lockouts",
-                if safety_summary.locked_out_tool_count == 0 {
+                if data.safety.sensors.is_empty() && safety_summary.locked_out_tool_count == 0 {
+                    Tone::Neutral
+                } else if safety_summary.locked_out_tool_count == 0 {
                     Tone::Success
                 } else {
                     Tone::Warning
                 },
-            );
-            ui_chrome::metric_tile(ui, "Yield", yield_label, "focus lot");
-        });
+            ),
+            ("Yield", yield_label, "focus lot", Tone::Neutral),
+        ];
+        ui_chrome::metric_tiles(ui, &metrics);
     }
 
     fn spine_ui(
@@ -203,10 +259,13 @@ impl WorkflowPanel {
                     "2",
                     "Process route",
                     route_detail(data.process_flow),
-                    if data.process_flow.findings().is_empty() {
-                        Tone::Success
-                    } else {
-                        Tone::Warning
+                    match (
+                        data.process_flow.route.nodes.is_empty(),
+                        data.process_flow.findings().is_empty(),
+                    ) {
+                        (true, _) => Tone::Neutral,
+                        (false, true) => Tone::Success,
+                        (false, false) => Tone::Warning,
                     },
                     WorkflowDestination::ProcessFlow,
                     destination,
@@ -216,12 +275,15 @@ impl WorkflowPanel {
                     "3",
                     "Recipe control",
                     recipe_detail(data.process_flow, data.recipes),
-                    if missing_recipe_ids(&linked_recipe_ids(data.process_flow), data.recipes)
-                        .is_empty()
                     {
-                        Tone::Success
-                    } else {
-                        Tone::Warning
+                        let recipe_ids = linked_recipe_ids(data.process_flow);
+                        if recipe_ids.is_empty() {
+                            Tone::Neutral
+                        } else if missing_recipe_ids(&recipe_ids, data.recipes).is_empty() {
+                            Tone::Success
+                        } else {
+                            Tone::Warning
+                        }
                     },
                     WorkflowDestination::ProcessFlow,
                     destination,
@@ -282,7 +344,12 @@ impl WorkflowPanel {
                     "7",
                     "Facility guardrails",
                     guardrail_detail(data),
-                    if data.safety.summary().locked_out_tool_count == 0 {
+                    if data.safety.sensors.is_empty()
+                        && data.environment.sensors.is_empty()
+                        && data.maintenance.tools.is_empty()
+                    {
+                        Tone::Neutral
+                    } else if data.safety.summary().locked_out_tool_count == 0 {
                         Tone::Success
                     } else {
                         Tone::Warning
@@ -349,7 +416,7 @@ impl WorkflowPanel {
         destination: &mut Option<WorkflowDestination>,
     ) {
         ui_chrome::section_label(ui, "Shared Objects");
-        ui.horizontal_wrapped(|ui| {
+        let mut links = |ui: &mut egui::Ui| {
             if ui.button("Trace genealogy").clicked() {
                 *destination = Some(WorkflowDestination::Traceability);
             }
@@ -362,15 +429,19 @@ impl WorkflowPanel {
             if ui.button("Open environment").clicked() {
                 *destination = Some(WorkflowDestination::Environment);
             }
-        });
+        };
+        if ui.ctx().content_rect().width() < 760.0 || ui.available_width() < 760.0 {
+            ui.vertical(|ui| links(ui));
+        } else {
+            ui.horizontal_wrapped(|ui| links(ui));
+        }
 
         let recipe_links = linked_recipe_ids(data.process_flow);
         let missing_recipes = missing_recipe_ids(&recipe_links, data.recipes);
-        if missing_recipes.is_empty() {
-            ui_chrome::muted(
-                ui,
-                "All process-flow recipe links resolve in the recipe catalog.",
-            );
+        if recipe_links.is_empty() {
+            ui_chrome::muted(ui, "No process-flow recipe links loaded.");
+        } else if missing_recipes.is_empty() {
+            ui_chrome::muted(ui, "All process-flow recipe links resolve.");
         } else {
             ui.colored_label(
                 Tone::Warning.color(),
@@ -404,6 +475,23 @@ impl WorkflowPanel {
                 .unwrap_or_else(|| lot_ids[0].clone());
         }
     }
+}
+
+fn workflow_has_data(data: &WorkflowData<'_>) -> bool {
+    !data.document.shapes.is_empty()
+        || !data.process_flow.route.nodes.is_empty()
+        || !data.recipes.recipes.is_empty()
+        || !data.mes.lots.is_empty()
+        || !data.inventory.lots.is_empty()
+        || !data.maintenance.tools.is_empty()
+        || !data.environment.sensors.is_empty()
+        || !data.scheduler.tools.is_empty()
+        || !data.scheduler.lots.is_empty()
+        || !data.safety.sensors.is_empty()
+        || !data.wafer_map.dies.is_empty()
+        || !data.yield_analysis.lots.is_empty()
+        || !data.notebook.entries.is_empty()
+        || data.equipment.tools().next().is_some()
 }
 
 fn workflow_lot_ids(data: &WorkflowData<'_>) -> Vec<String> {

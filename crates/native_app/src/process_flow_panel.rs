@@ -115,23 +115,37 @@ impl ProcessFlowPanel {
                 self.summary_ui(ui, &findings);
                 ui.separator();
 
-                ui.columns(3, |columns| {
-                    columns[0].set_min_width(250.0);
-                    columns[1].set_min_width(280.0);
-                    columns[2].set_min_width(280.0);
+                if ui.available_width() < 860.0 {
+                    ui_chrome::section_label(ui, "Nodes");
+                    self.node_list_ui(ui);
+                    ui.separator();
+                    ui_chrome::section_label(ui, "Selected Step");
+                    self.selected_node_ui(ui);
+                    ui.separator();
+                    ui_chrome::section_label(ui, "Connections");
+                    self.connection_ui(ui);
+                    ui.separator();
+                    ui_chrome::section_label(ui, "Findings");
+                    self.finding_list_ui(ui, &findings, 240.0);
+                } else {
+                    ui.columns(3, |columns| {
+                        columns[0].set_min_width(250.0);
+                        columns[1].set_min_width(280.0);
+                        columns[2].set_min_width(280.0);
 
-                    ui_chrome::section_label(&mut columns[0], "Nodes");
-                    self.node_list_ui(&mut columns[0]);
+                        ui_chrome::section_label(&mut columns[0], "Nodes");
+                        self.node_list_ui(&mut columns[0]);
 
-                    ui_chrome::section_label(&mut columns[1], "Selected Step");
-                    self.selected_node_ui(&mut columns[1]);
+                        ui_chrome::section_label(&mut columns[1], "Selected Step");
+                        self.selected_node_ui(&mut columns[1]);
 
-                    ui_chrome::section_label(&mut columns[2], "Connections");
-                    self.connection_ui(&mut columns[2]);
-                    columns[2].separator();
-                    ui_chrome::section_label(&mut columns[2], "Findings");
-                    self.finding_list_ui(&mut columns[2], &findings, 240.0);
-                });
+                        ui_chrome::section_label(&mut columns[2], "Connections");
+                        self.connection_ui(&mut columns[2]);
+                        columns[2].separator();
+                        ui_chrome::section_label(&mut columns[2], "Findings");
+                        self.finding_list_ui(&mut columns[2], &findings, 240.0);
+                    });
+                }
 
                 ui.separator();
                 self.mes_export_preview_ui(ui);
@@ -151,41 +165,43 @@ impl ProcessFlowPanel {
             .iter()
             .filter(|finding| finding.severity == ProcessFlowFindingSeverity::Error)
             .count();
-        ui.horizontal_wrapped(|ui| {
-            ui_chrome::metric_tile(
-                ui,
-                "Route graph",
-                format!("{} nodes", self.model.route.nodes.len()),
-                &format!("{} connections", self.model.route.edges.len()),
-            );
-            ui_chrome::metric_tile(
-                ui,
-                "MES route",
-                format!("{mes_steps} steps"),
-                &self.model.route.mes_route_id,
-            );
-            ui_chrome::metric_tile(
-                ui,
-                "Controls",
-                format!("{hold_points} holds"),
-                "signoff and branch checkpoints",
-            );
-            ui_chrome::metric_tile_tone(
-                ui,
-                "Validation",
-                if errors == 0 {
-                    "Ready".to_string()
-                } else {
-                    format!("{errors} errors")
-                },
-                "recipe and eligible-tool coverage",
-                if errors == 0 {
-                    Tone::Success
-                } else {
-                    Tone::Danger
-                },
-            );
-        });
+        ui_chrome::metric_tiles(
+            ui,
+            &[
+                (
+                    "Route graph",
+                    format!("{} nodes", self.model.route.nodes.len()),
+                    "connections",
+                    Tone::Neutral,
+                ),
+                (
+                    "MES route",
+                    format!("{mes_steps} steps"),
+                    self.model.route.mes_route_id.as_str(),
+                    Tone::Neutral,
+                ),
+                (
+                    "Controls",
+                    format!("{hold_points} holds"),
+                    "signoff and branch checkpoints",
+                    Tone::Neutral,
+                ),
+                (
+                    "Validation",
+                    if errors == 0 {
+                        "Ready".to_string()
+                    } else {
+                        format!("{errors} errors")
+                    },
+                    "recipe and eligible-tool coverage",
+                    if errors == 0 {
+                        Tone::Success
+                    } else {
+                        Tone::Danger
+                    },
+                ),
+            ],
+        );
     }
 
     fn node_list_ui(&mut self, ui: &mut egui::Ui) {

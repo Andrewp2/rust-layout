@@ -5,7 +5,7 @@ use layout_model::cross_section::{
     CrossSectionProcess, CrossSectionSegment, CrossSectionSnapshot, MaterialId, ProcessStepKind,
 };
 
-use crate::ui_chrome;
+use crate::ui_chrome::{self, Tone};
 
 pub(crate) struct CrossSectionPanel {
     process: CrossSectionProcess,
@@ -161,16 +161,35 @@ impl CrossSectionPanel {
                     return;
                 };
 
-                ui.horizontal_wrapped(|ui| {
-                    process_metric_ui(ui, "Sequence steps", self.process.steps.len().to_string());
-                    process_metric_ui(ui, "Window", format!("{:.1} um", self.process.width_um));
-                    process_metric_ui(ui, "Segments", snapshot.segments.len().to_string());
-                    process_metric_ui(
-                        ui,
-                        "Active step",
-                        format!("{} / {}", snapshot.step_index, self.snapshots.len() - 1),
-                    );
-                });
+                ui_chrome::metric_tiles(
+                    ui,
+                    &[
+                        (
+                            "Sequence steps",
+                            self.process.steps.len().to_string(),
+                            "",
+                            Tone::Info,
+                        ),
+                        (
+                            "Window",
+                            format!("{:.1} um", self.process.width_um),
+                            "",
+                            Tone::Info,
+                        ),
+                        (
+                            "Segments",
+                            snapshot.segments.len().to_string(),
+                            "",
+                            Tone::Info,
+                        ),
+                        (
+                            "Active step",
+                            format!("{} / {}", snapshot.step_index, self.snapshots.len() - 1),
+                            "",
+                            Tone::Info,
+                        ),
+                    ],
+                );
 
                 ui.separator();
                 ui.label(RichText::new(&snapshot.title).strong());
@@ -196,16 +215,6 @@ impl CrossSectionPanel {
             .map(|material| material.name.clone())
             .unwrap_or_else(|| id.as_str().to_string())
     }
-}
-
-fn process_metric_ui(ui: &mut egui::Ui, label: &str, value: String) {
-    egui::Frame::group(ui.style())
-        .inner_margin(egui::Margin::symmetric(10, 8))
-        .show(ui, |ui| {
-            ui.set_min_width(130.0);
-            ui.label(RichText::new(value).strong());
-            ui.label(RichText::new(label).small().color(Color32::GRAY));
-        });
 }
 
 fn draw_cross_section(

@@ -1,6 +1,10 @@
 use eframe::egui::{self, Color32, RichText, TextEdit};
-use layout_model::notebook::{
-    LabNotebook, NotebookEntry, NotebookEntryId, NotebookFilter, NotebookLinkKind, NotebookLinks,
+use layout_model::{
+    mes::LotId,
+    notebook::{
+        LabNotebook, NotebookEntry, NotebookEntryId, NotebookFilter, NotebookLinkKind,
+        NotebookLinks,
+    },
 };
 
 use crate::ui_chrome::{self, Tone};
@@ -27,6 +31,34 @@ impl LabNotebookPanel {
 
     pub(crate) fn notebook(&self) -> &LabNotebook {
         &self.notebook
+    }
+
+    pub(crate) fn add_quick_lot_note(&mut self, lot_id: &str) -> NotebookEntryId {
+        let mut sequence = self.notebook.entries.len() + 1;
+        let mut entry_id = NotebookEntryId::new(format!("WF-{sequence:04}"));
+        while self.notebook.entry(&entry_id).is_some() {
+            sequence += 1;
+            entry_id = NotebookEntryId::new(format!("WF-{sequence:04}"));
+        }
+        let entry = NotebookEntry {
+            id: entry_id.clone(),
+            title: format!("Workflow note for {lot_id}"),
+            author: "workflow".to_string(),
+            created_at: "2026-05-08".to_string(),
+            updated_at: "2026-05-08".to_string(),
+            body_markdown: format!("Workflow note linked to lot {lot_id}."),
+            tags: vec!["workflow".to_string()],
+            links: NotebookLinks {
+                lots: vec![LotId::new(lot_id)],
+                ..NotebookLinks::default()
+            },
+        };
+        self.notebook.entries.push(entry);
+        self.selected_entry = Some(entry_id.clone());
+        self.filter = NotebookFilter::default();
+        self.selected_tag = "All tags".to_string();
+        self.selected_link_kind = None;
+        entry_id
     }
 
     pub(crate) fn ui(&mut self, ui: &mut egui::Ui, status: &mut String) {
@@ -60,11 +92,17 @@ impl LabNotebookPanel {
                 self.filter_bar_ui(ui);
                 ui.separator();
 
-                ui.columns(2, |columns| {
-                    columns[0].set_min_width(250.0);
-                    self.entry_list_ui(&mut columns[0], &filtered_ids);
-                    self.selected_entry_ui(&mut columns[1], status);
-                });
+                if ui.available_width() < 760.0 {
+                    self.entry_list_ui(ui, &filtered_ids);
+                    ui.separator();
+                    self.selected_entry_ui(ui, status);
+                } else {
+                    ui.columns(2, |columns| {
+                        columns[0].set_min_width(250.0);
+                        self.entry_list_ui(&mut columns[0], &filtered_ids);
+                        self.selected_entry_ui(&mut columns[1], status);
+                    });
+                }
             });
     }
 
@@ -134,13 +172,12 @@ impl LabNotebookPanel {
     }
 
     fn filter_bar_ui(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
+        if ui.available_width() < 520.0 {
             ui.label("Search");
             ui.add_sized(
-                [220.0, 22.0],
+                [ui.available_width().min(280.0), 22.0],
                 TextEdit::singleline(&mut self.filter.query).hint_text("residue, RUN-ETCH, CD"),
             );
-
             egui::ComboBox::from_id_salt("notebook_dashboard_tag")
                 .selected_text(&self.selected_tag)
                 .show_ui(ui, |ui| {
@@ -162,7 +199,45 @@ impl LabNotebookPanel {
                         ui.selectable_value(&mut self.selected_link_kind, Some(kind), kind.label());
                     }
                 });
-        });
+        } else {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Search");
+                ui.add_sized(
+                    [220.0, 22.0],
+                    TextEdit::singleline(&mut self.filter.query).hint_text("residue, RUN-ETCH, CD"),
+                );
+
+                egui::ComboBox::from_id_salt("notebook_dashboard_tag")
+                    .selected_text(&self.selected_tag)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.selected_tag,
+                            "All tags".to_string(),
+                            "All tags",
+                        );
+                        for tag in self.notebook.tags() {
+                            ui.selectable_value(&mut self.selected_tag, tag.clone(), tag);
+                        }
+                    });
+
+                let selected_link_label = self
+                    .selected_link_kind
+                    .map(|kind| kind.label())
+                    .unwrap_or("Any link");
+                egui::ComboBox::from_id_salt("notebook_dashboard_link_kind")
+                    .selected_text(selected_link_label)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.selected_link_kind, None, "Any link");
+                        for kind in NotebookLinkKind::ALL {
+                            ui.selectable_value(
+                                &mut self.selected_link_kind,
+                                Some(kind),
+                                kind.label(),
+                            );
+                        }
+                    });
+            });
+        }
         self.sync_filter_controls();
     }
 
@@ -285,36 +360,42 @@ fn link_count_rows(ui: &mut egui::Ui, links: &NotebookLinks) {
 }
 
 fn link_chips_ui(ui: &mut egui::Ui, links: &NotebookLinks) {
-    ui.horizontal_wrapped(|ui| {
-        for lot in &links.lots {
-            link_chip(ui, "lot", &lot.to_string(), Tone::Info);
-        }
-        for wafer in &links.wafers {
-            link_chip(ui, "wafer", &wafer.to_string(), Tone::Info);
-        }
-        for recipe in &links.recipes {
-            link_chip(ui, "recipe", &recipe.to_string(), Tone::Success);
-        }
-        for run in &links.tool_runs {
-            link_chip(ui, "run", &run.to_string(), Tone::Warning);
-        }
-        for metrology in &links.metrology {
-            link_chip(
-                ui,
-                metrology.kind.label(),
-                &format!("{} {}", metrology.id, metrology.summary),
-                Tone::Neutral,
-            );
-        }
-        for image in &links.images {
-            link_chip(
-                ui,
-                "image",
-                &format!("{} {}", image.id, image.label),
-                Tone::Neutral,
-            );
-        }
-    });
+    if ui.available_width() < 760.0 {
+        ui.vertical(|ui| link_chips_contents(ui, links));
+    } else {
+        ui.horizontal_wrapped(|ui| link_chips_contents(ui, links));
+    }
+}
+
+fn link_chips_contents(ui: &mut egui::Ui, links: &NotebookLinks) {
+    for lot in &links.lots {
+        link_chip(ui, "lot", &lot.to_string(), Tone::Info);
+    }
+    for wafer in &links.wafers {
+        link_chip(ui, "wafer", &wafer.to_string(), Tone::Info);
+    }
+    for recipe in &links.recipes {
+        link_chip(ui, "recipe", &recipe.to_string(), Tone::Success);
+    }
+    for run in &links.tool_runs {
+        link_chip(ui, "run", &run.to_string(), Tone::Warning);
+    }
+    for metrology in &links.metrology {
+        link_chip(
+            ui,
+            metrology.kind.label(),
+            &format!("{} {}", metrology.id, metrology.summary),
+            Tone::Neutral,
+        );
+    }
+    for image in &links.images {
+        link_chip(
+            ui,
+            "image",
+            &format!("{} {}", image.id, image.label),
+            Tone::Neutral,
+        );
+    }
 }
 
 fn link_chip(ui: &mut egui::Ui, prefix: &str, value: &str, tone: Tone) {
@@ -330,11 +411,15 @@ fn link_chip(ui: &mut egui::Ui, prefix: &str, value: &str, tone: Tone) {
         .corner_radius(6)
         .inner_margin(egui::Margin::symmetric(7, 3))
         .show(ui, |ui| {
+            ui.set_max_width(ui.available_width().clamp(96.0, 360.0));
             let text_color = ui_chrome::readable_text_color(color);
-            ui.label(
-                RichText::new(format!("{prefix}: {value}"))
-                    .small()
-                    .color(text_color),
+            ui.add(
+                egui::Label::new(
+                    RichText::new(format!("{prefix}: {value}"))
+                        .small()
+                        .color(text_color),
+                )
+                .wrap(),
             );
         });
 }

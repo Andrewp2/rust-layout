@@ -52,9 +52,18 @@ impl RecipeManagerPanel {
         &self.catalog
     }
 
+    pub(crate) fn select_recipe_id(&mut self, recipe_id: &str) -> bool {
+        let recipe_id = RecipeId::from(recipe_id.to_string());
+        if self.catalog.recipe(&recipe_id).is_none() {
+            return false;
+        }
+        self.select_recipe(recipe_id);
+        true
+    }
+
     pub(crate) fn ui(&mut self, ui: &mut egui::Ui, status: &mut String) {
         egui::CollapsingHeader::new("Recipe Manager")
-            .default_open(true)
+            .default_open(false)
             .show(ui, |ui| {
                 if self.catalog.recipes.is_empty() {
                     ui.label("No recipes loaded");

@@ -8,35 +8,32 @@ use layout_model::{
 use crate::ui_chrome::{self, Tone};
 
 pub(crate) struct LayoutDiffPanel {
-    baseline: DiffBaseline,
+    baseline: DiffSource,
+    candidate: DiffSource,
     changed_only: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DiffBaseline {
+enum DiffSource {
+    Current,
     Demo,
     Hierarchy,
-    Blank,
+    Empty,
 }
 
 impl Default for LayoutDiffPanel {
     fn default() -> Self {
         Self {
-            baseline: DiffBaseline::Demo,
+            baseline: DiffSource::Demo,
+            candidate: DiffSource::Current,
             changed_only: true,
         }
     }
 }
 
 impl LayoutDiffPanel {
-    pub(crate) fn ui(&mut self, ui: &mut egui::Ui, candidate: &Document) {
-        let baseline = self.baseline.document();
-        let report = diff_documents(
-            self.baseline.label(),
-            &baseline,
-            "current workspace",
-            candidate,
-        );
+    pub(crate) fn ui(&mut self, ui: &mut egui::Ui, current: &Document) {
+        let report = self.report(current);
 
         egui::ScrollArea::vertical()
             .id_salt("layout_diff_review")
@@ -45,9 +42,12 @@ impl LayoutDiffPanel {
                     ui,
                     "Design review",
                     "Layout Diff Review",
-                    &format!("{} vs current", self.baseline.label()),
+                    &format!("{} -> {}", self.baseline.label(), self.candidate.label()),
                     |ui| {
-                        self.baseline_picker(ui);
+                        ui.label("From");
+                        source_picker(ui, "layout_diff_baseline", &mut self.baseline);
+                        ui.label("To");
+                        source_picker(ui, "layout_diff_candidate", &mut self.candidate);
                         ui.checkbox(&mut self.changed_only, "Changed layers only");
                     },
                 );
@@ -55,10 +55,36 @@ impl LayoutDiffPanel {
                 summary_ui(ui, &report);
 
                 ui.separator();
-                ui.columns(2, |columns| {
-                    bounds_ui(&mut columns[0], "Baseline bounds", report.baseline_bounds);
-                    bounds_ui(&mut columns[1], "Candidate bounds", report.candidate_bounds);
-                });
+                if ui.available_width() < 680.0 {
+                    bounds_ui(
+                        ui,
+                        "Baseline Geometry",
+                        report.baseline_name.as_str(),
+                        report.baseline_bounds,
+                    );
+                    ui.separator();
+                    bounds_ui(
+                        ui,
+                        "Candidate Geometry",
+                        report.candidate_name.as_str(),
+                        report.candidate_bounds,
+                    );
+                } else {
+                    ui.columns(2, |columns| {
+                        bounds_ui(
+                            &mut columns[0],
+                            "Baseline Geometry",
+                            report.baseline_name.as_str(),
+                            report.baseline_bounds,
+                        );
+                        bounds_ui(
+                            &mut columns[1],
+                            "Candidate Geometry",
+                            report.candidate_name.as_str(),
+                            report.candidate_bounds,
+                        );
+                    });
+                }
 
                 ui.separator();
                 layers_ui(ui, &report, self.changed_only);
@@ -68,18 +94,10 @@ impl LayoutDiffPanel {
             });
     }
 
-    pub(crate) fn context_ui(&mut self, ui: &mut egui::Ui, candidate: &Document) {
-        let baseline = self.baseline.document();
-        let report = diff_documents(
-            self.baseline.label(),
-            &baseline,
-            "current workspace",
-            candidate,
-        );
+    pub(crate) fn context_ui(&mut self, ui: &mut egui::Ui, current: &Document) {
+        let report = self.report(current);
 
         ui_chrome::section_label(ui, "Layout Diff");
-        self.baseline_picker(ui);
-        ui.separator();
         ui.label(format!("Baseline: {}", report.baseline_name));
         ui.label(format!("Candidate: {}", report.candidate_name));
         ui.separator();
@@ -112,76 +130,73 @@ impl LayoutDiffPanel {
         );
     }
 
-    fn baseline_picker(&mut self, ui: &mut egui::Ui) {
-        egui::ComboBox::from_id_salt("layout_diff_baseline")
-            .selected_text(self.baseline.label())
-            .show_ui(ui, |ui| {
-                ui.selectable_value(
-                    &mut self.baseline,
-                    DiffBaseline::Demo,
-                    DiffBaseline::Demo.label(),
-                );
-                ui.selectable_value(
-                    &mut self.baseline,
-                    DiffBaseline::Hierarchy,
-                    DiffBaseline::Hierarchy.label(),
-                );
-                ui.selectable_value(
-                    &mut self.baseline,
-                    DiffBaseline::Blank,
-                    DiffBaseline::Blank.label(),
-                );
-            });
+    fn report(&self, current: &Document) -> LayoutDiffReport {
+        let baseline = self.baseline.document(current);
+        let candidate = self.candidate.document(current);
+        diff_documents(
+            self.baseline.label(),
+            &baseline,
+            self.candidate.label(),
+            &candidate,
+        )
     }
 }
 
-impl DiffBaseline {
+impl DiffSource {
     fn label(self) -> &'static str {
         match self {
-            Self::Demo => "demo layout",
-            Self::Hierarchy => "hierarchy demo",
-            Self::Blank => "blank layout",
+            Self::Current => "Current workspace",
+            Self::Demo => "Demo layout",
+            Self::Hierarchy => "Hierarchy demo",
+            Self::Empty => "Empty layout",
         }
     }
 
-    fn document(self) -> Document {
+    fn document(self, current: &Document) -> Document {
         match self {
+            Self::Current => current.clone(),
             Self::Demo => Document::demo(),
             Self::Hierarchy => Document::hierarchy_demo(),
-            Self::Blank => Document::new("blank layout"),
+            Self::Empty => Document::new("empty layout"),
         }
     }
+}
+
+fn source_picker(ui: &mut egui::Ui, id: &'static str, selected: &mut DiffSource) {
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(selected.label())
+        .show_ui(ui, |ui| {
+            for source in [
+                DiffSource::Current,
+                DiffSource::Demo,
+                DiffSource::Hierarchy,
+                DiffSource::Empty,
+            ] {
+                ui.selectable_value(selected, source, source.label());
+            }
+        });
 }
 
 fn summary_ui(ui: &mut egui::Ui, report: &LayoutDiffReport) {
-    ui.horizontal_wrapped(|ui| {
-        ui_chrome::metric_tile(ui, "Baseline", report.summary.baseline_shapes, "shapes");
-        ui_chrome::metric_tile(ui, "Candidate", report.summary.candidate_shapes, "shapes");
-        ui_chrome::metric_tile_tone(
-            ui,
-            "Added",
-            report.summary.added_shapes,
-            "shapes",
-            Tone::Success,
-        );
-        ui_chrome::metric_tile_tone(
-            ui,
-            "Removed",
-            report.summary.removed_shapes,
-            "shapes",
-            Tone::Danger,
-        );
-        ui_chrome::metric_tile_tone(
-            ui,
-            "Modified",
-            report.summary.modified_shapes,
-            "shapes",
-            Tone::Warning,
-        );
-    });
+    egui::Grid::new("layout_diff_summary_grid")
+        .num_columns(2)
+        .spacing([16.0, 4.0])
+        .show(ui, |ui| {
+            summary_value(ui, "Baseline shapes", report.summary.baseline_shapes);
+            summary_value(ui, "Candidate shapes", report.summary.candidate_shapes);
+            summary_value(ui, "Added", report.summary.added_shapes);
+            summary_value(ui, "Removed", report.summary.removed_shapes);
+            summary_value(ui, "Modified", report.summary.modified_shapes);
+        });
 }
 
-fn bounds_ui(ui: &mut egui::Ui, label: &str, bounds: Option<Rect>) {
+fn summary_value(ui: &mut egui::Ui, label: &str, value: usize) {
+    ui.strong(label);
+    ui.label(value.to_string());
+    ui.end_row();
+}
+
+fn bounds_ui(ui: &mut egui::Ui, label: &str, empty_subject: &str, bounds: Option<Rect>) {
     ui_chrome::section_label(ui, label);
     if let Some(bounds) = bounds {
         ui.label(format!(
@@ -194,35 +209,40 @@ fn bounds_ui(ui: &mut egui::Ui, label: &str, bounds: Option<Rect>) {
             bounds.min.x, bounds.min.y, bounds.max.x, bounds.max.y
         ));
     } else {
-        ui_chrome::empty_state(ui, "No geometry");
+        ui_chrome::empty_state(ui, &format!("No shapes in {empty_subject}"));
     }
 }
 
 fn layers_ui(ui: &mut egui::Ui, report: &LayoutDiffReport, changed_only: bool) {
     ui_chrome::section_label(ui, "Layer Summary");
-    egui::Grid::new("layout_diff_layer_grid")
-        .striped(true)
-        .min_col_width(72.0)
+    egui::ScrollArea::horizontal()
+        .id_salt("layout_diff_layer_horizontal")
         .show(ui, |ui| {
-            ui.strong("Layer");
-            ui.strong("Baseline");
-            ui.strong("Candidate");
-            ui.strong("Delta");
-            ui.end_row();
-            for layer in &report.layers {
-                let delta = layer.added_shapes + layer.removed_shapes + layer.modified_shapes;
-                if changed_only && delta == 0 {
-                    continue;
-                }
-                ui.label(format!("{} {}", layer.layer.0, layer.name));
-                ui.label(layer.baseline_shapes.to_string());
-                ui.label(layer.candidate_shapes.to_string());
-                ui.label(format!(
-                    "+{} / -{} / ~{}",
-                    layer.added_shapes, layer.removed_shapes, layer.modified_shapes
-                ));
-                ui.end_row();
-            }
+            egui::Grid::new("layout_diff_layer_grid")
+                .striped(true)
+                .min_col_width(72.0)
+                .show(ui, |ui| {
+                    ui.strong("Layer");
+                    ui.strong("Baseline");
+                    ui.strong("Candidate");
+                    ui.strong("Delta");
+                    ui.end_row();
+                    for layer in &report.layers {
+                        let delta =
+                            layer.added_shapes + layer.removed_shapes + layer.modified_shapes;
+                        if changed_only && delta == 0 {
+                            continue;
+                        }
+                        ui.label(format!("{} {}", layer.layer.0, layer.name));
+                        ui.label(layer.baseline_shapes.to_string());
+                        ui.label(layer.candidate_shapes.to_string());
+                        ui.label(format!(
+                            "+{} / -{} / ~{}",
+                            layer.added_shapes, layer.removed_shapes, layer.modified_shapes
+                        ));
+                        ui.end_row();
+                    }
+                });
         });
 }
 
@@ -233,28 +253,32 @@ fn changes_ui(ui: &mut egui::Ui, report: &LayoutDiffReport) {
         return;
     }
 
-    egui::Grid::new("layout_diff_changes_grid")
-        .striped(true)
-        .min_col_width(76.0)
+    egui::ScrollArea::horizontal()
+        .id_salt("layout_diff_changes_horizontal")
         .show(ui, |ui| {
-            ui.strong("Type");
-            ui.strong("Shape");
-            ui.strong("Layer");
-            ui.strong("Bounds");
-            ui.strong("Detail");
-            ui.end_row();
-            for change in report.changes.iter().take(200) {
-                ui.colored_label(change_color(change.kind), change.kind.label());
-                ui.label(format!("#{}", change.id.0));
-                ui.label(format!("{} {}", change.layer.0, change.layer_name));
-                ui.label(format!(
-                    "{} x {}",
-                    change.bounds.width().abs(),
-                    change.bounds.height().abs()
-                ));
-                ui.label(&change.detail);
-                ui.end_row();
-            }
+            egui::Grid::new("layout_diff_changes_grid")
+                .striped(true)
+                .min_col_width(76.0)
+                .show(ui, |ui| {
+                    ui.strong("Type");
+                    ui.strong("Shape");
+                    ui.strong("Layer");
+                    ui.strong("Bounds");
+                    ui.strong("Detail");
+                    ui.end_row();
+                    for change in report.changes.iter().take(200) {
+                        ui.colored_label(change_color(change.kind), change.kind.label());
+                        ui.label(format!("#{}", change.id.0));
+                        ui.label(format!("{} {}", change.layer.0, change.layer_name));
+                        ui.label(format!(
+                            "{} x {}",
+                            change.bounds.width().abs(),
+                            change.bounds.height().abs()
+                        ));
+                        ui.label(&change.detail);
+                        ui.end_row();
+                    }
+                });
         });
     if report.changes.len() > 200 {
         ui_chrome::muted(

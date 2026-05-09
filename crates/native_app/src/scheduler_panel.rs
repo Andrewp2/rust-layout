@@ -151,32 +151,34 @@ impl SchedulerPanel {
         let bottleneck = queue_summaries
             .iter()
             .max_by_key(|summary| summary.total_process_minutes);
-        ui.horizontal_wrapped(|ui| {
-            ui_chrome::metric_tile(
-                ui,
-                "Recommended",
-                scheduled,
-                &format!("{} unscheduled", unscheduled_lots),
-            );
-            ui_chrome::metric_tile(
-                ui,
-                "Queue load",
-                format!("{} min", total_queue_minutes(queue_summaries)),
-                "waiting process time",
-            );
-            ui_chrome::metric_tile_tone(
-                ui,
-                "Bottleneck",
-                bottleneck
-                    .map(|summary| summary.tool_class.label().to_string())
-                    .unwrap_or_else(|| "none".to_string()),
-                bottleneck
-                    .map(|summary| format!("{} lots", summary.waiting_lots))
-                    .unwrap_or_default()
-                    .as_str(),
-                Tone::Warning,
-            );
-        });
+        let bottleneck_detail = bottleneck
+            .map(|summary| format!("{} lots", summary.waiting_lots))
+            .unwrap_or_default();
+        ui_chrome::metric_tiles(
+            ui,
+            &[
+                (
+                    "Recommended",
+                    scheduled.to_string(),
+                    &format!("{} unscheduled", unscheduled_lots),
+                    Tone::Neutral,
+                ),
+                (
+                    "Queue load",
+                    format!("{} min", total_queue_minutes(queue_summaries)),
+                    "waiting process time",
+                    Tone::Neutral,
+                ),
+                (
+                    "Bottleneck",
+                    bottleneck
+                        .map(|summary| summary.tool_class.label().to_string())
+                        .unwrap_or_else(|| "none".to_string()),
+                    bottleneck_detail.as_str(),
+                    Tone::Warning,
+                ),
+            ],
+        );
     }
 
     fn recommendations_ui(
@@ -186,6 +188,37 @@ impl SchedulerPanel {
         status: &mut String,
     ) {
         ui_chrome::section_label(ui, "Recommended Next Lot");
+        if ui.available_width() < 520.0 {
+            for recommendation in recommendations {
+                let selected = self.selected_tool.as_ref() == Some(&recommendation.tool_id);
+                ui.group(|ui| {
+                    ui.set_width(ui.available_width().clamp(220.0, 420.0));
+                    ui.horizontal_wrapped(|ui| {
+                        if ui
+                            .selectable_label(selected, recommendation.tool_id.to_string())
+                            .clicked()
+                        {
+                            self.selected_tool = Some(recommendation.tool_id.clone());
+                            *status = format!("selected dispatch tool {}", recommendation.tool_id);
+                        }
+                        ui.label(
+                            recommendation
+                                .lot_id
+                                .as_ref()
+                                .map(ToString::to_string)
+                                .unwrap_or_else(|| "--".to_string()),
+                        );
+                    });
+                    ui.small(format!(
+                        "{} to {}",
+                        format_optional_time(recommendation.start_minute),
+                        format_optional_time(recommendation.finish_minute)
+                    ));
+                    ui.add(egui::Label::new(&recommendation.reason).wrap());
+                });
+            }
+            return;
+        }
         egui::Grid::new("scheduler_recommendations")
             .striped(true)
             .show(ui, |ui| {

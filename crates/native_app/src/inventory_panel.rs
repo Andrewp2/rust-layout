@@ -36,14 +36,24 @@ impl InventoryPanel {
 
                 self.summary_ui(ui);
                 ui.separator();
-                ui.columns(2, |columns| {
-                    self.lot_table_ui(&mut columns[0], status);
+                if ui.available_width() < 720.0 {
+                    self.lot_table_ui(ui, status);
+                    ui.separator();
                     if let Some(lot) = self.selected_lot().cloned() {
-                        self.detail_ui(&mut columns[1], &lot);
+                        self.detail_ui(ui, &lot);
                     } else {
-                        ui_chrome::empty_state(&mut columns[1], "No material lot selected");
+                        ui_chrome::empty_state(ui, "No material lot selected");
                     }
-                });
+                } else {
+                    ui.columns(2, |columns| {
+                        self.lot_table_ui(&mut columns[0], status);
+                        if let Some(lot) = self.selected_lot().cloned() {
+                            self.detail_ui(&mut columns[1], &lot);
+                        } else {
+                            ui_chrome::empty_state(&mut columns[1], "No material lot selected");
+                        }
+                    });
+                }
             });
     }
 
@@ -144,33 +154,49 @@ impl InventoryPanel {
             .map(|lot| lot.usage.len())
             .sum::<usize>();
 
-        ui.horizontal_wrapped(|ui| {
-            ui_chrome::metric_tile(ui, "Material lots", self.inventory.lots.len(), "tracked");
-            ui_chrome::metric_tile_tone(
-                ui,
-                "Low stock",
-                low_stock,
-                "at reorder point",
-                if low_stock > 0 {
-                    Tone::Warning
-                } else {
-                    Tone::Success
-                },
-            );
-            ui_chrome::metric_tile_tone(
-                ui,
-                "Expired",
-                expired,
-                "blocked for product",
-                if expired > 0 {
-                    Tone::Danger
-                } else {
-                    Tone::Success
-                },
-            );
-            ui_chrome::metric_tile_tone(ui, "Expiring", expiring, "within 30 days", Tone::Info);
-            ui_chrome::metric_tile(ui, "Usage links", usage_count, "fab objects");
-        });
+        ui_chrome::metric_tiles(
+            ui,
+            &[
+                (
+                    "Material lots",
+                    self.inventory.lots.len().to_string(),
+                    "tracked",
+                    Tone::Neutral,
+                ),
+                (
+                    "Low stock",
+                    low_stock.to_string(),
+                    "at reorder point",
+                    if low_stock > 0 {
+                        Tone::Warning
+                    } else {
+                        Tone::Success
+                    },
+                ),
+                (
+                    "Expired",
+                    expired.to_string(),
+                    "blocked for product",
+                    if expired > 0 {
+                        Tone::Danger
+                    } else {
+                        Tone::Success
+                    },
+                ),
+                (
+                    "Expiring",
+                    expiring.to_string(),
+                    "within 30 days",
+                    Tone::Info,
+                ),
+                (
+                    "Usage links",
+                    usage_count.to_string(),
+                    "fab objects",
+                    Tone::Neutral,
+                ),
+            ],
+        );
 
         ui.add_space(4.0);
         self.alert_summary_ui(ui, &alerts);
@@ -183,22 +209,39 @@ impl InventoryPanel {
             return;
         }
 
-        egui::Grid::new("inventory_alert_grid")
-            .striped(true)
-            .min_col_width(92.0)
-            .show(ui, |ui| {
-                ui.strong("Alert");
-                ui.strong("Lot");
-                ui.strong("Material");
-                ui.strong("Message");
-                ui.end_row();
-                for alert in alerts {
+        if ui.available_width() < 520.0 {
+            for alert in alerts {
+                ui.group(|ui| {
+                    ui.set_width(ui.available_width().clamp(220.0, 420.0));
                     ui.colored_label(alert_color(alert.kind), alert.kind.label());
-                    ui.label(alert.lot_id.to_string());
-                    ui.label(&alert.material_name);
-                    ui.label(&alert.message);
-                    ui.end_row();
-                }
+                    ui.small(format!("{} / {}", alert.lot_id, alert.material_name));
+                    ui.add(egui::Label::new(&alert.message).wrap());
+                });
+            }
+            return;
+        }
+
+        egui::ScrollArea::horizontal()
+            .id_salt("inventory_alert_horizontal")
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                egui::Grid::new("inventory_alert_grid")
+                    .striped(true)
+                    .min_col_width(92.0)
+                    .show(ui, |ui| {
+                        ui.strong("Alert");
+                        ui.strong("Lot");
+                        ui.strong("Material");
+                        ui.strong("Message");
+                        ui.end_row();
+                        for alert in alerts {
+                            ui.colored_label(alert_color(alert.kind), alert.kind.label());
+                            ui.label(alert.lot_id.to_string());
+                            ui.label(&alert.material_name);
+                            ui.label(&alert.message);
+                            ui.end_row();
+                        }
+                    });
             });
     }
 
@@ -209,31 +252,58 @@ impl InventoryPanel {
             return;
         }
 
-        egui::Grid::new("inventory_lot_table")
-            .striped(true)
-            .min_col_width(78.0)
-            .show(ui, |ui| {
-                ui.strong("Lot");
-                ui.strong("Material");
-                ui.strong("Stock");
-                ui.strong("Expires");
-                ui.end_row();
-
-                for lot in self.inventory.sorted_lots() {
-                    let selected = self.selected_lot.as_ref() == Some(&lot.id);
+        if ui.available_width() < 520.0 {
+            for lot in self.inventory.sorted_lots() {
+                let selected = self.selected_lot.as_ref() == Some(&lot.id);
+                ui.group(|ui| {
+                    ui.set_width(ui.available_width().clamp(220.0, 420.0));
                     if ui.selectable_label(selected, lot.id.to_string()).clicked() {
                         self.selected_lot = Some(lot.id.clone());
                         *status = format!("inventory selected {}", lot.id);
                     }
-                    ui.label(&lot.material_name);
+                    ui.add(egui::Label::new(&lot.material_name).wrap());
                     ui.colored_label(stock_color(lot), lot.stock.format());
-                    ui.label(
+                    ui.small(format!(
+                        "Expires {}",
                         lot.expires_on
                             .map(format_date)
-                            .unwrap_or_else(|| "none".to_string()),
-                    );
-                    ui.end_row();
-                }
+                            .unwrap_or_else(|| "none".to_string())
+                    ));
+                });
+            }
+            return;
+        }
+
+        egui::ScrollArea::horizontal()
+            .id_salt("inventory_lot_horizontal")
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                egui::Grid::new("inventory_lot_table")
+                    .striped(true)
+                    .min_col_width(78.0)
+                    .show(ui, |ui| {
+                        ui.strong("Lot");
+                        ui.strong("Material");
+                        ui.strong("Stock");
+                        ui.strong("Expires");
+                        ui.end_row();
+
+                        for lot in self.inventory.sorted_lots() {
+                            let selected = self.selected_lot.as_ref() == Some(&lot.id);
+                            if ui.selectable_label(selected, lot.id.to_string()).clicked() {
+                                self.selected_lot = Some(lot.id.clone());
+                                *status = format!("inventory selected {}", lot.id);
+                            }
+                            ui.label(&lot.material_name);
+                            ui.colored_label(stock_color(lot), lot.stock.format());
+                            ui.label(
+                                lot.expires_on
+                                    .map(format_date)
+                                    .unwrap_or_else(|| "none".to_string()),
+                            );
+                            ui.end_row();
+                        }
+                    });
             });
     }
 
@@ -284,30 +354,35 @@ impl InventoryPanel {
             return;
         }
 
-        egui::Grid::new(("inventory_usage", lot.id.as_str()))
-            .striped(true)
-            .min_col_width(78.0)
+        egui::ScrollArea::horizontal()
+            .id_salt(("inventory_usage_horizontal", lot.id.as_str()))
+            .auto_shrink([false, true])
             .show(ui, |ui| {
-                ui.strong("Date");
-                ui.strong("Qty");
-                ui.strong("Actor");
-                ui.strong("Fab links");
-                ui.end_row();
-                for usage in &lot.usage {
-                    ui.label(format_date(usage.timestamp));
-                    ui.label(usage.quantity.format());
-                    ui.label(&usage.actor);
-                    ui.label(
-                        usage
-                            .links
-                            .iter()
-                            .map(|link| link.label())
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                    )
-                    .on_hover_text(&usage.note);
-                    ui.end_row();
-                }
+                egui::Grid::new(("inventory_usage", lot.id.as_str()))
+                    .striped(true)
+                    .min_col_width(78.0)
+                    .show(ui, |ui| {
+                        ui.strong("Date");
+                        ui.strong("Qty");
+                        ui.strong("Actor");
+                        ui.strong("Fab links");
+                        ui.end_row();
+                        for usage in &lot.usage {
+                            ui.label(format_date(usage.timestamp));
+                            ui.label(usage.quantity.format());
+                            ui.label(&usage.actor);
+                            ui.label(
+                                usage
+                                    .links
+                                    .iter()
+                                    .map(|link| link.label())
+                                    .collect::<Vec<_>>()
+                                    .join(", "),
+                            )
+                            .on_hover_text(&usage.note);
+                            ui.end_row();
+                        }
+                    });
             });
     }
 }

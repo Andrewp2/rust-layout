@@ -114,63 +114,77 @@ impl SafetyPanel {
                     },
                 );
 
-                ui.horizontal_wrapped(|ui| {
-                    ui_chrome::metric_tile_tone(
-                        ui,
-                        "Overall state",
-                        summary
-                            .highest_severity
-                            .map(SafetySeverity::label)
-                            .unwrap_or("blank"),
-                        "simulated monitor",
-                        severity_tone(summary.highest_severity.unwrap_or(SafetySeverity::Normal)),
-                    );
-                    ui_chrome::metric_tile_tone(
-                        ui,
-                        "Active conditions",
-                        summary.active_condition_count,
-                        "warning or critical sensors",
-                        if summary.active_condition_count == 0 {
-                            Tone::Success
-                        } else {
-                            Tone::Warning
-                        },
-                    );
-                    ui_chrome::metric_tile_tone(
-                        ui,
-                        "Locked tools",
-                        summary.locked_out_tool_count,
-                        "computed from interlocks",
-                        if summary.locked_out_tool_count == 0 {
-                            Tone::Success
-                        } else {
-                            Tone::Danger
-                        },
-                    );
-                    ui_chrome::metric_tile_tone(
-                        ui,
-                        "Open incidents",
-                        summary.open_incident_count,
-                        "simulated audit trail",
-                        if summary.open_incident_count == 0 {
-                            Tone::Success
-                        } else {
-                            Tone::Warning
-                        },
-                    );
-                });
+                ui_chrome::metric_tiles(
+                    ui,
+                    &[
+                        (
+                            "Overall state",
+                            summary
+                                .highest_severity
+                                .map(SafetySeverity::label)
+                                .unwrap_or("blank")
+                                .to_string(),
+                            "simulated monitor",
+                            severity_tone(
+                                summary.highest_severity.unwrap_or(SafetySeverity::Normal),
+                            ),
+                        ),
+                        (
+                            "Active conditions",
+                            summary.active_condition_count.to_string(),
+                            "warning or critical sensors",
+                            if summary.active_condition_count == 0 {
+                                Tone::Success
+                            } else {
+                                Tone::Warning
+                            },
+                        ),
+                        (
+                            "Locked tools",
+                            summary.locked_out_tool_count.to_string(),
+                            "computed from interlocks",
+                            if summary.locked_out_tool_count == 0 {
+                                Tone::Success
+                            } else {
+                                Tone::Danger
+                            },
+                        ),
+                        (
+                            "Open incidents",
+                            summary.open_incident_count.to_string(),
+                            "simulated audit trail",
+                            if summary.open_incident_count == 0 {
+                                Tone::Success
+                            } else {
+                                Tone::Warning
+                            },
+                        ),
+                    ],
+                );
 
                 ui.separator();
-                ui.columns(2, |columns| {
-                    self.sensors_ui(&mut columns[0]);
-                    self.lockouts_ui(&mut columns[1], &lockouts);
-                });
+                if ui.available_width() < 720.0 {
+                    self.sensors_ui(ui);
+                    ui.separator();
+                    self.lockouts_ui(ui, &lockouts);
+                } else {
+                    ui.columns(2, |columns| {
+                        self.sensors_ui(&mut columns[0]);
+                        self.lockouts_ui(&mut columns[1], &lockouts);
+                    });
+                }
 
                 ui.separator();
-                ui.columns(2, |columns| {
-                    self.routing_ui(&mut columns[0]);
-                    incidents_ui(&mut columns[1], &self.model.incidents);
-                });
+                if ui.available_width() < 720.0 {
+                    self.routing_ui(ui);
+                    ui.separator();
+                    incidents_ui(ui, &self.model.incidents);
+                } else {
+                    ui.columns(2, |columns| {
+                        self.routing_ui(&mut columns[0]);
+                        incidents_ui(&mut columns[1], &self.model.incidents);
+                    });
+                }
 
                 ui.separator();
                 audit_ui(ui, &self.model);
@@ -184,25 +198,46 @@ impl SafetyPanel {
             return;
         }
 
-        egui::Grid::new("safety_sensor_grid")
-            .striped(true)
-            .min_col_width(76.0)
-            .show(ui, |ui| {
-                ui.strong("Sensor");
-                ui.strong("Domain");
-                ui.strong("State");
-                ui.strong("Value");
-                ui.end_row();
-                for sensor in &self.model.sensors {
-                    ui.label(&sensor.name);
-                    ui.label(sensor.domain.label());
+        if ui.available_width() < 520.0 {
+            for sensor in &self.model.sensors {
+                ui.group(|ui| {
+                    ui.set_width(ui.available_width().clamp(220.0, 420.0));
+                    ui.strong(&sensor.name);
+                    ui.small(sensor.domain.label());
                     ui.colored_label(
                         severity_color(sensor.severity),
                         format!("{} / {}", sensor.state.label(), sensor.severity.label()),
                     );
                     ui.label(format!("{} {}", compact_number(sensor.value), sensor.unit));
-                    ui.end_row();
-                }
+                });
+            }
+            return;
+        }
+
+        egui::ScrollArea::horizontal()
+            .id_salt("safety_sensor_horizontal")
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                egui::Grid::new("safety_sensor_grid")
+                    .striped(true)
+                    .min_col_width(76.0)
+                    .show(ui, |ui| {
+                        ui.strong("Sensor");
+                        ui.strong("Domain");
+                        ui.strong("State");
+                        ui.strong("Value");
+                        ui.end_row();
+                        for sensor in &self.model.sensors {
+                            ui.label(&sensor.name);
+                            ui.label(sensor.domain.label());
+                            ui.colored_label(
+                                severity_color(sensor.severity),
+                                format!("{} / {}", sensor.state.label(), sensor.severity.label()),
+                            );
+                            ui.label(format!("{} {}", compact_number(sensor.value), sensor.unit));
+                            ui.end_row();
+                        }
+                    });
             });
     }
 
@@ -243,20 +278,40 @@ impl SafetyPanel {
             return;
         }
 
-        egui::Grid::new("safety_alarm_routes")
-            .striped(true)
-            .min_col_width(90.0)
+        if ui.available_width() < 520.0 {
+            for route in &self.model.alarm_routes {
+                ui.group(|ui| {
+                    ui.set_width(ui.available_width().clamp(220.0, 420.0));
+                    ui.strong(route.domain.label());
+                    ui.small(route.minimum_severity.label());
+                    ui.add(
+                        egui::Label::new(format!("{} via {}", route.target.label(), route.channel))
+                            .wrap(),
+                    );
+                });
+            }
+            return;
+        }
+
+        egui::ScrollArea::horizontal()
+            .id_salt("safety_alarm_routes_horizontal")
+            .auto_shrink([false, true])
             .show(ui, |ui| {
-                ui.strong("Domain");
-                ui.strong("Severity");
-                ui.strong("Target");
-                ui.end_row();
-                for route in &self.model.alarm_routes {
-                    ui.label(route.domain.label());
-                    ui.label(route.minimum_severity.label());
-                    ui.label(format!("{} via {}", route.target.label(), route.channel));
-                    ui.end_row();
-                }
+                egui::Grid::new("safety_alarm_routes")
+                    .striped(true)
+                    .min_col_width(90.0)
+                    .show(ui, |ui| {
+                        ui.strong("Domain");
+                        ui.strong("Severity");
+                        ui.strong("Target");
+                        ui.end_row();
+                        for route in &self.model.alarm_routes {
+                            ui.label(route.domain.label());
+                            ui.label(route.minimum_severity.label());
+                            ui.label(format!("{} via {}", route.target.label(), route.channel));
+                            ui.end_row();
+                        }
+                    });
             });
 
         ui.add_space(6.0);
@@ -323,22 +378,27 @@ fn audit_ui(ui: &mut egui::Ui, model: &SafetySystem) {
         return;
     }
 
-    egui::Grid::new("safety_audit_grid")
-        .striped(true)
-        .min_col_width(90.0)
+    egui::ScrollArea::horizontal()
+        .id_salt("safety_audit_horizontal")
+        .auto_shrink([false, true])
         .show(ui, |ui| {
-            ui.strong("Seq");
-            ui.strong("Time");
-            ui.strong("Kind");
-            ui.strong("Message");
-            ui.end_row();
-            for event in &model.audit_events {
-                ui.colored_label(audit_color(event.kind), format!("#{}", event.sequence));
-                ui.label(&event.timestamp);
-                ui.label(event.kind.label());
-                ui.label(&event.message);
-                ui.end_row();
-            }
+            egui::Grid::new("safety_audit_grid")
+                .striped(true)
+                .min_col_width(90.0)
+                .show(ui, |ui| {
+                    ui.strong("Seq");
+                    ui.strong("Time");
+                    ui.strong("Kind");
+                    ui.strong("Message");
+                    ui.end_row();
+                    for event in &model.audit_events {
+                        ui.colored_label(audit_color(event.kind), format!("#{}", event.sequence));
+                        ui.label(&event.timestamp);
+                        ui.label(event.kind.label());
+                        ui.label(&event.message);
+                        ui.end_row();
+                    }
+                });
         });
 }
 

@@ -28,6 +28,7 @@ use layout_model::{
         ToolState as EquipmentToolState,
     },
     experiment::ExperimentPlan,
+    fab_ref::{FabObjectKind, FabObjectRef},
     gdsii::{export_gdsii, import_gdsii},
     genealogy::LotGenealogy,
     inventory::Inventory,
@@ -95,7 +96,7 @@ use recipe_panel::RecipeManagerPanel;
 use safety_panel::SafetyPanel;
 use scheduler_panel::SchedulerPanel;
 use spc_fdc_panel::SpcFdcPanel;
-use workflow_panel::{WorkflowData, WorkflowDestination, WorkflowPanel};
+use workflow_panel::{WorkflowAction, WorkflowData, WorkflowDestination, WorkflowPanel};
 
 #[cfg(not(target_arch = "wasm32"))]
 use futures_util::{Sink, SinkExt, StreamExt};
@@ -118,8 +119,22 @@ const CAMERA_NEAR_PLANE: f32 = 10.0;
 const CAMERA_FAR_PLANE_MIN: f32 = 250_000.0;
 const CAMERA_FAR_PLANE_SPAN_MULTIPLIER: f32 = 4.0;
 const CAMERA_FAR_PLANE_MARGIN_MULTIPLIER: f32 = 1.5;
+const MAX_CONNECTIVITY_ROWS: usize = 40;
+const MAX_DRC_OVERLAY_MARKERS: usize = 500;
+const LAYOUT_MIN_ZOOM: f32 = 0.000_05;
+const LAYOUT_MAX_ZOOM: f32 = 512.0;
+const PROCESS_LAYER_CHOICES: [ProcessLayer; 8] = [
+    ProcessLayer::Diffusion,
+    ProcessLayer::Poly,
+    ProcessLayer::Contact,
+    ProcessLayer::Metal1,
+    ProcessLayer::Via1,
+    ProcessLayer::Metal2,
+    ProcessLayer::Oxide,
+    ProcessLayer::Annotation,
+];
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Tool {
     Select,
     Rect,
@@ -130,7 +145,7 @@ enum Tool {
     Route,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum ViewMode {
     Workflow,
     Layout2d,
@@ -228,6 +243,31 @@ impl ViewMode {
         }
     }
 
+    fn rail_label(self) -> &'static str {
+        match self {
+            Self::Workflow => "Home",
+            Self::Layout2d => "Layout",
+            Self::Layout3d => "3D",
+            Self::MaskPrep => "Reticle",
+            Self::LayoutDiff => "Diff",
+            Self::FabControl => "Fab",
+            Self::Inventory => "Inv",
+            Self::Maintenance => "Maint",
+            Self::Environment => "Env",
+            Self::Scheduler => "Dispatch",
+            Self::Safety => "Safety",
+            Self::SpcFdc => "SPC",
+            Self::ProcessFlow => "Flow",
+            Self::ProcessControl => "R2R",
+            Self::CrossSection => "X-sec",
+            Self::Traceability => "Trace",
+            Self::Experiment => "DOE",
+            Self::Metrology => "Metro",
+            Self::Yield => "Yield",
+            Self::Notebook => "Notes",
+        }
+    }
+
     fn status_message(self) -> &'static str {
         match self {
             Self::Workflow => "integrated FabOS workflow",
@@ -301,6 +341,32 @@ enum ModuleGroup {
     Engineering,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommandAction {
+    SelectView(ViewMode),
+    ToggleRail(ViewMode),
+    SelectTool(Tool),
+    RunDrc,
+    LoadDemo,
+    NewBlank,
+    LoadStress(usize),
+    LoadHierarchy,
+    ShowOptions,
+    ToggleGrid2d,
+    ToggleGrid3d,
+    ToggleDrcOverlay,
+    ToggleOrigin,
+    Reset3d,
+    ToggleFullscreen,
+}
+
+#[derive(Clone, Debug)]
+struct CommandEntry {
+    label: String,
+    detail: String,
+    action: CommandAction,
+}
+
 impl ModuleGroup {
     const ALL: [Self; 4] = [
         Self::Design,
@@ -316,6 +382,83 @@ impl ModuleGroup {
             Self::Analysis => "Analysis",
             Self::Engineering => "Engineering",
         }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct AppContext {
+    active: Option<FabObjectRef>,
+    lot: Option<String>,
+    wafer: Option<String>,
+    tool: Option<String>,
+    recipe: Option<String>,
+    material_lot: Option<String>,
+}
+
+impl AppContext {
+    fn from_selections(
+        selected_mes_lot: Option<&LotId>,
+        selected_yield_lot: &str,
+        selected_yield_wafer: &str,
+        selected_tool: Option<&EquipmentToolId>,
+    ) -> Self {
+        let mut context = Self::default();
+        if let Some(lot_id) = selected_mes_lot {
+            context.set_lot(lot_id.as_str().to_string());
+        } else if !selected_yield_lot.is_empty() {
+            context.set_lot(selected_yield_lot.to_string());
+        }
+        if !selected_yield_wafer.is_empty() {
+            context.wafer = Some(selected_yield_wafer.to_string());
+        }
+        if let Some(tool_id) = selected_tool {
+            context.tool = Some(tool_id.as_str().to_string());
+        }
+        context
+    }
+
+    fn focus_lot(&self) -> Option<&str> {
+        self.lot.as_deref()
+    }
+
+    fn focus_tool(&self) -> Option<&str> {
+        self.tool.as_deref()
+    }
+
+    fn focus_recipe(&self) -> Option<&str> {
+        self.recipe.as_deref()
+    }
+
+    fn set_lot(&mut self, lot_id: String) {
+        self.active = Some(FabObjectRef::lot(lot_id.clone()));
+        self.lot = Some(lot_id);
+    }
+
+    fn set_wafer(&mut self, wafer_id: String) {
+        self.active = Some(FabObjectRef::wafer(wafer_id.clone()));
+        self.wafer = Some(wafer_id);
+    }
+
+    fn set_tool(&mut self, tool_id: String) {
+        self.active = Some(FabObjectRef::tool(tool_id.clone()));
+        self.tool = Some(tool_id);
+    }
+
+    fn set_recipe(&mut self, recipe_id: String) {
+        self.active = Some(FabObjectRef::recipe(recipe_id.clone()));
+        self.recipe = Some(recipe_id);
+    }
+
+    fn set_material_lot(&mut self, material_lot_id: String) {
+        self.active = Some(FabObjectRef::material_lot(material_lot_id.clone()));
+        self.material_lot = Some(material_lot_id);
+    }
+
+    fn active_label(&self) -> String {
+        self.active
+            .as_ref()
+            .map(FabObjectRef::label)
+            .unwrap_or_else(|| "No object selected".to_string())
     }
 }
 
@@ -392,6 +535,7 @@ struct EditorSettings {
     show_grid_2d: bool,
     show_grid_3d: bool,
     show_origin_marker: bool,
+    show_drc_overlay: bool,
     min_grid_pixels: f32,
     units: UnitDisplay,
     unit_precision: usize,
@@ -407,7 +551,8 @@ impl Default for EditorSettings {
             snap_enabled: true,
             show_grid_2d: true,
             show_grid_3d: true,
-            show_origin_marker: true,
+            show_origin_marker: false,
+            show_drc_overlay: false,
             min_grid_pixels: 24.0,
             units: UnitDisplay::Auto,
             unit_precision: 2,
@@ -869,6 +1014,7 @@ pub struct FabricadApp {
     yield_analysis: YieldAnalysis,
     selected_yield_lot: String,
     selected_yield_wafer: String,
+    app_context: AppContext,
     workflow_panel: WorkflowPanel,
     mask_panel: MaskPrepPanel,
     layout_diff_panel: LayoutDiffPanel,
@@ -891,6 +1037,15 @@ pub struct FabricadApp {
     connectivity: ConnectivityReport,
     show_hidden_markers: bool,
     show_waived_markers: bool,
+    drc_marker_filter: String,
+    connectivity_filter: String,
+    nav_rail_modes: BTreeSet<ViewMode>,
+    show_command_palette: bool,
+    show_sidebar_modules: bool,
+    show_inspector_drawer: bool,
+    show_layers_drawer: bool,
+    command_palette_query: String,
+    fullscreen: bool,
     selected: BTreeSet<ShapeId>,
     selected_occurrence: Option<ShapeOccurrenceId>,
     active_layer: LayerId,
@@ -939,6 +1094,7 @@ pub struct FabricadApp {
     collab: Option<CollabClient>,
     cell_name_drafts: BTreeMap<CellId, String>,
     instance_name_drafts: BTreeMap<(CellId, InstanceId), String>,
+    layer_name_drafts: BTreeMap<LayerId, String>,
     mes: FabMesData,
     selected_mes_lot: Option<LotId>,
     show_mes_panel: bool,
@@ -957,11 +1113,90 @@ pub struct FabricadApp {
     benchmark_3d: Option<Benchmark3dState>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartupView {
+    Workflow,
+    Layout2d,
+    Layout3d,
+    MaskPrep,
+    LayoutDiff,
+    FabControl,
+    Inventory,
+    Maintenance,
+    Environment,
+    Scheduler,
+    Safety,
+    Traceability,
+    Metrology,
+    Yield,
+    SpcFdc,
+    ProcessFlow,
+    ProcessControl,
+    CrossSection,
+    Experiment,
+    Notebook,
+}
+
+impl StartupView {
+    pub fn from_slug(value: &str) -> Option<Self> {
+        match value {
+            "workflow" | "home" => Some(Self::Workflow),
+            "layout" | "layout2d" | "mask-layout" => Some(Self::Layout2d),
+            "3d" | "layout3d" | "viewport3d" => Some(Self::Layout3d),
+            "reticle" | "mask-prep" | "maskprep" => Some(Self::MaskPrep),
+            "diff" | "layout-diff" | "layoutdiff" => Some(Self::LayoutDiff),
+            "fab" | "equipment" | "fab-control" => Some(Self::FabControl),
+            "inventory" => Some(Self::Inventory),
+            "maintenance" => Some(Self::Maintenance),
+            "environment" => Some(Self::Environment),
+            "dispatch" | "scheduler" => Some(Self::Scheduler),
+            "safety" => Some(Self::Safety),
+            "traceability" | "trace" => Some(Self::Traceability),
+            "metrology" | "metro" => Some(Self::Metrology),
+            "yield" => Some(Self::Yield),
+            "spc" | "spc-fdc" | "spcfdc" => Some(Self::SpcFdc),
+            "process-flow" | "processflow" | "flow" => Some(Self::ProcessFlow),
+            "r2r" | "process-control" | "processcontrol" => Some(Self::ProcessControl),
+            "cross-section" | "crosssection" | "xsec" => Some(Self::CrossSection),
+            "doe" | "experiment" => Some(Self::Experiment),
+            "notebook" | "notes" => Some(Self::Notebook),
+            _ => None,
+        }
+    }
+
+    fn view_mode(self) -> ViewMode {
+        match self {
+            Self::Workflow => ViewMode::Workflow,
+            Self::Layout2d => ViewMode::Layout2d,
+            Self::Layout3d => ViewMode::Layout3d,
+            Self::MaskPrep => ViewMode::MaskPrep,
+            Self::LayoutDiff => ViewMode::LayoutDiff,
+            Self::FabControl => ViewMode::FabControl,
+            Self::Inventory => ViewMode::Inventory,
+            Self::Maintenance => ViewMode::Maintenance,
+            Self::Environment => ViewMode::Environment,
+            Self::Scheduler => ViewMode::Scheduler,
+            Self::Safety => ViewMode::Safety,
+            Self::Traceability => ViewMode::Traceability,
+            Self::Metrology => ViewMode::Metrology,
+            Self::Yield => ViewMode::Yield,
+            Self::SpcFdc => ViewMode::SpcFdc,
+            Self::ProcessFlow => ViewMode::ProcessFlow,
+            Self::ProcessControl => ViewMode::ProcessControl,
+            Self::CrossSection => ViewMode::CrossSection,
+            Self::Experiment => ViewMode::Experiment,
+            Self::Notebook => ViewMode::Notebook,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StartupOptions {
+    pub demo_workspace: bool,
     pub stress_count: Option<usize>,
     pub hierarchy_demo: bool,
     pub view_3d: bool,
+    pub view_mode: Option<StartupView>,
     pub benchmark_3d: Option<Benchmark3dOptions>,
     pub show_options: bool,
     pub select_first_shape: bool,
@@ -1033,7 +1268,7 @@ impl WorkspaceDataset {
     fn blank() -> Self {
         Self {
             schema_version: 1,
-            document: Document::new("Untitled layout"),
+            document: blank_layout_document("Untitled layout"),
             mes: empty_mes_data(),
             yield_analysis: empty_yield_analysis(),
             wafer_map: empty_wafer_map(),
@@ -1076,12 +1311,23 @@ impl WorkspaceDataset {
     }
 }
 
+fn blank_layout_document(name: impl Into<String>) -> Document {
+    let mut document = Document::new(name);
+    document.layers.clear();
+    document.next_layer_id = 1;
+    document
+}
+
 fn empty_mes_data() -> FabMesData {
     FabMesData {
         routes: BTreeMap::new(),
         lots: BTreeMap::new(),
         travelers: BTreeMap::new(),
     }
+}
+
+fn default_nav_rail_modes() -> BTreeSet<ViewMode> {
+    ViewMode::ALL.into_iter().collect()
 }
 
 fn empty_yield_analysis() -> YieldAnalysis {
@@ -1116,7 +1362,7 @@ async fn run_offscreen_render_async(
 ) -> Result<OffscreenRenderReport, Box<dyn std::error::Error>> {
     let width = options.width.max(1);
     let height = options.height.max(1);
-    let zoom = options.zoom.clamp(0.001, 32.0);
+    let zoom = options.zoom.clamp(LAYOUT_MIN_ZOOM, LAYOUT_MAX_ZOOM);
     if width != options.width {
         warn!(
             requested_width = options.width,
@@ -1222,6 +1468,12 @@ impl FabricadApp {
         let selected_mes_lot = mes.lots.keys().next().cloned();
         let equipment_sim = dataset.equipment;
         let selected_equipment_tool = equipment_sim.tools().next().map(|tool| tool.id.clone());
+        let app_context = AppContext::from_selections(
+            selected_mes_lot.as_ref(),
+            &selected_yield_lot,
+            &selected_yield_wafer,
+            selected_equipment_tool.as_ref(),
+        );
         let workflow_panel = WorkflowPanel::default();
         let mask_panel = MaskPrepPanel::new(&document, &mes, selected_mes_lot.as_ref());
         let layout_diff_panel = LayoutDiffPanel::default();
@@ -1246,6 +1498,7 @@ impl FabricadApp {
             yield_analysis,
             selected_yield_lot,
             selected_yield_wafer,
+            app_context,
             workflow_panel,
             mask_panel,
             layout_diff_panel,
@@ -1268,6 +1521,15 @@ impl FabricadApp {
             connectivity,
             show_hidden_markers: false,
             show_waived_markers: true,
+            drc_marker_filter: String::new(),
+            connectivity_filter: String::new(),
+            nav_rail_modes: default_nav_rail_modes(),
+            show_command_palette: false,
+            show_sidebar_modules: false,
+            show_inspector_drawer: false,
+            show_layers_drawer: false,
+            command_palette_query: String::new(),
+            fullscreen: false,
             selected: BTreeSet::new(),
             selected_occurrence: None,
             active_layer,
@@ -1319,6 +1581,7 @@ impl FabricadApp {
             collab: None,
             cell_name_drafts: BTreeMap::new(),
             instance_name_drafts: BTreeMap::new(),
+            layer_name_drafts: BTreeMap::new(),
             mes,
             selected_mes_lot,
             show_mes_panel: true,
@@ -1342,6 +1605,14 @@ impl FabricadApp {
 
     pub fn new_with_options(cc: &eframe::CreationContext<'_>, options: StartupOptions) -> Self {
         let mut app = Self::new(cc);
+        if options.demo_workspace {
+            app.apply_workspace_dataset(
+                WorkspaceDataset::demo(),
+                DataSource::Demo,
+                DataSource::Demo,
+                "test workspace: demo",
+            );
+        }
         if options.hierarchy_demo {
             app.document = Document::hierarchy_demo();
             app.apply_current_technology_to_document();
@@ -1373,7 +1644,7 @@ impl FabricadApp {
         }
         app.reset_3d_camera_to_document();
         if let Some(zoom) = options.zoom {
-            let clamped = zoom.clamp(0.008, 4.0);
+            let clamped = zoom.clamp(LAYOUT_MIN_ZOOM, LAYOUT_MAX_ZOOM);
             if (clamped - zoom).abs() > f32::EPSILON {
                 warn!(
                     requested_zoom = zoom,
@@ -1395,7 +1666,12 @@ impl FabricadApp {
         if options.hierarchy_workflow_demo {
             app.apply_hierarchy_workflow_demo();
         }
-        if options.view_3d {
+        if let Some(view_mode) = options.view_mode.map(StartupView::view_mode) {
+            app.view_mode = view_mode;
+            if matches!(view_mode, ViewMode::Layout3d) {
+                app.reset_3d_camera_to_document();
+            }
+        } else if options.view_3d {
             app.view_mode = ViewMode::Layout3d;
             app.reset_3d_camera_to_document();
         }
@@ -1606,9 +1882,9 @@ impl FabricadApp {
                 self.rules = rules;
             }
             Err(err) => {
-                self.rules = RuleDeck::demo(&self.document);
+                self.rules = empty_rule_deck(self.document.grid);
                 self.set_error_status(format!(
-                    "technology rule load failed: {err}; using demo rule deck"
+                    "technology rule load failed: {err}; DRC rules disabled"
                 ));
             }
         }
@@ -1675,6 +1951,7 @@ impl FabricadApp {
     fn clear_edit_drafts(&mut self) {
         self.cell_name_drafts.clear();
         self.instance_name_drafts.clear();
+        self.layer_name_drafts.clear();
     }
 
     fn reset_loro_log_from_document(&mut self) {
@@ -2278,7 +2555,7 @@ impl FabricadApp {
         self.rerun_drc();
     }
 
-    fn add_shape(&mut self, layer: LayerId, kind: ShapeKind) -> ShapeId {
+    fn add_shape(&mut self, layer: LayerId, kind: ShapeKind) -> Option<ShapeId> {
         self.add_shape_with_metadata(layer, kind, None, None)
     }
 
@@ -2288,7 +2565,11 @@ impl FabricadApp {
         kind: ShapeKind,
         net: Option<NetId>,
         name: Option<String>,
-    ) -> ShapeId {
+    ) -> Option<ShapeId> {
+        if !self.document.layers.contains_key(&layer) {
+            self.status = "add a layer before drawing".to_string();
+            return None;
+        }
         let id = self.document.allocate_shape_id();
         let shape = Shape {
             id,
@@ -2305,7 +2586,7 @@ impl FabricadApp {
         self.selected.clear();
         self.selected.insert(id);
         self.selected_occurrence = Some(ShapeOccurrenceId::top_level(id));
-        id
+        Some(id)
     }
 
     fn add_layer_from_ui(&mut self) {
@@ -2328,7 +2609,7 @@ impl FabricadApp {
         ];
         let layer = Layer {
             id,
-            name: format!("layer {}", id.0),
+            name: format!("Layer {}", self.document.layers.len() + 1),
             process: ProcessLayer::Metal1,
             purpose: "custom".to_string(),
             color: palette[id.0 as usize % palette.len()],
@@ -2348,12 +2629,7 @@ impl FabricadApp {
         self.status = format!("added {}", layer.name);
     }
 
-    fn remove_active_layer(&mut self) {
-        if self.document.layers.len() <= 1 {
-            self.status = "cannot remove the last layer".to_string();
-            return;
-        }
-        let id = self.active_layer;
+    fn remove_layer_by_id(&mut self, id: LayerId) {
         let Some(layer) = self.document.layers.get(&id).cloned() else {
             self.reset_active_layer();
             self.status = "active layer was missing".to_string();
@@ -2392,6 +2668,22 @@ impl FabricadApp {
             shape_count,
             if shape_count == 1 { "" } else { "s" }
         );
+    }
+
+    fn rename_layer(&mut self, id: LayerId, name: String) {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            self.status = "layer name cannot be empty".to_string();
+            return;
+        }
+        let Some(layer) = self.document.layers.get_mut(&id) else {
+            self.status = "layer was missing".to_string();
+            return;
+        };
+        if layer.name != trimmed {
+            layer.name = trimmed.to_string();
+            self.status = format!("renamed layer {}", layer.name);
+        }
     }
 
     fn move_shape(&mut self, id: ShapeId, delta: Vector) {
@@ -2750,6 +3042,51 @@ impl FabricadApp {
         self.status = format!("renamed cell to {name}");
     }
 
+    fn create_empty_cell(&mut self) {
+        let cell_id = self.document.allocate_cell_id();
+        let cell = Cell::new(cell_id, format!("cell {}", cell_id.0));
+        let redo = Operation::AddCell { cell: cell.clone() };
+        let undo = Operation::DeleteCell { id: cell_id };
+        self.apply_with_history(redo, undo);
+        self.status = format!("created {}", cell.name);
+    }
+
+    fn delete_cell(&mut self, id: CellId) {
+        if id == self.document.top_cell {
+            self.status = "cannot delete the top cell".to_string();
+            return;
+        }
+        let instance_count = self.cell_instance_count(id);
+        if instance_count > 0 {
+            self.status = format!("cannot delete cell with {instance_count} instance(s)");
+            return;
+        }
+        let Some(cell) = self.document.cell(id).cloned() else {
+            self.status = "cell no longer exists".to_string();
+            return;
+        };
+        let redo = Operation::DeleteCell { id };
+        let undo = Operation::AddCell { cell: cell.clone() };
+        self.apply_with_history(redo, undo);
+        self.cell_name_drafts.remove(&id);
+        self.selected.clear();
+        self.selected_occurrence = None;
+        self.status = format!("deleted {}", cell.name);
+    }
+
+    fn cell_instance_count(&self, id: CellId) -> usize {
+        self.document
+            .cells
+            .values()
+            .map(|cell| {
+                cell.instances
+                    .values()
+                    .filter(|instance| instance.cell == id)
+                    .count()
+            })
+            .sum()
+    }
+
     fn rename_instance(&mut self, parent: CellId, id: InstanceId, name: Option<String>) {
         let name = name.and_then(|name| {
             let trimmed = name.trim().to_string();
@@ -2965,6 +3302,12 @@ impl FabricadApp {
             .tools()
             .next()
             .map(|tool| tool.id.clone());
+        self.app_context = AppContext::from_selections(
+            self.selected_mes_lot.as_ref(),
+            &self.selected_yield_lot,
+            &self.selected_yield_wafer,
+            self.selected_equipment_tool.as_ref(),
+        );
         self.equipment_recipe_drafts.clear();
         self.last_equipment_tick = Instant::now();
         self.status = label.to_string();
@@ -2988,6 +3331,260 @@ impl FabricadApp {
             .unwrap_or_default();
         if self.selected_yield_wafer.is_empty() {
             warn!("selected yield lot has no wafers; selected yield wafer defaults to empty");
+        }
+    }
+
+    fn ensure_app_context(&mut self) {
+        let lot_ids = self.context_lot_ids();
+        if !lot_ids.is_empty()
+            && self
+                .app_context
+                .focus_lot()
+                .is_none_or(|lot_id| !lot_ids.iter().any(|candidate| candidate == lot_id))
+        {
+            let lot_id = lot_ids
+                .iter()
+                .find(|lot_id| lot_id.as_str() == "L-00042")
+                .cloned()
+                .or_else(|| {
+                    self.selected_mes_lot
+                        .as_ref()
+                        .map(|lot_id| lot_id.as_str().to_string())
+                })
+                .or_else(|| lot_ids.first().cloned());
+            if let Some(lot_id) = lot_id {
+                self.apply_focus_object(FabObjectRef::lot(lot_id), false);
+            }
+        }
+
+        let tool_ids = self.context_tool_ids();
+        if !tool_ids.is_empty()
+            && self
+                .app_context
+                .focus_tool()
+                .is_none_or(|tool_id| !tool_ids.iter().any(|candidate| candidate == tool_id))
+        {
+            if let Some(tool_id) = self
+                .selected_equipment_tool
+                .as_ref()
+                .map(|tool_id| tool_id.as_str().to_string())
+                .or_else(|| tool_ids.first().cloned())
+            {
+                self.app_context.set_tool(tool_id);
+            }
+        }
+
+        let recipe_ids = self.context_recipe_ids();
+        if !recipe_ids.is_empty()
+            && self
+                .app_context
+                .focus_recipe()
+                .is_none_or(|recipe_id| !recipe_ids.iter().any(|candidate| candidate == recipe_id))
+        {
+            if let Some(recipe_id) = recipe_ids.first().cloned() {
+                self.app_context.set_recipe(recipe_id);
+            }
+        }
+    }
+
+    fn context_lot_ids(&self) -> Vec<String> {
+        let mut ids = BTreeSet::new();
+        ids.extend(self.mes.lots.keys().map(|id| id.as_str().to_string()));
+        ids.extend(
+            self.scheduler_panel
+                .schedule()
+                .lots
+                .iter()
+                .map(|lot| lot.id.as_str().to_string()),
+        );
+        ids.extend(self.yield_analysis.lots.iter().map(|lot| lot.id.clone()));
+        ids.extend(
+            self.notebook_panel
+                .notebook()
+                .entries
+                .iter()
+                .flat_map(|entry| entry.links.lots.iter().map(|lot| lot.as_str().to_string())),
+        );
+        ids.into_iter().collect()
+    }
+
+    fn context_tool_ids(&self) -> Vec<String> {
+        let mut ids = BTreeSet::new();
+        ids.extend(
+            self.equipment_sim
+                .tools()
+                .map(|tool| tool.id.as_str().to_string()),
+        );
+        ids.extend(
+            self.scheduler_panel
+                .schedule()
+                .tools
+                .iter()
+                .map(|tool| tool.id.as_str().to_string()),
+        );
+        ids.extend(self.mes.routes.values().flat_map(|route| {
+            route.steps.iter().flat_map(|step| {
+                step.eligible_tools
+                    .iter()
+                    .map(|tool| tool.as_str().to_string())
+            })
+        }));
+        ids.into_iter().collect()
+    }
+
+    fn context_recipe_ids(&self) -> Vec<String> {
+        let mut ids = BTreeSet::new();
+        ids.extend(
+            self.recipe_panel
+                .catalog()
+                .recipes
+                .keys()
+                .map(|id| id.as_str().to_string()),
+        );
+        ids.extend(
+            self.process_flow_panel
+                .model()
+                .route
+                .nodes
+                .iter()
+                .filter_map(|node| {
+                    node.recipe
+                        .as_ref()
+                        .map(|binding| binding.recipe_id.as_str().to_string())
+                }),
+        );
+        ids.extend(self.mes.routes.values().flat_map(|route| {
+            route
+                .steps
+                .iter()
+                .map(|step| step.required_recipe.as_str().to_string())
+        }));
+        ids.into_iter().collect()
+    }
+
+    fn set_focus_object(&mut self, object: FabObjectRef) {
+        self.apply_focus_object(object, true);
+    }
+
+    fn apply_focus_object(&mut self, object: FabObjectRef, announce: bool) {
+        match object.kind {
+            FabObjectKind::Lot => {
+                let lot_id = object.id;
+                self.app_context.set_lot(lot_id.clone());
+                self.workflow_panel.set_focus_lot(lot_id.clone());
+                let mes_lot_id = LotId::new(lot_id.clone());
+                if self.mes.lots.contains_key(&mes_lot_id) {
+                    self.selected_mes_lot = Some(mes_lot_id);
+                }
+                if self.yield_analysis.lots.iter().any(|lot| lot.id == lot_id) {
+                    self.selected_yield_lot = lot_id.clone();
+                    let wafer_ids = self.yield_analysis.wafer_ids_for_lot(&lot_id);
+                    if !wafer_ids.contains(&self.selected_yield_wafer) {
+                        self.selected_yield_wafer = wafer_ids.first().cloned().unwrap_or_default();
+                    }
+                }
+            }
+            FabObjectKind::Wafer => {
+                self.app_context.set_wafer(object.id.clone());
+                self.selected_yield_wafer = object.id;
+            }
+            FabObjectKind::Tool => {
+                let tool_id = object.id;
+                self.app_context.set_tool(tool_id.clone());
+                if self
+                    .equipment_sim
+                    .tools()
+                    .any(|tool| tool.id.as_str() == tool_id)
+                {
+                    self.selected_equipment_tool = Some(EquipmentToolId::new(tool_id));
+                }
+            }
+            FabObjectKind::Recipe => {
+                let recipe_id = object.id;
+                self.app_context.set_recipe(recipe_id.clone());
+                self.recipe_panel.select_recipe_id(&recipe_id);
+            }
+            FabObjectKind::MaterialLot => {
+                self.app_context.set_material_lot(object.id);
+            }
+            _ => {
+                self.app_context.active = Some(object);
+            }
+        }
+        if announce {
+            self.status = format!("context {}", self.app_context.active_label());
+        }
+    }
+
+    fn sync_workflow_focus_from_context(&mut self) {
+        if let Some(lot_id) = self.app_context.focus_lot() {
+            if self.workflow_panel.focus_lot() != lot_id {
+                self.workflow_panel.set_focus_lot(lot_id.to_string());
+            }
+        }
+    }
+
+    fn sync_context_from_workflow(&mut self) {
+        let lot_id = self.workflow_panel.focus_lot().to_string();
+        if !lot_id.is_empty() && self.app_context.focus_lot() != Some(lot_id.as_str()) {
+            self.apply_focus_object(FabObjectRef::lot(lot_id), false);
+        }
+    }
+
+    fn context_mes_action(&self) -> Option<(LotId, OperatorAction, String)> {
+        let lot_id = LotId::new(self.app_context.focus_lot()?.to_string());
+        let lot = self.mes.lots.get(&lot_id)?;
+        let traveler = self.mes.travelers.get(&lot_id)?;
+        let route = self.mes.routes.get(&lot.route_id)?;
+        match traveler.status {
+            TravelerStatus::WaitingForStep => {
+                let step = traveler.current_step(route)?;
+                let tool_id = step
+                    .primary_tool()
+                    .cloned()
+                    .unwrap_or_else(|| ToolId::new("NO-ELIGIBLE-TOOL"));
+                Some((
+                    lot_id,
+                    OperatorAction::StartStep {
+                        step_id: step.id.clone(),
+                        tool_id,
+                        tool_class: step.required_tool_class,
+                        recipe_id: step.required_recipe.clone(),
+                        operator: self.mes_action_operator(),
+                    },
+                    format!("Start {}", step.id),
+                ))
+            }
+            TravelerStatus::Running => {
+                let run = traveler.active_run.as_ref()?;
+                Some((
+                    lot_id,
+                    OperatorAction::CompleteStep {
+                        step_id: run.step_id.clone(),
+                        operator: self.mes_action_operator(),
+                    },
+                    format!("Complete {}", run.step_id),
+                ))
+            }
+            TravelerStatus::WaitingForSignoff => {
+                let pending = traveler.pending_signoff.as_ref()?;
+                Some((
+                    lot_id,
+                    OperatorAction::SignOff {
+                        step_id: pending.run.step_id.clone(),
+                        operator: self.mes_action_operator(),
+                    },
+                    format!("Sign off {}", pending.run.step_id),
+                ))
+            }
+            TravelerStatus::OnHold => Some((
+                lot_id,
+                OperatorAction::ReleaseHold {
+                    operator: self.mes_action_operator(),
+                },
+                "Release hold".to_string(),
+            )),
+            TravelerStatus::Complete | TravelerStatus::Scrapped => None,
         }
     }
 
@@ -3310,7 +3907,7 @@ impl FabricadApp {
                     .name
                     .clone()
                     .or_else(|| route_net.net.map(|net| format!("NET{}", net.0)));
-                self.add_shape_with_metadata(
+                let placed = self.add_shape_with_metadata(
                     self.active_layer,
                     ShapeKind::Path {
                         points: route.points,
@@ -3319,13 +3916,17 @@ impl FabricadApp {
                     route_net.net,
                     route_net.name,
                 );
-                self.status = if let Some(net_label) = net_label {
-                    format!(
-                        "route placed on {net_label} with {point_count} points after {visited} visited nodes"
-                    )
-                } else {
-                    format!("route placed with {point_count} points after {visited} visited nodes")
-                };
+                if placed.is_some() {
+                    self.status = if let Some(net_label) = net_label {
+                        format!(
+                            "route placed on {net_label} with {point_count} points after {visited} visited nodes"
+                        )
+                    } else {
+                        format!(
+                            "route placed with {point_count} points after {visited} visited nodes"
+                        )
+                    };
+                }
             }
             Err(err) => {
                 self.status = format!("route failed: {err:?}");
@@ -3377,6 +3978,16 @@ impl FabricadApp {
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         let wants_keyboard = ctx.wants_keyboard_input();
         ctx.input(|input| {
+            if (input.modifiers.ctrl || input.modifiers.command)
+                && input.modifiers.shift
+                && input.key_pressed(Key::P)
+            {
+                self.show_command_palette = true;
+                self.command_palette_query.clear();
+            }
+            if input.key_pressed(Key::F11) {
+                self.toggle_fullscreen(ctx);
+            }
             if self.settings.single_key_shortcuts {
                 if input.key_pressed(Key::Num1) {
                     self.tool = Tool::Select;
@@ -3413,7 +4024,10 @@ impl FabricadApp {
                 if input.modifiers.command && input.key_pressed(Key::D) {
                     self.duplicate_selection();
                 }
-                if self.settings.single_key_shortcuts && !input.modifiers.any() {
+                if self.settings.single_key_shortcuts
+                    && !input.modifiers.any()
+                    && matches!(self.view_mode, ViewMode::Layout2d)
+                {
                     if input.key_pressed(Key::R) {
                         self.rotate_selected_90();
                     }
@@ -3525,30 +4139,37 @@ impl FabricadApp {
                 &format!("Sim time: {} s", self.equipment_sim.now_s),
                 |_| {},
             );
-            ui.horizontal_wrapped(|ui| {
-                ui_chrome::metric_tile(ui, "Tools", tools.len(), "");
-                ui_chrome::metric_tile_tone(
-                    ui,
-                    "Running",
-                    tools
-                        .iter()
-                        .filter(|tool| tool.state == EquipmentToolState::Running)
-                        .count(),
-                    "",
-                    ui_chrome::Tone::Success,
-                );
-                ui_chrome::metric_tile_tone(
-                    ui,
-                    "Active alarms",
-                    self.equipment_sim.active_alarms().len(),
-                    "",
-                    if self.equipment_sim.active_alarms().is_empty() {
-                        ui_chrome::Tone::Neutral
-                    } else {
-                        ui_chrome::Tone::Danger
-                    },
-                );
-            });
+            ui_chrome::metric_tiles(
+                ui,
+                &[
+                    (
+                        "Tools",
+                        tools.len().to_string(),
+                        "",
+                        ui_chrome::Tone::Neutral,
+                    ),
+                    (
+                        "Running",
+                        tools
+                            .iter()
+                            .filter(|tool| tool.state == EquipmentToolState::Running)
+                            .count()
+                            .to_string(),
+                        "",
+                        ui_chrome::Tone::Success,
+                    ),
+                    (
+                        "Active alarms",
+                        self.equipment_sim.active_alarms().len().to_string(),
+                        "",
+                        if self.equipment_sim.active_alarms().is_empty() {
+                            ui_chrome::Tone::Neutral
+                        } else {
+                            ui_chrome::Tone::Danger
+                        },
+                    ),
+                ],
+            );
             ui.separator();
 
             let wide = ui.available_width() > 980.0;
@@ -3582,111 +4203,125 @@ impl FabricadApp {
                 420.0
             })
             .show(ui, |ui| {
-                egui::Grid::new("equipment_tool_grid")
-                    .num_columns(5)
-                    .striped(true)
-                    .spacing(vec2(14.0, 8.0))
+                egui::ScrollArea::horizontal()
+                    .id_salt("equipment_tool_grid_horizontal")
+                    .auto_shrink([false, true])
                     .show(ui, |ui| {
-                        ui.strong("Tool");
-                        ui.strong("State");
-                        ui.strong("Recipe / run");
-                        ui.strong("Sensors");
-                        ui.strong("Commands");
-                        ui.end_row();
+                        egui::Grid::new("equipment_tool_grid")
+                            .num_columns(5)
+                            .striped(true)
+                            .spacing(vec2(14.0, 8.0))
+                            .show(ui, |ui| {
+                                ui.strong("Tool");
+                                ui.strong("State");
+                                ui.strong("Recipe / run");
+                                ui.strong("Sensors");
+                                ui.strong("Commands");
+                                ui.end_row();
 
-                        for tool in tools {
-                            let selected = self.selected_equipment_tool.as_ref() == Some(&tool.id);
-                            let label = format!("{}\n{}", tool.name, tool.id);
-                            if ui.selectable_label(selected, label).clicked() {
-                                self.selected_equipment_tool = Some(tool.id.clone());
-                            }
+                                for tool in tools {
+                                    let selected =
+                                        self.selected_equipment_tool.as_ref() == Some(&tool.id);
+                                    let label = format!("{}\n{}", tool.name, tool.id);
+                                    if ui.selectable_label(selected, label).clicked() {
+                                        self.set_focus_object(FabObjectRef::tool(
+                                            tool.id.as_str().to_string(),
+                                        ));
+                                    }
 
-                            ui.label(
-                                egui::RichText::new(tool.state.label())
-                                    .color(equipment_state_color(tool.state))
-                                    .strong(),
-                            );
-                            ui.label(equipment_recipe_run_summary(tool, self.equipment_sim.now_s));
-                            ui.label(equipment_recent_sensor_summary(tool));
-
-                            ui.horizontal_wrapped(|ui| {
-                                if ui
-                                    .add_enabled(
-                                        tool.state == EquipmentToolState::Offline,
-                                        egui::Button::new("Online"),
-                                    )
-                                    .clicked()
-                                {
-                                    pending_command =
-                                        Some((tool.id.clone(), HostCommand::BringOnline));
-                                }
-                                if let Some(recipe_id) = self.selected_recipe_for_tool(tool)
-                                    && ui
-                                        .add_enabled(
-                                            tool.state.accepts_recipe_load(),
-                                            egui::Button::new("Load"),
-                                        )
-                                        .clicked()
-                                {
-                                    pending_command = Some((
-                                        tool.id.clone(),
-                                        HostCommand::LoadRecipe {
-                                            selection: self.selection_for_tool(tool, recipe_id),
-                                        },
+                                    ui.label(
+                                        egui::RichText::new(tool.state.label())
+                                            .color(equipment_state_color(tool.state))
+                                            .strong(),
+                                    );
+                                    ui.label(equipment_recipe_run_summary(
+                                        tool,
+                                        self.equipment_sim.now_s,
                                     ));
-                                }
-                                if ui
-                                    .add_enabled(
-                                        tool.state == EquipmentToolState::RecipeLoaded,
-                                        egui::Button::new("Start"),
-                                    )
-                                    .clicked()
-                                {
-                                    pending_command = Some((tool.id.clone(), HostCommand::Start));
-                                }
-                                if ui
-                                    .add_enabled(
-                                        tool.state == EquipmentToolState::Running,
-                                        egui::Button::new("Stop"),
-                                    )
-                                    .clicked()
-                                {
-                                    pending_command = Some((tool.id.clone(), HostCommand::Stop));
-                                }
-                                if ui
-                                    .add_enabled(
-                                        !matches!(
-                                            tool.state,
-                                            EquipmentToolState::Offline
-                                                | EquipmentToolState::Maintenance
-                                        ),
-                                        egui::Button::new("Alarm"),
-                                    )
-                                    .clicked()
-                                {
-                                    pending_command = Some((
-                                        tool.id.clone(),
-                                        HostCommand::TriggerAlarm {
-                                            code: "HOST-SIM".to_string(),
-                                            message: "operator injected simulator alarm"
-                                                .to_string(),
-                                            severity: AlarmSeverity::Warning,
-                                        },
-                                    ));
-                                }
-                                if ui
-                                    .add_enabled(
-                                        tool.state == EquipmentToolState::Alarm,
-                                        egui::Button::new("Clear"),
-                                    )
-                                    .clicked()
-                                {
-                                    pending_command =
-                                        Some((tool.id.clone(), HostCommand::ClearAlarm));
+                                    ui.label(equipment_recent_sensor_summary(tool));
+
+                                    ui.horizontal_wrapped(|ui| {
+                                        if ui
+                                            .add_enabled(
+                                                tool.state == EquipmentToolState::Offline,
+                                                egui::Button::new("Online"),
+                                            )
+                                            .clicked()
+                                        {
+                                            pending_command =
+                                                Some((tool.id.clone(), HostCommand::BringOnline));
+                                        }
+                                        if let Some(recipe_id) = self.selected_recipe_for_tool(tool)
+                                            && ui
+                                                .add_enabled(
+                                                    tool.state.accepts_recipe_load(),
+                                                    egui::Button::new("Load"),
+                                                )
+                                                .clicked()
+                                        {
+                                            pending_command = Some((
+                                                tool.id.clone(),
+                                                HostCommand::LoadRecipe {
+                                                    selection: self
+                                                        .selection_for_tool(tool, recipe_id),
+                                                },
+                                            ));
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                tool.state == EquipmentToolState::RecipeLoaded,
+                                                egui::Button::new("Start"),
+                                            )
+                                            .clicked()
+                                        {
+                                            pending_command =
+                                                Some((tool.id.clone(), HostCommand::Start));
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                tool.state == EquipmentToolState::Running,
+                                                egui::Button::new("Stop"),
+                                            )
+                                            .clicked()
+                                        {
+                                            pending_command =
+                                                Some((tool.id.clone(), HostCommand::Stop));
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                !matches!(
+                                                    tool.state,
+                                                    EquipmentToolState::Offline
+                                                        | EquipmentToolState::Maintenance
+                                                ),
+                                                egui::Button::new("Alarm"),
+                                            )
+                                            .clicked()
+                                        {
+                                            pending_command = Some((
+                                                tool.id.clone(),
+                                                HostCommand::TriggerAlarm {
+                                                    code: "HOST-SIM".to_string(),
+                                                    message: "operator injected simulator alarm"
+                                                        .to_string(),
+                                                    severity: AlarmSeverity::Warning,
+                                                },
+                                            ));
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                tool.state == EquipmentToolState::Alarm,
+                                                egui::Button::new("Clear"),
+                                            )
+                                            .clicked()
+                                        {
+                                            pending_command =
+                                                Some((tool.id.clone(), HostCommand::ClearAlarm));
+                                        }
+                                    });
+                                    ui.end_row();
                                 }
                             });
-                            ui.end_row();
-                        }
                     });
             });
 
@@ -3979,31 +4614,45 @@ impl FabricadApp {
     }
 
     fn navigation_panel(&mut self, ctx: &egui::Context) {
+        let width = if Self::viewport_width(ctx) < 600.0 {
+            84.0
+        } else {
+            ui_chrome::NAV_WIDTH
+        };
         egui::SidePanel::left("app_navigation")
             .resizable(false)
-            .default_width(ui_chrome::NAV_WIDTH)
+            .default_width(width)
             .show(ctx, |ui| {
-                ui.set_width(ui_chrome::NAV_WIDTH - 18.0);
-                ui.add_space(6.0);
+                ui.set_width(width - 18.0);
+                ui.add_space(4.0);
 
                 egui::ScrollArea::vertical()
                     .id_salt("app_navigation_scroll")
                     .show(ui, |ui| {
-                        for group in ModuleGroup::ALL {
-                            ui_chrome::section_label(ui, group.label());
-                            for mode in ViewMode::ALL
-                                .into_iter()
-                                .filter(|candidate| candidate.group() == group)
+                        let visible_modes = ViewMode::ALL
+                            .iter()
+                            .copied()
+                            .filter(|mode| self.nav_rail_modes.contains(mode))
+                            .collect::<Vec<_>>();
+                        if visible_modes.is_empty() {
+                            ui_chrome::empty_state(ui, "No pinned modules");
+                        }
+                        for mode in visible_modes {
+                            let selected = self.view_mode == mode;
+                            let label = if selected {
+                                RichText::new(mode.rail_label()).strong()
+                            } else {
+                                RichText::new(mode.rail_label())
+                            };
+                            if ui
+                                .add_sized(
+                                    [ui.available_width(), 24.0],
+                                    egui::Button::selectable(selected, label),
+                                )
+                                .on_hover_text(mode.title())
+                                .clicked()
                             {
-                                let selected = self.view_mode == mode;
-                                let label = if selected {
-                                    RichText::new(mode.nav_label()).strong()
-                                } else {
-                                    RichText::new(mode.nav_label())
-                                };
-                                if ui.selectable_label(selected, label).clicked() {
-                                    self.select_view_mode(mode);
-                                }
+                                self.select_view_mode(mode);
                             }
                         }
                     });
@@ -4039,150 +4688,503 @@ impl FabricadApp {
         self.select_view_mode(mode);
     }
 
+    fn handle_workflow_action(&mut self, action: WorkflowAction) {
+        match action {
+            WorkflowAction::Open(destination) => self.open_workflow_destination(destination),
+            WorkflowAction::LoadDemoWorkspace => self.load_demo_workspace(),
+        }
+    }
+
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.vertical(|ui| {
+            self.menu_bar(ui);
+            ui.allocate_ui_with_layout(
+                vec2(ui.available_width(), 30.0),
+                egui::Layout::left_to_right(Align::Center),
+                |ui| {
+                    ui.set_min_height(30.0);
+                    self.tool_strip(ui);
+                },
+            );
+        });
+    }
+
+    fn viewport_width(ctx: &egui::Context) -> f32 {
+        ctx.content_rect().width()
+    }
+
+    fn inline_side_panels(ctx: &egui::Context) -> bool {
+        Self::viewport_width(ctx) >= ui_chrome::INLINE_SIDE_PANEL_MIN_WIDTH
+    }
+
+    fn menu_bar(&mut self, ui: &mut egui::Ui) {
+        self.ensure_app_context();
+        let compact = ui.available_width() < ui_chrome::COMPACT_MENU_WIDTH;
+        ui.scope(|ui| {
+            let visuals = ui.visuals_mut();
+            visuals.widgets.inactive.bg_fill = Color32::TRANSPARENT;
+            visuals.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
+            visuals.widgets.inactive.corner_radius = 0.into();
+            visuals.widgets.hovered.corner_radius = 0.into();
+            visuals.widgets.active.corner_radius = 0.into();
+            ui.spacing_mut().button_padding = vec2(3.0, 2.0);
+            ui.spacing_mut().item_spacing = if compact {
+                vec2(8.0, 2.0)
+            } else {
+                vec2(10.0, 2.0)
+            };
             ui.horizontal(|ui| {
-                ui.label(RichText::new(self.view_mode.title()).strong());
-                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(RichText::new(format!("User {}", short_user(self.user_id))).small());
-                    ui.label(RichText::new(&self.status).color(ui.visuals().weak_text_color()));
-                });
+                ui.menu_button(menu_hotkey_label(ui, "File", 0), |ui| self.file_menu(ui));
+                ui.menu_button(menu_hotkey_label(ui, "Edit", 0), |ui| self.edit_menu(ui));
+                ui.menu_button(menu_hotkey_label(ui, "View", 0), |ui| self.view_menu(ui));
+                if compact {
+                    ui.menu_button("More", |ui| self.menu_bar_more(ui));
+                } else {
+                    ui.menu_button(menu_hotkey_label(ui, "Bookmarks", 0), |ui| {
+                        self.bookmarks_menu(ui)
+                    });
+                    ui.menu_button(menu_hotkey_label(ui, "Display", 0), |ui| {
+                        self.display_menu(ui)
+                    });
+                    ui.menu_button(menu_hotkey_label(ui, "Tools", 0), |ui| self.tools_menu(ui));
+                    ui.menu_button(menu_hotkey_label(ui, "Macros", 0), |ui| {
+                        self.macros_menu(ui)
+                    });
+                    ui.menu_button(menu_hotkey_label(ui, "Help", 0), |ui| self.help_menu(ui));
+
+                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(format!("User {}", short_user(self.user_id))).small(),
+                        );
+                        if let Some(status) = self.visible_status() {
+                            ui.label(RichText::new(status).color(ui.visuals().weak_text_color()));
+                        }
+                    });
+                }
             });
+        });
+    }
+
+    fn menu_bar_more(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("Bookmarks", |ui| self.bookmarks_menu(ui));
+        ui.menu_button("Display", |ui| self.display_menu(ui));
+        ui.menu_button("Tools", |ui| self.tools_menu(ui));
+        ui.menu_button("Macros", |ui| self.macros_menu(ui));
+        ui.menu_button("Help", |ui| self.help_menu(ui));
+    }
+
+    fn tool_strip(&mut self, ui: &mut egui::Ui) {
+        let compact = ui.available_width() < ui_chrome::COMPACT_TOOL_STRIP_WIDTH;
+        let drawer_mode = !Self::inline_side_panels(ui.ctx());
+        ui.scope(|ui| {
+            ui.spacing_mut().button_padding = vec2(5.0, 3.0);
+            ui.visuals_mut().widgets.inactive.corner_radius = 0.into();
+            ui.visuals_mut().widgets.hovered.corner_radius = 0.into();
+            ui.visuals_mut().widgets.active.corner_radius = 0.into();
             ui.horizontal_wrapped(|ui| {
-                let editing_mode = matches!(self.view_mode, ViewMode::Layout2d);
-                if editing_mode {
-                    ui.label("Tool");
+                if matches!(self.view_mode, ViewMode::Layout2d | ViewMode::Layout3d) {
+                    if ui
+                        .selectable_label(matches!(self.view_mode, ViewMode::Layout2d), "2D")
+                        .clicked()
+                    {
+                        self.select_view_mode(ViewMode::Layout2d);
+                    }
+                    if ui
+                        .selectable_label(matches!(self.view_mode, ViewMode::Layout3d), "3D")
+                        .clicked()
+                    {
+                        self.select_view_mode(ViewMode::Layout3d);
+                    }
+                    ui.separator();
+                }
+                if matches!(self.view_mode, ViewMode::Layout2d) {
+                    let can_delete = self.selected_instance_info().is_some()
+                        || !self.selected_top_level_shapes().is_empty();
                     tool_button(ui, &mut self.tool, Tool::Select, "Select");
                     tool_button(ui, &mut self.tool, Tool::Rect, "Rect");
                     tool_button(ui, &mut self.tool, Tool::Polygon, "Poly");
                     tool_button(ui, &mut self.tool, Tool::Path, "Path");
                     tool_button(ui, &mut self.tool, Tool::Via, "Via");
-                    tool_button(ui, &mut self.tool, Tool::Measure, "Measure");
-                    tool_button(ui, &mut self.tool, Tool::Route, "Route");
-                    let can_delete = self.selected_instance_info().is_some()
-                        || !self.selected_top_level_shapes().is_empty();
-                    if ui
-                        .add_enabled(can_delete, egui::Button::new("Delete"))
-                        .clicked()
-                    {
-                        self.delete_selection();
-                    }
-                    ui.separator();
-                }
-
-                if matches!(self.view_mode, ViewMode::Layout3d) {
-                    if ui.button("Reset 3D").clicked() {
-                        self.reset_3d_camera_to_document();
-                    }
-                    ui.separator();
-                }
-
-                if editing_mode {
-                    ui.menu_button("Edit", |ui| {
-                        if ui.button("Undo").clicked() {
-                            self.undo();
-                        }
-                        if ui.button("Redo").clicked() {
-                            self.redo();
-                        }
-                        ui.separator();
-                        if ui.button("Copy").clicked() {
-                            self.copy_selection();
-                        }
-                        if ui.button("Paste").clicked() {
-                            self.paste_clipboard();
-                        }
-                        if ui.button("Duplicate").clicked() {
-                            self.duplicate_selection();
-                        }
-                        if ui.button("Delete").clicked() {
+                    if compact {
+                        ui.menu_button("More", |ui| {
+                            ui.selectable_value(&mut self.tool, Tool::Measure, "Measure");
+                            ui.selectable_value(&mut self.tool, Tool::Route, "Route");
+                            if ui
+                                .add_enabled(can_delete, egui::Button::new("Delete"))
+                                .clicked()
+                            {
+                                self.delete_selection();
+                                ui.close();
+                            }
+                        });
+                    } else {
+                        tool_button(ui, &mut self.tool, Tool::Measure, "Measure");
+                        tool_button(ui, &mut self.tool, Tool::Route, "Route");
+                        if can_delete && ui.button("Delete").clicked() {
                             self.delete_selection();
                         }
-                        ui.separator();
-                        if ui.button("Make Cell").clicked() {
-                            self.create_cell_from_selection();
+                    }
+                } else if matches!(self.view_mode, ViewMode::Layout3d) {
+                    if compact {
+                        ui.menu_button("More", |ui| {
+                            if ui.button("Reset 3D").clicked() {
+                                self.reset_3d_camera_to_document();
+                                ui.close();
+                            }
+                            if ui.button("Fullscreen").clicked() {
+                                self.toggle_fullscreen(ui.ctx());
+                                ui.close();
+                            }
+                        });
+                    } else {
+                        if ui.button("Reset 3D").clicked() {
+                            self.reset_3d_camera_to_document();
                         }
-                        if ui.button("Rotate 90").clicked() {
-                            self.rotate_selected_90();
+                        if ui.button("Fullscreen").clicked() {
+                            self.toggle_fullscreen(ui.ctx());
                         }
-                        if ui.button("Mirror X").clicked() {
-                            self.mirror_selected_x();
-                        }
-                        if ui.button("Mirror Y").clicked() {
-                            self.mirror_selected_y();
-                        }
-                    });
+                    }
                 }
-
-                ui.menu_button("Document", |ui| {
-                    if ui.button("New Blank Workspace").clicked() {
-                        self.new_blank_workspace();
-                    }
-                    if ui.button("Load Demo Workspace").clicked() {
-                        self.load_demo_workspace();
-                    }
-                    ui.separator();
-                    if ui.button("Save Workspace").clicked() {
-                        self.save_workspace();
-                    }
-                    if ui.button("Load Workspace").clicked() {
-                        self.load_workspace();
-                    }
-                    ui.separator();
-                    ui.label("Layout only");
-                    if ui.button("Save Layout JSON").clicked() {
-                        self.save_document();
-                    }
-                    if ui.button("Load Layout JSON").clicked() {
-                        self.load_document();
-                    }
-                    ui.separator();
-                    if ui.button("Export GDS").clicked() {
-                        self.export_gds_document();
-                    }
-                    if ui.button("Import GDS").clicked() {
-                        self.import_gds_document();
-                    }
-                    ui.separator();
-                    if ui.button("Connect collaboration").clicked() {
-                        self.connect_collaboration();
-                    }
-                });
-
-                ui.menu_button("Analyze", |ui| {
-                    if ui.button("Run DRC").clicked() {
-                        self.rerun_drc();
-                    }
-                    if ui.button("Diagnostics").clicked() {
-                        self.show_diagnostics = true;
-                    }
-                });
-
-                ui.menu_button("Demo Data", |ui| {
-                    if ui.button("Load Full Demo Workspace").clicked() {
-                        self.load_demo_workspace();
-                    }
-                    ui.separator();
-                    ui.label("Layout test scenes");
-                    if ui.button("10k stress").clicked() {
-                        self.make_stress_document(10_000);
-                    }
-                    if ui.button("100k stress").clicked() {
-                        self.make_stress_document(100_000);
-                    }
-                    if ui.button("1M stress").clicked() {
-                        self.make_stress_document(1_000_000);
-                    }
-                    if ui.button("Hierarchy").clicked() {
-                        self.make_hierarchy_document();
-                    }
-                });
-
-                if ui.button("Options").clicked() {
-                    self.show_options = true;
+                if drawer_mode {
+                    self.panel_drawer_buttons(ui);
                 }
             });
         });
+        ui.add_space(4.0);
+    }
+
+    fn panel_drawer_buttons(&mut self, ui: &mut egui::Ui) {
+        if self.view_mode.has_inspector_panel() {
+            if ui
+                .selectable_label(self.show_inspector_drawer, "Inspector")
+                .clicked()
+            {
+                self.show_inspector_drawer = !self.show_inspector_drawer;
+            }
+        }
+        if self.view_mode.has_secondary_panel() {
+            if ui
+                .selectable_label(self.show_layers_drawer, self.secondary_panel_label())
+                .clicked()
+            {
+                self.show_layers_drawer = !self.show_layers_drawer;
+            }
+        }
+    }
+
+    fn secondary_panel_label(&self) -> &'static str {
+        match self.view_mode {
+            ViewMode::Metrology => "Map",
+            ViewMode::MaskPrep
+            | ViewMode::CrossSection
+            | ViewMode::Layout2d
+            | ViewMode::Layout3d => "Layers",
+            ViewMode::Experiment => "Responses",
+            ViewMode::Notebook => "Links",
+            _ => "Panel",
+        }
+    }
+
+    fn visible_status(&self) -> Option<&str> {
+        let status = self.status.trim();
+        if status.is_empty()
+            || status == self.view_mode.title()
+            || status == self.view_mode.status_message()
+        {
+            None
+        } else {
+            Some(status)
+        }
+    }
+
+    fn file_menu(&mut self, ui: &mut egui::Ui) {
+        if ui.button("New Blank Workspace").clicked() {
+            self.new_blank_workspace();
+            ui.close();
+        }
+        if ui.button("Load Demo Workspace").clicked() {
+            self.load_demo_workspace();
+            ui.close();
+        }
+        ui.separator();
+        if ui.button("Save Workspace").clicked() {
+            self.save_workspace();
+            ui.close();
+        }
+        if ui.button("Load Workspace").clicked() {
+            self.load_workspace();
+            ui.close();
+        }
+        ui.separator();
+        ui.label("Layout");
+        if ui.button("Save Layout JSON").clicked() {
+            self.save_document();
+            ui.close();
+        }
+        if ui.button("Load Layout JSON").clicked() {
+            self.load_document();
+            ui.close();
+        }
+        if ui.button("Export GDS").clicked() {
+            self.export_gds_document();
+            ui.close();
+        }
+        if ui.button("Import GDS").clicked() {
+            self.import_gds_document();
+            ui.close();
+        }
+        ui.separator();
+        if ui.button("Connect Collaboration").clicked() {
+            self.connect_collaboration();
+            ui.close();
+        }
+    }
+
+    fn edit_menu(&mut self, ui: &mut egui::Ui) {
+        let editing_mode = matches!(self.view_mode, ViewMode::Layout2d);
+        let can_delete = editing_mode
+            && (self.selected_instance_info().is_some()
+                || !self.selected_top_level_shapes().is_empty());
+        if ui
+            .add_enabled(editing_mode, egui::Button::new("Undo"))
+            .clicked()
+        {
+            self.undo();
+            ui.close();
+        }
+        if ui
+            .add_enabled(editing_mode, egui::Button::new("Redo"))
+            .clicked()
+        {
+            self.redo();
+            ui.close();
+        }
+        ui.separator();
+        if ui
+            .add_enabled(editing_mode, egui::Button::new("Copy"))
+            .clicked()
+        {
+            self.copy_selection();
+            ui.close();
+        }
+        if ui
+            .add_enabled(editing_mode, egui::Button::new("Paste"))
+            .clicked()
+        {
+            self.paste_clipboard();
+            ui.close();
+        }
+        if ui
+            .add_enabled(editing_mode, egui::Button::new("Duplicate"))
+            .clicked()
+        {
+            self.duplicate_selection();
+            ui.close();
+        }
+        if ui
+            .add_enabled(can_delete, egui::Button::new("Delete"))
+            .clicked()
+        {
+            self.delete_selection();
+            ui.close();
+        }
+        ui.separator();
+        if ui
+            .add_enabled(editing_mode, egui::Button::new("Make Cell"))
+            .clicked()
+        {
+            self.create_cell_from_selection();
+            ui.close();
+        }
+        if ui
+            .add_enabled(editing_mode, egui::Button::new("Rotate 90"))
+            .clicked()
+        {
+            self.rotate_selected_90();
+            ui.close();
+        }
+        if ui
+            .add_enabled(editing_mode, egui::Button::new("Mirror X"))
+            .clicked()
+        {
+            self.mirror_selected_x();
+            ui.close();
+        }
+        if ui
+            .add_enabled(editing_mode, egui::Button::new("Mirror Y"))
+            .clicked()
+        {
+            self.mirror_selected_y();
+            ui.close();
+        }
+    }
+
+    fn view_menu(&mut self, ui: &mut egui::Ui) {
+        if ui.button("Command Palette...").clicked() {
+            self.show_command_palette = true;
+            self.command_palette_query.clear();
+            ui.close();
+        }
+        if ui.button("Sidebar Modules...").clicked() {
+            self.show_sidebar_modules = true;
+            ui.close();
+        }
+        ui.separator();
+        for group in ModuleGroup::ALL {
+            ui.menu_button(group.label(), |ui| {
+                for mode in ViewMode::ALL
+                    .into_iter()
+                    .filter(|candidate| candidate.group() == group)
+                {
+                    if ui
+                        .selectable_label(self.view_mode == mode, mode.nav_label())
+                        .clicked()
+                    {
+                        self.select_view_mode(mode);
+                        ui.close();
+                    }
+                }
+            });
+        }
+    }
+
+    fn bookmarks_menu(&mut self, ui: &mut egui::Ui) {
+        if ui.button("Origin").clicked() {
+            self.pan = Vec2::ZERO;
+            self.status = "focused origin".to_string();
+            ui.close();
+        }
+        if ui
+            .add_enabled(
+                self.layout_bounds().is_some(),
+                egui::Button::new("Layout Bounds"),
+            )
+            .clicked()
+        {
+            if let Some(bounds) = self.layout_bounds() {
+                self.focus_rect(bounds);
+                self.status = "focused layout bounds".to_string();
+            }
+            ui.close();
+        }
+    }
+
+    fn display_menu(&mut self, ui: &mut egui::Ui) {
+        ui.checkbox(&mut self.settings.show_grid_2d, "2D grid");
+        ui.checkbox(&mut self.settings.show_grid_3d, "3D grid");
+        ui.checkbox(&mut self.settings.show_origin_marker, "Origin crosshair");
+        ui.checkbox(&mut self.settings.show_drc_overlay, "DRC overlay");
+        ui.separator();
+        ui.label("Theme");
+        for theme in EditorTheme::ALL {
+            ui.selectable_value(&mut self.settings.theme, theme, theme.label());
+        }
+        ui.separator();
+        ui.label("Units");
+        for unit in UnitDisplay::ALL {
+            ui.selectable_value(&mut self.settings.units, unit, unit.label());
+        }
+        ui.separator();
+        if ui.button("Options...").clicked() {
+            self.show_options = true;
+            ui.close();
+        }
+    }
+
+    fn tools_menu(&mut self, ui: &mut egui::Ui) {
+        if ui.button("Command Palette...").clicked() {
+            self.show_command_palette = true;
+            self.command_palette_query.clear();
+            ui.close();
+        }
+        ui.separator();
+        let editing_mode = matches!(self.view_mode, ViewMode::Layout2d);
+        if editing_mode {
+            ui.label("Layout Tools");
+            ui.selectable_value(&mut self.tool, Tool::Select, "Select");
+            ui.selectable_value(&mut self.tool, Tool::Rect, "Rectangle");
+            ui.selectable_value(&mut self.tool, Tool::Polygon, "Polygon");
+            ui.selectable_value(&mut self.tool, Tool::Path, "Path");
+            ui.selectable_value(&mut self.tool, Tool::Via, "Via");
+            ui.selectable_value(&mut self.tool, Tool::Measure, "Measure");
+            ui.selectable_value(&mut self.tool, Tool::Route, "Route");
+            ui.separator();
+        }
+
+        ui.label("Technology");
+        let technology_rows: Vec<_> = self
+            .technologies
+            .iter()
+            .enumerate()
+            .map(|(index, technology)| (index, technology.name.clone()))
+            .collect();
+        for (index, name) in technology_rows {
+            if ui
+                .selectable_label(index == self.active_technology, name)
+                .clicked()
+            {
+                self.switch_technology(index);
+                ui.close();
+            }
+        }
+        ui.separator();
+        if ui.button("Run DRC").clicked() {
+            self.rerun_drc();
+            ui.close();
+        }
+        if ui.button("Diagnostics").clicked() {
+            self.show_diagnostics = true;
+            ui.close();
+        }
+        if let Some((lot_id, action, label)) = self.context_mes_action() {
+            ui.separator();
+            if ui.button(label).clicked() {
+                self.apply_mes_action(&lot_id, action);
+                ui.close();
+            }
+        }
+        if let Some(lot_id) = self.app_context.focus_lot().map(str::to_string) {
+            if ui.button("Add Focus Note").clicked() {
+                let entry_id = self.notebook_panel.add_quick_lot_note(&lot_id);
+                self.app_context
+                    .active
+                    .replace(FabObjectRef::notebook_entry(entry_id.to_string()));
+                self.status = format!("added notebook entry {entry_id}");
+                ui.close();
+            }
+        }
+    }
+
+    fn macros_menu(&mut self, ui: &mut egui::Ui) {
+        if ui.button("Load Full Demo Workspace").clicked() {
+            self.load_demo_workspace();
+            ui.close();
+        }
+        ui.separator();
+        ui.label("Layout Test Scenes");
+        if ui.button("10k Stress").clicked() {
+            self.make_stress_document(10_000);
+            ui.close();
+        }
+        if ui.button("100k Stress").clicked() {
+            self.make_stress_document(100_000);
+            ui.close();
+        }
+        if ui.button("1M Stress").clicked() {
+            self.make_stress_document(1_000_000);
+            ui.close();
+        }
+        if ui.button("Hierarchy").clicked() {
+            self.make_hierarchy_document();
+            ui.close();
+        }
+    }
+
+    fn help_menu(&mut self, ui: &mut egui::Ui) {
+        if ui.button("About Fabricad").clicked() {
+            self.status = "Fabricad mask-layout editor".to_string();
+            ui.close();
+        }
     }
 
     fn options_window(&mut self, ctx: &egui::Context) {
@@ -4211,17 +5213,288 @@ impl FabricadApp {
         self.show_diagnostics = open;
     }
 
+    fn command_palette_window(&mut self, ctx: &egui::Context) {
+        if !self.show_command_palette {
+            return;
+        }
+        let mut open = self.show_command_palette;
+        let mut pending = None;
+        egui::Window::new("Command Palette")
+            .open(&mut open)
+            .resizable(true)
+            .collapsible(false)
+            .default_width(520.0)
+            .show(ctx, |ui| {
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.command_palette_query)
+                        .hint_text("Type a command")
+                        .desired_width(ui.available_width()),
+                );
+                response.request_focus();
+                let query = self.command_palette_query.trim().to_ascii_lowercase();
+                let commands = self.command_entries();
+                let matches = commands
+                    .into_iter()
+                    .filter(|entry| {
+                        query.is_empty()
+                            || entry.label.to_ascii_lowercase().contains(&query)
+                            || entry.detail.to_ascii_lowercase().contains(&query)
+                    })
+                    .take(14)
+                    .collect::<Vec<_>>();
+
+                if ui.input(|input| input.key_pressed(Key::Escape)) {
+                    self.show_command_palette = false;
+                }
+                if ui.input(|input| input.key_pressed(Key::Enter))
+                    && let Some(first) = matches.first()
+                {
+                    pending = Some(first.action);
+                }
+
+                ui.separator();
+                if matches.is_empty() {
+                    ui_chrome::empty_state(ui, "No commands match");
+                }
+                for entry in matches {
+                    if ui
+                        .selectable_label(false, &entry.label)
+                        .on_hover_text(&entry.detail)
+                        .clicked()
+                    {
+                        pending = Some(entry.action);
+                    }
+                    ui_chrome::muted(ui, entry.detail);
+                }
+            });
+        self.show_command_palette = open && self.show_command_palette;
+        if let Some(action) = pending {
+            self.execute_command(action, ctx);
+            self.show_command_palette = false;
+            self.command_palette_query.clear();
+        }
+    }
+
+    fn sidebar_modules_window(&mut self, ctx: &egui::Context) {
+        if !self.show_sidebar_modules {
+            return;
+        }
+        let mut open = self.show_sidebar_modules;
+        egui::Window::new("Sidebar Modules")
+            .open(&mut open)
+            .resizable(true)
+            .default_size(vec2(360.0, 560.0))
+            .min_width(300.0)
+            .min_height(300.0)
+            .show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Default").clicked() {
+                        self.nav_rail_modes = default_nav_rail_modes();
+                    }
+                    if ui.button("All").clicked() {
+                        self.nav_rail_modes = ViewMode::ALL.into_iter().collect();
+                    }
+                    if ui.button("None").clicked() {
+                        self.nav_rail_modes.clear();
+                    }
+                });
+                ui.separator();
+                let scroll_width = ui.available_width();
+                egui::ScrollArea::vertical()
+                    .id_salt("sidebar_modules_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_min_width(scroll_width);
+                        for group in ModuleGroup::ALL {
+                            ui_chrome::section_label(ui, group.label());
+                            for mode in ViewMode::ALL
+                                .into_iter()
+                                .filter(|candidate| candidate.group() == group)
+                            {
+                                let mut shown = self.nav_rail_modes.contains(&mode);
+                                if ui.checkbox(&mut shown, mode.nav_label()).changed() {
+                                    if shown {
+                                        self.nav_rail_modes.insert(mode);
+                                    } else {
+                                        self.nav_rail_modes.remove(&mode);
+                                    }
+                                }
+                            }
+                        }
+                    });
+            });
+        self.show_sidebar_modules = open;
+    }
+
+    fn command_entries(&self) -> Vec<CommandEntry> {
+        let mut entries = Vec::new();
+        for mode in ViewMode::ALL {
+            entries.push(CommandEntry {
+                label: format!("Go to {}", mode.title()),
+                detail: "View".to_string(),
+                action: CommandAction::SelectView(mode),
+            });
+            entries.push(CommandEntry {
+                label: format!(
+                    "{} {} in sidebar",
+                    if self.nav_rail_modes.contains(&mode) {
+                        "Hide"
+                    } else {
+                        "Show"
+                    },
+                    mode.nav_label()
+                ),
+                detail: "Sidebar modules".to_string(),
+                action: CommandAction::ToggleRail(mode),
+            });
+        }
+        for (tool, label) in [
+            (Tool::Select, "Select tool"),
+            (Tool::Rect, "Rectangle tool"),
+            (Tool::Polygon, "Polygon tool"),
+            (Tool::Path, "Path tool"),
+            (Tool::Via, "Via tool"),
+            (Tool::Measure, "Measure tool"),
+            (Tool::Route, "Route tool"),
+        ] {
+            entries.push(CommandEntry {
+                label: label.to_string(),
+                detail: "Layout tools".to_string(),
+                action: CommandAction::SelectTool(tool),
+            });
+        }
+        entries.extend([
+            CommandEntry {
+                label: "Run DRC".to_string(),
+                detail: "Design rules".to_string(),
+                action: CommandAction::RunDrc,
+            },
+            CommandEntry {
+                label: "New blank workspace".to_string(),
+                detail: "File".to_string(),
+                action: CommandAction::NewBlank,
+            },
+            CommandEntry {
+                label: "Load demo workspace".to_string(),
+                detail: "File".to_string(),
+                action: CommandAction::LoadDemo,
+            },
+            CommandEntry {
+                label: "Load 10k stress layout".to_string(),
+                detail: "Macros".to_string(),
+                action: CommandAction::LoadStress(10_000),
+            },
+            CommandEntry {
+                label: "Load hierarchy demo".to_string(),
+                detail: "Macros".to_string(),
+                action: CommandAction::LoadHierarchy,
+            },
+            CommandEntry {
+                label: "Open options".to_string(),
+                detail: "Display".to_string(),
+                action: CommandAction::ShowOptions,
+            },
+            CommandEntry {
+                label: "Toggle 2D grid".to_string(),
+                detail: "Display".to_string(),
+                action: CommandAction::ToggleGrid2d,
+            },
+            CommandEntry {
+                label: "Toggle 3D grid".to_string(),
+                detail: "Display".to_string(),
+                action: CommandAction::ToggleGrid3d,
+            },
+            CommandEntry {
+                label: "Toggle DRC overlay".to_string(),
+                detail: "Display".to_string(),
+                action: CommandAction::ToggleDrcOverlay,
+            },
+            CommandEntry {
+                label: "Toggle origin crosshair".to_string(),
+                detail: "Display".to_string(),
+                action: CommandAction::ToggleOrigin,
+            },
+            CommandEntry {
+                label: "Reset 3D camera".to_string(),
+                detail: "3D viewport".to_string(),
+                action: CommandAction::Reset3d,
+            },
+            CommandEntry {
+                label: "Toggle fullscreen".to_string(),
+                detail: "Window".to_string(),
+                action: CommandAction::ToggleFullscreen,
+            },
+        ]);
+        entries
+    }
+
+    fn execute_command(&mut self, action: CommandAction, ctx: &egui::Context) {
+        match action {
+            CommandAction::SelectView(mode) => self.select_view_mode(mode),
+            CommandAction::ToggleRail(mode) => {
+                if !self.nav_rail_modes.remove(&mode) {
+                    self.nav_rail_modes.insert(mode);
+                }
+            }
+            CommandAction::SelectTool(tool) => {
+                self.select_view_mode(ViewMode::Layout2d);
+                self.tool = tool;
+            }
+            CommandAction::RunDrc => self.rerun_drc(),
+            CommandAction::LoadDemo => self.load_demo_workspace(),
+            CommandAction::NewBlank => self.new_blank_workspace(),
+            CommandAction::LoadStress(count) => self.make_stress_document(count),
+            CommandAction::LoadHierarchy => self.make_hierarchy_document(),
+            CommandAction::ShowOptions => self.show_options = true,
+            CommandAction::ToggleGrid2d => self.settings.show_grid_2d = !self.settings.show_grid_2d,
+            CommandAction::ToggleGrid3d => self.settings.show_grid_3d = !self.settings.show_grid_3d,
+            CommandAction::ToggleDrcOverlay => {
+                self.settings.show_drc_overlay = !self.settings.show_drc_overlay;
+            }
+            CommandAction::ToggleOrigin => {
+                self.settings.show_origin_marker = !self.settings.show_origin_marker;
+            }
+            CommandAction::Reset3d => self.reset_3d_camera_to_document(),
+            CommandAction::ToggleFullscreen => self.toggle_fullscreen(ctx),
+        }
+    }
+
+    fn toggle_fullscreen(&mut self, ctx: &egui::Context) {
+        self.fullscreen = !self.fullscreen;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+        self.status = if self.fullscreen {
+            "entered fullscreen".to_string()
+        } else {
+            "exited fullscreen".to_string()
+        };
+    }
+
     fn options_ui(&mut self, ui: &mut egui::Ui) {
-        egui::CollapsingHeader::new("Snapping grid")
+        egui::CollapsingHeader::new("Process technology and grid")
             .default_open(true)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut self.settings.snap_enabled, "Snap");
                     ui.checkbox(&mut self.settings.show_grid_2d, "2D grid");
                     ui.checkbox(&mut self.settings.show_grid_3d, "3D grid");
+                    ui.checkbox(&mut self.settings.show_drc_overlay, "DRC overlay");
                 });
                 ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.settings.show_origin_marker, "Origin");
+                    ui.label("Process technology");
+                    let mut selected = self.active_technology;
+                    egui::ComboBox::from_id_salt("options_technology_picker")
+                        .selected_text(self.current_technology().name.clone())
+                        .show_ui(ui, |ui| {
+                            for (index, technology) in self.technologies.iter().enumerate() {
+                                ui.selectable_value(&mut selected, index, &technology.name);
+                            }
+                        });
+                    if selected != self.active_technology {
+                        self.switch_technology(selected);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.settings.show_origin_marker, "Origin crosshair");
                     ui.label("Min px");
                     ui.add(
                         egui::DragValue::new(&mut self.settings.min_grid_pixels)
@@ -4249,7 +5522,7 @@ impl FabricadApp {
                 });
                 let dbu_per_micron = self.current_technology().dbu_per_micron.max(1);
                 ui.label(format!(
-                    "{} per snap, {} DBU/um",
+                    "{} per snap, {} database units per um",
                     self.format_length(self.document.grid as f64),
                     dbu_per_micron
                 ));
@@ -4345,7 +5618,7 @@ impl FabricadApp {
     }
 
     fn technology_panel(&mut self, ui: &mut egui::Ui) {
-        ui.label("Technology");
+        ui.label("Process technology");
         let mut selected = self.active_technology;
         let selected_name = self.current_technology().name.clone();
         egui::ComboBox::from_id_salt("technology_picker")
@@ -4360,8 +5633,13 @@ impl FabricadApp {
         }
         let technology = self.current_technology();
         ui.label(format!(
-            "Grid: {} dbu (tech {}), DBU/um: {}",
-            self.document.grid, technology.grid, technology.dbu_per_micron
+            "Snap grid: {} ({})",
+            self.document.grid,
+            self.format_length(self.document.grid as f64)
+        ));
+        ui.label(format!(
+            "Technology grid: {} dbu, database units: {} per um",
+            technology.grid, technology.dbu_per_micron
         ));
     }
 
@@ -4469,21 +5747,35 @@ impl FabricadApp {
         egui::TopBottomPanel::bottom("mes_traveler")
             .resizable(true)
             .default_height(260.0)
-            .show(ctx, |ui| self.mes_ui(ui));
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("mes_panel_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| self.mes_ui(ui));
+            });
     }
 
     fn mes_ui(&mut self, ui: &mut egui::Ui) {
         let mut action = None;
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| self.mes_wip_board_ui(ui));
+        if ui.available_width() < 720.0 {
+            self.mes_wip_board_ui(ui);
             ui.separator();
-            ui.vertical(|ui| {
-                action = self.mes_selected_lot_ui(ui);
-                if self.mes.lots.is_empty() {
-                    ui_chrome::empty_state(ui, "No traveler selected");
-                }
+            action = self.mes_selected_lot_ui(ui);
+            if self.mes.lots.is_empty() {
+                ui_chrome::empty_state(ui, "No traveler selected");
+            }
+        } else {
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| self.mes_wip_board_ui(ui));
+                ui.separator();
+                ui.vertical(|ui| {
+                    action = self.mes_selected_lot_ui(ui);
+                    if self.mes.lots.is_empty() {
+                        ui_chrome::empty_state(ui, "No traveler selected");
+                    }
+                });
             });
-        });
+        }
         if let Some((lot_id, action)) = action {
             self.apply_mes_action(&lot_id, action);
         }
@@ -4505,7 +5797,7 @@ impl FabricadApp {
             };
             let selected = self.selected_mes_lot.as_ref() == Some(&lot_id);
             if ui.selectable_label(selected, label).clicked() {
-                self.selected_mes_lot = Some(lot_id);
+                self.set_focus_object(FabObjectRef::lot(lot_id.as_str().to_string()));
             }
             ui.small(detail);
         }
@@ -4788,11 +6080,11 @@ impl FabricadApp {
             .resizable(true)
             .default_width(ui_chrome::INSPECTOR_WIDTH)
             .show(ctx, |ui| {
-                ui_chrome::section_label(ui, "Context");
                 egui::ScrollArea::vertical()
                     .id_salt("inspector_panel_scroll")
                     .show(ui, |ui| match self.view_mode {
                         ViewMode::Workflow => {
+                            self.sync_workflow_focus_from_context();
                             let data = WorkflowData {
                                 document: &self.document,
                                 process_flow: self.process_flow_panel.model(),
@@ -4809,6 +6101,7 @@ impl FabricadApp {
                                 notebook: self.notebook_panel.notebook(),
                             };
                             self.workflow_panel.context_ui(ui, data);
+                            self.sync_context_from_workflow();
                         }
                         ViewMode::Metrology => self.metrology_context_panel(ui),
                         ViewMode::MaskPrep => self.mask_panel.context_ui(
@@ -4846,17 +6139,20 @@ impl FabricadApp {
                         }
                         ViewMode::Notebook => self.notebook_panel.context_ui(ui),
                         ViewMode::Layout2d | ViewMode::Layout3d => {
-                            self.technology_panel(ui);
-                            ui.separator();
+                            egui::CollapsingHeader::new("Document")
+                                .default_open(false)
+                                .show(ui, |ui| self.technology_panel(ui));
                             self.recipe_panel.ui(ui, &mut self.status);
-                            ui.separator();
                             self.hierarchy_panel(ui);
-                            ui.separator();
-                            self.status_panel(ui);
-                            ui.separator();
-                            self.net_panel(ui);
-                            ui.separator();
-                            self.marker_panel(ui);
+                            egui::CollapsingHeader::new("Connectivity")
+                                .default_open(false)
+                                .show(ui, |ui| self.net_panel(ui));
+                            egui::CollapsingHeader::new("DRC Markers")
+                                .default_open(false)
+                                .show(ui, |ui| self.marker_panel(ui));
+                            egui::CollapsingHeader::new("Diagnostics")
+                                .default_open(false)
+                                .show(ui, |ui| self.status_panel(ui));
                         }
                         ViewMode::FabControl | ViewMode::Yield => {}
                     });
@@ -4889,22 +6185,19 @@ impl FabricadApp {
                     self.notebook_panel.link_filter_ui(ui);
                     return;
                 }
+                if matches!(self.view_mode, ViewMode::Layout3d) {
+                    self.stack_3d_panel(ui);
+                    ui.separator();
+                }
                 ui_chrome::section_label(ui, "Layers");
                 ui.horizontal(|ui| {
                     if ui.button("Add layer").clicked() {
                         self.add_layer_from_ui();
                     }
-                    let can_remove = self.document.layers.len() > 1
-                        && self.document.layers.contains_key(&self.active_layer);
-                    if ui
-                        .add_enabled(can_remove, egui::Button::new("Remove"))
-                        .clicked()
-                    {
-                        self.remove_active_layer();
-                    }
                 });
                 ui.add_space(4.0);
                 let mut visibility_ops = Vec::new();
+                let mut remove_layer = None;
                 let mut layer_rows: Vec<_> = self
                     .document
                     .layers
@@ -4921,6 +6214,10 @@ impl FabricadApp {
                     })
                     .collect();
                 layer_rows.sort_by_key(|(id, _, _, _, _, order)| (*order, *id));
+                if layer_rows.is_empty() {
+                    ui_chrome::empty_state(ui, "No layers. Add a layer to draw.");
+                    return;
+                }
                 egui::ScrollArea::vertical()
                     .id_salt("layers_panel_scroll")
                     .show(ui, |ui| {
@@ -4932,24 +6229,443 @@ impl FabricadApp {
                                         ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
                                     ui.painter().rect_filled(swatch_rect, 2.0, color);
                                     if ui
-                                        .selectable_label(self.active_layer == layer_id, &name)
-                                        .on_hover_text(purpose)
+                                        .selectable_label(self.active_layer == layer_id, "")
                                         .clicked()
                                     {
                                         self.active_layer = layer_id;
                                     }
+                                    let mut edited_name = self
+                                        .layer_name_drafts
+                                        .get(&layer_id)
+                                        .cloned()
+                                        .unwrap_or(name);
+                                    let response = ui
+                                        .add(
+                                            egui::TextEdit::singleline(&mut edited_name)
+                                                .desired_width(118.0)
+                                                .id_salt(("layer_name", layer_id.0)),
+                                        )
+                                        .on_hover_text(purpose);
+                                    if response.has_focus() {
+                                        self.active_layer = layer_id;
+                                    }
+                                    let commit = text_edit_commit_requested(ui, &response);
+                                    if response.changed() || response.has_focus() {
+                                        self.layer_name_drafts
+                                            .insert(layer_id, edited_name.clone());
+                                    }
+                                    let remove_label = edited_name.clone();
+                                    if commit {
+                                        self.layer_name_drafts.remove(&layer_id);
+                                        self.rename_layer(layer_id, edited_name);
+                                    } else if !response.has_focus() && !response.changed() {
+                                        self.layer_name_drafts.remove(&layer_id);
+                                    }
                                     if ui.checkbox(&mut visible, "").changed() {
                                         visibility_ops.push((layer_id, visible));
+                                    }
+                                    if ui
+                                        .small_button("x")
+                                        .on_hover_text(format!("Remove {remove_label}"))
+                                        .clicked()
+                                    {
+                                        remove_layer = Some(layer_id);
                                     }
                                 });
                             });
                         }
                     });
+                ui.separator();
+                self.active_layer_properties_ui(ui);
                 for (layer, visible) in visibility_ops {
                     self.apply_operation_without_history(&Operation::SetLayerVisibility {
                         layer,
                         visible,
                     });
+                }
+                if let Some(layer) = remove_layer {
+                    self.remove_layer_by_id(layer);
+                }
+            });
+    }
+
+    fn responsive_panel_windows(&mut self, ctx: &egui::Context) {
+        if Self::inline_side_panels(ctx) {
+            self.show_inspector_drawer = false;
+            self.show_layers_drawer = false;
+            return;
+        }
+
+        if self.view_mode.has_inspector_panel() && self.show_inspector_drawer {
+            let mut open = true;
+            egui::Window::new("Inspector")
+                .open(&mut open)
+                .resizable(true)
+                .default_size(vec2(340.0, 560.0))
+                .min_width(280.0)
+                .constrain_to(ctx.content_rect())
+                .show(ctx, |ui| self.inspector_drawer_contents(ui));
+            self.show_inspector_drawer = open;
+        }
+
+        if self.view_mode.has_secondary_panel() && self.show_layers_drawer {
+            let mut open = true;
+            egui::Window::new(self.secondary_panel_label())
+                .open(&mut open)
+                .resizable(true)
+                .default_size(vec2(320.0, 560.0))
+                .min_width(260.0)
+                .constrain_to(ctx.content_rect())
+                .show(ctx, |ui| self.layers_drawer_contents(ui));
+            self.show_layers_drawer = open;
+        }
+    }
+
+    fn inspector_drawer_contents(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical()
+            .id_salt("inspector_drawer_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| match self.view_mode {
+                ViewMode::Workflow => {
+                    self.sync_workflow_focus_from_context();
+                    let data = WorkflowData {
+                        document: &self.document,
+                        process_flow: self.process_flow_panel.model(),
+                        recipes: self.recipe_panel.catalog(),
+                        mes: &self.mes,
+                        inventory: self.inventory_panel.inventory(),
+                        maintenance: self.maintenance_panel.model(),
+                        environment: self.environment_panel.model(),
+                        scheduler: self.scheduler_panel.schedule(),
+                        safety: self.safety_panel.model(),
+                        equipment: &self.equipment_sim,
+                        wafer_map: &self.wafer_map,
+                        yield_analysis: &self.yield_analysis,
+                        notebook: self.notebook_panel.notebook(),
+                    };
+                    self.workflow_panel.context_ui(ui, data);
+                    self.sync_context_from_workflow();
+                }
+                ViewMode::Metrology => self.metrology_context_panel(ui),
+                ViewMode::MaskPrep => self.mask_panel.context_ui(
+                    ui,
+                    &self.document,
+                    &self.mes,
+                    self.selected_mes_lot.as_ref(),
+                    &mut self.status,
+                ),
+                ViewMode::LayoutDiff => self.layout_diff_panel.context_ui(ui, &self.document),
+                ViewMode::Inventory => self.inventory_panel.context_ui(ui),
+                ViewMode::Maintenance => self.maintenance_panel.context_ui(ui),
+                ViewMode::Environment => self.environment_panel.context_ui(ui),
+                ViewMode::Scheduler => self.scheduler_panel.context_ui(ui),
+                ViewMode::Safety => self.safety_panel.context_ui(ui),
+                ViewMode::SpcFdc => {
+                    self.spc_fdc_panel
+                        .context_ui(ui, &self.yield_analysis, &self.equipment_sim);
+                }
+                ViewMode::ProcessFlow => {
+                    self.process_flow_panel.context_ui(ui, &mut self.status);
+                }
+                ViewMode::ProcessControl => self
+                    .process_control_panel
+                    .context_ui(ui, &self.yield_analysis),
+                ViewMode::CrossSection => self.cross_section_panel.context_ui(ui),
+                ViewMode::Traceability => self.genealogy_panel.context_ui(ui),
+                ViewMode::Experiment => {
+                    self.experiment_panel.context_ui(ui, &mut self.status);
+                }
+                ViewMode::Notebook => self.notebook_panel.context_ui(ui),
+                ViewMode::Layout2d | ViewMode::Layout3d => {
+                    egui::CollapsingHeader::new("Document")
+                        .default_open(false)
+                        .show(ui, |ui| self.technology_panel(ui));
+                    self.recipe_panel.ui(ui, &mut self.status);
+                    self.hierarchy_panel(ui);
+                    egui::CollapsingHeader::new("Connectivity")
+                        .default_open(false)
+                        .show(ui, |ui| self.net_panel(ui));
+                    egui::CollapsingHeader::new("DRC Markers")
+                        .default_open(false)
+                        .show(ui, |ui| self.marker_panel(ui));
+                    egui::CollapsingHeader::new("Diagnostics")
+                        .default_open(false)
+                        .show(ui, |ui| self.status_panel(ui));
+                }
+                ViewMode::FabControl | ViewMode::Yield => {}
+            });
+    }
+
+    fn layers_drawer_contents(&mut self, ui: &mut egui::Ui) {
+        if matches!(self.view_mode, ViewMode::Metrology) {
+            self.metrology_panel(ui);
+            return;
+        }
+        if matches!(self.view_mode, ViewMode::MaskPrep) {
+            self.mask_panel.layer_stack_ui(ui);
+            return;
+        }
+        if matches!(self.view_mode, ViewMode::Experiment) {
+            self.experiment_panel
+                .response_capture_ui(ui, &mut self.status);
+            return;
+        }
+        if matches!(self.view_mode, ViewMode::CrossSection) {
+            self.cross_section_panel.layer_stack_ui(ui);
+            return;
+        }
+        if matches!(self.view_mode, ViewMode::Notebook) {
+            self.notebook_panel.link_filter_ui(ui);
+            return;
+        }
+        if matches!(self.view_mode, ViewMode::Layout3d) {
+            self.stack_3d_panel(ui);
+            ui.separator();
+        }
+
+        ui_chrome::section_label(ui, "Layers");
+        ui.horizontal(|ui| {
+            if ui.button("Add layer").clicked() {
+                self.add_layer_from_ui();
+            }
+        });
+        ui.add_space(4.0);
+
+        let mut visibility_ops = Vec::new();
+        let mut remove_layer = None;
+        let mut layer_rows: Vec<_> = self
+            .document
+            .layers
+            .values()
+            .map(|layer| {
+                (
+                    layer.id,
+                    layer.name.clone(),
+                    layer.purpose.clone(),
+                    layer.color,
+                    layer.visible,
+                    layer.display_order,
+                )
+            })
+            .collect();
+        layer_rows.sort_by_key(|(id, _, _, _, _, order)| (*order, *id));
+        if layer_rows.is_empty() {
+            ui_chrome::empty_state(ui, "No layers. Add a layer to draw.");
+            return;
+        }
+
+        egui::ScrollArea::vertical()
+            .id_salt("layers_drawer_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for (layer_id, name, purpose, color, mut visible, _) in layer_rows {
+                    ui.push_id(("layer_drawer_row", layer_id.0), |ui| {
+                        ui.horizontal(|ui| {
+                            let color = layer_color32(color, 1.0);
+                            let (swatch_rect, _) =
+                                ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
+                            ui.painter().rect_filled(swatch_rect, 2.0, color);
+                            if ui
+                                .selectable_label(self.active_layer == layer_id, "")
+                                .clicked()
+                            {
+                                self.active_layer = layer_id;
+                            }
+                            let mut edited_name = self
+                                .layer_name_drafts
+                                .get(&layer_id)
+                                .cloned()
+                                .unwrap_or(name);
+                            let response = ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut edited_name)
+                                        .desired_width(118.0)
+                                        .id_salt(("layer_drawer_name", layer_id.0)),
+                                )
+                                .on_hover_text(purpose);
+                            if response.has_focus() {
+                                self.active_layer = layer_id;
+                            }
+                            let commit = text_edit_commit_requested(ui, &response);
+                            if response.changed() || response.has_focus() {
+                                self.layer_name_drafts.insert(layer_id, edited_name.clone());
+                            }
+                            let remove_label = edited_name.clone();
+                            if commit {
+                                self.layer_name_drafts.remove(&layer_id);
+                                self.rename_layer(layer_id, edited_name);
+                            } else if !response.has_focus() && !response.changed() {
+                                self.layer_name_drafts.remove(&layer_id);
+                            }
+                            if ui.checkbox(&mut visible, "").changed() {
+                                visibility_ops.push((layer_id, visible));
+                            }
+                            if ui
+                                .small_button("x")
+                                .on_hover_text(format!("Remove {remove_label}"))
+                                .clicked()
+                            {
+                                remove_layer = Some(layer_id);
+                            }
+                        });
+                    });
+                }
+            });
+
+        ui.separator();
+        self.active_layer_properties_ui(ui);
+        for (layer, visible) in visibility_ops {
+            self.apply_operation_without_history(&Operation::SetLayerVisibility { layer, visible });
+        }
+        if let Some(layer) = remove_layer {
+            self.remove_layer_by_id(layer);
+        }
+    }
+
+    fn active_layer_properties_ui(&mut self, ui: &mut egui::Ui) {
+        let mut visual_dirty = false;
+        let mut analysis_dirty = false;
+        let mut changed_name = None;
+        let Some(layer) = self.document.layers.get_mut(&self.active_layer) else {
+            ui_chrome::empty_state(ui, "No active layer");
+            return;
+        };
+        egui::CollapsingHeader::new("Layer Properties")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.label(format!("Layer ID: {}", layer.id.0));
+                ui.horizontal(|ui| {
+                    ui.label("Process");
+                    egui::ComboBox::from_id_salt(("layer_process", layer.id.0))
+                        .selected_text(process_layer_label(layer.process))
+                        .show_ui(ui, |ui| {
+                            for process in PROCESS_LAYER_CHOICES {
+                                if ui
+                                    .selectable_value(
+                                        &mut layer.process,
+                                        process,
+                                        process_layer_label(process),
+                                    )
+                                    .changed()
+                                {
+                                    analysis_dirty = true;
+                                }
+                            }
+                        });
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Purpose");
+                    if ui.text_edit_singleline(&mut layer.purpose).changed() {
+                        visual_dirty = true;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Display order");
+                    if ui
+                        .add(egui::DragValue::new(&mut layer.display_order).speed(1))
+                        .changed()
+                    {
+                        visual_dirty = true;
+                    }
+                    if ui.checkbox(&mut layer.locked, "Locked").changed() {
+                        visual_dirty = true;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Color");
+                    let mut rgb = [layer.color[0], layer.color[1], layer.color[2]];
+                    if ui.color_edit_button_rgb(&mut rgb).changed() {
+                        layer.color[0] = rgb[0];
+                        layer.color[1] = rgb[1];
+                        layer.color[2] = rgb[2];
+                        visual_dirty = true;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    let mut has_gds_layer = layer.gds_layer.is_some();
+                    if ui.checkbox(&mut has_gds_layer, "GDS geometry").changed() {
+                        layer.gds_layer =
+                            has_gds_layer.then_some(u16::try_from(layer.id.0).unwrap_or(u16::MAX));
+                        visual_dirty = true;
+                    }
+                    if let Some(gds_layer) = layer.gds_layer.as_mut() {
+                        if ui
+                            .add(egui::DragValue::new(gds_layer).range(0..=u16::MAX).speed(1))
+                            .changed()
+                        {
+                            visual_dirty = true;
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Datatype");
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut layer.gds_datatype)
+                                .range(0..=u16::MAX)
+                                .speed(1),
+                        )
+                        .changed()
+                    {
+                        visual_dirty = true;
+                    }
+                    ui.label("Texttype");
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut layer.gds_texttype)
+                                .range(0..=u16::MAX)
+                                .speed(1),
+                        )
+                        .changed()
+                    {
+                        visual_dirty = true;
+                    }
+                });
+                if visual_dirty || analysis_dirty {
+                    changed_name = Some(layer.name.clone());
+                }
+            });
+
+        if let Some(name) = changed_name {
+            self.reset_render_cache();
+            if analysis_dirty {
+                self.rebuild_rules_from_technology();
+                self.rerun_drc();
+                self.rebuild_connectivity();
+            }
+            self.status = format!("updated layer {name}");
+        }
+    }
+
+    fn stack_3d_panel(&self, ui: &mut egui::Ui) {
+        ui_chrome::section_label(ui, "3D Stack");
+        let mut rows: Vec<_> = self
+            .document
+            .layers
+            .values()
+            .filter(|layer| !matches!(layer.process, ProcessLayer::Annotation))
+            .collect();
+        rows.sort_by_key(|layer| (layer.display_order, layer.id));
+        if rows.is_empty() {
+            ui_chrome::empty_state(ui, "No printable layers");
+            return;
+        }
+        egui::Grid::new("layer_3d_stack_grid")
+            .striped(true)
+            .min_col_width(46.0)
+            .show(ui, |ui| {
+                ui.strong("Layer");
+                ui.strong("Process");
+                ui.strong("Z base");
+                ui.strong("Z top");
+                ui.end_row();
+                for layer in rows {
+                    let (base_z, thickness) = layer_3d_stack_position(layer.process);
+                    ui.label(&layer.name);
+                    ui.label(process_layer_label(layer.process));
+                    ui.label(format!("{base_z:.0}"));
+                    ui.label(format!("{:.0}", base_z + thickness));
+                    ui.end_row();
                 }
             });
     }
@@ -5168,28 +6884,100 @@ impl FabricadApp {
     }
 
     fn marker_panel(&mut self, ui: &mut egui::Ui) {
-        ui.label("DRC Markers");
-        ui.label(format!(
-            "Active: {} / Total: {} / Saved states: {}",
-            self.active_marker_count(),
-            self.violations.len(),
-            self.document.marker_states.len()
-        ));
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut self.show_waived_markers, "Waived");
-            ui.checkbox(&mut self.show_hidden_markers, "Hidden");
-            if ui.button("Clear").clicked() {
+        ui.horizontal_wrapped(|ui| {
+            ui_chrome::status_pill(
+                ui,
+                &format!("{} active", self.active_marker_count()),
+                if self.active_marker_count() == 0 {
+                    ui_chrome::Tone::Success
+                } else {
+                    ui_chrome::Tone::Danger
+                },
+            );
+            ui_chrome::status_pill(
+                ui,
+                &format!("{} saved states", self.document.marker_states.len()),
+                ui_chrome::Tone::Neutral,
+            );
+        });
+        if self.violations.is_empty() {
+            ui_chrome::empty_state(ui, "No DRC markers");
+            return;
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(&mut self.settings.show_drc_overlay, "Overlay")
+                .on_hover_text("Draw active DRC marker bounds in the layout viewport.");
+            ui.checkbox(&mut self.show_waived_markers, "Show waived")
+                .on_hover_text("Waived markers are accepted exceptions that stay recorded.");
+            ui.checkbox(&mut self.show_hidden_markers, "Show hidden")
+                .on_hover_text("Hidden markers are suppressed from this marker list.");
+            if ui.button("Clear states").clicked() {
                 self.clear_marker_states();
             }
         });
+        ui.horizontal(|ui| {
+            ui.label("Filter");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.drc_marker_filter)
+                    .desired_width(ui.available_width())
+                    .hint_text("rule or message"),
+            );
+        });
+
+        let filter = self.drc_marker_filter.trim().to_ascii_lowercase();
+        let mut visible_rows = Vec::new();
+        let mut rule_counts = BTreeMap::new();
+        for (index, violation) in self.violations.iter().enumerate() {
+            let state = self.marker_state(violation);
+            if (state.hidden && !self.show_hidden_markers)
+                || (state.waived && !self.show_waived_markers)
+            {
+                continue;
+            }
+            if !filter.is_empty()
+                && !violation.rule.to_ascii_lowercase().contains(&filter)
+                && !violation.message.to_ascii_lowercase().contains(&filter)
+            {
+                continue;
+            }
+            *rule_counts.entry(violation.rule.clone()).or_insert(0usize) += 1;
+            visible_rows.push(index);
+        }
+        if visible_rows.is_empty() {
+            ui_chrome::empty_state(ui, "No DRC markers match the filter");
+            return;
+        }
+
+        egui::CollapsingHeader::new(format!("Rules ({} visible)", visible_rows.len()))
+            .default_open(false)
+            .show(ui, |ui| {
+                egui::Grid::new("drc_marker_rule_summary")
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.strong("Rule");
+                        ui.strong("Count");
+                        ui.end_row();
+                        for (rule, count) in rule_counts.iter().take(12) {
+                            ui.label(rule);
+                            ui.label(count.to_string());
+                            ui.end_row();
+                        }
+                    });
+                if rule_counts.len() > 12 {
+                    ui_chrome::muted(ui, format!("{} more rules", rule_counts.len() - 12));
+                }
+            });
 
         let mut action = None;
         egui::ScrollArea::vertical()
             .id_salt("drc_marker_scroll")
             .max_height(260.0)
-            .show_rows(ui, 24.0, self.violations.len(), |ui, row_range| {
+            .show_rows(ui, 28.0, visible_rows.len(), |ui, row_range| {
                 for row in row_range {
-                    let Some(violation) = self.violations.get(row) else {
+                    let Some(violation_index) = visible_rows.get(row).copied() else {
+                        continue;
+                    };
+                    let Some(violation) = self.violations.get(violation_index) else {
                         continue;
                     };
                     let key = drc_marker_key(violation);
@@ -5202,12 +6990,6 @@ impl FabricadApp {
                             .cloned()
                             .unwrap_or_default()
                     };
-                    if (state.hidden && !self.show_hidden_markers)
-                        || (state.waived && !self.show_waived_markers)
-                    {
-                        ui.add_space(24.0);
-                        continue;
-                    }
                     ui.horizontal_wrapped(|ui| {
                         let status = marker_status_label(&state);
                         let label = format!("#{} {}{}", violation.id, violation.rule, status);
@@ -5251,17 +7033,43 @@ impl FabricadApp {
     }
 
     fn net_panel(&mut self, ui: &mut egui::Ui) {
-        ui.label("Connectivity");
         if let Some(reason) = &self.connectivity.skipped {
-            ui.label(reason);
+            ui_chrome::empty_state(ui, reason);
             return;
         }
-        ui.label(format!(
-            "Nets: {} / Shorts: {} / Opens: {}",
-            self.connectivity.components.len(),
-            self.connectivity.shorts.len(),
-            self.connectivity.opens.len()
-        ));
+        ui.horizontal_wrapped(|ui| {
+            ui_chrome::status_pill(
+                ui,
+                &format!("{} nets", self.connectivity.components.len()),
+                ui_chrome::Tone::Neutral,
+            );
+            ui_chrome::status_pill(
+                ui,
+                &format!("{} shorts", self.connectivity.shorts.len()),
+                if self.connectivity.shorts.is_empty() {
+                    ui_chrome::Tone::Success
+                } else {
+                    ui_chrome::Tone::Danger
+                },
+            );
+            ui_chrome::status_pill(
+                ui,
+                &format!("{} opens", self.connectivity.opens.len()),
+                if self.connectivity.opens.is_empty() {
+                    ui_chrome::Tone::Success
+                } else {
+                    ui_chrome::Tone::Warning
+                },
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label("Filter");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.connectivity_filter)
+                    .desired_width(ui.available_width())
+                    .hint_text("net name or component"),
+            );
+        });
 
         if let Some(component) = self.selected_net_component().cloned() {
             let name = component
@@ -5290,29 +7098,86 @@ impl FabricadApp {
             }
         }
 
+        let filter = self.connectivity_filter.trim().to_ascii_lowercase();
+        let short_matches: Vec<_> = self
+            .connectivity
+            .shorts
+            .iter()
+            .filter(|short| {
+                filter.is_empty()
+                    || short.component.to_string().contains(&filter)
+                    || short
+                        .names
+                        .iter()
+                        .any(|name| name.to_ascii_lowercase().contains(&filter))
+            })
+            .collect();
+        let open_matches: Vec<_> = self
+            .connectivity
+            .opens
+            .iter()
+            .filter(|open| {
+                filter.is_empty()
+                    || open.name.to_ascii_lowercase().contains(&filter)
+                    || open
+                        .components
+                        .iter()
+                        .any(|component| component.to_string().contains(&filter))
+            })
+            .collect();
+
         let mut focus_target = None;
-        for short in &self.connectivity.shorts {
-            if ui
-                .selectable_label(
-                    false,
-                    format!("Short #{} {}", short.component, short.names.join(" / ")),
-                )
-                .clicked()
-            {
-                focus_target = Some(short.bounds);
-            }
+        if !short_matches.is_empty() {
+            egui::CollapsingHeader::new(format!(
+                "Shorts (showing {} of {} matching, {} total)",
+                short_matches.len().min(MAX_CONNECTIVITY_ROWS),
+                short_matches.len(),
+                self.connectivity.shorts.len()
+            ))
+            .default_open(false)
+            .show(ui, |ui| {
+                for short in short_matches.iter().take(MAX_CONNECTIVITY_ROWS) {
+                    if ui
+                        .selectable_label(
+                            false,
+                            format!("Short #{} {}", short.component, short.names.join(" / ")),
+                        )
+                        .clicked()
+                    {
+                        focus_target = Some(short.bounds);
+                    }
+                }
+            });
         }
-        for open in &self.connectivity.opens {
-            if ui
-                .selectable_label(
-                    false,
-                    format!("Open {} ({} islands)", open.name, open.components.len()),
-                )
-                .clicked()
-            {
-                focus_target = Some(open.bounds);
-            }
+        if !open_matches.is_empty() {
+            egui::CollapsingHeader::new(format!(
+                "Opens (showing {} of {} matching, {} total)",
+                open_matches.len().min(MAX_CONNECTIVITY_ROWS),
+                open_matches.len(),
+                self.connectivity.opens.len()
+            ))
+            .default_open(false)
+            .show(ui, |ui| {
+                for open in open_matches.iter().take(MAX_CONNECTIVITY_ROWS) {
+                    if ui
+                        .selectable_label(
+                            false,
+                            format!("Open {} ({} islands)", open.name, open.components.len()),
+                        )
+                        .clicked()
+                    {
+                        focus_target = Some(open.bounds);
+                    }
+                }
+            });
         }
+        if self.connectivity.shorts.is_empty() && self.connectivity.opens.is_empty() {
+            ui_chrome::empty_state(ui, "No shorts or opens");
+        } else if short_matches.is_empty() && open_matches.is_empty() {
+            ui_chrome::empty_state(ui, "No connectivity issues match the filter");
+        }
+        drop(short_matches);
+        drop(open_matches);
         if let Some(bounds) = focus_target {
             self.focus_rect(bounds);
         }
@@ -5320,6 +7185,9 @@ impl FabricadApp {
 
     fn hierarchy_panel(&mut self, ui: &mut egui::Ui) {
         ui.label("Cells");
+        if ui.button("Add cell").clicked() {
+            self.create_empty_cell();
+        }
         let cell_rows: Vec<_> = self
             .document
             .cells
@@ -5330,11 +7198,14 @@ impl FabricadApp {
                     cell.name.clone(),
                     cell.shapes.len(),
                     cell.instances.len(),
+                    self.cell_instance_count(cell.id),
                     cell.id == self.document.top_cell,
                 )
             })
             .collect();
-        for (id, name, shape_count, instance_count, is_top) in cell_rows {
+        for (id, name, shape_count, child_instance_count, placed_instance_count, is_top) in
+            cell_rows
+        {
             ui.horizontal(|ui| {
                 let mut edited_name = self
                     .cell_name_drafts
@@ -5356,9 +7227,28 @@ impl FabricadApp {
                 } else if !response.has_focus() && !response.changed() {
                     self.cell_name_drafts.remove(&id);
                 }
-                ui.label(format!("{shape_count} sh / {instance_count} inst"));
+                ui.label(format!(
+                    "{shape_count} shapes / {child_instance_count} child instances"
+                ))
+                .on_hover_text(format!(
+                    "{} placed instance{}",
+                    placed_instance_count,
+                    if placed_instance_count == 1 { "" } else { "s" }
+                ));
                 if !is_top && ui.button("Place").clicked() {
                     self.place_cell_instance(id);
+                }
+                let can_delete = !is_top && placed_instance_count == 0;
+                if ui
+                    .add_enabled(can_delete, egui::Button::new("Delete"))
+                    .on_disabled_hover_text(if is_top {
+                        "The top cell cannot be deleted"
+                    } else {
+                        "Delete placed instances before deleting this cell"
+                    })
+                    .clicked()
+                {
+                    self.delete_cell(id);
                 }
             });
         }
@@ -5784,6 +7674,8 @@ impl FabricadApp {
 
         let lot_id = self.selected_yield_lot.clone();
         let wafer_id = self.selected_yield_wafer.clone();
+        let previous_context_lot = lot_id.clone();
+        let previous_context_wafer = wafer_id.clone();
         let lot_summary = self.yield_analysis.lot_summary(&lot_id).cloned();
         let wafer_summary = self
             .yield_analysis
@@ -5846,75 +7738,123 @@ impl FabricadApp {
                 });
 
                 if let Some(summary) = &lot_summary {
-                    ui.horizontal_wrapped(|ui| {
-                        yield_metric_ui(
-                            ui,
-                            "Lot yield",
-                            format_percent(summary.yield_fraction),
-                            format!(
-                                "{} pass / {} fail / {} dies",
-                                summary.passing_dies, summary.failing_dies, summary.total_dies
+                    let lot_yield_detail = format!(
+                        "{} pass / {} fail / {} dies",
+                        summary.passing_dies, summary.failing_dies, summary.total_dies
+                    );
+                    let main_fail_detail = summary.spatial_pattern.label().to_string();
+                    let recipe_detail = lot_route_label(&self.yield_analysis, &lot_id);
+                    ui_chrome::metric_tiles(
+                        ui,
+                        &[
+                            (
+                                "Lot yield",
+                                format_percent(summary.yield_fraction),
+                                lot_yield_detail.as_str(),
+                                ui_chrome::Tone::Neutral,
                             ),
-                        );
-                        yield_metric_ui(
-                            ui,
-                            "Main fail",
-                            summary
-                                .dominant_failure
-                                .map(FailureMode::label)
-                                .unwrap_or("none")
-                                .to_string(),
-                            summary.spatial_pattern.label().to_string(),
-                        );
-                        yield_metric_ui(
-                            ui,
-                            "Recipe path",
-                            lot_recipe_label(&self.yield_analysis, &lot_id),
-                            lot_route_label(&self.yield_analysis, &lot_id),
-                        );
-                    });
+                            (
+                                "Main fail",
+                                summary
+                                    .dominant_failure
+                                    .map(FailureMode::label)
+                                    .unwrap_or("none")
+                                    .to_string(),
+                                main_fail_detail.as_str(),
+                                ui_chrome::Tone::Neutral,
+                            ),
+                            (
+                                "Recipe path",
+                                lot_recipe_label(&self.yield_analysis, &lot_id),
+                                recipe_detail.as_str(),
+                                ui_chrome::Tone::Neutral,
+                            ),
+                        ],
+                    );
                 }
 
                 ui.separator();
-                ui.columns(2, |columns| {
-                    ui_chrome::section_label(&mut columns[0], &format!("Wafer Map {wafer_id}"));
-                    draw_yield_wafer_map(&mut columns[0], &die_outcomes);
+                if ui.available_width() < 760.0 {
+                    ui_chrome::section_label(ui, &format!("Wafer Map {wafer_id}"));
+                    draw_yield_wafer_map(ui, &die_outcomes);
                     if let Some(summary) = &wafer_summary {
-                        columns[0].label(format!(
+                        ui.label(format!(
                             "{} yield, {} failures, {}",
                             format_percent(summary.yield_fraction),
                             summary.failing_dies,
                             summary.spatial_pattern.label()
                         ));
                         for hint in &summary.root_cause_hints {
-                            columns[0].label(hint);
+                            ui.label(hint);
                         }
                     }
-
-                    ui_chrome::section_label(&mut columns[1], "Wafer Yield");
-                    self.yield_wafer_rows(&mut columns[1], &wafer_rows);
-                    columns[1].separator();
-                    ui_chrome::section_label(&mut columns[1], "Failure Modes");
+                    ui.separator();
+                    ui_chrome::section_label(ui, "Wafer Yield");
+                    self.yield_wafer_rows(ui, &wafer_rows);
+                    ui.separator();
+                    ui_chrome::section_label(ui, "Failure Modes");
                     if let Some(summary) = &lot_summary {
-                        failure_breakdown_ui(&mut columns[1], summary);
+                        failure_breakdown_ui(ui, summary);
                     }
-                });
+                } else {
+                    ui.columns(2, |columns| {
+                        ui_chrome::section_label(&mut columns[0], &format!("Wafer Map {wafer_id}"));
+                        draw_yield_wafer_map(&mut columns[0], &die_outcomes);
+                        if let Some(summary) = &wafer_summary {
+                            columns[0].label(format!(
+                                "{} yield, {} failures, {}",
+                                format_percent(summary.yield_fraction),
+                                summary.failing_dies,
+                                summary.spatial_pattern.label()
+                            ));
+                            for hint in &summary.root_cause_hints {
+                                columns[0].label(hint);
+                            }
+                        }
+
+                        ui_chrome::section_label(&mut columns[1], "Wafer Yield");
+                        self.yield_wafer_rows(&mut columns[1], &wafer_rows);
+                        columns[1].separator();
+                        ui_chrome::section_label(&mut columns[1], "Failure Modes");
+                        if let Some(summary) = &lot_summary {
+                            failure_breakdown_ui(&mut columns[1], summary);
+                        }
+                    });
+                }
 
                 ui.separator();
-                ui.columns(2, |columns| {
-                    ui_chrome::section_label(&mut columns[0], "Lot / Recipe Comparison");
-                    lot_comparison_ui(&mut columns[0], &comparisons);
-                    ui_chrome::section_label(
-                        &mut columns[1],
-                        "Selected Wafer Process Measurements",
-                    );
-                    wafer_measurements_ui(&mut columns[1], &measurements);
-                });
+                if ui.available_width() < 760.0 {
+                    ui_chrome::section_label(ui, "Lot / Recipe Comparison");
+                    lot_comparison_ui(ui, &comparisons);
+                    ui.separator();
+                    ui_chrome::section_label(ui, "Selected Wafer Process Measurements");
+                    wafer_measurements_ui(ui, &measurements);
+                } else {
+                    ui.columns(2, |columns| {
+                        ui_chrome::section_label(&mut columns[0], "Lot / Recipe Comparison");
+                        lot_comparison_ui(&mut columns[0], &comparisons);
+                        ui_chrome::section_label(
+                            &mut columns[1],
+                            "Selected Wafer Process Measurements",
+                        );
+                        wafer_measurements_ui(&mut columns[1], &measurements);
+                    });
+                }
 
                 ui.separator();
                 ui_chrome::section_label(ui, "Measurement Correlation");
                 correlation_table_ui(ui, &correlations);
             });
+
+        if self.selected_yield_lot != previous_context_lot {
+            self.app_context.set_lot(self.selected_yield_lot.clone());
+            self.workflow_panel
+                .set_focus_lot(self.selected_yield_lot.clone());
+        }
+        if self.selected_yield_wafer != previous_context_wafer {
+            self.app_context
+                .set_wafer(self.selected_yield_wafer.clone());
+        }
     }
 
     fn yield_wafer_rows(&mut self, ui: &mut egui::Ui, rows: &[YieldSummary]) {
@@ -5944,6 +7884,8 @@ impl FabricadApp {
             });
         if let Some(wafer_id) = selected {
             self.selected_yield_wafer = wafer_id;
+            self.app_context
+                .set_wafer(self.selected_yield_wafer.clone());
         }
     }
 
@@ -5966,7 +7908,8 @@ impl FabricadApp {
             let scroll = ui.input(|input| input.raw_scroll_delta.y);
             if scroll.abs() > 0.0 {
                 let previous_zoom = self.zoom;
-                self.zoom = (self.zoom * (scroll * 0.0015).exp()).clamp(0.008, 4.0);
+                self.zoom =
+                    (self.zoom * (scroll * 0.0015).exp()).clamp(LAYOUT_MIN_ZOOM, LAYOUT_MAX_ZOOM);
                 if let Some(pointer) = response.hover_pos() {
                     let center = canvas.center();
                     let before = (pointer - center - self.pan) / previous_zoom;
@@ -6077,7 +8020,10 @@ impl FabricadApp {
             self.draw_visible_cpu_shapes(&painter, canvas, viewport, &visible_occurrences);
         }
         self.draw_selected_net_highlight(&painter, canvas, viewport);
-        self.draw_violations(&painter, canvas);
+        if self.settings.show_drc_overlay {
+            self.draw_violations(&painter, canvas);
+            self.draw_drc_overlay_legend(&painter, canvas);
+        }
         self.draw_selected_vertex_handles(&painter, canvas);
         self.draw_edit_preview(ui, &painter, canvas);
         self.draw_route_points(&painter, canvas);
@@ -6087,6 +8033,7 @@ impl FabricadApp {
         self.handle_canvas_input(ui, &response, canvas);
         self.broadcast_selection_if_changed();
         self.perf.frame_ms = frame_start.elapsed().as_secs_f64() * 1000.0;
+        draw_fps_overlay(&painter, canvas, Some(self.perf.frame_ms), None);
     }
 
     fn canvas_3d(&mut self, ui: &mut egui::Ui) {
@@ -6494,6 +8441,14 @@ impl FabricadApp {
 
         let basis = self.camera_3d.basis();
         ui.input(|input| {
+            if input.key_pressed(Key::R) && !input.modifiers.any() {
+                self.camera_3d.speed = (self.camera_3d.speed * 1.5).min(2_000_000.0);
+                self.status = format!("3D speed {:.0}", self.camera_3d.speed);
+            }
+            if input.key_pressed(Key::F) && !input.modifiers.any() {
+                self.camera_3d.speed = (self.camera_3d.speed / 1.5).max(100.0);
+                self.status = format!("3D speed {:.0}", self.camera_3d.speed);
+            }
             let mut direction = Vec3f::ZERO;
             if input.key_down(Key::W) || input.key_down(Key::ArrowUp) {
                 direction += basis.forward;
@@ -6771,7 +8726,7 @@ impl FabricadApp {
                     Point::new(center.x - half, center.y - half),
                     Point::new(center.x + half, center.y + half),
                 );
-                add_slab_faces(faces, &rect.corners(), base_z, top_z + 120.0, color);
+                add_slab_faces(faces, &rect.corners(), base_z, top_z, color);
             }
             ShapeKind::Label { .. } | ShapeKind::Measurement { .. } | ShapeKind::Polygon(_) => {}
         }
@@ -6904,31 +8859,62 @@ impl FabricadApp {
         stats: Render3dStats,
         gpu_frame_ms: Option<f64>,
     ) {
-        let position = self.camera_3d.position;
-        let capped = if stats.capped || stats.cpu_face_capped {
-            " capped"
-        } else {
-            ""
-        };
-        let text = format!(
-            "3D flycam  shapes: {}  faces: {}  {}{}  xyz: {:.0}, {:.0}, {:.0}",
-            stats.shapes, stats.faces, "slabs", capped, position.x, position.y, position.z
-        );
-        painter.text(
-            canvas.left_top() + vec2(12.0, 12.0),
-            Align2::LEFT_TOP,
-            text,
-            FontId::monospace(12.0),
-            Color32::from_rgb(220, 232, 228),
-        );
-        painter.text(
-            canvas.left_bottom() + vec2(12.0, -12.0),
-            Align2::LEFT_BOTTOM,
-            format_3d_fps_label(gpu_frame_ms, self.smoothed_3d_ui_frame_ms),
-            FontId::monospace(12.0),
-            Color32::from_rgb(220, 232, 228),
+        if stats.capped || stats.cpu_face_capped {
+            painter.text(
+                canvas.left_top() + vec2(12.0, 12.0),
+                Align2::LEFT_TOP,
+                "3D render capped",
+                FontId::monospace(11.0),
+                Color32::from_rgba_premultiplied(220, 232, 228, 170),
+            );
+        }
+        if canvas.width() >= 520.0 && canvas.height() >= 150.0 {
+            painter.text(
+                canvas.left_bottom() + vec2(12.0, -12.0),
+                Align2::LEFT_BOTTOM,
+                "WASD move  Q/E down/up  R/F speed  Shift faster  Esc release  F11 fullscreen",
+                FontId::monospace(11.0),
+                Color32::from_rgba_premultiplied(220, 232, 228, 150),
+            );
+        } else if canvas.width() >= 300.0 && canvas.height() >= 150.0 {
+            painter.text(
+                canvas.left_bottom() + vec2(12.0, -12.0),
+                Align2::LEFT_BOTTOM,
+                "WASD  Q/E  R/F  F11",
+                FontId::monospace(11.0),
+                Color32::from_rgba_premultiplied(220, 232, 228, 150),
+            );
+        }
+        draw_fps_overlay(
+            painter,
+            canvas,
+            gpu_frame_ms.or(self.smoothed_3d_ui_frame_ms),
+            (canvas.width() >= 520.0).then(|| format!("speed {:.0}", self.camera_3d.speed)),
         );
     }
+}
+
+fn draw_fps_overlay(
+    painter: &Painter,
+    canvas: EguiRect,
+    frame_ms: Option<f64>,
+    detail: Option<String>,
+) {
+    if canvas.width() < 120.0 || canvas.height() < 80.0 {
+        return;
+    }
+    let mut text = format_3d_fps_label(frame_ms, None);
+    if let Some(detail) = detail {
+        text.push_str("  ");
+        text.push_str(&detail);
+    }
+    painter.text(
+        canvas.right_bottom() + vec2(-12.0, -10.0),
+        Align2::RIGHT_BOTTOM,
+        text,
+        FontId::monospace(11.0),
+        Color32::from_rgba_premultiplied(220, 232, 228, 155),
+    );
 }
 
 fn format_3d_fps_label(gpu_frame_ms: Option<f64>, _ui_frame_ms: Option<f64>) -> String {
@@ -7085,20 +9071,7 @@ impl FabricadApp {
         if !layer.visible || matches!(layer.process, ProcessLayer::Annotation) {
             return None;
         }
-        let current_key = (layer.display_order, layer.id);
-        let index = self
-            .document
-            .layers
-            .values()
-            .filter(|layer| !matches!(layer.process, ProcessLayer::Annotation))
-            .filter(|layer| (layer.display_order, layer.id) < current_key)
-            .count() as f32;
-        let base_z = index * 170.0;
-        let thickness = match layer.process {
-            ProcessLayer::Contact | ProcessLayer::Via1 => 240.0,
-            ProcessLayer::Oxide => 55.0,
-            _ => 95.0,
-        };
+        let (base_z, thickness) = layer_3d_stack_position(layer.process);
         Some((base_z, base_z + thickness, layer_color_3d(layer.color)))
     }
 
@@ -7121,17 +9094,11 @@ impl FabricadApp {
         layer_order.sort_unstable_by_key(|(display_order, id, _, _, _)| (*display_order, *id));
         layer_order
             .iter()
-            .enumerate()
-            .filter_map(|(index, (_, id, process, color, visible))| {
+            .filter_map(|(_, id, process, color, visible)| {
                 if !visible {
                     return None;
                 }
-                let base_z = index as f32 * 170.0;
-                let thickness = match process {
-                    ProcessLayer::Contact | ProcessLayer::Via1 => 240.0,
-                    ProcessLayer::Oxide => 55.0,
-                    _ => 95.0,
-                };
+                let (base_z, thickness) = layer_3d_stack_position(*process);
                 Some((
                     *id,
                     Layer3dStyle {
@@ -7152,8 +9119,7 @@ impl FabricadApp {
         painter.rect_filled(canvas, 0.0, Color32::from_rgb(13, 16, 18));
         if !self.settings.show_grid_2d {
             if self.settings.show_origin_marker {
-                let origin = self.world_to_screen(Point::ZERO, canvas);
-                painter.circle_filled(origin, 3.0, Color32::from_rgb(220, 220, 210));
+                self.draw_origin_marker(painter, canvas);
             }
             return;
         }
@@ -7185,9 +9151,25 @@ impl FabricadApp {
             painter.line_segment([a, b], stroke);
         }
         if self.settings.show_origin_marker {
-            let origin = self.world_to_screen(Point::ZERO, canvas);
-            painter.circle_filled(origin, 3.0, Color32::from_rgb(220, 220, 210));
+            self.draw_origin_marker(painter, canvas);
         }
+    }
+
+    fn draw_origin_marker(&self, painter: &Painter, canvas: EguiRect) {
+        let origin = self.world_to_screen(Point::ZERO, canvas);
+        if !canvas.expand(18.0).contains(origin) {
+            return;
+        }
+        let stroke = Stroke::new(1.0, Color32::from_rgba_premultiplied(220, 220, 210, 145));
+        painter.line_segment([origin + vec2(-6.0, 0.0), origin + vec2(6.0, 0.0)], stroke);
+        painter.line_segment([origin + vec2(0.0, -6.0), origin + vec2(0.0, 6.0)], stroke);
+        painter.text(
+            origin + vec2(8.0, -8.0),
+            Align2::LEFT_BOTTOM,
+            "0,0",
+            FontId::monospace(10.0),
+            Color32::from_rgba_premultiplied(220, 220, 210, 130),
+        );
     }
 
     fn draw_scale_bar(&self, painter: &Painter, canvas: EguiRect) {
@@ -7574,10 +9556,14 @@ impl FabricadApp {
     }
 
     fn draw_violations(&self, painter: &Painter, canvas: EguiRect) {
+        let mut drawn = 0usize;
         for violation in &self.violations {
             let state = self.marker_state(violation);
             if state.hidden || state.waived {
                 continue;
+            }
+            if drawn >= MAX_DRC_OVERLAY_MARKERS {
+                break;
             }
             let min = self.world_to_screen(violation.bounds.min, canvas);
             let max = self.world_to_screen(violation.bounds.max, canvas);
@@ -7588,7 +9574,28 @@ impl FabricadApp {
                 Stroke::new(2.0, Color32::from_rgb(255, 70, 70)),
                 StrokeKind::Outside,
             );
+            drawn += 1;
         }
+    }
+
+    fn draw_drc_overlay_legend(&self, painter: &Painter, canvas: EguiRect) {
+        let active = self.active_marker_count();
+        if active == 0 || canvas.width() < 220.0 || canvas.height() < 90.0 {
+            return;
+        }
+        let drawn = active.min(MAX_DRC_OVERLAY_MARKERS);
+        let text = if drawn < active {
+            format!("DRC overlay: first {drawn} of {active} active")
+        } else {
+            format!("DRC overlay: {active} active")
+        };
+        painter.text(
+            canvas.right_top() + vec2(-12.0, 12.0),
+            Align2::RIGHT_TOP,
+            text,
+            FontId::monospace(11.0),
+            Color32::from_rgba_premultiplied(255, 190, 190, 165),
+        );
     }
 
     fn draw_edit_preview(&self, ui: &egui::Ui, painter: &Painter, canvas: EguiRect) {
@@ -8026,21 +10033,26 @@ impl eframe::App for FabricadApp {
         phase_times.toolbar += take_elapsed_ms(&mut phase_cursor);
         self.navigation_panel(ctx);
         phase_times.navigation += take_elapsed_ms(&mut phase_cursor);
-        if self.view_mode.has_inspector_panel() {
+        let inline_side_panels = Self::inline_side_panels(ctx);
+        if inline_side_panels && self.view_mode.has_inspector_panel() {
             self.inspector_panel(ctx);
         }
         phase_times.inspector += take_elapsed_ms(&mut phase_cursor);
-        if self.view_mode.has_secondary_panel() {
+        if inline_side_panels && self.view_mode.has_secondary_panel() {
             self.layers_panel(ctx);
         }
         phase_times.layers += take_elapsed_ms(&mut phase_cursor);
         self.options_window(ctx);
         self.diagnostics_window(ctx);
+        self.sidebar_modules_window(ctx);
+        self.command_palette_window(ctx);
+        self.responsive_panel_windows(ctx);
         phase_times.windows += take_elapsed_ms(&mut phase_cursor);
         self.mes_panel(ctx);
         phase_times.mes += take_elapsed_ms(&mut phase_cursor);
         egui::CentralPanel::default().show(ctx, |ui| match self.view_mode {
             ViewMode::Workflow => {
+                self.sync_workflow_focus_from_context();
                 let data = WorkflowData {
                     document: &self.document,
                     process_flow: self.process_flow_panel.model(),
@@ -8056,9 +10068,10 @@ impl eframe::App for FabricadApp {
                     yield_analysis: &self.yield_analysis,
                     notebook: self.notebook_panel.notebook(),
                 };
-                if let Some(destination) = self.workflow_panel.ui(ui, data) {
-                    self.open_workflow_destination(destination);
+                if let Some(action) = self.workflow_panel.ui(ui, data) {
+                    self.handle_workflow_action(action);
                 }
+                self.sync_context_from_workflow();
             }
             ViewMode::Layout2d => self.canvas(ui),
             ViewMode::Layout3d => self.canvas_3d(ui),
@@ -8458,10 +10471,23 @@ fn coord_from_f32(value: f32) -> Coord {
 }
 
 fn rule_deck_for_document(document: &Document, technology: &TechnologyFile) -> RuleDeck {
+    if document.layers.is_empty() {
+        return empty_rule_deck(document.grid);
+    }
     RuleDeck::from_technology(document, technology).unwrap_or_else(|err| {
-        error!("technology rule load failed: {err}; using demo rule deck");
-        RuleDeck::demo(document)
+        error!("technology rule load failed: {err}; DRC rules disabled for this document");
+        empty_rule_deck(document.grid)
     })
+}
+
+fn empty_rule_deck(grid: Coord) -> RuleDeck {
+    RuleDeck {
+        grid,
+        min_width: BTreeMap::new(),
+        min_spacing: BTreeMap::new(),
+        via_enclosure: Vec::new(),
+        forbidden_overlaps: Vec::new(),
+    }
 }
 
 fn connectivity_report_for_document(
@@ -8498,10 +10524,6 @@ fn document_object_count(document: &Document) -> usize {
             .values()
             .map(|cell| 1 + cell.shapes.len() + cell.instances.len())
             .sum::<usize>()
-}
-
-fn yield_metric_ui(ui: &mut egui::Ui, label: &str, value: String, detail: String) {
-    ui_chrome::metric_tile(ui, label, value, &detail);
 }
 
 fn draw_yield_wafer_map(ui: &mut egui::Ui, outcomes: &[DieOutcome]) {
@@ -9411,6 +11433,28 @@ fn tool_button(ui: &mut egui::Ui, active: &mut Tool, value: Tool, label: &str) {
     }
 }
 
+fn menu_hotkey_label(ui: &egui::Ui, label: &str, hotkey_index: usize) -> egui::WidgetText {
+    let mut job = egui::text::LayoutJob::default();
+    let base = egui::TextFormat {
+        font_id: FontId::proportional(14.0),
+        color: ui.visuals().text_color(),
+        ..Default::default()
+    };
+    let underline = egui::TextFormat {
+        underline: Stroke::new(1.0, ui.visuals().text_color()),
+        ..base.clone()
+    };
+    for (index, character) in label.chars().enumerate() {
+        let format = if index == hotkey_index {
+            underline.clone()
+        } else {
+            base.clone()
+        };
+        job.append(&character.to_string(), 0.0, format);
+    }
+    job.into()
+}
+
 fn append_shape_view_3d_to_batch(
     batch: &mut renderer::RenderBatch3d,
     flattened: FlattenedShapeView<'_>,
@@ -9504,7 +11548,7 @@ fn append_shape_view_3d_to_batch(
                 batch,
                 rect,
                 style.base_z,
-                style.top_z + 120.0,
+                style.top_z,
                 style.color,
                 include_sides,
             )
@@ -9618,12 +11662,7 @@ fn append_slab_to_3d_batch(
                 .map(|point| Vec3f::new(point.x as f32, point.y as f32, top_z)),
         );
     }
-    let mut faces = usize::from(append_face_points_to_3d_batch(
-        batch,
-        FaceSurface3d::Top,
-        &top,
-        color,
-    ));
+    let mut faces = usize::from(append_top_face_points_to_3d_batch(batch, &top, color));
 
     if include_sides {
         let bottom = top
@@ -9835,6 +11874,124 @@ fn append_face_points_to_3d_batch(
     true
 }
 
+fn append_top_face_points_to_3d_batch(
+    batch: &mut renderer::RenderBatch3d,
+    points: &[Vec3f],
+    fill: Color32,
+) -> bool {
+    if points.len() < 3 || batch.vertices.len() > u32::MAX as usize - points.len() {
+        return false;
+    }
+    let triangles = triangulate_xy_polygon(points);
+    if triangles.is_empty() {
+        return false;
+    }
+    let base = batch.vertices.len() as u32;
+    let color = color32_to_gpu(fill);
+    batch
+        .vertices
+        .extend(points.iter().map(|point| renderer::GpuVertex3d {
+            position: [point.x, point.y, point.z],
+            normal: [0.0, 0.0, 1.0],
+            color,
+        }));
+    for [a, b, c] in triangles {
+        batch
+            .indices
+            .extend_from_slice(&[base + a as u32, base + b as u32, base + c as u32]);
+    }
+    true
+}
+
+fn triangulate_xy_polygon(points: &[Vec3f]) -> Vec<[usize; 3]> {
+    if points.len() < 3 {
+        return Vec::new();
+    }
+    if points.len() == 3 {
+        return vec![[0, 1, 2]];
+    }
+    let mut vertices: Vec<usize> = (0..points.len()).collect();
+    if polygon_area_xy(points) < 0.0 {
+        vertices.reverse();
+    }
+    let mut triangles = Vec::with_capacity(points.len().saturating_sub(2));
+    let mut guard = 0usize;
+    while vertices.len() > 3 && guard < points.len() * points.len() {
+        guard += 1;
+        let mut ear_index = None;
+        for index in 0..vertices.len() {
+            let previous = vertices[(index + vertices.len() - 1) % vertices.len()];
+            let current = vertices[index];
+            let next = vertices[(index + 1) % vertices.len()];
+            if !is_convex_xy(points[previous], points[current], points[next]) {
+                continue;
+            }
+            let contains_vertex = vertices.iter().any(|candidate| {
+                *candidate != previous
+                    && *candidate != current
+                    && *candidate != next
+                    && point_in_triangle_xy(
+                        points[*candidate],
+                        points[previous],
+                        points[current],
+                        points[next],
+                    )
+            });
+            if !contains_vertex {
+                ear_index = Some(index);
+                triangles.push([previous, current, next]);
+                break;
+            }
+        }
+        let Some(index) = ear_index else {
+            triangulate_xy_fan(&vertices, &mut triangles);
+            return triangles;
+        };
+        vertices.remove(index);
+    }
+    if vertices.len() == 3 {
+        triangles.push([vertices[0], vertices[1], vertices[2]]);
+    }
+    triangles
+}
+
+fn triangulate_xy_fan(vertices: &[usize], triangles: &mut Vec<[usize; 3]>) {
+    for index in 1..vertices.len().saturating_sub(1) {
+        triangles.push([vertices[0], vertices[index], vertices[index + 1]]);
+    }
+}
+
+fn polygon_area_xy(points: &[Vec3f]) -> f32 {
+    let Some(first) = points.first() else {
+        return 0.0;
+    };
+    let mut previous = *first;
+    let mut area = 0.0;
+    for point in &points[1..] {
+        area += previous.x * point.y - point.x * previous.y;
+        previous = *point;
+    }
+    (area + previous.x * first.y - first.x * previous.y) * 0.5
+}
+
+fn is_convex_xy(a: Vec3f, b: Vec3f, c: Vec3f) -> bool {
+    let cross = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+    cross > 0.0
+}
+
+fn point_in_triangle_xy(point: Vec3f, a: Vec3f, b: Vec3f, c: Vec3f) -> bool {
+    let area = triangle_area_sign_xy(point, a, b);
+    let b_area = triangle_area_sign_xy(point, b, c);
+    let c_area = triangle_area_sign_xy(point, c, a);
+    let has_negative = area < -0.001 || b_area < -0.001 || c_area < -0.001;
+    let has_positive = area > 0.001 || b_area > 0.001 || c_area > 0.001;
+    !(has_negative && has_positive)
+}
+
+fn triangle_area_sign_xy(a: Vec3f, b: Vec3f, c: Vec3f) -> f32 {
+    (a.x - c.x) * (b.y - c.y) - (b.x - c.x) * (a.y - c.y)
+}
+
 fn append_quad_to_3d_batch(
     batch: &mut renderer::RenderBatch3d,
     points: [Vec3f; 4],
@@ -9997,6 +12154,32 @@ fn layer_color_3d(color: [f32; 4]) -> Color32 {
         (color[1] * 255.0).clamp(0.0, 255.0) as u8,
         (color[2] * 255.0).clamp(0.0, 255.0) as u8,
     )
+}
+
+fn layer_3d_stack_position(process: ProcessLayer) -> (f32, f32) {
+    match process {
+        ProcessLayer::Diffusion => (0.0, 80.0),
+        ProcessLayer::Oxide => (95.0, 40.0),
+        ProcessLayer::Poly => (155.0, 75.0),
+        ProcessLayer::Contact => (230.0, 110.0),
+        ProcessLayer::Metal1 => (340.0, 90.0),
+        ProcessLayer::Via1 => (430.0, 120.0),
+        ProcessLayer::Metal2 => (550.0, 90.0),
+        ProcessLayer::Annotation => (0.0, 0.0),
+    }
+}
+
+fn process_layer_label(process: ProcessLayer) -> &'static str {
+    match process {
+        ProcessLayer::Diffusion => "Diffusion",
+        ProcessLayer::Poly => "Poly",
+        ProcessLayer::Contact => "Contact",
+        ProcessLayer::Metal1 => "Metal 1",
+        ProcessLayer::Via1 => "Via 1",
+        ProcessLayer::Metal2 => "Metal 2",
+        ProcessLayer::Oxide => "Oxide",
+        ProcessLayer::Annotation => "Annotation",
+    }
 }
 
 fn shade_color(color: Color32, multiplier: f32) -> Color32 {
@@ -10425,6 +12608,7 @@ mod tests {
     fn blank_workspace_dataset_has_no_demo_operational_data() {
         let dataset = WorkspaceDataset::blank();
 
+        assert!(dataset.document.layers.is_empty());
         assert!(dataset.document.shapes.is_empty());
         assert!(dataset.mes.lots.is_empty());
         assert!(dataset.yield_analysis.lots.is_empty());
@@ -10521,6 +12705,76 @@ mod tests {
                 .iter()
                 .any(|entry| { entry.links.lots.iter().any(|lot| lot.as_str() == focus_lot) })
         );
+    }
+
+    #[test]
+    fn app_context_lot_selection_updates_linked_views() {
+        let cc = eframe::CreationContext::_new_kittest(egui::Context::default());
+        let mut app = FabricadApp::new(&cc);
+        app.apply_workspace_dataset(
+            WorkspaceDataset::demo(),
+            DataSource::Demo,
+            DataSource::Demo,
+            "demo",
+        );
+
+        app.set_focus_object(FabObjectRef::lot("L-00042"));
+
+        assert_eq!(app.app_context.focus_lot(), Some("L-00042"));
+        assert_eq!(app.workflow_panel.focus_lot(), "L-00042");
+        assert_eq!(
+            app.selected_mes_lot.as_ref().map(LotId::as_str),
+            Some("L-00042")
+        );
+        assert_eq!(app.selected_yield_lot, "L-00042");
+        assert!(
+            app.yield_analysis
+                .wafer_ids_for_lot("L-00042")
+                .contains(&app.selected_yield_wafer)
+        );
+    }
+
+    #[test]
+    fn context_mes_action_advances_focus_lot_traveler() {
+        let cc = eframe::CreationContext::_new_kittest(egui::Context::default());
+        let mut app = FabricadApp::new(&cc);
+        app.apply_workspace_dataset(
+            WorkspaceDataset::demo(),
+            DataSource::Demo,
+            DataSource::Demo,
+            "demo",
+        );
+        app.set_focus_object(FabObjectRef::lot("L-00042"));
+
+        let (lot_id, action, label) = app.context_mes_action().expect("focus lot has action");
+        assert!(label.starts_with("Start "));
+        assert!(matches!(action, OperatorAction::StartStep { .. }));
+        app.apply_mes_action(&lot_id, action);
+
+        let traveler = app.mes.travelers.get(&lot_id).expect("traveler exists");
+        assert_eq!(traveler.status, TravelerStatus::Running);
+    }
+
+    #[test]
+    fn quick_workflow_note_links_to_focus_lot() {
+        let cc = eframe::CreationContext::_new_kittest(egui::Context::default());
+        let mut app = FabricadApp::new(&cc);
+        app.apply_workspace_dataset(
+            WorkspaceDataset::demo(),
+            DataSource::Demo,
+            DataSource::Demo,
+            "demo",
+        );
+        let before = app.notebook_panel.notebook().entries.len();
+        let entry_id = app.notebook_panel.add_quick_lot_note("L-00042");
+
+        assert_eq!(app.notebook_panel.notebook().entries.len(), before + 1);
+        let entry = app
+            .notebook_panel
+            .notebook()
+            .entry(&entry_id)
+            .expect("created note is present");
+        assert!(entry.links.lots.iter().any(|lot| lot.as_str() == "L-00042"));
     }
 
     #[test]
@@ -10927,6 +13181,29 @@ mod tests {
         assert_eq!(faces, 5);
         assert_triangle_winding_matches_vertex_normals(&batch);
         assert!(batch.vertices[0].normal[2] > 0.99);
+    }
+
+    #[test]
+    fn concave_3d_top_caps_use_ear_clipping() {
+        let points = [
+            Point::new(0, 0),
+            Point::new(100, 0),
+            Point::new(100, 40),
+            Point::new(40, 40),
+            Point::new(40, 100),
+            Point::new(0, 100),
+        ];
+        let mut batch = renderer::RenderBatch3d::default();
+        let faces = append_slab_to_3d_batch(&mut batch, &points, 0.0, 20.0, Color32::WHITE, true);
+
+        assert_eq!(faces, 7);
+        let top_points = batch.vertices[..6]
+            .iter()
+            .map(|vertex| Vec3f::new(vertex.position[0], vertex.position[1], vertex.position[2]))
+            .collect::<Vec<_>>();
+        assert_eq!(triangulate_xy_polygon(&top_points).len(), 4);
+        assert_eq!(batch.indices.len(), 48);
+        assert_triangle_winding_matches_vertex_normals(&batch);
     }
 
     #[test]

@@ -39,14 +39,24 @@ fn startup_options_from_url() -> fabricad_app::StartupOptions {
     let mut options = fabricad_app::StartupOptions::default();
     for (key, value) in query_pairs(&search) {
         match key.as_str() {
+            "workspace" if value == "demo" => {
+                options.demo_workspace = true;
+            }
+            "demo" if value == "1" || value == "true" => {
+                options.demo_workspace = true;
+            }
             "scene" if value == "hierarchy" => {
                 options.hierarchy_demo = true;
             }
             "scene" if value == "stress" => {
                 options.stress_count = Some(options.stress_count.unwrap_or(10_000));
             }
-            "view" if value == "3d" => {
-                options.view_3d = true;
+            "view" => {
+                if let Some(view) = fabricad_app::StartupView::from_slug(&value) {
+                    options.view_mode = Some(view);
+                } else if value == "3d" {
+                    options.view_3d = true;
+                }
             }
             "options" if value == "1" || value == "true" => {
                 options.show_options = true;

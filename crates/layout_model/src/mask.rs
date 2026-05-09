@@ -10,6 +10,9 @@ use crate::{
     recipe::{RecipeBinding, RecipeId},
 };
 
+const MAX_RETAINED_MASK_ISSUES: usize = 500;
+const MAX_MASK_SPACING_COMPARISONS: usize = 50_000;
+
 macro_rules! string_id {
     ($name:ident) => {
         #[derive(
@@ -291,7 +294,7 @@ impl ReticlePrep {
             field_count: self.fields.len(),
             exposure_block_count: self.exposure_blocks.len(),
             printable_shape_count: 0,
-            issues: Vec::new(),
+            ..MaskCheckReport::default()
         };
 
         validate_reticle(self, &mut report);
@@ -299,7 +302,7 @@ impl ReticlePrep {
         let mut layer_lookup = BTreeMap::new();
         for layer in &self.layer_stack {
             if layer_lookup.insert(layer.layer, layer).is_some() {
-                report.issues.push(MaskPrepIssue::error(
+                report.push_issue(MaskPrepIssue::error(
                     "duplicate_layer",
                     format!(
                         "layer {} appears more than once in the mask stack",
@@ -308,20 +311,20 @@ impl ReticlePrep {
                 ));
             }
             if document.layer(layer.layer).is_none() {
-                report.issues.push(MaskPrepIssue::error(
+                report.push_issue(MaskPrepIssue::error(
                     "unknown_layer",
                     format!("mask stack references missing layer {}", layer.layer.0),
                 ));
             }
             if layer.min_feature < 0 || layer.min_spacing < 0 {
-                report.issues.push(MaskPrepIssue::error(
+                report.push_issue(MaskPrepIssue::error(
                     "negative_rule",
                     format!("{} has a negative reticle rule", layer.name),
                 ));
             }
         }
         if self.layer_stack.is_empty() {
-            report.issues.push(MaskPrepIssue::error(
+            report.push_issue(MaskPrepIssue::error(
                 "empty_stack",
                 "mask layer stack is empty",
             ));
@@ -331,7 +334,7 @@ impl ReticlePrep {
         for field in &self.fields {
             validate_field(document, &self.reticle, field, &mut report);
             if field_lookup.insert(field.id.clone(), field).is_some() {
-                report.issues.push(
+                report.push_issue(
                     MaskPrepIssue::error(
                         "duplicate_field",
                         format!("reticle field {} appears more than once", field.id),
@@ -341,7 +344,7 @@ impl ReticlePrep {
             }
         }
         if self.fields.is_empty() {
-            report.issues.push(MaskPrepIssue::error(
+            report.push_issue(MaskPrepIssue::error(
                 "empty_fields",
                 "reticle has no fields",
             ));
@@ -351,7 +354,7 @@ impl ReticlePrep {
             validate_exposure_block(block, &field_lookup, &layer_lookup, document, &mut report);
         }
         if self.exposure_blocks.is_empty() {
-            report.issues.push(MaskPrepIssue::error(
+            report.push_issue(MaskPrepIssue::error(
                 "empty_exposure_blocks",
                 "reticle prep has no exposure blocks",
             ));
@@ -361,7 +364,7 @@ impl ReticlePrep {
         report.printable_shape_count = shapes.len();
         for layer in &self.layer_stack {
             if layer.critical && !shapes.iter().any(|shape| shape.layer == layer.layer) {
-                report.issues.push(
+                report.push_issue(
                     MaskPrepIssue::warning(
                         "empty_critical_layer",
                         format!(
@@ -467,25 +470,70 @@ pub struct MaskCheckReport {
     pub exposure_block_count: usize,
     pub printable_shape_count: usize,
     pub issues: Vec<MaskPrepIssue>,
+    #[serde(skip)]
+    error_count: usize,
+    #[serde(skip)]
+    warning_count: usize,
+    #[serde(skip)]
+    omitted_issue_count: usize,
 }
 
 impl MaskCheckReport {
+    fn push_issue(&mut self, issue: MaskPrepIssue) {
+        match issue.severity {
+            MaskIssueSeverity::Error => self.error_count += 1,
+            MaskIssueSeverity::Warning => self.warning_count += 1,
+        }
+        if self.issues.len() < MAX_RETAINED_MASK_ISSUES {
+            self.issues.push(issue);
+        } else {
+            self.omitted_issue_count += 1;
+        }
+    }
+
     pub fn error_count(&self) -> usize {
-        self.issues
-            .iter()
-            .filter(|issue| issue.severity == MaskIssueSeverity::Error)
-            .count()
+        if self.should_count_retained_issues() {
+            self.issues
+                .iter()
+                .filter(|issue| issue.severity == MaskIssueSeverity::Error)
+                .count()
+        } else {
+            self.error_count
+        }
     }
 
     pub fn warning_count(&self) -> usize {
-        self.issues
-            .iter()
-            .filter(|issue| issue.severity == MaskIssueSeverity::Warning)
-            .count()
+        if self.should_count_retained_issues() {
+            self.issues
+                .iter()
+                .filter(|issue| issue.severity == MaskIssueSeverity::Warning)
+                .count()
+        } else {
+            self.warning_count
+        }
+    }
+
+    pub fn total_issue_count(&self) -> usize {
+        self.error_count() + self.warning_count()
+    }
+
+    pub fn omitted_issue_count(&self) -> usize {
+        if self.should_count_retained_issues() {
+            0
+        } else {
+            self.omitted_issue_count
+        }
     }
 
     pub fn is_clean(&self) -> bool {
-        self.issues.is_empty()
+        self.total_issue_count() == 0
+    }
+
+    fn should_count_retained_issues(&self) -> bool {
+        self.error_count == 0
+            && self.warning_count == 0
+            && self.omitted_issue_count == 0
+            && !self.issues.is_empty()
     }
 }
 
@@ -499,19 +547,19 @@ struct MaskShapeRef {
 
 fn validate_reticle(prep: &ReticlePrep, report: &mut MaskCheckReport) {
     if prep.mask_design_id.trim().is_empty() {
-        report.issues.push(MaskPrepIssue::error(
+        report.push_issue(MaskPrepIssue::error(
             "empty_mask_id",
             "mask design id is empty",
         ));
     }
     if prep.reticle.size.width <= 0 || prep.reticle.size.height <= 0 {
-        report.issues.push(MaskPrepIssue::error(
+        report.push_issue(MaskPrepIssue::error(
             "bad_reticle_size",
             "reticle size must be positive",
         ));
     }
     if prep.reticle.size.max_field_width <= 0 || prep.reticle.size.max_field_height <= 0 {
-        report.issues.push(MaskPrepIssue::error(
+        report.push_issue(MaskPrepIssue::error(
             "bad_field_limit",
             "reticle field limits must be positive",
         ));
@@ -525,13 +573,13 @@ fn validate_field(
     report: &mut MaskCheckReport,
 ) {
     if field.name.trim().is_empty() {
-        report.issues.push(
+        report.push_issue(
             MaskPrepIssue::error("empty_field_name", "reticle field name is empty")
                 .with_field(field.id.clone()),
         );
     }
     if document.cell(field.source_cell).is_none() && field.source_cell != DEFAULT_TOP_CELL_ID {
-        report.issues.push(
+        report.push_issue(
             MaskPrepIssue::error(
                 "unknown_source_cell",
                 format!(
@@ -543,7 +591,7 @@ fn validate_field(
         );
     }
     if field.layout_bounds.width() <= 0 || field.layout_bounds.height() <= 0 {
-        report.issues.push(
+        report.push_issue(
             MaskPrepIssue::error(
                 "empty_field_bounds",
                 format!("field {} has empty layout bounds", field.id),
@@ -554,7 +602,7 @@ fn validate_field(
     if field.layout_bounds.width() > reticle.size.max_field_width
         || field.layout_bounds.height() > reticle.size.max_field_height
     {
-        report.issues.push(
+        report.push_issue(
             MaskPrepIssue::error(
                 "field_too_large",
                 format!("field {} exceeds the reticle field limit", field.id),
@@ -563,7 +611,7 @@ fn validate_field(
         );
     }
     if field.stepping.columns == 0 || field.stepping.rows == 0 {
-        report.issues.push(
+        report.push_issue(
             MaskPrepIssue::error(
                 "bad_field_stepping",
                 format!("field {} has zero stepping count", field.id),
@@ -581,7 +629,7 @@ fn validate_exposure_block(
     report: &mut MaskCheckReport,
 ) {
     let Some(field) = fields.get(&block.field_id) else {
-        report.issues.push(
+        report.push_issue(
             MaskPrepIssue::error(
                 "unknown_exposure_field",
                 format!(
@@ -594,7 +642,7 @@ fn validate_exposure_block(
         return;
     };
     if block.dose_mj_cm2 <= 0.0 || !block.dose_mj_cm2.is_finite() {
-        report.issues.push(
+        report.push_issue(
             MaskPrepIssue::error(
                 "bad_exposure_dose",
                 format!("block {} has invalid exposure dose", block.id),
@@ -603,7 +651,7 @@ fn validate_exposure_block(
         );
     }
     if block.passes == 0 {
-        report.issues.push(
+        report.push_issue(
             MaskPrepIssue::error(
                 "bad_exposure_passes",
                 format!("block {} has zero exposure passes", block.id),
@@ -612,7 +660,7 @@ fn validate_exposure_block(
         );
     }
     if block.bounds.width() <= 0 || block.bounds.height() <= 0 {
-        report.issues.push(
+        report.push_issue(
             MaskPrepIssue::error(
                 "empty_exposure_bounds",
                 format!("block {} has empty exposure bounds", block.id),
@@ -620,7 +668,7 @@ fn validate_exposure_block(
             .with_block(block.id.clone()),
         );
     } else if !field.layout_bounds.contains_rect(block.bounds) {
-        report.issues.push(
+        report.push_issue(
             MaskPrepIssue::warning(
                 "block_outside_field",
                 format!("block {} extends outside field {}", block.id, field.id),
@@ -629,7 +677,7 @@ fn validate_exposure_block(
         );
     }
     if block.layer_ids.is_empty() {
-        report.issues.push(
+        report.push_issue(
             MaskPrepIssue::warning(
                 "empty_block_layers",
                 format!("block {} does not expose any mask layers", block.id),
@@ -639,7 +687,7 @@ fn validate_exposure_block(
     }
     for layer_id in &block.layer_ids {
         if !layers.contains_key(layer_id) {
-            report.issues.push(
+            report.push_issue(
                 MaskPrepIssue::error(
                     "block_layer_not_in_stack",
                     format!(
@@ -652,7 +700,7 @@ fn validate_exposure_block(
             );
         }
         if document.layer(*layer_id).is_none() {
-            report.issues.push(
+            report.push_issue(
                 MaskPrepIssue::error(
                     "block_unknown_layer",
                     format!("block {} references missing layer {}", block.id, layer_id.0),
@@ -676,7 +724,7 @@ fn validate_mask_geometry(
         if let Some(min_feature) = shape.min_feature
             && min_feature < layer.min_feature as f64
         {
-            report.issues.push(
+            report.push_issue(
                 MaskPrepIssue::error(
                     "min_feature",
                     format!(
@@ -690,37 +738,56 @@ fn validate_mask_geometry(
         }
     }
 
-    for left_index in 0..shapes.len() {
-        for right in &shapes[left_index + 1..] {
-            let left = shapes[left_index];
-            if left.layer != right.layer {
-                continue;
-            }
-            let Some(layer) = layers.get(&left.layer) else {
-                continue;
-            };
-            if layer.min_spacing <= 0 {
-                continue;
-            }
-            let distance = left.bounds.distance_to_rect(right.bounds);
-            if distance < layer.min_spacing as f64 {
-                report.issues.push(
-                    MaskPrepIssue::warning(
-                        "min_spacing",
-                        format!(
-                            "{} shapes {} and {} are {:.0} dbu apart, below reticle spacing {}",
-                            layer.name,
-                            left.shape_id.0,
-                            right.shape_id.0,
-                            distance,
-                            layer.min_spacing
-                        ),
-                    )
-                    .with_layer(left.layer)
-                    .with_shape(left.shape_id, left.bounds.union(right.bounds)),
-                );
+    let mut shapes_by_layer: BTreeMap<LayerId, Vec<MaskShapeRef>> = BTreeMap::new();
+    for shape in shapes {
+        shapes_by_layer.entry(shape.layer).or_default().push(*shape);
+    }
+
+    let mut spacing_comparisons = 0usize;
+    let mut spacing_limited = false;
+    'spacing: for (layer_id, layer_shapes) in shapes_by_layer {
+        let Some(layer) = layers.get(&layer_id) else {
+            continue;
+        };
+        if layer.min_spacing <= 0 {
+            continue;
+        }
+        for left_index in 0..layer_shapes.len() {
+            let left = layer_shapes[left_index];
+            for right in &layer_shapes[left_index + 1..] {
+                if spacing_comparisons >= MAX_MASK_SPACING_COMPARISONS {
+                    spacing_limited = true;
+                    break 'spacing;
+                }
+                spacing_comparisons += 1;
+                let distance = left.bounds.distance_to_rect(right.bounds);
+                if distance < layer.min_spacing as f64 {
+                    report.push_issue(
+                        MaskPrepIssue::warning(
+                            "min_spacing",
+                            format!(
+                                "{} shapes {} and {} are {:.0} dbu apart, below reticle spacing {}",
+                                layer.name,
+                                left.shape_id.0,
+                                right.shape_id.0,
+                                distance,
+                                layer.min_spacing
+                            ),
+                        )
+                        .with_layer(left.layer)
+                        .with_shape(left.shape_id, left.bounds.union(right.bounds)),
+                    );
+                }
             }
         }
+    }
+    if spacing_limited {
+        report.push_issue(MaskPrepIssue::warning(
+            "spacing_check_limited",
+            format!(
+                "spacing validation stopped after {MAX_MASK_SPACING_COMPARISONS} same-layer comparisons"
+            ),
+        ));
     }
 }
 

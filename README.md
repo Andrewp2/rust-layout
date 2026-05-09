@@ -167,6 +167,22 @@ When an intentional rendering change updates the quarantined expected output, re
 ./scripts/render_e2e.py --update-baselines
 ```
 
+Whole-app layout audits capture every Fabricad module across a fixed viewport matrix and
+write raw screenshots plus contact sheets for manual review of clipped labels, crowded
+margins, awkward wrapping, and misplaced scrollbars:
+
+```bash
+./scripts/ui_layout_audit.py
+```
+
+Artifacts are written to `target/ui-layout-audit/`; open
+`target/ui-layout-audit/index.html` or the PNGs under `contact-sheets/`. For a faster
+smoke pass while iterating on chrome/layout changes, run:
+
+```bash
+./scripts/ui_layout_audit.py --quick
+```
+
 ## Web Build
 
 The `wasm_app` crate is wired for Trunk:

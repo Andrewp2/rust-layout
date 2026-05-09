@@ -38,10 +38,16 @@ impl SpcFdcPanel {
                 monitor_metrics_ui(ui, &monitor);
 
                 ui.separator();
-                ui.columns(2, |columns| {
-                    self.spc_section(&mut columns[0], &monitor);
-                    self.fdc_section(&mut columns[1], &monitor);
-                });
+                if ui.available_width() < 760.0 {
+                    self.spc_section(ui, &monitor);
+                    ui.separator();
+                    self.fdc_section(ui, &monitor);
+                } else {
+                    ui.columns(2, |columns| {
+                        self.spc_section(&mut columns[0], &monitor);
+                        self.fdc_section(&mut columns[1], &monitor);
+                    });
+                }
 
                 ui.separator();
                 findings_ui(ui, &monitor.findings);
@@ -278,30 +284,53 @@ fn monitor_from_fab_context(
 }
 
 fn monitor_metrics_ui(ui: &mut egui::Ui, monitor: &SpcFdcMonitor) {
-    ui.horizontal_wrapped(|ui| {
-        metric(
-            ui,
-            "Critical",
-            monitor.finding_count_by_severity(MonitorSeverity::Critical),
-        );
-        metric(
-            ui,
-            "Warning",
-            monitor.finding_count_by_severity(MonitorSeverity::Warning),
-        );
-        metric(ui, "SPC charts", monitor.charts.len());
-        metric(ui, "FDC traces", monitor.traces.len());
-        metric(ui, "Active alarms", monitor.alarm_summary.active_count);
-    });
-}
-
-fn metric(ui: &mut egui::Ui, label: &str, value: usize) {
-    let tone = match label {
-        "Critical" if value > 0 => Tone::Danger,
-        "Warning" if value > 0 => Tone::Warning,
-        _ => Tone::Neutral,
-    };
-    ui_chrome::metric_tile_tone(ui, label, value, "", tone);
+    ui_chrome::metric_tiles(
+        ui,
+        &[
+            (
+                "Critical",
+                monitor
+                    .finding_count_by_severity(MonitorSeverity::Critical)
+                    .to_string(),
+                "",
+                if monitor.finding_count_by_severity(MonitorSeverity::Critical) > 0 {
+                    Tone::Danger
+                } else {
+                    Tone::Neutral
+                },
+            ),
+            (
+                "Warning",
+                monitor
+                    .finding_count_by_severity(MonitorSeverity::Warning)
+                    .to_string(),
+                "",
+                if monitor.finding_count_by_severity(MonitorSeverity::Warning) > 0 {
+                    Tone::Warning
+                } else {
+                    Tone::Neutral
+                },
+            ),
+            (
+                "SPC charts",
+                monitor.charts.len().to_string(),
+                "",
+                Tone::Neutral,
+            ),
+            (
+                "FDC traces",
+                monitor.traces.len().to_string(),
+                "",
+                Tone::Neutral,
+            ),
+            (
+                "Active alarms",
+                monitor.alarm_summary.active_count.to_string(),
+                "",
+                Tone::Neutral,
+            ),
+        ],
+    );
 }
 
 fn findings_ui(ui: &mut egui::Ui, findings: &[MonitorFinding]) {
@@ -311,22 +340,30 @@ fn findings_ui(ui: &mut egui::Ui, findings: &[MonitorFinding]) {
         return;
     }
 
-    egui::Grid::new("spc_fdc_findings")
-        .striped(true)
-        .min_col_width(72.0)
+    egui::ScrollArea::horizontal()
+        .id_salt("spc_fdc_findings_horizontal")
+        .auto_shrink([false, true])
         .show(ui, |ui| {
-            ui.strong("Severity");
-            ui.strong("Source");
-            ui.strong("Finding");
-            ui.strong("Context");
-            ui.end_row();
-            for finding in findings {
-                ui.colored_label(severity_color(finding.severity), finding.severity.label());
-                ui.label(finding.source.label());
-                ui.label(&finding.title);
-                ui.label(finding_context(finding));
-                ui.end_row();
-            }
+            egui::Grid::new("spc_fdc_findings")
+                .striped(true)
+                .min_col_width(72.0)
+                .show(ui, |ui| {
+                    ui.strong("Severity");
+                    ui.strong("Source");
+                    ui.strong("Finding");
+                    ui.strong("Context");
+                    ui.end_row();
+                    for finding in findings {
+                        ui.colored_label(
+                            severity_color(finding.severity),
+                            finding.severity.label(),
+                        );
+                        ui.label(finding.source.label());
+                        ui.label(&finding.title);
+                        ui.label(finding_context(finding));
+                        ui.end_row();
+                    }
+                });
         });
 }
 

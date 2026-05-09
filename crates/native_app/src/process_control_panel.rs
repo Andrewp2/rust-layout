@@ -187,52 +187,66 @@ impl ProcessControlPanel {
                 let latest = trend.last();
 
                 if let Some(latest) = latest {
-                    ui.horizontal_wrapped(|ui| {
-                        control_metric_ui(
-                            ui,
-                            "Latest output",
-                            format_measurement(latest.value, &latest.unit),
-                            format!(
-                                "target {}, EWMA {} {}",
-                                format_measurement(latest.target, &latest.unit),
-                                format_signed(latest.ewma_error),
-                                latest.unit
+                    let target_detail = format!(
+                        "target {}, EWMA {} {}",
+                        format_measurement(latest.target, &latest.unit),
+                        format_signed(latest.ewma_error),
+                        latest.unit
+                    );
+                    let recipe_detail = format!(
+                        "{} / {} / {}",
+                        latest.source.lot_id, latest.source.wafer_id, latest.source.tool_run_id
+                    );
+                    let yield_detail = yield_context_detail(analysis, latest);
+                    ui_chrome::metric_tiles(
+                        ui,
+                        &[
+                            (
+                                "Latest output",
+                                format_measurement(latest.value, &latest.unit),
+                                target_detail.as_str(),
+                                ui_chrome::Tone::Neutral,
                             ),
-                        );
-                        control_metric_ui(
-                            ui,
-                            "Recipe path",
-                            latest.recipe.to_string(),
-                            format!(
-                                "{} / {} / {}",
-                                latest.source.lot_id,
-                                latest.source.wafer_id,
-                                latest.source.tool_run_id
+                            (
+                                "Recipe path",
+                                latest.recipe.to_string(),
+                                recipe_detail.as_str(),
+                                ui_chrome::Tone::Neutral,
                             ),
-                        );
-                        control_metric_ui(
-                            ui,
-                            "Yield context",
-                            latest
-                                .yield_fraction
-                                .map(format_percent)
-                                .unwrap_or_else(|| "-".to_string()),
-                            yield_context_detail(analysis, latest),
-                        );
-                    });
+                            (
+                                "Yield context",
+                                latest
+                                    .yield_fraction
+                                    .map(format_percent)
+                                    .unwrap_or_else(|| "-".to_string()),
+                                yield_detail.as_str(),
+                                ui_chrome::Tone::Neutral,
+                            ),
+                        ],
+                    );
                 }
 
                 ui.separator();
-                ui.columns(2, |columns| {
-                    ui_chrome::section_label(&mut columns[0], "Target vs measured");
-                    draw_control_chart(&mut columns[0], &loop_definition, &trend);
-                    columns[0].separator();
-                    control_history_table(&mut columns[0], &trend);
+                if ui.available_width() < 760.0 {
+                    ui_chrome::section_label(ui, "Target vs measured");
+                    draw_control_chart(ui, &loop_definition, &trend);
+                    ui.separator();
+                    control_history_table(ui, &trend);
+                    ui.separator();
+                    ui_chrome::section_label(ui, "Control actions");
+                    requested_transition = self.control_actions_ui(ui, &loop_definition, &actions);
+                } else {
+                    ui.columns(2, |columns| {
+                        ui_chrome::section_label(&mut columns[0], "Target vs measured");
+                        draw_control_chart(&mut columns[0], &loop_definition, &trend);
+                        columns[0].separator();
+                        control_history_table(&mut columns[0], &trend);
 
-                    ui_chrome::section_label(&mut columns[1], "Control actions");
-                    requested_transition =
-                        self.control_actions_ui(&mut columns[1], &loop_definition, &actions);
-                });
+                        ui_chrome::section_label(&mut columns[1], "Control actions");
+                        requested_transition =
+                            self.control_actions_ui(&mut columns[1], &loop_definition, &actions);
+                    });
+                }
             });
 
         if let Some((action_id, transition)) = requested_transition {
@@ -254,7 +268,8 @@ impl ProcessControlPanel {
         let mut requested_transition = None;
         for action in actions {
             let selected = self.selected_action.as_ref() == Some(&action.id);
-            ui.horizontal(|ui| {
+            let compact = ui.ctx().content_rect().width() < 760.0 || ui.available_width() < 760.0;
+            let mut row = |ui: &mut egui::Ui| {
                 if ui
                     .selectable_label(
                         selected,
@@ -268,8 +283,19 @@ impl ProcessControlPanel {
                 {
                     self.selected_action = Some(action.id.clone());
                 }
-                ui.colored_label(action_state_color(action.state), action.id.as_str());
-            });
+                let state_color = action_state_color(action.state);
+                if compact {
+                    let wrapped_id = action.id.as_str().replace('-', "- ");
+                    ui.add(egui::Label::new(RichText::new(wrapped_id).color(state_color)).wrap());
+                } else {
+                    ui.colored_label(state_color, action.id.as_str());
+                }
+            };
+            if compact {
+                ui.vertical(|ui| row(ui));
+            } else {
+                ui.horizontal(|ui| row(ui));
+            }
         }
 
         let selected_action = self
@@ -282,20 +308,32 @@ impl ProcessControlPanel {
         };
 
         ui.separator();
-        ui.label(RichText::new(&action.id.0).strong());
-        ui.label(format!(
-            "{} from {} {}",
-            loop_definition.output.label, action.source.lot_id, action.source.wafer_id
-        ));
-        ui.label(format!(
-            "Measured {}, target {}, error {} {}",
-            format_measurement(action.measured_value, &loop_definition.output.unit),
-            format_measurement(action.target_value, &loop_definition.output.unit),
-            format_signed(action.error),
-            loop_definition.output.unit
-        ));
+        let compact = ui.ctx().content_rect().width() < 760.0 || ui.available_width() < 760.0;
+        let action_label = if compact {
+            action.id.0.replace('-', "- ")
+        } else {
+            action.id.0.clone()
+        };
+        ui.add(egui::Label::new(RichText::new(action_label).strong()).wrap());
+        ui.add(
+            egui::Label::new(format!(
+                "{} from {} {}",
+                loop_definition.output.label, action.source.lot_id, action.source.wafer_id
+            ))
+            .wrap(),
+        );
+        ui.add(
+            egui::Label::new(format!(
+                "Measured {}, target {}, error {} {}",
+                format_measurement(action.measured_value, &loop_definition.output.unit),
+                format_measurement(action.target_value, &loop_definition.output.unit),
+                format_signed(action.error),
+                loop_definition.output.unit
+            ))
+            .wrap(),
+        );
         ui.label(format!("Confidence {}", format_percent(action.confidence)));
-        ui.label(&action.rationale);
+        ui.add(egui::Label::new(&action.rationale).wrap());
 
         ui.separator();
         adjustment_table(ui, &action.adjustments);
@@ -423,10 +461,6 @@ impl RequestedTransition {
             Self::Apply => "applied",
         }
     }
-}
-
-fn control_metric_ui(ui: &mut egui::Ui, label: &str, value: String, detail: String) {
-    ui_chrome::metric_tile(ui, label, value, &detail);
 }
 
 fn draw_control_chart(
@@ -567,40 +601,45 @@ fn draw_control_chart(
 }
 
 fn control_history_table(ui: &mut egui::Ui, trend: &[ControlTrendPoint]) {
-    egui::Grid::new("process_control_history_grid")
-        .striped(true)
-        .min_col_width(64.0)
+    egui::ScrollArea::horizontal()
+        .id_salt("process_control_history_horizontal")
+        .auto_shrink([false, true])
         .show(ui, |ui| {
-            ui.strong("Run");
-            ui.strong("Wafer");
-            ui.strong("Value");
-            ui.strong("EWMA");
-            ui.strong("Yield");
-            ui.end_row();
-            for point in trend.iter().rev().take(8) {
-                ui.label(point.source.run_index.to_string());
-                ui.label(format!("{} {}", point.source.lot_id, point.source.wafer_id));
-                ui.colored_label(
-                    if point.in_spec {
-                        Color32::from_rgb(112, 190, 135)
-                    } else {
-                        Color32::from_rgb(220, 104, 96)
-                    },
-                    format_measurement(point.value, &point.unit),
-                );
-                ui.label(format!(
-                    "{} {}",
-                    format_signed(point.ewma_error),
-                    point.unit
-                ));
-                ui.label(
-                    point
-                        .yield_fraction
-                        .map(format_percent)
-                        .unwrap_or_else(|| "-".to_string()),
-                );
-                ui.end_row();
-            }
+            egui::Grid::new("process_control_history_grid")
+                .striped(true)
+                .min_col_width(64.0)
+                .show(ui, |ui| {
+                    ui.strong("Run");
+                    ui.strong("Wafer");
+                    ui.strong("Value");
+                    ui.strong("EWMA");
+                    ui.strong("Yield");
+                    ui.end_row();
+                    for point in trend.iter().rev().take(8) {
+                        ui.label(point.source.run_index.to_string());
+                        ui.label(format!("{} {}", point.source.lot_id, point.source.wafer_id));
+                        ui.colored_label(
+                            if point.in_spec {
+                                Color32::from_rgb(112, 190, 135)
+                            } else {
+                                Color32::from_rgb(220, 104, 96)
+                            },
+                            format_measurement(point.value, &point.unit),
+                        );
+                        ui.label(format!(
+                            "{} {}",
+                            format_signed(point.ewma_error),
+                            point.unit
+                        ));
+                        ui.label(
+                            point
+                                .yield_fraction
+                                .map(format_percent)
+                                .unwrap_or_else(|| "-".to_string()),
+                        );
+                        ui.end_row();
+                    }
+                });
         });
 }
 
@@ -609,35 +648,40 @@ fn adjustment_table(ui: &mut egui::Ui, adjustments: &[RecipeParameterAdjustment]
         ui.label("No recipe parameter changes");
         return;
     }
-    egui::Grid::new("process_control_adjustments_grid")
-        .striped(true)
-        .min_col_width(70.0)
+    egui::ScrollArea::horizontal()
+        .id_salt("process_control_adjustments_horizontal")
+        .auto_shrink([false, true])
         .show(ui, |ui| {
-            ui.strong("Parameter");
-            ui.strong("Current");
-            ui.strong("Proposed");
-            ui.strong("Delta");
-            ui.end_row();
-            for adjustment in adjustments {
-                ui.label(&adjustment.label);
-                ui.label(format_parameter_value(
-                    &adjustment.previous_value,
-                    adjustment.unit,
-                ));
-                ui.label(
-                    RichText::new(format_parameter_value(
-                        &adjustment.proposed_value,
-                        adjustment.unit,
-                    ))
-                    .strong(),
-                );
-                ui.label(format!(
-                    "{} {}",
-                    format_signed(adjustment.delta),
-                    adjustment.unit.map(RecipeUnit::symbol).unwrap_or("")
-                ));
-                ui.end_row();
-            }
+            egui::Grid::new("process_control_adjustments_grid")
+                .striped(true)
+                .min_col_width(70.0)
+                .show(ui, |ui| {
+                    ui.strong("Parameter");
+                    ui.strong("Current");
+                    ui.strong("Proposed");
+                    ui.strong("Delta");
+                    ui.end_row();
+                    for adjustment in adjustments {
+                        ui.label(&adjustment.label);
+                        ui.label(format_parameter_value(
+                            &adjustment.previous_value,
+                            adjustment.unit,
+                        ));
+                        ui.label(
+                            RichText::new(format_parameter_value(
+                                &adjustment.proposed_value,
+                                adjustment.unit,
+                            ))
+                            .strong(),
+                        );
+                        ui.label(format!(
+                            "{} {}",
+                            format_signed(adjustment.delta),
+                            adjustment.unit.map(RecipeUnit::symbol).unwrap_or("")
+                        ));
+                        ui.end_row();
+                    }
+                });
         });
 }
 
