@@ -7934,84 +7934,100 @@ impl FabricadApp {
             self.selected_yield_lot = lot_ids.first().cloned().unwrap_or_default();
         }
 
-        let wafer_ids = self
-            .yield_analysis
-            .wafer_ids_for_lot(&self.selected_yield_lot);
-        if !wafer_ids.contains(&self.selected_yield_wafer) {
-            self.selected_yield_wafer = wafer_ids.first().cloned().unwrap_or_default();
-        }
-
-        let lot_id = self.selected_yield_lot.clone();
-        let wafer_id = self.selected_yield_wafer.clone();
-        let previous_context_lot = lot_id.clone();
-        let previous_context_wafer = wafer_id.clone();
-        let lot_summary = self.yield_analysis.lot_summary(&lot_id).cloned();
-        let wafer_summary = self
-            .yield_analysis
-            .wafer_summary(&lot_id, &wafer_id)
-            .cloned();
-        let die_outcomes = self
-            .yield_analysis
-            .die_outcomes_for_wafer(&lot_id, &wafer_id);
-        let wafer_rows = self
-            .yield_analysis
-            .wafer_summaries_for_lot(&lot_id)
-            .into_iter()
-            .cloned()
-            .collect::<Vec<_>>();
-        let measurements = self
-            .yield_analysis
-            .measurements_for_wafer(&lot_id, &wafer_id)
-            .into_iter()
-            .cloned()
-            .collect::<Vec<_>>();
-        let comparisons = self.yield_analysis.lot_comparisons.clone();
-        let correlations = self.yield_analysis.correlations.clone();
+        let previous_context_lot = self.selected_yield_lot.clone();
+        let previous_context_wafer = self.selected_yield_wafer.clone();
+        let state_id = egui::Id::new("yield_dashboard_state");
+        let mut dashboard_state = ui
+            .data_mut(|data| data.get_temp::<YieldDashboardState>(state_id))
+            .unwrap_or_default();
 
         egui::ScrollArea::vertical()
             .id_salt("yield_dashboard_scroll")
             .show(ui, |ui| {
-                ui_chrome::module_header(ui, "Fab analysis", "Yield Dashboard", "", |ui| {
-                    ui.label("Lot");
-                    egui::ComboBox::from_id_salt("yield_lot_picker")
-                        .selected_text(if lot_id.is_empty() {
-                            "none"
-                        } else {
-                            lot_id.as_str()
-                        })
-                        .show_ui(ui, |ui| {
-                            for candidate in &lot_ids {
-                                ui.selectable_value(
-                                    &mut self.selected_yield_lot,
-                                    candidate.clone(),
-                                    candidate,
-                                );
-                            }
-                        });
-                    ui.label("Wafer");
-                    egui::ComboBox::from_id_salt("yield_wafer_picker")
-                        .selected_text(if wafer_id.is_empty() {
-                            "none"
-                        } else {
-                            wafer_id.as_str()
-                        })
-                        .show_ui(ui, |ui| {
-                            for candidate in &wafer_ids {
-                                ui.selectable_value(
-                                    &mut self.selected_yield_wafer,
-                                    candidate.clone(),
-                                    candidate,
-                                );
-                            }
-                        });
-                });
+                let header_detail =
+                    yield_header_detail(&self.yield_analysis, &self.selected_yield_lot);
+                ui_chrome::module_header(
+                    ui,
+                    "Fab analysis",
+                    "Yield Dashboard",
+                    &header_detail,
+                    |ui| {
+                        yield_selector_controls(
+                            ui,
+                            &self.yield_analysis,
+                            &lot_ids,
+                            &mut self.selected_yield_lot,
+                            &mut self.selected_yield_wafer,
+                            &mut dashboard_state,
+                        );
+                    },
+                );
+
+                let wafer_ids = self
+                    .yield_analysis
+                    .wafer_ids_for_lot(&self.selected_yield_lot);
+                if !wafer_ids.contains(&self.selected_yield_wafer) {
+                    self.selected_yield_wafer = wafer_ids.first().cloned().unwrap_or_default();
+                    dashboard_state.selected_die = None;
+                }
+
+                let lot_id = self.selected_yield_lot.clone();
+                let wafer_id = self.selected_yield_wafer.clone();
+                let lot_summary = self.yield_analysis.lot_summary(&lot_id).cloned();
+                let wafer_summary = self
+                    .yield_analysis
+                    .wafer_summary(&lot_id, &wafer_id)
+                    .cloned();
+                let die_outcomes = self
+                    .yield_analysis
+                    .die_outcomes_for_wafer(&lot_id, &wafer_id);
+                let wafer_rows = self
+                    .yield_analysis
+                    .wafer_summaries_for_lot(&lot_id)
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let measurements = self
+                    .yield_analysis
+                    .measurements_for_wafer(&lot_id, &wafer_id)
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let die_tests = self
+                    .yield_analysis
+                    .test_results
+                    .iter()
+                    .filter(|result| result.lot_id == lot_id && result.wafer_id == wafer_id)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let comparisons = self.yield_analysis.lot_comparisons.clone();
+                let correlations = self.yield_analysis.correlations.clone();
 
                 if let Some(summary) = &lot_summary {
                     let lot_yield_detail = format!(
                         "{} pass / {} fail / {} dies",
                         summary.passing_dies, summary.failing_dies, summary.total_dies
                     );
-                    let main_fail_detail = summary.spatial_pattern.label().to_string();
+                    let wafer_yield = wafer_summary
+                        .as_ref()
+                        .map(|summary| format_percent(summary.yield_fraction))
+                        .unwrap_or_else(|| "-".to_string());
+                    let wafer_yield_detail = wafer_summary
+                        .as_ref()
+                        .map(|summary| {
+                            format!(
+                                "{} fail / {} dies / {}",
+                                summary.failing_dies,
+                                summary.total_dies,
+                                summary.spatial_pattern.label()
+                            )
+                        })
+                        .unwrap_or_else(|| "no wafer summary".to_string());
+                    let main_fail_detail = format!(
+                        "{} / {} visible dies",
+                        summary.spatial_pattern.label(),
+                        yield_visible_die_count(&die_outcomes, dashboard_state.map_filter)
+                    );
                     let recipe_detail = lot_route_label(&self.yield_analysis, &lot_id);
                     ui_chrome::metric_tiles(
                         ui,
@@ -8020,7 +8036,16 @@ impl FabricadApp {
                                 "Lot yield",
                                 format_percent(summary.yield_fraction),
                                 lot_yield_detail.as_str(),
-                                ui_chrome::Tone::Neutral,
+                                yield_tone(summary.yield_fraction),
+                            ),
+                            (
+                                "Wafer yield",
+                                wafer_yield,
+                                wafer_yield_detail.as_str(),
+                                wafer_summary
+                                    .as_ref()
+                                    .map(|summary| yield_tone(summary.yield_fraction))
+                                    .unwrap_or(ui_chrome::Tone::Neutral),
                             ),
                             (
                                 "Main fail",
@@ -8030,7 +8055,10 @@ impl FabricadApp {
                                     .unwrap_or("none")
                                     .to_string(),
                                 main_fail_detail.as_str(),
-                                ui_chrome::Tone::Neutral,
+                                summary
+                                    .dominant_failure
+                                    .map(|_| ui_chrome::Tone::Warning)
+                                    .unwrap_or(ui_chrome::Tone::Success),
                             ),
                             (
                                 "Recipe path",
@@ -8042,71 +8070,168 @@ impl FabricadApp {
                     );
                 }
 
+                yield_filter_toolbar(
+                    ui,
+                    &mut dashboard_state,
+                    lot_summary.as_ref(),
+                    &die_outcomes,
+                    &measurements,
+                );
+                normalize_yield_selected_die(&mut dashboard_state, &die_outcomes);
+
                 ui.separator();
-                if ui.available_width() < 760.0 {
-                    ui_chrome::section_label(ui, &format!("Wafer Map {wafer_id}"));
-                    draw_yield_wafer_map(ui, &die_outcomes);
-                    if let Some(summary) = &wafer_summary {
-                        ui.label(format!(
-                            "{} yield, {} failures, {}",
-                            format_percent(summary.yield_fraction),
-                            summary.failing_dies,
-                            summary.spatial_pattern.label()
-                        ));
-                        for hint in &summary.root_cause_hints {
-                            ui.label(hint);
-                        }
-                    }
-                    ui.separator();
-                    ui_chrome::section_label(ui, "Wafer Yield");
-                    self.yield_wafer_rows(ui, &wafer_rows);
-                    ui.separator();
-                    ui_chrome::section_label(ui, "Failure Modes");
-                    if let Some(summary) = &lot_summary {
-                        failure_breakdown_ui(ui, summary);
-                    }
-                } else {
-                    ui.columns(2, |columns| {
-                        ui_chrome::section_label(&mut columns[0], &format!("Wafer Map {wafer_id}"));
-                        draw_yield_wafer_map(&mut columns[0], &die_outcomes);
-                        if let Some(summary) = &wafer_summary {
-                            columns[0].label(format!(
-                                "{} yield, {} failures, {}",
-                                format_percent(summary.yield_fraction),
-                                summary.failing_dies,
-                                summary.spatial_pattern.label()
-                            ));
-                            for hint in &summary.root_cause_hints {
-                                columns[0].label(hint);
-                            }
-                        }
+                let dashboard_width = ui.available_width();
+                if dashboard_width >= 1040.0 {
+                    ui.columns(3, |columns| {
+                        yield_map_panel_ui(
+                            &mut columns[0],
+                            &wafer_id,
+                            wafer_summary.as_ref(),
+                            &die_outcomes,
+                            &mut dashboard_state,
+                        );
 
                         ui_chrome::section_label(&mut columns[1], "Wafer Yield");
-                        self.yield_wafer_rows(&mut columns[1], &wafer_rows);
+                        self.yield_wafer_rows(
+                            &mut columns[1],
+                            &wafer_rows,
+                            dashboard_state.show_only_attention_wafers,
+                        );
                         columns[1].separator();
                         ui_chrome::section_label(&mut columns[1], "Failure Modes");
                         if let Some(summary) = &lot_summary {
-                            failure_breakdown_ui(&mut columns[1], summary);
+                            failure_breakdown_ui(
+                                &mut columns[1],
+                                summary,
+                                &mut dashboard_state.map_filter,
+                            );
                         }
+
+                        ui_chrome::section_label(&mut columns[2], "Root-cause Signals");
+                        root_cause_hints_ui(
+                            &mut columns[2],
+                            lot_summary.as_ref(),
+                            wafer_summary.as_ref(),
+                            &measurements,
+                            &correlations,
+                            &comparisons,
+                            &lot_id,
+                        );
+                        columns[2].separator();
+                        ui_chrome::section_label(&mut columns[2], "Die Drill-down");
+                        yield_die_drilldown_ui(
+                            &mut columns[2],
+                            &die_outcomes,
+                            &die_tests,
+                            dashboard_state.selected_die,
+                        );
                     });
+                } else if dashboard_width >= 740.0 {
+                    ui.columns(2, |columns| {
+                        yield_map_panel_ui(
+                            &mut columns[0],
+                            &wafer_id,
+                            wafer_summary.as_ref(),
+                            &die_outcomes,
+                            &mut dashboard_state,
+                        );
+                        columns[0].separator();
+                        ui_chrome::section_label(&mut columns[0], "Die Drill-down");
+                        yield_die_drilldown_ui(
+                            &mut columns[0],
+                            &die_outcomes,
+                            &die_tests,
+                            dashboard_state.selected_die,
+                        );
+
+                        ui_chrome::section_label(&mut columns[1], "Wafer Yield");
+                        self.yield_wafer_rows(
+                            &mut columns[1],
+                            &wafer_rows,
+                            dashboard_state.show_only_attention_wafers,
+                        );
+                        columns[1].separator();
+                        ui_chrome::section_label(&mut columns[1], "Failure Modes");
+                        if let Some(summary) = &lot_summary {
+                            failure_breakdown_ui(
+                                &mut columns[1],
+                                summary,
+                                &mut dashboard_state.map_filter,
+                            );
+                        }
+                        columns[1].separator();
+                        ui_chrome::section_label(&mut columns[1], "Root-cause Signals");
+                        root_cause_hints_ui(
+                            &mut columns[1],
+                            lot_summary.as_ref(),
+                            wafer_summary.as_ref(),
+                            &measurements,
+                            &correlations,
+                            &comparisons,
+                            &lot_id,
+                        );
+                    });
+                } else {
+                    yield_map_panel_ui(
+                        ui,
+                        &wafer_id,
+                        wafer_summary.as_ref(),
+                        &die_outcomes,
+                        &mut dashboard_state,
+                    );
+                    ui.separator();
+                    ui_chrome::section_label(ui, "Die Drill-down");
+                    yield_die_drilldown_ui(
+                        ui,
+                        &die_outcomes,
+                        &die_tests,
+                        dashboard_state.selected_die,
+                    );
+                    ui.separator();
+                    ui_chrome::section_label(ui, "Wafer Yield");
+                    self.yield_wafer_rows(
+                        ui,
+                        &wafer_rows,
+                        dashboard_state.show_only_attention_wafers,
+                    );
+                    ui.separator();
+                    ui_chrome::section_label(ui, "Failure Modes");
+                    if let Some(summary) = &lot_summary {
+                        failure_breakdown_ui(ui, summary, &mut dashboard_state.map_filter);
+                    }
+                    ui.separator();
+                    ui_chrome::section_label(ui, "Root-cause Signals");
+                    root_cause_hints_ui(
+                        ui,
+                        lot_summary.as_ref(),
+                        wafer_summary.as_ref(),
+                        &measurements,
+                        &correlations,
+                        &comparisons,
+                        &lot_id,
+                    );
                 }
 
                 ui.separator();
                 if ui.available_width() < 760.0 {
                     ui_chrome::section_label(ui, "Lot / Recipe Comparison");
-                    lot_comparison_ui(ui, &comparisons);
+                    lot_comparison_ui(ui, &comparisons, &lot_id);
                     ui.separator();
                     ui_chrome::section_label(ui, "Selected Wafer Process Measurements");
-                    wafer_measurements_ui(ui, &measurements);
+                    wafer_measurements_ui(ui, &measurements, dashboard_state.show_only_excursions);
                 } else {
                     ui.columns(2, |columns| {
                         ui_chrome::section_label(&mut columns[0], "Lot / Recipe Comparison");
-                        lot_comparison_ui(&mut columns[0], &comparisons);
+                        lot_comparison_ui(&mut columns[0], &comparisons, &lot_id);
                         ui_chrome::section_label(
                             &mut columns[1],
                             "Selected Wafer Process Measurements",
                         );
-                        wafer_measurements_ui(&mut columns[1], &measurements);
+                        wafer_measurements_ui(
+                            &mut columns[1],
+                            &measurements,
+                            dashboard_state.show_only_excursions,
+                        );
                     });
                 }
 
@@ -8114,6 +8239,7 @@ impl FabricadApp {
                 ui_chrome::section_label(ui, "Measurement Correlation");
                 correlation_table_ui(ui, &correlations);
             });
+        ui.data_mut(|data| data.insert_temp(state_id, dashboard_state));
 
         if self.selected_yield_lot != previous_context_lot {
             self.app_context.set_lot(self.selected_yield_lot.clone());
@@ -8126,30 +8252,57 @@ impl FabricadApp {
         }
     }
 
-    fn yield_wafer_rows(&mut self, ui: &mut egui::Ui, rows: &[YieldSummary]) {
+    fn yield_wafer_rows(
+        &mut self,
+        ui: &mut egui::Ui,
+        rows: &[YieldSummary],
+        show_attention_only: bool,
+    ) {
         let mut selected = None;
-        egui::Grid::new("yield_wafer_rows")
-            .striped(true)
-            .min_col_width(62.0)
+        let visible_rows = rows
+            .iter()
+            .filter(|summary| !show_attention_only || summary.failing_dies > 0)
+            .collect::<Vec<_>>();
+        if visible_rows.is_empty() {
+            ui.label("No wafers match the current filter");
+            return;
+        }
+        egui::ScrollArea::horizontal()
+            .id_salt("yield_wafer_rows_horizontal")
             .show(ui, |ui| {
-                ui.strong("Wafer");
-                ui.strong("Yield");
-                ui.strong("Fails");
-                ui.strong("Pattern");
-                ui.end_row();
-                for summary in rows {
-                    let wafer_id = summary.wafer_id.as_deref().unwrap_or("lot");
-                    if ui
-                        .selectable_label(self.selected_yield_wafer == wafer_id, wafer_id)
-                        .clicked()
-                    {
-                        selected = Some(wafer_id.to_string());
-                    }
-                    ui.label(format_percent(summary.yield_fraction));
-                    ui.label(summary.failing_dies.to_string());
-                    ui.label(summary.spatial_pattern.label());
-                    ui.end_row();
-                }
+                egui::Grid::new("yield_wafer_rows")
+                    .striped(true)
+                    .min_col_width(64.0)
+                    .show(ui, |ui| {
+                        ui.strong("Wafer");
+                        ui.strong("Yield");
+                        ui.strong("Fails");
+                        ui.strong("Mode");
+                        ui.strong("Pattern");
+                        ui.end_row();
+                        for summary in visible_rows {
+                            let wafer_id = summary.wafer_id.as_deref().unwrap_or("lot");
+                            if ui
+                                .selectable_label(self.selected_yield_wafer == wafer_id, wafer_id)
+                                .clicked()
+                            {
+                                selected = Some(wafer_id.to_string());
+                            }
+                            ui.colored_label(
+                                yield_tone(summary.yield_fraction).color(),
+                                format_percent(summary.yield_fraction),
+                            );
+                            ui.label(summary.failing_dies.to_string());
+                            ui.label(
+                                summary
+                                    .dominant_failure
+                                    .map(FailureMode::label)
+                                    .unwrap_or("-"),
+                            );
+                            ui.label(summary.spatial_pattern.label());
+                            ui.end_row();
+                        }
+                    });
             });
         if let Some(wafer_id) = selected {
             self.selected_yield_wafer = wafer_id;
@@ -10856,9 +11009,301 @@ fn document_object_count(document: &Document) -> usize {
             .sum::<usize>()
 }
 
-fn draw_yield_wafer_map(ui: &mut egui::Ui, outcomes: &[DieOutcome]) {
-    let size = ui.available_width().clamp(220.0, 360.0);
-    let (rect, response) = ui.allocate_exact_size(vec2(size, size), Sense::hover());
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum YieldMapFilter {
+    All,
+    Failing,
+    Passing,
+    FailureMode(FailureMode),
+}
+
+impl Default for YieldMapFilter {
+    fn default() -> Self {
+        Self::All
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct YieldDashboardState {
+    map_filter: YieldMapFilter,
+    selected_die: Option<layout_model::yield_analysis::DieAddress>,
+    show_only_attention_wafers: bool,
+    show_only_excursions: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum YieldMeasurementStatus {
+    Low,
+    High,
+    InSpec,
+    NoSpec,
+}
+
+fn yield_header_detail(analysis: &YieldAnalysis, lot_id: &str) -> String {
+    if lot_id.is_empty() {
+        return String::new();
+    }
+    format!(
+        "{} - {}",
+        lot_recipe_label(analysis, lot_id),
+        lot_route_label(analysis, lot_id)
+    )
+}
+
+fn yield_selector_controls(
+    ui: &mut egui::Ui,
+    analysis: &YieldAnalysis,
+    lot_ids: &[String],
+    selected_lot: &mut String,
+    selected_wafer: &mut String,
+    state: &mut YieldDashboardState,
+) {
+    ui.label("Lot");
+    let old_lot = selected_lot.clone();
+    egui::ComboBox::from_id_salt("yield_lot_picker")
+        .width(210.0)
+        .selected_text(if selected_lot.is_empty() {
+            "none".to_string()
+        } else {
+            yield_lot_option_label(analysis, selected_lot)
+        })
+        .show_ui(ui, |ui| {
+            for candidate in lot_ids {
+                ui.selectable_value(
+                    selected_lot,
+                    candidate.clone(),
+                    yield_lot_option_label(analysis, candidate),
+                );
+            }
+        });
+    if selected_lot.as_str() != old_lot.as_str() {
+        let wafer_ids = analysis.wafer_ids_for_lot(selected_lot);
+        *selected_wafer = wafer_ids.first().cloned().unwrap_or_default();
+        state.selected_die = None;
+    }
+
+    let wafer_ids = analysis.wafer_ids_for_lot(selected_lot);
+    if !wafer_ids
+        .iter()
+        .any(|candidate| candidate.as_str() == selected_wafer.as_str())
+    {
+        *selected_wafer = wafer_ids.first().cloned().unwrap_or_default();
+        state.selected_die = None;
+    }
+
+    ui.label("Wafer");
+    let old_wafer = selected_wafer.clone();
+    egui::ComboBox::from_id_salt("yield_wafer_picker")
+        .width(220.0)
+        .selected_text(if selected_wafer.is_empty() {
+            "none".to_string()
+        } else {
+            yield_wafer_option_label(analysis, selected_lot, selected_wafer)
+        })
+        .show_ui(ui, |ui| {
+            for candidate in &wafer_ids {
+                ui.selectable_value(
+                    selected_wafer,
+                    candidate.clone(),
+                    yield_wafer_option_label(analysis, selected_lot, candidate),
+                );
+            }
+        });
+    if selected_wafer.as_str() != old_wafer.as_str() {
+        state.selected_die = None;
+    }
+}
+
+fn yield_lot_option_label(analysis: &YieldAnalysis, lot_id: &str) -> String {
+    let recipe = lot_recipe_label(analysis, lot_id);
+    analysis
+        .lot_summary(lot_id)
+        .map(|summary| {
+            format!(
+                "{}  {}  {} fail",
+                lot_id,
+                format_percent(summary.yield_fraction),
+                summary.failing_dies
+            )
+        })
+        .unwrap_or_else(|| format!("{lot_id}  {recipe}"))
+}
+
+fn yield_wafer_option_label(analysis: &YieldAnalysis, lot_id: &str, wafer_id: &str) -> String {
+    analysis
+        .wafer_summary(lot_id, wafer_id)
+        .map(|summary| {
+            format!(
+                "{}  {}  {} fail",
+                wafer_id,
+                format_percent(summary.yield_fraction),
+                summary.failing_dies
+            )
+        })
+        .unwrap_or_else(|| wafer_id.to_string())
+}
+
+fn yield_filter_toolbar(
+    ui: &mut egui::Ui,
+    state: &mut YieldDashboardState,
+    lot_summary: Option<&YieldSummary>,
+    outcomes: &[DieOutcome],
+    measurements: &[ProcessMeasurement],
+) {
+    let previous_filter = state.map_filter;
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Map");
+        if ui
+            .selectable_label(state.map_filter == YieldMapFilter::All, "All")
+            .clicked()
+        {
+            state.map_filter = YieldMapFilter::All;
+        }
+        if ui
+            .selectable_label(state.map_filter == YieldMapFilter::Failing, "Failing")
+            .clicked()
+        {
+            state.map_filter = YieldMapFilter::Failing;
+        }
+        if ui
+            .selectable_label(state.map_filter == YieldMapFilter::Passing, "Passing")
+            .clicked()
+        {
+            state.map_filter = YieldMapFilter::Passing;
+        }
+
+        let mode_options = yield_failure_mode_options(lot_summary, outcomes);
+        ui.add_enabled_ui(!mode_options.is_empty(), |ui| {
+            egui::ComboBox::from_id_salt("yield_failure_mode_filter")
+                .width(160.0)
+                .selected_text(match state.map_filter {
+                    YieldMapFilter::FailureMode(mode) => mode.label().to_string(),
+                    _ => "Failure mode".to_string(),
+                })
+                .show_ui(ui, |ui| {
+                    for mode in mode_options {
+                        ui.selectable_value(
+                            &mut state.map_filter,
+                            YieldMapFilter::FailureMode(mode),
+                            mode.label(),
+                        );
+                    }
+                });
+        });
+
+        ui.separator();
+        ui.checkbox(&mut state.show_only_attention_wafers, "Failing wafers");
+        let excursion_count = measurements
+            .iter()
+            .filter(|measurement| measurement_is_excursion(measurement))
+            .count();
+        ui.checkbox(&mut state.show_only_excursions, "Excursions");
+        ui_chrome::muted(
+            ui,
+            format!(
+                "{} / {} dies visible, {} excursions",
+                yield_visible_die_count(outcomes, state.map_filter),
+                outcomes.len(),
+                excursion_count
+            ),
+        );
+    });
+    if state.map_filter != previous_filter {
+        state.selected_die = None;
+    }
+}
+
+fn yield_failure_mode_options(
+    summary: Option<&YieldSummary>,
+    outcomes: &[DieOutcome],
+) -> Vec<FailureMode> {
+    let mut modes = BTreeSet::new();
+    if let Some(summary) = summary {
+        modes.extend(summary.failure_counts.keys().copied());
+    }
+    for outcome in outcomes {
+        modes.extend(outcome.failure_modes.iter().copied());
+    }
+    modes.into_iter().collect()
+}
+
+fn normalize_yield_selected_die(state: &mut YieldDashboardState, outcomes: &[DieOutcome]) {
+    if state.selected_die.is_some_and(|die| {
+        outcomes
+            .iter()
+            .any(|outcome| outcome.die == die && yield_filter_includes(outcome, state.map_filter))
+    }) {
+        return;
+    }
+
+    state.selected_die = outcomes
+        .iter()
+        .find(|outcome| !outcome.passed && yield_filter_includes(outcome, state.map_filter))
+        .or_else(|| {
+            outcomes
+                .iter()
+                .find(|outcome| yield_filter_includes(outcome, state.map_filter))
+        })
+        .map(|outcome| outcome.die);
+}
+
+fn yield_visible_die_count(outcomes: &[DieOutcome], filter: YieldMapFilter) -> usize {
+    outcomes
+        .iter()
+        .filter(|outcome| yield_filter_includes(outcome, filter))
+        .count()
+}
+
+fn yield_filter_includes(outcome: &DieOutcome, filter: YieldMapFilter) -> bool {
+    match filter {
+        YieldMapFilter::All => true,
+        YieldMapFilter::Failing => !outcome.passed,
+        YieldMapFilter::Passing => outcome.passed,
+        YieldMapFilter::FailureMode(mode) => outcome.failure_modes.contains(&mode),
+    }
+}
+
+fn yield_map_panel_ui(
+    ui: &mut egui::Ui,
+    wafer_id: &str,
+    wafer_summary: Option<&YieldSummary>,
+    outcomes: &[DieOutcome],
+    state: &mut YieldDashboardState,
+) {
+    ui_chrome::section_label(ui, &format!("Wafer Map {wafer_id}"));
+    if let Some(selected_die) =
+        draw_yield_wafer_map(ui, outcomes, state.map_filter, state.selected_die)
+    {
+        state.selected_die = Some(selected_die);
+    }
+    if let Some(summary) = wafer_summary {
+        ui.horizontal_wrapped(|ui| {
+            let yield_text = format_percent(summary.yield_fraction);
+            ui_chrome::status_pill(ui, &yield_text, yield_tone(summary.yield_fraction));
+            ui.label(format!(
+                "{} failures / {} dies / {}",
+                summary.failing_dies,
+                summary.total_dies,
+                summary.spatial_pattern.label()
+            ));
+        });
+    }
+    yield_map_legend_ui(ui, outcomes, state.map_filter);
+}
+
+fn draw_yield_wafer_map(
+    ui: &mut egui::Ui,
+    outcomes: &[DieOutcome],
+    filter: YieldMapFilter,
+    selected_die: Option<layout_model::yield_analysis::DieAddress>,
+) -> Option<layout_model::yield_analysis::DieAddress> {
+    let available_width = ui.available_width().max(1.0);
+    let size = if available_width < 420.0 {
+        available_width
+    } else {
+        420.0
+    };
+    let (rect, response) = ui.allocate_exact_size(vec2(size, size), Sense::click());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 4.0, ui.visuals().faint_bg_color);
 
@@ -10870,7 +11315,7 @@ fn draw_yield_wafer_map(ui: &mut egui::Ui, outcomes: &[DieOutcome]) {
             FontId::proportional(14.0),
             ui.visuals().weak_text_color(),
         );
-        return;
+        return None;
     }
 
     let center = rect.center();
@@ -10895,6 +11340,9 @@ fn draw_yield_wafer_map(ui: &mut egui::Ui, outcomes: &[DieOutcome]) {
     let die_size = ((radius * 2.0) / (max_coordinate * 2.0 + 1.0) * 0.72).clamp(5.0, 16.0);
     let scale = radius * 0.9 / max_coordinate;
     let mut hovered = None;
+    let mut clicked = None;
+    let pointer = response.hover_pos();
+    let response_clicked = response.clicked();
 
     for outcome in outcomes {
         let pos = Pos2::new(
@@ -10902,9 +11350,14 @@ fn draw_yield_wafer_map(ui: &mut egui::Ui, outcomes: &[DieOutcome]) {
             center.y - outcome.die.row as f32 * scale,
         );
         let die_rect = EguiRect::from_center_size(pos, vec2(die_size, die_size));
-        let color = outcome_color(outcome);
+        let included = yield_filter_includes(outcome, filter);
+        let color = if included {
+            outcome_color(outcome)
+        } else {
+            ui.visuals().widgets.inactive.bg_fill
+        };
         painter.rect_filled(die_rect, 1.5, color);
-        if !outcome.passed {
+        if !outcome.passed && included {
             painter.rect_stroke(
                 die_rect,
                 1.5,
@@ -10912,25 +11365,70 @@ fn draw_yield_wafer_map(ui: &mut egui::Ui, outcomes: &[DieOutcome]) {
                 StrokeKind::Outside,
             );
         }
-        if response
-            .hover_pos()
-            .is_some_and(|pointer| die_rect.expand(2.0).contains(pointer))
-        {
-            hovered = Some(outcome);
+        if selected_die == Some(outcome.die) {
+            painter.rect_stroke(
+                die_rect.expand(1.5),
+                2.0,
+                Stroke::new(1.75, ui.visuals().selection.stroke.color),
+                StrokeKind::Outside,
+            );
+        }
+        if pointer.is_some_and(|pointer| die_rect.expand(2.0).contains(pointer)) {
+            hovered = Some((outcome, included));
+            if response_clicked && included {
+                clicked = Some(outcome.die);
+            }
         }
     }
 
-    if let Some(outcome) = hovered {
+    if let Some((outcome, included)) = hovered {
         let mode = outcome
             .failure_modes
             .first()
             .map(|mode| mode.label())
             .unwrap_or(if outcome.passed { "pass" } else { "fail" });
-        response.on_hover_text(format!(
+        let mut hover_text = format!(
             "die ({}, {})\n{}\n{} failed / {} tests",
             outcome.die.column, outcome.die.row, mode, outcome.failed_tests, outcome.test_count
-        ));
+        );
+        if !included {
+            hover_text.push_str("\nfiltered out");
+        }
+        response.on_hover_text(hover_text);
     }
+    clicked
+}
+
+fn yield_map_legend_ui(ui: &mut egui::Ui, outcomes: &[DieOutcome], filter: YieldMapFilter) {
+    let modes = yield_failure_mode_options(None, outcomes);
+    ui.horizontal_wrapped(|ui| {
+        yield_swatch(ui, Color32::from_rgb(72, 164, 108));
+        ui.label(if filter == YieldMapFilter::Passing {
+            RichText::new("Pass").strong()
+        } else {
+            RichText::new("Pass")
+        });
+        for mode in modes {
+            yield_swatch(ui, failure_mode_color(mode));
+            let active = filter == YieldMapFilter::FailureMode(mode);
+            ui.label(if active {
+                RichText::new(mode.label()).strong()
+            } else {
+                RichText::new(mode.label())
+            });
+        }
+    });
+}
+
+fn yield_swatch(ui: &mut egui::Ui, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(vec2(11.0, 11.0), Sense::hover());
+    ui.painter().rect_filled(rect, 2.0, color);
+    ui.painter().rect_stroke(
+        rect,
+        2.0,
+        Stroke::new(0.5, ui.visuals().widgets.noninteractive.bg_stroke.color),
+        StrokeKind::Outside,
+    );
 }
 
 fn outcome_color(outcome: &DieOutcome) -> Color32 {
@@ -10957,7 +11455,11 @@ fn failure_mode_color(mode: FailureMode) -> Color32 {
     }
 }
 
-fn failure_breakdown_ui(ui: &mut egui::Ui, summary: &YieldSummary) {
+fn failure_breakdown_ui(
+    ui: &mut egui::Ui,
+    summary: &YieldSummary,
+    active_filter: &mut YieldMapFilter,
+) {
     if summary.failure_counts.is_empty() {
         ui.label("No failing dies in selected scope");
         return;
@@ -10971,83 +11473,142 @@ fn failure_breakdown_ui(ui: &mut egui::Ui, summary: &YieldSummary) {
     let denominator = summary.failing_dies.max(1) as f32;
     for (mode, count) in rows {
         ui.horizontal(|ui| {
-            let (swatch, _) = ui.allocate_exact_size(vec2(12.0, 12.0), Sense::hover());
-            ui.painter()
-                .rect_filled(swatch, 2.0, failure_mode_color(mode));
-            ui.label(mode.label());
+            yield_swatch(ui, failure_mode_color(mode));
+            let selected = *active_filter == YieldMapFilter::FailureMode(mode);
+            if ui.selectable_label(selected, mode.label()).clicked() {
+                *active_filter = if selected {
+                    YieldMapFilter::All
+                } else {
+                    YieldMapFilter::FailureMode(mode)
+                };
+            }
+            let available_width = ui.available_width();
+            let bar_width = available_width.min(190.0).max(available_width.min(72.0));
             ui.add(
                 egui::ProgressBar::new(count as f32 / denominator)
-                    .desired_width(120.0)
+                    .desired_width(bar_width)
                     .text(format!("{} dies", count)),
             );
         });
     }
 }
 
-fn lot_comparison_ui(ui: &mut egui::Ui, comparisons: &[LotComparison]) {
+fn lot_comparison_ui(ui: &mut egui::Ui, comparisons: &[LotComparison], focus_lot: &str) {
     if comparisons.is_empty() {
         ui.label("No comparison lots loaded");
         return;
     }
-    for comparison in comparisons {
+    let mut scoped = comparisons
+        .iter()
+        .filter(|comparison| comparison_involves_lot(comparison, focus_lot))
+        .collect::<Vec<_>>();
+    if scoped.is_empty() {
+        scoped = comparisons.iter().collect();
+    }
+    for comparison in scoped {
+        ui.horizontal_wrapped(|ui| {
+            ui.strong(format!(
+                "{} / {} -> {} / {}",
+                comparison.baseline_lot_id,
+                comparison.baseline_recipe_id,
+                comparison.candidate_lot_id,
+                comparison.candidate_recipe_id
+            ));
+            let delta = format_signed_percent(comparison.yield_delta);
+            ui_chrome::status_pill(ui, &delta, yield_delta_tone(comparison.yield_delta));
+        });
         ui.label(format!(
-            "{} / {} -> {} / {}",
-            comparison.baseline_lot_id,
-            comparison.baseline_recipe_id,
-            comparison.candidate_lot_id,
-            comparison.candidate_recipe_id
-        ));
-        ui.label(format!(
-            "{} to {} ({})",
+            "{} to {}",
             format_percent(comparison.baseline_yield),
-            format_percent(comparison.candidate_yield),
-            format_signed_percent(comparison.yield_delta)
+            format_percent(comparison.candidate_yield)
         ));
-        ui.label(&comparison.root_cause_hint);
-        egui::Grid::new(("lot_comparison_modes", &comparison.baseline_lot_id))
-            .striped(true)
+        ui.add(egui::Label::new(yield_clean_root_cause_hint(&comparison.root_cause_hint)).wrap());
+        egui::ScrollArea::horizontal()
+            .id_salt((
+                "lot_comparison_modes_horizontal",
+                &comparison.baseline_lot_id,
+            ))
             .show(ui, |ui| {
-                ui.strong("Mode");
-                ui.strong("Base");
-                ui.strong("Candidate");
-                ui.strong("Delta");
-                ui.end_row();
-                for delta in comparison.failure_mode_deltas.iter().take(5) {
-                    ui.label(delta.mode.label());
-                    ui.label(format_percent(delta.baseline_fraction));
-                    ui.label(format_percent(delta.candidate_fraction));
-                    ui.label(format_signed_percent(delta.delta_fraction));
-                    ui.end_row();
-                }
+                egui::Grid::new(("lot_comparison_modes", &comparison.baseline_lot_id))
+                    .striped(true)
+                    .min_col_width(82.0)
+                    .show(ui, |ui| {
+                        ui.strong("Mode");
+                        ui.strong("Base");
+                        ui.strong("Candidate");
+                        ui.strong("Delta");
+                        ui.end_row();
+                        for delta in comparison.failure_mode_deltas.iter().take(6) {
+                            ui.horizontal(|ui| {
+                                yield_swatch(ui, failure_mode_color(delta.mode));
+                                ui.label(delta.mode.label());
+                            });
+                            ui.label(format_percent(delta.baseline_fraction));
+                            ui.label(format_percent(delta.candidate_fraction));
+                            ui.colored_label(
+                                yield_delta_tone(-delta.delta_fraction).color(),
+                                format_signed_percent(delta.delta_fraction),
+                            );
+                            ui.end_row();
+                        }
+                    });
             });
     }
 }
 
-fn wafer_measurements_ui(ui: &mut egui::Ui, measurements: &[ProcessMeasurement]) {
+fn wafer_measurements_ui(
+    ui: &mut egui::Ui,
+    measurements: &[ProcessMeasurement],
+    show_only_excursions: bool,
+) {
     if measurements.is_empty() {
         ui.label("No measurements for selected wafer");
         return;
     }
-    egui::Grid::new("yield_wafer_measurements")
-        .striped(true)
+    let visible = measurements
+        .iter()
+        .filter(|measurement| !show_only_excursions || measurement_is_excursion(measurement))
+        .collect::<Vec<_>>();
+    if visible.is_empty() {
+        ui.label("No measurement excursions on selected wafer");
+        return;
+    }
+    egui::ScrollArea::horizontal()
+        .id_salt("yield_wafer_measurements_horizontal")
         .show(ui, |ui| {
-            ui.strong("Measurement");
-            ui.strong("Value");
-            ui.strong("Target");
-            ui.strong("Step");
-            ui.end_row();
-            for measurement in measurements {
-                ui.label(measurement.name.replace('_', " "));
-                ui.label(format_measurement(measurement.value, &measurement.unit));
-                ui.label(
-                    measurement
-                        .target
-                        .map(|target| format_measurement(target, &measurement.unit))
-                        .unwrap_or_else(|| "-".to_string()),
-                );
-                ui.label(&measurement.step_id);
-                ui.end_row();
-            }
+            egui::Grid::new("yield_wafer_measurements")
+                .striped(true)
+                .min_col_width(78.0)
+                .show(ui, |ui| {
+                    ui.strong("Measurement");
+                    ui.strong("Value");
+                    ui.strong("Target");
+                    ui.strong("Spec");
+                    ui.strong("Delta");
+                    ui.strong("Status");
+                    ui.strong("Step");
+                    ui.end_row();
+                    for measurement in visible {
+                        let status = measurement_status(measurement);
+                        let (status_label, status_tone) = measurement_status_label(status);
+                        ui.label(measurement.name.replace('_', " "));
+                        ui.colored_label(
+                            status_tone.color(),
+                            format_measurement(measurement.value, &measurement.unit),
+                        );
+                        ui.label(
+                            measurement
+                                .target
+                                .map(|target| format_measurement(target, &measurement.unit))
+                                .unwrap_or_else(|| "-".to_string()),
+                        );
+                        ui.label(format_spec_range(measurement));
+                        ui.label(format_measurement_delta(measurement));
+                        ui.colored_label(status_tone.color(), status_label);
+                        ui.label(&measurement.step_id);
+                        ui.end_row();
+                    }
+                });
         });
 }
 
@@ -11056,6 +11617,13 @@ fn correlation_table_ui(ui: &mut egui::Ui, correlations: &[CorrelationRecord]) {
         ui.label("No wafer-level correlations");
         return;
     }
+    let mut rows = correlations.iter().collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .correlation_to_failure_rate
+            .abs()
+            .total_cmp(&left.correlation_to_failure_rate.abs())
+    });
     egui::ScrollArea::horizontal()
         .id_salt("yield_correlation_horizontal")
         .show(ui, |ui| {
@@ -11065,14 +11633,20 @@ fn correlation_table_ui(ui: &mut egui::Ui, correlations: &[CorrelationRecord]) {
                 .show(ui, |ui| {
                     ui.strong("Measurement");
                     ui.strong("Corr");
+                    ui.strong("Samples");
                     ui.strong("High fail mean");
                     ui.strong("Low fail mean");
+                    ui.strong("Step");
                     ui.strong("Mode");
                     ui.strong("Hint");
                     ui.end_row();
-                    for record in correlations {
+                    for record in rows {
                         ui.label(record.measurement_name.replace('_', " "));
-                        ui.label(format!("{:+.2}", record.correlation_to_failure_rate));
+                        ui.colored_label(
+                            correlation_tone(record.correlation_to_failure_rate).color(),
+                            format!("{:+.2}", record.correlation_to_failure_rate),
+                        );
+                        ui.label(record.sample_count.to_string());
                         ui.label(format_measurement(
                             record.mean_high_failure_value,
                             &record.unit,
@@ -11081,17 +11655,354 @@ fn correlation_table_ui(ui: &mut egui::Ui, correlations: &[CorrelationRecord]) {
                             record.mean_low_failure_value,
                             &record.unit,
                         ));
+                        ui.label(&record.route_step_id);
                         ui.label(
                             record
                                 .likely_failure_mode
                                 .map(FailureMode::label)
                                 .unwrap_or("-"),
                         );
-                        ui.label(&record.root_cause_hint);
+                        ui.label(yield_clean_root_cause_hint(&record.root_cause_hint));
                         ui.end_row();
                     }
                 });
         });
+}
+
+fn root_cause_hints_ui(
+    ui: &mut egui::Ui,
+    lot_summary: Option<&YieldSummary>,
+    wafer_summary: Option<&YieldSummary>,
+    measurements: &[ProcessMeasurement],
+    correlations: &[CorrelationRecord],
+    comparisons: &[LotComparison],
+    lot_id: &str,
+) {
+    let mut seen = BTreeSet::new();
+    let mut emitted = 0_usize;
+
+    if let Some(summary) = wafer_summary {
+        for hint in summary.root_cause_hints.iter().take(3) {
+            emit_yield_signal(
+                ui,
+                &mut seen,
+                &mut emitted,
+                "Wafer",
+                yield_tone(summary.yield_fraction),
+                hint.clone(),
+            );
+        }
+    }
+    if let Some(summary) = lot_summary {
+        for hint in summary.root_cause_hints.iter().take(2) {
+            emit_yield_signal(
+                ui,
+                &mut seen,
+                &mut emitted,
+                "Lot",
+                yield_tone(summary.yield_fraction),
+                hint.clone(),
+            );
+        }
+    }
+
+    for measurement in measurements
+        .iter()
+        .filter(|measurement| measurement_is_excursion(measurement))
+        .take(3)
+    {
+        let detail = format!(
+            "{} {} outside {} at {}",
+            measurement.name.replace('_', " "),
+            format_measurement(measurement.value, &measurement.unit),
+            format_spec_range(measurement),
+            measurement.step_id
+        );
+        emit_yield_signal(
+            ui,
+            &mut seen,
+            &mut emitted,
+            "Process",
+            ui_chrome::Tone::Warning,
+            detail,
+        );
+    }
+
+    let mut correlation_rows = correlations.iter().collect::<Vec<_>>();
+    correlation_rows.sort_by(|left, right| {
+        right
+            .correlation_to_failure_rate
+            .abs()
+            .total_cmp(&left.correlation_to_failure_rate.abs())
+    });
+    for record in correlation_rows
+        .into_iter()
+        .filter(|record| record.correlation_to_failure_rate.abs() >= 0.35)
+        .take(2)
+    {
+        let detail = format!(
+            "{} correlation {:+.2}; {}",
+            record.measurement_name.replace('_', " "),
+            record.correlation_to_failure_rate,
+            yield_clean_root_cause_hint(&record.root_cause_hint)
+        );
+        emit_yield_signal(
+            ui,
+            &mut seen,
+            &mut emitted,
+            "Corr",
+            correlation_tone(record.correlation_to_failure_rate),
+            detail,
+        );
+    }
+
+    if let Some(comparison) = comparisons
+        .iter()
+        .find(|comparison| comparison_involves_lot(comparison, lot_id))
+    {
+        emit_yield_signal(
+            ui,
+            &mut seen,
+            &mut emitted,
+            "Compare",
+            yield_delta_tone(comparison.yield_delta),
+            yield_clean_root_cause_hint(&comparison.root_cause_hint),
+        );
+    }
+
+    if emitted == 0 {
+        ui.label("No strong yield excursion in selected scope");
+    }
+}
+
+fn emit_yield_signal(
+    ui: &mut egui::Ui,
+    seen: &mut BTreeSet<String>,
+    emitted: &mut usize,
+    source: &str,
+    tone: ui_chrome::Tone,
+    detail: String,
+) {
+    if !seen.insert(detail.clone()) {
+        return;
+    }
+    *emitted += 1;
+    yield_signal_row(ui, source, tone, &detail);
+}
+
+fn yield_signal_row(ui: &mut egui::Ui, source: &str, tone: ui_chrome::Tone, detail: &str) {
+    ui.horizontal(|ui| {
+        ui_chrome::status_pill(ui, source, tone);
+        ui.add(egui::Label::new(detail).wrap());
+    });
+}
+
+fn yield_die_drilldown_ui(
+    ui: &mut egui::Ui,
+    outcomes: &[DieOutcome],
+    tests: &[layout_model::yield_analysis::TestResult],
+    selected_die: Option<layout_model::yield_analysis::DieAddress>,
+) {
+    let Some(die) = selected_die else {
+        ui.label("No die selected");
+        return;
+    };
+    let Some(outcome) = outcomes.iter().find(|outcome| outcome.die == die) else {
+        ui.label("Selected die is not present on this wafer");
+        return;
+    };
+
+    ui.horizontal_wrapped(|ui| {
+        if outcome.passed {
+            ui_chrome::status_pill(ui, "PASS", ui_chrome::Tone::Success);
+        } else {
+            ui_chrome::status_pill(ui, "FAIL", ui_chrome::Tone::Danger);
+        }
+        ui.strong(format!("C{} R{}", die.column, die.row));
+        ui.label(format!(
+            "{} failed / {} tests",
+            outcome.failed_tests, outcome.test_count
+        ));
+    });
+    if !outcome.failure_modes.is_empty() {
+        ui.horizontal_wrapped(|ui| {
+            for mode in &outcome.failure_modes {
+                yield_swatch(ui, failure_mode_color(*mode));
+                ui.label(mode.label());
+            }
+        });
+    }
+
+    let mut die_tests = tests
+        .iter()
+        .filter(|test| test.die == die)
+        .collect::<Vec<_>>();
+    die_tests.sort_by(|left, right| left.kind.label().cmp(right.kind.label()));
+    if die_tests.is_empty() {
+        ui.label("No test records for selected die");
+        return;
+    }
+
+    egui::ScrollArea::horizontal()
+        .id_salt(("yield_die_tests", die.column, die.row))
+        .show(ui, |ui| {
+            egui::Grid::new(("yield_die_tests_grid", die.column, die.row))
+                .striped(true)
+                .min_col_width(76.0)
+                .show(ui, |ui| {
+                    ui.strong("Test");
+                    ui.strong("Value");
+                    ui.strong("Spec");
+                    ui.strong("Result");
+                    ui.strong("Mode");
+                    ui.strong("Step");
+                    ui.strong("Tool run");
+                    ui.end_row();
+                    for test in die_tests {
+                        let tone = if test.passed {
+                            ui_chrome::Tone::Success
+                        } else {
+                            ui_chrome::Tone::Danger
+                        };
+                        ui.label(test.kind.label());
+                        ui.colored_label(tone.color(), format_test_value(test.measured_value));
+                        ui.label(format_test_spec(test.lower_spec, test.upper_spec));
+                        ui.colored_label(tone.color(), if test.passed { "pass" } else { "fail" });
+                        ui.label(test.failure_mode.map(FailureMode::label).unwrap_or("-"));
+                        ui.label(&test.process_context.step_id);
+                        ui.label(&test.process_context.tool_run_id);
+                        ui.end_row();
+                    }
+                });
+        });
+}
+
+fn measurement_status(measurement: &ProcessMeasurement) -> YieldMeasurementStatus {
+    if measurement
+        .lower_spec
+        .is_some_and(|lower| measurement.value < lower)
+    {
+        return YieldMeasurementStatus::Low;
+    }
+    if measurement
+        .upper_spec
+        .is_some_and(|upper| measurement.value > upper)
+    {
+        return YieldMeasurementStatus::High;
+    }
+    if measurement.lower_spec.is_some() || measurement.upper_spec.is_some() {
+        YieldMeasurementStatus::InSpec
+    } else {
+        YieldMeasurementStatus::NoSpec
+    }
+}
+
+fn measurement_is_excursion(measurement: &ProcessMeasurement) -> bool {
+    matches!(
+        measurement_status(measurement),
+        YieldMeasurementStatus::Low | YieldMeasurementStatus::High
+    )
+}
+
+fn measurement_status_label(status: YieldMeasurementStatus) -> (&'static str, ui_chrome::Tone) {
+    match status {
+        YieldMeasurementStatus::Low => ("LOW", ui_chrome::Tone::Danger),
+        YieldMeasurementStatus::High => ("HIGH", ui_chrome::Tone::Danger),
+        YieldMeasurementStatus::InSpec => ("OK", ui_chrome::Tone::Success),
+        YieldMeasurementStatus::NoSpec => ("NO SPEC", ui_chrome::Tone::Neutral),
+    }
+}
+
+fn format_spec_range(measurement: &ProcessMeasurement) -> String {
+    match (measurement.lower_spec, measurement.upper_spec) {
+        (Some(lower), Some(upper)) => format!(
+            "{} - {}",
+            format_measurement(lower, &measurement.unit),
+            format_measurement(upper, &measurement.unit)
+        ),
+        (Some(lower), None) => format!(">= {}", format_measurement(lower, &measurement.unit)),
+        (None, Some(upper)) => format!("<= {}", format_measurement(upper, &measurement.unit)),
+        (None, None) => "-".to_string(),
+    }
+}
+
+fn format_measurement_delta(measurement: &ProcessMeasurement) -> String {
+    measurement
+        .target
+        .map(|target| format_signed_measurement(measurement.value - target, &measurement.unit))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn format_signed_measurement(value: f64, unit: &str) -> String {
+    if value.abs() >= 10.0 {
+        format!("{value:+.1} {unit}")
+    } else {
+        format!("{value:+.2} {unit}")
+    }
+}
+
+fn format_test_value(value: f64) -> String {
+    if value.abs() >= 100.0 {
+        format!("{value:.0}")
+    } else if value.abs() >= 10.0 {
+        format!("{value:.2}")
+    } else {
+        format!("{value:.3}")
+    }
+}
+
+fn format_test_spec(lower: Option<f64>, upper: Option<f64>) -> String {
+    match (lower, upper) {
+        (Some(lower), Some(upper)) => {
+            format!(
+                "{} - {}",
+                format_test_value(lower),
+                format_test_value(upper)
+            )
+        }
+        (Some(lower), None) => format!(">= {}", format_test_value(lower)),
+        (None, Some(upper)) => format!("<= {}", format_test_value(upper)),
+        (None, None) => "-".to_string(),
+    }
+}
+
+fn comparison_involves_lot(comparison: &LotComparison, lot_id: &str) -> bool {
+    comparison.baseline_lot_id == lot_id || comparison.candidate_lot_id == lot_id
+}
+
+fn yield_clean_root_cause_hint(hint: &str) -> String {
+    hint.replace(" in this MVP comparison", " in this comparison")
+        .replace("MVP ", "")
+}
+
+fn yield_tone(yield_fraction: f64) -> ui_chrome::Tone {
+    if yield_fraction >= 0.94 {
+        ui_chrome::Tone::Success
+    } else if yield_fraction >= 0.86 {
+        ui_chrome::Tone::Warning
+    } else {
+        ui_chrome::Tone::Danger
+    }
+}
+
+fn yield_delta_tone(delta_fraction: f64) -> ui_chrome::Tone {
+    if delta_fraction >= 0.02 {
+        ui_chrome::Tone::Success
+    } else if delta_fraction <= -0.02 {
+        ui_chrome::Tone::Danger
+    } else {
+        ui_chrome::Tone::Neutral
+    }
+}
+
+fn correlation_tone(correlation: f64) -> ui_chrome::Tone {
+    if correlation.abs() >= 0.55 {
+        ui_chrome::Tone::Warning
+    } else if correlation.abs() >= 0.35 {
+        ui_chrome::Tone::Info
+    } else {
+        ui_chrome::Tone::Neutral
+    }
 }
 
 fn lot_recipe_label(analysis: &YieldAnalysis, lot_id: &str) -> String {
