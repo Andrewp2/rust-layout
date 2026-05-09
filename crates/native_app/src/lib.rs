@@ -4189,14 +4189,48 @@ impl FabricadApp {
             self.selected_equipment_tool = tools.first().map(|tool| tool.id.clone());
         }
 
+        let running_count = tools
+            .iter()
+            .filter(|tool| tool.state == EquipmentToolState::Running)
+            .count();
+        let ready_count = tools
+            .iter()
+            .filter(|tool| {
+                matches!(
+                    tool.state,
+                    EquipmentToolState::OnlineIdle | EquipmentToolState::Completed
+                )
+            })
+            .count();
+        let loaded_count = tools
+            .iter()
+            .filter(|tool| tool.state == EquipmentToolState::RecipeLoaded)
+            .count();
+        let alarm_count = tools
+            .iter()
+            .map(|tool| equipment_active_alarm_count(tool))
+            .sum::<usize>();
+        let critical_count = tools
+            .iter()
+            .flat_map(|tool| tool.active_alarms.iter())
+            .filter(|alarm| alarm.active && alarm.severity == AlarmSeverity::Critical)
+            .count();
+        let sample_count = tools
+            .iter()
+            .map(|tool| tool.recent_sensors.len())
+            .sum::<usize>();
+        let selected_label = self
+            .selected_equipment_tool
+            .as_ref()
+            .map(|tool_id| tool_id.as_str())
+            .unwrap_or("none");
+        let detail = format!(
+            "Sim time: {} s | Selected tool: {}",
+            self.equipment_sim.now_s, selected_label
+        );
+
         ui.vertical(|ui| {
-            ui_chrome::module_header(
-                ui,
-                "Fab operations",
-                "Fab Control Room",
-                &format!("Sim time: {} s", self.equipment_sim.now_s),
-                |_| {},
-            );
+            ui_chrome::module_header(ui, "Fab operations", "Fab Control Room", &detail, |_| {});
             ui_chrome::metric_tiles(
                 ui,
                 &[
@@ -4208,37 +4242,65 @@ impl FabricadApp {
                     ),
                     (
                         "Running",
-                        tools
-                            .iter()
-                            .filter(|tool| tool.state == EquipmentToolState::Running)
-                            .count()
-                            .to_string(),
-                        "",
+                        running_count.to_string(),
+                        "active runs",
                         ui_chrome::Tone::Success,
                     ),
                     (
+                        "Ready",
+                        ready_count.to_string(),
+                        "idle or complete",
+                        if ready_count == 0 {
+                            ui_chrome::Tone::Warning
+                        } else {
+                            ui_chrome::Tone::Info
+                        },
+                    ),
+                    (
+                        "Loaded",
+                        loaded_count.to_string(),
+                        "waiting start",
+                        ui_chrome::Tone::Info,
+                    ),
+                    (
                         "Active alarms",
-                        self.equipment_sim.active_alarms().len().to_string(),
-                        "",
-                        if self.equipment_sim.active_alarms().is_empty() {
+                        alarm_count.to_string(),
+                        if critical_count > 0 {
+                            "critical present"
+                        } else {
+                            "interlocks"
+                        },
+                        if alarm_count == 0 {
                             ui_chrome::Tone::Neutral
                         } else {
                             ui_chrome::Tone::Danger
                         },
                     ),
+                    (
+                        "Samples",
+                        sample_count.to_string(),
+                        "recent sensor points",
+                        ui_chrome::Tone::Neutral,
+                    ),
                 ],
             );
+            ui.separator();
+            self.equipment_fleet_overview(ui, &tools);
             ui.separator();
 
             let wide = ui.available_width() > 980.0;
             if wide {
+                let total_width = ui.available_width();
+                let fleet_width = (total_width * 0.58).clamp(540.0, 760.0);
+                let detail_width = (total_width - fleet_width - 18.0).max(360.0);
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
-                        ui.set_width((ui.available_width() * 0.62).max(560.0));
+                        ui.set_width(fleet_width);
                         self.equipment_tool_grid(ui, &tools);
                     });
                     ui.separator();
                     ui.vertical(|ui| {
+                        ui.set_width(detail_width);
                         self.selected_equipment_panel(ui, &tools);
                     });
                 });
@@ -4250,9 +4312,62 @@ impl FabricadApp {
         });
     }
 
+    fn equipment_fleet_overview(&self, ui: &mut egui::Ui, tools: &[EquipmentTool]) {
+        ui_chrome::section_label(ui, "Fleet Overview");
+        ui.horizontal_wrapped(|ui| {
+            for state in [
+                EquipmentToolState::Running,
+                EquipmentToolState::RecipeLoaded,
+                EquipmentToolState::OnlineIdle,
+                EquipmentToolState::Completed,
+                EquipmentToolState::Alarm,
+                EquipmentToolState::Maintenance,
+                EquipmentToolState::Offline,
+            ] {
+                let count = tools.iter().filter(|tool| tool.state == state).count();
+                if count > 0 {
+                    ui_chrome::status_pill(
+                        ui,
+                        &format!("{} {}", state.label(), count),
+                        equipment_state_tone(state),
+                    );
+                }
+            }
+        });
+
+        let active_runs = tools
+            .iter()
+            .filter_map(|tool| {
+                let run = tool.active_run.as_ref()?;
+                Some(format!(
+                    "{} {} {} s",
+                    tool.id,
+                    run.recipe.recipe_id,
+                    equipment_run_elapsed_s(run, self.equipment_sim.now_s)
+                ))
+            })
+            .collect::<Vec<_>>();
+        if active_runs.is_empty() {
+            ui_chrome::muted(ui, "No process run is currently executing.");
+        } else {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Active runs").strong());
+                for run in active_runs {
+                    ui.label(run);
+                }
+            });
+        }
+    }
+
     fn equipment_tool_grid(&mut self, ui: &mut egui::Ui, tools: &[EquipmentTool]) {
-        ui_chrome::section_label(ui, "Tool Grid");
+        ui_chrome::section_label(ui, "Tool Fleet");
         let mut pending_command: Option<(EquipmentToolId, HostCommand)> = None;
+        let mut ordered_tools = tools.iter().collect::<Vec<_>>();
+        ordered_tools.sort_by(|left, right| {
+            equipment_state_sort_rank(left.state)
+                .cmp(&equipment_state_sort_rank(right.state))
+                .then_with(|| left.id.as_str().cmp(right.id.as_str()))
+        });
         egui::ScrollArea::vertical()
             .id_salt("equipment_tool_grid_scroll")
             .max_height(if ui.available_height() > 520.0 {
@@ -4266,117 +4381,103 @@ impl FabricadApp {
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
                         egui::Grid::new("equipment_tool_grid")
-                            .num_columns(5)
+                            .num_columns(6)
                             .striped(true)
-                            .spacing(vec2(14.0, 8.0))
+                            .spacing(vec2(16.0, 10.0))
                             .show(ui, |ui| {
                                 ui.strong("Tool");
                                 ui.strong("State");
                                 ui.strong("Recipe / run");
                                 ui.strong("Sensors");
-                                ui.strong("Commands");
+                                ui.strong("Alarms");
+                                ui.strong("Host commands");
                                 ui.end_row();
 
-                                for tool in tools {
+                                for tool in ordered_tools {
                                     let selected =
                                         self.selected_equipment_tool.as_ref() == Some(&tool.id);
-                                    let label = format!("{}\n{}", tool.name, tool.id);
-                                    if ui.selectable_label(selected, label).clicked() {
-                                        self.set_focus_object(FabObjectRef::tool(
-                                            tool.id.as_str().to_string(),
+                                    ui.vertical(|ui| {
+                                        if ui
+                                            .add(egui::Button::selectable(
+                                                selected,
+                                                RichText::new(&tool.name).strong(),
+                                            ))
+                                            .on_hover_text("Select this tool for detailed control")
+                                            .clicked()
+                                        {
+                                            self.set_focus_object(FabObjectRef::tool(
+                                                tool.id.as_str().to_string(),
+                                            ));
+                                        }
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "{} | {}",
+                                                tool.id,
+                                                tool.kind.label()
+                                            ))
+                                            .small()
+                                            .color(ui.visuals().weak_text_color()),
+                                        );
+                                    });
+
+                                    ui.vertical(|ui| {
+                                        ui_chrome::status_pill(
+                                            ui,
+                                            tool.state.label(),
+                                            equipment_state_tone(tool.state),
+                                        );
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "updated {} s ago",
+                                                self.equipment_sim
+                                                    .now_s
+                                                    .saturating_sub(tool.last_updated_at_s)
+                                            ))
+                                            .small()
+                                            .color(ui.visuals().weak_text_color()),
+                                        );
+                                    });
+
+                                    ui.vertical(|ui| {
+                                        ui.label(equipment_recipe_run_summary(
+                                            tool,
+                                            self.equipment_sim.now_s,
                                         ));
-                                    }
-
-                                    ui.label(
-                                        egui::RichText::new(tool.state.label())
-                                            .color(equipment_state_color(tool.state))
-                                            .strong(),
-                                    );
-                                    ui.label(equipment_recipe_run_summary(
-                                        tool,
-                                        self.equipment_sim.now_s,
-                                    ));
-                                    ui.label(equipment_recent_sensor_summary(tool));
-
-                                    ui.horizontal_wrapped(|ui| {
-                                        if ui
-                                            .add_enabled(
-                                                tool.state == EquipmentToolState::Offline,
-                                                egui::Button::new("Online"),
-                                            )
-                                            .clicked()
+                                        if let Some((progress, elapsed_s, duration_s)) =
+                                            equipment_run_progress(tool, self.equipment_sim.now_s)
                                         {
-                                            pending_command =
-                                                Some((tool.id.clone(), HostCommand::BringOnline));
-                                        }
-                                        if let Some(recipe_id) = self.selected_recipe_for_tool(tool)
-                                            && ui
-                                                .add_enabled(
-                                                    tool.state.accepts_recipe_load(),
-                                                    egui::Button::new("Load"),
-                                                )
-                                                .clicked()
-                                        {
-                                            pending_command = Some((
-                                                tool.id.clone(),
-                                                HostCommand::LoadRecipe {
-                                                    selection: self
-                                                        .selection_for_tool(tool, recipe_id),
-                                                },
-                                            ));
-                                        }
-                                        if ui
-                                            .add_enabled(
-                                                tool.state == EquipmentToolState::RecipeLoaded,
-                                                egui::Button::new("Start"),
-                                            )
-                                            .clicked()
-                                        {
-                                            pending_command =
-                                                Some((tool.id.clone(), HostCommand::Start));
-                                        }
-                                        if ui
-                                            .add_enabled(
-                                                tool.state == EquipmentToolState::Running,
-                                                egui::Button::new("Stop"),
-                                            )
-                                            .clicked()
-                                        {
-                                            pending_command =
-                                                Some((tool.id.clone(), HostCommand::Stop));
-                                        }
-                                        if ui
-                                            .add_enabled(
-                                                !matches!(
-                                                    tool.state,
-                                                    EquipmentToolState::Offline
-                                                        | EquipmentToolState::Maintenance
-                                                ),
-                                                egui::Button::new("Alarm"),
-                                            )
-                                            .clicked()
-                                        {
-                                            pending_command = Some((
-                                                tool.id.clone(),
-                                                HostCommand::TriggerAlarm {
-                                                    code: "HOST-SIM".to_string(),
-                                                    message: "operator injected simulator alarm"
-                                                        .to_string(),
-                                                    severity: AlarmSeverity::Warning,
-                                                },
-                                            ));
-                                        }
-                                        if ui
-                                            .add_enabled(
-                                                tool.state == EquipmentToolState::Alarm,
-                                                egui::Button::new("Clear"),
-                                            )
-                                            .clicked()
-                                        {
-                                            pending_command =
-                                                Some((tool.id.clone(), HostCommand::ClearAlarm));
+                                            ui.add(
+                                                egui::ProgressBar::new(progress)
+                                                    .desired_width(150.0)
+                                                    .text(format!("{elapsed_s}/{duration_s} s")),
+                                            );
                                         }
                                     });
+
+                                    ui.vertical(|ui| {
+                                        ui.label(equipment_recent_sensor_summary(tool));
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "{} streams | {} samples",
+                                                equipment_sensor_names(tool).len(),
+                                                tool.recent_sensors.len()
+                                            ))
+                                            .small()
+                                            .color(ui.visuals().weak_text_color()),
+                                        );
+                                    });
+
+                                    ui.label(equipment_tool_alarm_summary(tool));
+
+                                    if let Some(command) = self.equipment_host_command_controls(
+                                        ui,
+                                        tool,
+                                        self.selected_recipe_for_tool(tool),
+                                        true,
+                                        false,
+                                    ) {
+                                        pending_command = Some(command);
+                                    }
                                     ui.end_row();
                                 }
                             });
@@ -4402,77 +4503,171 @@ impl FabricadApp {
             return;
         };
 
-        ui.heading(&tool.name);
         ui.horizontal_wrapped(|ui| {
-            ui.label(tool.id.to_string());
-            ui.separator();
+            ui.heading(&tool.name);
+            ui_chrome::status_pill(ui, tool.state.label(), equipment_state_tone(tool.state));
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(tool.id.to_string()).strong());
             ui.label(tool.kind.label());
-            ui.separator();
             ui.label(tool.class.label());
-            ui.separator();
-            ui.label(
-                egui::RichText::new(tool.state.label())
-                    .color(equipment_state_color(tool.state))
-                    .strong(),
-            );
+            ui.label(format!(
+                "last update {} s ago",
+                self.equipment_sim
+                    .now_s
+                    .saturating_sub(tool.last_updated_at_s)
+            ));
         });
 
+        egui::Grid::new(("equipment_selected_summary", tool.id.as_str()))
+            .num_columns(4)
+            .spacing(vec2(12.0, 6.0))
+            .show(ui, |ui| {
+                ui.label(RichText::new("Active alarms").small());
+                ui.label(equipment_tool_alarm_summary(&tool));
+                ui.label(RichText::new("Sensor streams").small());
+                ui.label(format!(
+                    "{} streams, {} samples",
+                    equipment_sensor_names(&tool).len(),
+                    tool.recent_sensors.len()
+                ));
+                ui.end_row();
+                ui.label(RichText::new("Loaded context").small());
+                ui.label(
+                    tool.selected_recipe
+                        .as_ref()
+                        .map(equipment_selection_context)
+                        .unwrap_or_else(|| "No loaded lot / wafer context".to_string()),
+                );
+                ui.label(RichText::new("Run state").small());
+                ui.label(equipment_recipe_run_summary(
+                    &tool,
+                    self.equipment_sim.now_s,
+                ));
+                ui.end_row();
+            });
+
         ui.separator();
-        ui.strong("Recipe");
+        ui_chrome::section_label(ui, "Recipe Setup");
         let mut draft = self
             .selected_recipe_for_tool(&tool)
             .unwrap_or_else(|| EquipmentRecipeId::new(""));
-        let selected_recipe_text = tool
-            .available_recipes
-            .get(&draft)
-            .map(|recipe| format!("{} v{}", recipe.name, recipe.version))
-            .unwrap_or_else(|| "No recipe".to_string());
-        egui::ComboBox::from_id_salt(("equipment_recipe", tool.id.as_str()))
-            .selected_text(selected_recipe_text)
-            .show_ui(ui, |ui| {
-                for recipe in tool.available_recipes.values() {
-                    ui.selectable_value(
-                        &mut draft,
-                        recipe.id.clone(),
-                        format!("{} v{}", recipe.name, recipe.version),
-                    );
-                }
-            });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Recipe");
+            let selected_recipe_text = tool
+                .available_recipes
+                .get(&draft)
+                .map(|recipe| format!("{} v{}", recipe.name, recipe.version))
+                .unwrap_or_else(|| "No recipe".to_string());
+            egui::ComboBox::from_id_salt(("equipment_recipe", tool.id.as_str()))
+                .selected_text(selected_recipe_text)
+                .show_ui(ui, |ui| {
+                    for recipe in tool.available_recipes.values() {
+                        ui.selectable_value(
+                            &mut draft,
+                            recipe.id.clone(),
+                            format!("{} v{}", recipe.name, recipe.version),
+                        );
+                    }
+                });
+            if let Some(recipe) = tool.available_recipes.get(&draft) {
+                ui.label(format!(
+                    "{} s process, {} parameter{}",
+                    recipe.duration_s,
+                    recipe.parameters.len(),
+                    if recipe.parameters.len() == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                ));
+            }
+        });
         if !draft.as_str().is_empty() {
             self.equipment_recipe_drafts
                 .insert(tool.id.clone(), draft.clone());
         }
 
-        let mut pending_command: Option<(EquipmentToolId, HostCommand)> = None;
+        ui_chrome::section_label(ui, "Host Commands");
+        ui_chrome::muted(ui, equipment_command_hint(&tool));
+        let command_recipe = (!draft.as_str().is_empty()).then_some(draft.clone());
+        let pending_command =
+            self.equipment_host_command_controls(ui, &tool, command_recipe, false, true);
+
+        if let Some((tool_id, command)) = pending_command {
+            self.send_equipment_command(tool_id, command);
+        }
+
+        ui.separator();
+        if ui.available_width() > 660.0 {
+            ui.columns(2, |columns| {
+                self.equipment_run_panel(&mut columns[0], &tool);
+                columns[0].separator();
+                self.equipment_event_log_panel(&mut columns[0], &tool);
+                self.equipment_sensor_panel(&mut columns[1], &tool);
+                columns[1].separator();
+                self.equipment_alarm_panel(&mut columns[1], &tool);
+            });
+        } else {
+            self.equipment_run_panel(ui, &tool);
+            ui.separator();
+            self.equipment_sensor_panel(ui, &tool);
+            ui.separator();
+            self.equipment_alarm_panel(ui, &tool);
+            ui.separator();
+            self.equipment_event_log_panel(ui, &tool);
+        }
+    }
+
+    fn equipment_host_command_controls(
+        &self,
+        ui: &mut egui::Ui,
+        tool: &EquipmentTool,
+        recipe_id: Option<EquipmentRecipeId>,
+        compact: bool,
+        include_service: bool,
+    ) -> Option<(EquipmentToolId, HostCommand)> {
+        let mut pending_command = None;
         ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(
                     tool.state == EquipmentToolState::Offline,
-                    egui::Button::new("Bring Online"),
+                    egui::Button::new(if compact { "Online" } else { "Bring Online" }),
                 )
+                .on_hover_text("Establish host control for an offline tool")
                 .clicked()
             {
                 pending_command = Some((tool.id.clone(), HostCommand::BringOnline));
             }
-            if ui
-                .add_enabled(
-                    tool.state.accepts_recipe_load() && !draft.as_str().is_empty(),
-                    egui::Button::new("Load Recipe"),
+            if let Some(recipe_id) = recipe_id {
+                if ui
+                    .add_enabled(
+                        tool.state.accepts_recipe_load(),
+                        egui::Button::new(if compact { "Load" } else { "Load Recipe" }),
+                    )
+                    .on_hover_text(format!("Load recipe {recipe_id}"))
+                    .clicked()
+                {
+                    pending_command = Some((
+                        tool.id.clone(),
+                        HostCommand::LoadRecipe {
+                            selection: self.selection_for_tool(tool, recipe_id),
+                        },
+                    ));
+                }
+            } else {
+                ui.add_enabled(
+                    false,
+                    egui::Button::new(if compact { "Load" } else { "Load Recipe" }),
                 )
-                .clicked()
-            {
-                pending_command = Some((
-                    tool.id.clone(),
-                    HostCommand::LoadRecipe {
-                        selection: self.selection_for_tool(&tool, draft.clone()),
-                    },
-                ));
+                .on_hover_text("No recipe is available for this tool");
             }
             if ui
                 .add_enabled(
                     tool.state == EquipmentToolState::RecipeLoaded,
                     egui::Button::new("Start"),
                 )
+                .on_hover_text("Start the loaded process recipe")
                 .clicked()
             {
                 pending_command = Some((tool.id.clone(), HostCommand::Start));
@@ -4482,29 +4677,20 @@ impl FabricadApp {
                     tool.state == EquipmentToolState::Running,
                     egui::Button::new("Stop"),
                 )
+                .on_hover_text("Abort the active process run")
                 .clicked()
             {
                 pending_command = Some((tool.id.clone(), HostCommand::Stop));
             }
             if ui
                 .add_enabled(
-                    tool.state != EquipmentToolState::Running,
-                    egui::Button::new("Reset"),
-                )
-                .clicked()
-            {
-                pending_command = Some((tool.id.clone(), HostCommand::Reset));
-            }
-        });
-        ui.horizontal_wrapped(|ui| {
-            if ui
-                .add_enabled(
                     !matches!(
                         tool.state,
                         EquipmentToolState::Offline | EquipmentToolState::Maintenance
                     ),
-                    egui::Button::new("Trigger Alarm"),
+                    egui::Button::new(if compact { "Alarm" } else { "Trigger Alarm" }),
                 )
+                .on_hover_text("Inject a simulator alarm for host-response testing")
                 .clicked()
             {
                 pending_command = Some((
@@ -4519,129 +4705,219 @@ impl FabricadApp {
             if ui
                 .add_enabled(
                     tool.state == EquipmentToolState::Alarm,
-                    egui::Button::new("Clear Alarm"),
+                    egui::Button::new(if compact { "Clear" } else { "Clear Alarm" }),
                 )
+                .on_hover_text("Clear active alarms and return the tool to online idle")
                 .clicked()
             {
                 pending_command = Some((tool.id.clone(), HostCommand::ClearAlarm));
             }
-            let maintenance_label = if tool.state == EquipmentToolState::Maintenance {
-                "Exit Maintenance"
-            } else {
-                "Maintenance"
-            };
-            if ui
-                .add_enabled(
-                    tool.state != EquipmentToolState::Running,
-                    egui::Button::new(maintenance_label),
-                )
-                .clicked()
-            {
-                pending_command = Some((
-                    tool.id.clone(),
-                    if tool.state == EquipmentToolState::Maintenance {
-                        HostCommand::ExitMaintenance
-                    } else {
-                        HostCommand::EnterMaintenance
-                    },
-                ));
+            if include_service {
+                if ui
+                    .add_enabled(
+                        tool.state != EquipmentToolState::Running,
+                        egui::Button::new("Reset"),
+                    )
+                    .on_hover_text("Clear loaded recipe and run context")
+                    .clicked()
+                {
+                    pending_command = Some((tool.id.clone(), HostCommand::Reset));
+                }
+                let maintenance_label = if tool.state == EquipmentToolState::Maintenance {
+                    "Exit Maintenance"
+                } else {
+                    "Maintenance"
+                };
+                if ui
+                    .add_enabled(
+                        tool.state != EquipmentToolState::Running,
+                        egui::Button::new(maintenance_label),
+                    )
+                    .on_hover_text("Toggle maintenance state for the selected tool")
+                    .clicked()
+                {
+                    pending_command = Some((
+                        tool.id.clone(),
+                        if tool.state == EquipmentToolState::Maintenance {
+                            HostCommand::ExitMaintenance
+                        } else {
+                            HostCommand::EnterMaintenance
+                        },
+                    ));
+                }
             }
         });
+        pending_command
+    }
 
-        if let Some((tool_id, command)) = pending_command {
-            self.send_equipment_command(tool_id, command);
+    fn equipment_event_log_panel(&self, ui: &mut egui::Ui, tool: &EquipmentTool) {
+        ui_chrome::section_label(ui, "Host / Tool Log");
+        if tool.event_log.is_empty() {
+            ui_chrome::empty_state(ui, "No host events logged");
+            return;
         }
-
-        ui.separator();
-        self.equipment_run_panel(ui, &tool);
-        ui.separator();
-        self.equipment_sensor_panel(ui, &tool);
-        ui.separator();
-        self.equipment_alarm_panel(ui);
+        egui::ScrollArea::vertical()
+            .id_salt(("equipment_event_log", tool.id.as_str()))
+            .max_height(132.0)
+            .show(ui, |ui| {
+                for entry in tool.event_log.iter().rev().take(8) {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            RichText::new(format!("t+{} s", entry.at_s))
+                                .small()
+                                .color(ui.visuals().weak_text_color()),
+                        );
+                        ui.label(&entry.message);
+                    });
+                }
+            });
     }
 
     fn equipment_run_panel(&self, ui: &mut egui::Ui, tool: &EquipmentTool) {
-        ui.strong("Current Run");
+        ui_chrome::section_label(ui, "Recipe / Run State");
         if let Some(run) = &tool.active_run {
-            ui.label(format!(
-                "{} on {} for {} s",
-                run.id,
-                run.recipe.recipe_id,
-                run.elapsed_s(self.equipment_sim.now_s)
-            ));
-            if let Some(recipe) = tool.selected_recipe_details() {
-                let progress = (run.elapsed_s(self.equipment_sim.now_s) as f32
-                    / recipe.duration_s as f32)
-                    .clamp(0.0, 1.0);
+            let elapsed_s = equipment_run_elapsed_s(run, self.equipment_sim.now_s);
+            ui.horizontal_wrapped(|ui| {
+                ui_chrome::status_pill(ui, run.status.label(), ui_chrome::Tone::Success);
+                ui.label(format!("{} on {}", run.id, run.recipe.recipe_id));
+            });
+            if let Some((progress, _, duration_s)) =
+                equipment_run_progress(tool, self.equipment_sim.now_s)
+            {
                 ui.add(
                     egui::ProgressBar::new(progress)
-                        .desired_width(ui.available_width().min(360.0))
-                        .text(format!("{:.0}%", progress * 100.0)),
+                        .desired_width(ui.available_width().min(420.0))
+                        .text(format!("{elapsed_s}/{duration_s} s")),
                 );
             }
+            egui::Grid::new(("equipment_active_run", tool.id.as_str()))
+                .num_columns(2)
+                .spacing(vec2(10.0, 4.0))
+                .show(ui, |ui| {
+                    ui.label("Context");
+                    ui.label(equipment_selection_context(&run.recipe));
+                    ui.end_row();
+                    ui.label("Sensor points");
+                    ui.label(run.sensor_count.to_string());
+                    ui.end_row();
+                });
         } else if let Some(selection) = &tool.selected_recipe {
-            ui.label(format!(
-                "Loaded {} v{}",
-                selection.recipe_id, selection.recipe_version
-            ));
-        } else {
-            ui.label("No active run");
-        }
-
-        ui.strong("Recent Runs");
-        if tool.recent_runs.is_empty() {
-            ui.label("No completed runs");
-            return;
-        }
-        for run in tool.recent_runs.iter().take(4) {
             ui.horizontal_wrapped(|ui| {
-                ui.label(run.id.to_string());
-                ui.label(
-                    egui::RichText::new(run.status.label())
-                        .color(equipment_run_status_color(run.status)),
-                );
+                ui_chrome::status_pill(ui, "Loaded", ui_chrome::Tone::Info);
                 ui.label(format!(
-                    "{} s, {} samples",
-                    run.elapsed_s(self.equipment_sim.now_s),
-                    run.sensor_count
+                    "{} v{}",
+                    selection.recipe_id, selection.recipe_version
                 ));
             });
+            ui_chrome::muted(ui, equipment_selection_context(selection));
+        } else {
+            ui_chrome::empty_state(ui, "No recipe is loaded");
         }
+
+        ui_chrome::section_label(ui, "Recent Runs");
+        if tool.recent_runs.is_empty() {
+            ui_chrome::empty_state(ui, "No completed runs");
+            return;
+        }
+        egui::Grid::new(("equipment_recent_runs", tool.id.as_str()))
+            .num_columns(5)
+            .striped(true)
+            .spacing(vec2(10.0, 4.0))
+            .show(ui, |ui| {
+                ui.strong("Run");
+                ui.strong("Status");
+                ui.strong("Recipe");
+                ui.strong("Duration");
+                ui.strong("Samples");
+                ui.end_row();
+                for run in tool.recent_runs.iter().take(5) {
+                    ui.label(run.id.to_string());
+                    ui.label(
+                        RichText::new(run.status.label())
+                            .color(equipment_run_status_color(run.status))
+                            .strong(),
+                    );
+                    ui.label(run.recipe.recipe_id.to_string());
+                    ui.label(format!(
+                        "{} s",
+                        equipment_run_elapsed_s(run, self.equipment_sim.now_s)
+                    ));
+                    ui.label(run.sensor_count.to_string());
+                    ui.end_row();
+                }
+            });
     }
 
     fn equipment_sensor_panel(&self, ui: &mut egui::Ui, tool: &EquipmentTool) {
-        ui.strong("Sensor Streams");
+        ui_chrome::section_label(ui, "Sensor Streams");
         let names = equipment_sensor_names(tool);
         if names.is_empty() {
-            ui.label("Waiting for samples");
+            ui_chrome::empty_state(ui, "Waiting for samples");
             return;
         }
-        for name in names {
-            let values = equipment_sensor_series(tool, &name, 36);
-            let latest = tool.latest_sensor(&name);
-            ui.horizontal(|ui| {
-                ui.set_min_height(42.0);
-                ui.vertical(|ui| {
+        egui::Grid::new(("equipment_sensor_grid", tool.id.as_str()))
+            .num_columns(4)
+            .striped(true)
+            .spacing(vec2(10.0, 6.0))
+            .show(ui, |ui| {
+                ui.strong("Signal");
+                ui.strong("Latest");
+                ui.strong("Freshness");
+                ui.strong("Trace");
+                ui.end_row();
+                for name in names {
+                    let values = equipment_sensor_series(tool, &name, 42);
+                    let latest = tool.latest_sensor(&name);
                     ui.label(&name);
                     if let Some(sample) = latest {
                         ui.label(equipment_sensor_value(sample));
+                        ui.label(equipment_sensor_age_text(sample, self.equipment_sim.now_s));
+                    } else {
+                        ui.label("No value");
+                        ui.label("-");
                     }
-                });
-                equipment_sparkline(ui, &values, Color32::from_rgb(96, 178, 255));
+                    equipment_sparkline(ui, &values, Color32::from_rgb(96, 178, 255));
+                    ui.end_row();
+                }
             });
-        }
     }
 
-    fn equipment_alarm_panel(&self, ui: &mut egui::Ui) {
-        ui_chrome::section_label(ui, "Active Alarms");
-        let alarms = self.equipment_sim.active_alarms();
-        if alarms.is_empty() {
-            ui_chrome::empty_state(ui, "No active alarms");
+    fn equipment_alarm_panel(&self, ui: &mut egui::Ui, tool: &EquipmentTool) {
+        ui_chrome::section_label(ui, "Alarms");
+        let active_tool_alarms = tool
+            .active_alarms
+            .iter()
+            .filter(|alarm| alarm.active)
+            .collect::<Vec<_>>();
+        if active_tool_alarms.is_empty() {
+            ui_chrome::status_pill(ui, "Selected tool clear", ui_chrome::Tone::Success);
         } else {
-            for alarm in alarms {
+            for alarm in active_tool_alarms {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(
-                        egui::RichText::new(alarm.severity.label())
+                        RichText::new(alarm.severity.label())
+                            .color(equipment_alarm_color(alarm.severity))
+                            .strong(),
+                    );
+                    ui.label(format!("{} at t+{} s", alarm.code, alarm.occurred_at_s));
+                    ui.label(&alarm.message);
+                });
+            }
+        }
+
+        let other_alarms = self
+            .equipment_sim
+            .active_alarms()
+            .into_iter()
+            .filter(|alarm| alarm.tool_id != tool.id)
+            .collect::<Vec<_>>();
+        if !other_alarms.is_empty() {
+            ui.separator();
+            ui_chrome::muted(ui, "Other active fab alarms");
+            for alarm in other_alarms.into_iter().take(4) {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(alarm.severity.label())
                             .color(equipment_alarm_color(alarm.severity))
                             .strong(),
                     );
@@ -4657,17 +4933,33 @@ impl FabricadApp {
         if recent_runs.is_empty() {
             ui_chrome::empty_state(ui, "No logged runs");
         } else {
-            for run in recent_runs.into_iter().take(5) {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(run.tool_id.to_string());
-                    ui.label(run.id.to_string());
-                    ui.label(run.recipe.recipe_id.to_string());
-                    ui.label(
-                        egui::RichText::new(run.status.label())
-                            .color(equipment_run_status_color(run.status)),
-                    );
+            egui::Grid::new("equipment_fab_run_log")
+                .num_columns(5)
+                .striped(true)
+                .spacing(vec2(10.0, 4.0))
+                .show(ui, |ui| {
+                    ui.strong("Tool");
+                    ui.strong("Run");
+                    ui.strong("Recipe");
+                    ui.strong("Status");
+                    ui.strong("Duration");
+                    ui.end_row();
+                    for run in recent_runs.into_iter().take(6) {
+                        ui.label(run.tool_id.to_string());
+                        ui.label(run.id.to_string());
+                        ui.label(run.recipe.recipe_id.to_string());
+                        ui.label(
+                            RichText::new(run.status.label())
+                                .color(equipment_run_status_color(run.status))
+                                .strong(),
+                        );
+                        ui.label(format!(
+                            "{} s",
+                            equipment_run_elapsed_s(run, self.equipment_sim.now_s)
+                        ));
+                        ui.end_row();
+                    }
                 });
-            }
         }
     }
 
@@ -12541,15 +12833,27 @@ fn equipment_process_step_label(kind: EquipmentToolKind) -> &'static str {
     }
 }
 
-fn equipment_state_color(state: EquipmentToolState) -> Color32 {
+fn equipment_state_tone(state: EquipmentToolState) -> ui_chrome::Tone {
     match state {
-        EquipmentToolState::Offline => Color32::from_rgb(145, 150, 158),
-        EquipmentToolState::OnlineIdle => Color32::from_rgb(105, 190, 120),
-        EquipmentToolState::RecipeLoaded => Color32::from_rgb(98, 170, 235),
-        EquipmentToolState::Running => Color32::from_rgb(250, 198, 90),
-        EquipmentToolState::Completed => Color32::from_rgb(120, 205, 180),
-        EquipmentToolState::Alarm => Color32::from_rgb(245, 98, 98),
-        EquipmentToolState::Maintenance => Color32::from_rgb(205, 150, 245),
+        EquipmentToolState::Offline => ui_chrome::Tone::Neutral,
+        EquipmentToolState::OnlineIdle => ui_chrome::Tone::Success,
+        EquipmentToolState::RecipeLoaded => ui_chrome::Tone::Info,
+        EquipmentToolState::Running => ui_chrome::Tone::Warning,
+        EquipmentToolState::Completed => ui_chrome::Tone::Success,
+        EquipmentToolState::Alarm => ui_chrome::Tone::Danger,
+        EquipmentToolState::Maintenance => ui_chrome::Tone::Warning,
+    }
+}
+
+fn equipment_state_sort_rank(state: EquipmentToolState) -> u8 {
+    match state {
+        EquipmentToolState::Alarm => 0,
+        EquipmentToolState::Running => 1,
+        EquipmentToolState::RecipeLoaded => 2,
+        EquipmentToolState::Completed => 3,
+        EquipmentToolState::OnlineIdle => 4,
+        EquipmentToolState::Maintenance => 5,
+        EquipmentToolState::Offline => 6,
     }
 }
 
@@ -12572,11 +12876,12 @@ fn equipment_run_status_color(status: RunStatus) -> Color32 {
 
 fn equipment_recipe_run_summary(tool: &EquipmentTool, now_s: u64) -> String {
     if let Some(run) = &tool.active_run {
-        return format!(
-            "{}\n{} s active",
-            run.recipe.recipe_id,
-            run.elapsed_s(now_s)
-        );
+        let elapsed_s = equipment_run_elapsed_s(run, now_s);
+        let duration = tool
+            .selected_recipe_details()
+            .map(|recipe| format!(" / {} s", recipe.duration_s))
+            .unwrap_or_default();
+        return format!("{}\n{}{} active", run.recipe.recipe_id, elapsed_s, duration);
     }
     if let Some(selection) = &tool.selected_recipe {
         return format!(
@@ -12587,12 +12892,89 @@ fn equipment_recipe_run_summary(tool: &EquipmentTool, now_s: u64) -> String {
     "No recipe".to_string()
 }
 
+fn equipment_run_elapsed_s(run: &layout_model::equipment::ToolRun, now_s: u64) -> u64 {
+    run.completed_at_s
+        .unwrap_or(now_s)
+        .saturating_sub(run.started_at_s)
+}
+
+fn equipment_run_progress(tool: &EquipmentTool, now_s: u64) -> Option<(f32, u64, u64)> {
+    let run = tool.active_run.as_ref()?;
+    let duration_s = tool
+        .selected_recipe_details()
+        .map(|recipe| recipe.duration_s)
+        .unwrap_or(1)
+        .max(1);
+    let elapsed_s = equipment_run_elapsed_s(run, now_s);
+    Some((
+        (elapsed_s as f32 / duration_s as f32).clamp(0.0, 1.0),
+        elapsed_s,
+        duration_s,
+    ))
+}
+
+fn equipment_active_alarm_count(tool: &EquipmentTool) -> usize {
+    tool.active_alarms
+        .iter()
+        .filter(|alarm| alarm.active)
+        .count()
+}
+
+fn equipment_tool_alarm_summary(tool: &EquipmentTool) -> String {
+    let active = tool
+        .active_alarms
+        .iter()
+        .filter(|alarm| alarm.active)
+        .collect::<Vec<_>>();
+    if active.is_empty() {
+        return "Clear".to_string();
+    }
+    let critical = active
+        .iter()
+        .filter(|alarm| alarm.severity == AlarmSeverity::Critical)
+        .count();
+    if critical > 0 {
+        format!("{} active, {} critical", active.len(), critical)
+    } else {
+        format!("{} active", active.len())
+    }
+}
+
+fn equipment_selection_context(selection: &RecipeSelection) -> String {
+    let lot = selection.lot_id.as_deref().unwrap_or("no lot");
+    let wafer = selection.wafer_id.as_deref().unwrap_or("no wafer");
+    let step = selection
+        .process_step_id
+        .as_deref()
+        .unwrap_or("no process step");
+    let operator = selection.operator.as_deref().unwrap_or("no operator");
+    format!("{lot} | {wafer} | {step} | {operator}")
+}
+
+fn equipment_command_hint(tool: &EquipmentTool) -> &'static str {
+    match tool.state {
+        EquipmentToolState::Offline => "Bring the tool online before loading a recipe.",
+        EquipmentToolState::OnlineIdle => "Select a recipe, load it, then start the run.",
+        EquipmentToolState::RecipeLoaded => {
+            "Start executes the loaded recipe; reset clears the context."
+        }
+        EquipmentToolState::Running => {
+            "Stop aborts the active run; alarms simulate host interlocks."
+        }
+        EquipmentToolState::Completed => "Load the next recipe or reset the completed context.",
+        EquipmentToolState::Alarm => "Clear alarms before loading or starting another process.",
+        EquipmentToolState::Maintenance => {
+            "Exit maintenance returns the tool to offline host control."
+        }
+    }
+}
+
 fn equipment_recent_sensor_summary(tool: &EquipmentTool) -> String {
     let names = equipment_sensor_names(tool);
     if names.is_empty() {
         return "No samples".to_string();
     }
-    names
+    let summary = names
         .into_iter()
         .take(2)
         .filter_map(|name| {
@@ -12600,7 +12982,12 @@ fn equipment_recent_sensor_summary(tool: &EquipmentTool) -> String {
                 .map(|sample| format!("{name}: {}", equipment_sensor_value(sample)))
         })
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    if summary.is_empty() {
+        "No samples".to_string()
+    } else {
+        summary
+    }
 }
 
 fn equipment_sensor_names(tool: &EquipmentTool) -> Vec<String> {
@@ -12627,6 +13014,15 @@ fn equipment_sensor_series(tool: &EquipmentTool, name: &str, max_samples: usize)
 fn equipment_sensor_value(sample: &SensorSample) -> String {
     let precision = if sample.value.abs() >= 100.0 { 0 } else { 2 };
     format!("{:.*} {}", precision, sample.value, sample.unit)
+}
+
+fn equipment_sensor_age_text(sample: &SensorSample, now_s: u64) -> String {
+    let age_s = now_s.saturating_sub(sample.at_s);
+    if age_s == 0 {
+        "live".to_string()
+    } else {
+        format!("{age_s} s ago")
+    }
 }
 
 fn equipment_sparkline(ui: &mut egui::Ui, values: &[f64], color: Color32) {
