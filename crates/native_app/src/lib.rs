@@ -38,8 +38,8 @@ use layout_model::{
         TravelerStatus,
     },
     metrology::{
-        DieCoord, FabObjectLinks, HistogramBin, Measurement, MeasurementKind, MeasurementStatus,
-        WaferGeometry, WaferMap,
+        DefectClass, DieCoord, FabObjectLinks, HistogramBin, Measurement, MeasurementKind,
+        MeasurementStatus, WaferGeometry, WaferMap,
     },
     notebook::LabNotebook,
     process_control::ProcessControlModel,
@@ -105,6 +105,7 @@ use wasm_bindgen::{JsCast, closure::Closure};
 
 const SAVE_PATH: &str = "examples/fabricad_layout.json";
 const WORKSPACE_PATH: &str = "examples/fabricad_workspace.json";
+#[cfg(not(target_arch = "wasm32"))]
 const DEMO_WORKSPACE_PATH: &str = "examples/fabricad_demo_workspace.json";
 const GDS_PATH: &str = "examples/fabricad_layout.gds";
 #[cfg(target_arch = "wasm32")]
@@ -167,6 +168,41 @@ enum ViewMode {
     Traceability,
     Experiment,
     Notebook,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MetrologyMapMode {
+    ValueMap,
+    DeviationMap,
+    DefectReview,
+    OverlayVectors,
+}
+
+impl MetrologyMapMode {
+    const ALL: [Self; 4] = [
+        Self::ValueMap,
+        Self::DeviationMap,
+        Self::DefectReview,
+        Self::OverlayVectors,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::ValueMap => "Value map",
+            Self::DeviationMap => "Deviation map",
+            Self::DefectReview => "Defect review",
+            Self::OverlayVectors => "Overlay vectors",
+        }
+    }
+
+    fn detail(self) -> &'static str {
+        match self {
+            Self::ValueMap => "Color dies by the selected metrology result.",
+            Self::DeviationMap => "Center color around the recipe target and spec limits.",
+            Self::DefectReview => "Show defect density and review markers.",
+            Self::OverlayVectors => "Draw synthetic overlay-error vectors across the wafer.",
+        }
+    }
 }
 
 impl ViewMode {
@@ -330,6 +366,10 @@ impl ViewMode {
                 | Self::Experiment
                 | Self::Notebook
         )
+    }
+
+    fn supports_viewport_fullscreen(self) -> bool {
+        matches!(self, Self::Layout2d | Self::Layout3d)
     }
 }
 
@@ -1045,13 +1085,14 @@ pub struct FabricadApp {
     show_inspector_drawer: bool,
     show_layers_drawer: bool,
     command_palette_query: String,
-    fullscreen: bool,
+    viewport_fullscreen: bool,
     selected: BTreeSet<ShapeId>,
     selected_occurrence: Option<ShapeOccurrenceId>,
     active_layer: LayerId,
     tool: Tool,
     view_mode: ViewMode,
     wafer_map: WaferMap,
+    metrology_map_mode: MetrologyMapMode,
     metrology_kind: MeasurementKind,
     selected_die: Option<DieCoord>,
     metrology_failed_only: bool,
@@ -1529,13 +1570,14 @@ impl FabricadApp {
             show_inspector_drawer: false,
             show_layers_drawer: false,
             command_palette_query: String::new(),
-            fullscreen: false,
+            viewport_fullscreen: false,
             selected: BTreeSet::new(),
             selected_occurrence: None,
             active_layer,
             tool: Tool::Select,
             view_mode: ViewMode::Workflow,
             wafer_map: dataset.wafer_map,
+            metrology_map_mode: MetrologyMapMode::ValueMap,
             metrology_kind: MeasurementKind::ThicknessNm,
             selected_die: None,
             metrology_failed_only: false,
@@ -3629,43 +3671,56 @@ impl FabricadApp {
     }
 
     fn load_demo_workspace(&mut self) {
-        let path = PathBuf::from(DEMO_WORKSPACE_PATH);
-        let dataset = match fs::read_to_string(&path)
-            .map_err(serde_json::Error::io)
-            .and_then(|contents| serde_json::from_str::<WorkspaceDataset>(&contents))
+        #[cfg(target_arch = "wasm32")]
         {
-            Ok(dataset) => dataset,
-            Err(err) => {
-                warn!(
-                    path = %path.display(),
-                    error = %err,
-                    "demo workspace load failed; regenerating demo workspace"
-                );
-                let dataset = WorkspaceDataset::demo();
-                if let Some(parent) = path.parent()
-                    && let Err(err) = fs::create_dir_all(parent)
-                {
-                    self.set_error_status(format!("demo workspace setup failed: {err}"));
-                    return;
-                }
-                match serde_json::to_string_pretty(&dataset)
-                    .and_then(|contents| fs::write(&path, contents).map_err(serde_json::Error::io))
-                {
-                    Ok(()) => {}
-                    Err(err) => {
+            self.apply_workspace_dataset(
+                WorkspaceDataset::demo(),
+                DataSource::Demo,
+                DataSource::Demo,
+                "loaded built-in demo workspace",
+            );
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let path = PathBuf::from(DEMO_WORKSPACE_PATH);
+            let dataset = match fs::read_to_string(&path)
+                .map_err(serde_json::Error::io)
+                .and_then(|contents| serde_json::from_str::<WorkspaceDataset>(&contents))
+            {
+                Ok(dataset) => dataset,
+                Err(err) => {
+                    warn!(
+                        path = %path.display(),
+                        error = %err,
+                        "demo workspace load failed; regenerating demo workspace"
+                    );
+                    let dataset = WorkspaceDataset::demo();
+                    if let Some(parent) = path.parent()
+                        && let Err(err) = fs::create_dir_all(parent)
+                    {
                         self.set_error_status(format!("demo workspace setup failed: {err}"));
                         return;
                     }
+                    match serde_json::to_string_pretty(&dataset).and_then(|contents| {
+                        fs::write(&path, contents).map_err(serde_json::Error::io)
+                    }) {
+                        Ok(()) => {}
+                        Err(err) => {
+                            self.set_error_status(format!("demo workspace setup failed: {err}"));
+                            return;
+                        }
+                    }
+                    dataset
                 }
-                dataset
-            }
-        };
-        self.apply_workspace_dataset(
-            dataset,
-            DataSource::Demo,
-            DataSource::Demo,
-            &format!("loaded demo workspace {DEMO_WORKSPACE_PATH}"),
-        );
+            };
+            self.apply_workspace_dataset(
+                dataset,
+                DataSource::Demo,
+                DataSource::Demo,
+                &format!("loaded demo workspace {DEMO_WORKSPACE_PATH}"),
+            );
+        }
     }
 
     fn save_document(&mut self) {
@@ -3986,7 +4041,10 @@ impl FabricadApp {
                 self.command_palette_query.clear();
             }
             if input.key_pressed(Key::F11) {
-                self.toggle_fullscreen(ctx);
+                self.toggle_viewport_fullscreen(ctx);
+            }
+            if input.key_pressed(Key::Escape) && self.viewport_fullscreen {
+                self.set_viewport_fullscreen(false, ctx);
             }
             if self.settings.single_key_shortcuts {
                 if input.key_pressed(Key::Num1) {
@@ -4667,6 +4725,9 @@ impl FabricadApp {
         if !matches!(mode, ViewMode::Layout2d) {
             self.tool = Tool::Select;
         }
+        if !mode.supports_viewport_fullscreen() {
+            self.viewport_fullscreen = false;
+        }
         self.status = mode.status_message().to_string();
     }
 
@@ -4832,7 +4893,7 @@ impl FabricadApp {
                                 ui.close();
                             }
                             if ui.button("Fullscreen").clicked() {
-                                self.toggle_fullscreen(ui.ctx());
+                                self.toggle_viewport_fullscreen(ui.ctx());
                                 ui.close();
                             }
                         });
@@ -4841,7 +4902,7 @@ impl FabricadApp {
                             self.reset_3d_camera_to_document();
                         }
                         if ui.button("Fullscreen").clicked() {
-                            self.toggle_fullscreen(ui.ctx());
+                            self.toggle_viewport_fullscreen(ui.ctx());
                         }
                     }
                 }
@@ -5420,8 +5481,8 @@ impl FabricadApp {
                 action: CommandAction::Reset3d,
             },
             CommandEntry {
-                label: "Toggle fullscreen".to_string(),
-                detail: "Window".to_string(),
+                label: "Toggle viewport fullscreen".to_string(),
+                detail: "Layout viewport".to_string(),
                 action: CommandAction::ToggleFullscreen,
             },
         ]);
@@ -5455,18 +5516,51 @@ impl FabricadApp {
                 self.settings.show_origin_marker = !self.settings.show_origin_marker;
             }
             CommandAction::Reset3d => self.reset_3d_camera_to_document(),
-            CommandAction::ToggleFullscreen => self.toggle_fullscreen(ctx),
+            CommandAction::ToggleFullscreen => self.toggle_viewport_fullscreen(ctx),
         }
     }
 
-    fn toggle_fullscreen(&mut self, ctx: &egui::Context) {
-        self.fullscreen = !self.fullscreen;
-        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
-        self.status = if self.fullscreen {
-            "entered fullscreen".to_string()
+    fn toggle_viewport_fullscreen(&mut self, ctx: &egui::Context) {
+        self.set_viewport_fullscreen(!self.viewport_fullscreen, ctx);
+    }
+
+    fn set_viewport_fullscreen(&mut self, fullscreen: bool, ctx: &egui::Context) {
+        if fullscreen && !self.view_mode.supports_viewport_fullscreen() {
+            self.status = "viewport fullscreen is available in layout views".to_string();
+            return;
+        }
+        self.viewport_fullscreen = fullscreen;
+        self.status = if self.viewport_fullscreen {
+            "entered viewport fullscreen".to_string()
         } else {
-            "exited fullscreen".to_string()
+            "exited viewport fullscreen".to_string()
         };
+        ctx.request_repaint();
+    }
+
+    fn viewport_fullscreen_ui(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing = Vec2::ZERO;
+                match self.view_mode {
+                    ViewMode::Layout2d => self.canvas(ui),
+                    ViewMode::Layout3d => self.canvas_3d(ui),
+                    _ => {}
+                }
+            });
+
+        egui::Area::new(egui::Id::new("viewport_fullscreen_exit"))
+            .anchor(Align2::RIGHT_TOP, vec2(-12.0, 12.0))
+            .show(ctx, |ui| {
+                if ui
+                    .button("Exit fullscreen")
+                    .on_hover_text("Return to the full Fabricad workspace.")
+                    .clicked()
+                {
+                    self.set_viewport_fullscreen(false, ctx);
+                }
+            });
     }
 
     fn options_ui(&mut self, ui: &mut egui::Ui) {
@@ -6165,7 +6259,12 @@ impl FabricadApp {
             .default_width(ui_chrome::LAYERS_WIDTH)
             .show(ctx, |ui| {
                 if matches!(self.view_mode, ViewMode::Metrology) {
-                    self.metrology_panel(ui);
+                    let max_height = ui.available_height();
+                    egui::ScrollArea::vertical()
+                        .id_salt("metrology_panel_scroll")
+                        .max_height(max_height)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| self.metrology_panel(ui));
                     return;
                 }
                 if matches!(self.view_mode, ViewMode::MaskPrep) {
@@ -6398,7 +6497,12 @@ impl FabricadApp {
 
     fn layers_drawer_contents(&mut self, ui: &mut egui::Ui) {
         if matches!(self.view_mode, ViewMode::Metrology) {
-            self.metrology_panel(ui);
+            let max_height = ui.available_height();
+            egui::ScrollArea::vertical()
+                .id_salt("metrology_drawer_scroll")
+                .max_height(max_height)
+                .auto_shrink([false, false])
+                .show(ui, |ui| self.metrology_panel(ui));
             return;
         }
         if matches!(self.view_mode, ViewMode::MaskPrep) {
@@ -6700,6 +6804,16 @@ impl FabricadApp {
         ));
 
         ui.separator();
+        ui.label("Data Products");
+        ui.label(format!(
+            "{} measurement records",
+            self.wafer_map.measurements.len()
+        ));
+        ui.label(format!("{} defect records", self.wafer_map.defects.len()));
+        ui.label("Map: die/site records");
+        ui.label("Review: rendered tool image thumbnail");
+
+        ui.separator();
         ui.label("Inspection Annotations");
         for annotation in self.wafer_map.annotations.iter().take(5) {
             let location = annotation
@@ -6719,6 +6833,23 @@ impl FabricadApp {
             ui_chrome::empty_state(ui, "No wafer map loaded");
             return;
         }
+        let previous_mode = self.metrology_map_mode;
+        egui::ComboBox::from_id_salt("metrology_map_mode_picker")
+            .selected_text(self.metrology_map_mode.label())
+            .show_ui(ui, |ui| {
+                for mode in MetrologyMapMode::ALL {
+                    ui.selectable_value(&mut self.metrology_map_mode, mode, mode.label());
+                }
+            });
+        if self.metrology_map_mode != previous_mode {
+            self.status = format!("metrology map: {}", self.metrology_map_mode.label());
+        }
+        ui.label(
+            RichText::new(self.metrology_map_mode.detail())
+                .small()
+                .color(ui.visuals().weak_text_color()),
+        );
+
         let previous_kind = self.metrology_kind;
         egui::ComboBox::from_id_salt("metrology_kind_picker")
             .selected_text(self.metrology_kind.label())
@@ -6742,6 +6873,9 @@ impl FabricadApp {
         ui.separator();
         let histogram = self.wafer_map.histogram(self.metrology_kind, 18);
         self.metrology_histogram_ui(ui, &histogram);
+
+        ui.separator();
+        self.metrology_radial_profile_ui(ui);
 
         ui.separator();
         self.metrology_selected_die_ui(ui);
@@ -6776,6 +6910,9 @@ impl FabricadApp {
                 format_metrology_value(summary.kind, min),
                 format_metrology_value(summary.kind, max)
             ));
+        }
+        if let Some(cpk) = metrology_capability_index(summary) {
+            ui.label(format!("Cpk: {cpk:.2}"));
         }
     }
 
@@ -6850,13 +6987,61 @@ impl FabricadApp {
         }
     }
 
+    fn metrology_radial_profile_ui(&self, ui: &mut egui::Ui) {
+        ui.label("Radial Profile");
+        let desired = vec2(ui.available_width().max(120.0), 90.0);
+        let (rect, _) = ui.allocate_exact_size(desired, Sense::hover());
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 4.0, Color32::from_rgb(18, 22, 24));
+        painter.rect_stroke(
+            rect,
+            4.0,
+            Stroke::new(1.0, Color32::from_rgb(70, 82, 86)),
+            StrokeKind::Inside,
+        );
+
+        let profile = metrology_radial_profile(&self.wafer_map, self.metrology_kind, 10);
+        let values = profile
+            .iter()
+            .filter_map(|(_, value)| *value)
+            .collect::<Vec<_>>();
+        if values.len() < 2 {
+            return;
+        }
+        let min = values.iter().copied().fold(f64::INFINITY, f64::min);
+        let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let span = (max - min).max(0.000_001);
+        let points = profile
+            .iter()
+            .filter_map(|(radius, value)| {
+                let value = (*value)?;
+                let x = rect.left() + rect.width() * radius.clamp(0.0, 1.0);
+                let y = rect.bottom() - rect.height() * (((value - min) / span) as f32);
+                Some(Pos2::new(x, y))
+            })
+            .collect::<Vec<_>>();
+        for pair in points.windows(2) {
+            painter.line_segment(
+                [pair[0], pair[1]],
+                Stroke::new(1.8, Color32::from_rgb(132, 205, 226)),
+            );
+        }
+        for point in points {
+            painter.circle_filled(point, 2.5, Color32::from_rgb(215, 238, 242));
+        }
+    }
+
     fn metrology_selected_die_ui(&self, ui: &mut egui::Ui) {
-        ui.label("Selected Die");
+        ui.label("Selected Site");
         let Some(die) = self.selected_die else {
             ui.label("None");
             return;
         };
         ui.label(format!("C{} R{}", die.column, die.row));
+        self.metrology_review_image_ui(ui, die);
+
+        ui.separator();
+        ui.label("Site Records");
         for kind in MeasurementKind::ALL {
             if let Some(measurement) = self.wafer_map.measurement_for(die, kind) {
                 ui.horizontal(|ui| {
@@ -6874,13 +7059,97 @@ impl FabricadApp {
             }
         }
 
-        let defect_count = self.wafer_map.defects_for_die(die).count();
-        if defect_count > 0 {
-            ui.label(format!("Defect records: {defect_count}"));
+        ui.separator();
+        let defects = self.wafer_map.defects_for_die(die).collect::<Vec<_>>();
+        ui.label(format!("Defect Records: {}", defects.len()));
+        for defect in defects.iter().take(5) {
+            ui.label(format!(
+                "{}  {:.2} um  sev {}",
+                defect_class_label(defect.class),
+                defect.size_um,
+                defect.severity
+            ));
         }
+
+        ui.separator();
+        ui.label("Annotations");
         for annotation in self.wafer_map.annotations_for_die(die) {
             ui.label(format!("{:?}: {}", annotation.kind, annotation.note));
         }
+    }
+
+    fn metrology_review_image_ui(&self, ui: &mut egui::Ui, die: DieCoord) {
+        ui.label("Review Image");
+        let desired = vec2(ui.available_width().max(160.0), 132.0);
+        let (rect, _) = ui.allocate_exact_size(desired, Sense::hover());
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 4.0, Color32::from_rgb(36, 39, 39));
+        painter.rect_stroke(
+            rect,
+            4.0,
+            Stroke::new(1.0, Color32::from_rgb(88, 96, 98)),
+            StrokeKind::Inside,
+        );
+
+        let image_rect = rect.shrink(10.0);
+        painter.rect_filled(image_rect, 2.0, Color32::from_rgb(75, 78, 76));
+        let stripe_count = 7;
+        for index in 0..stripe_count {
+            let x = image_rect.left()
+                + image_rect.width() * ((index as f32 + 0.5) / stripe_count as f32);
+            let stripe = EguiRect::from_center_size(
+                Pos2::new(x, image_rect.center().y),
+                vec2(image_rect.width() * 0.055, image_rect.height()),
+            );
+            painter.rect_filled(stripe, 0.0, Color32::from_rgb(104, 108, 105));
+        }
+
+        if let Some(cd) = self
+            .wafer_map
+            .measurement_for(die, MeasurementKind::CriticalDimensionNm)
+        {
+            let target = MeasurementKind::CriticalDimensionNm
+                .spec()
+                .target
+                .unwrap_or(cd.value);
+            let offset = ((cd.value - target) as f32 * 2.0).clamp(-16.0, 16.0);
+            let y = image_rect.center().y + offset;
+            painter.line_segment(
+                [
+                    Pos2::new(image_rect.left() + 22.0, y),
+                    Pos2::new(image_rect.right() - 22.0, y),
+                ],
+                Stroke::new(2.0, Color32::from_rgb(245, 225, 96)),
+            );
+            painter.text(
+                image_rect.left_top() + vec2(8.0, 8.0),
+                Align2::LEFT_TOP,
+                format!("CD {}", format_metrology_value(cd.kind, cd.value)),
+                FontId::monospace(10.0),
+                Color32::from_rgb(238, 236, 210),
+            );
+        }
+
+        for defect in self.wafer_map.defects_for_die(die).take(4) {
+            let local = defect_local_position(&self.wafer_map, defect.position_mm, die);
+            let point = Pos2::new(
+                image_rect.left() + image_rect.width() * local[0],
+                image_rect.top() + image_rect.height() * local[1],
+            );
+            painter.circle_stroke(
+                point,
+                (5.0 + defect.severity as f32).min(10.0),
+                Stroke::new(1.5, Color32::from_rgb(255, 112, 92)),
+            );
+        }
+
+        painter.text(
+            image_rect.left_bottom() + vec2(8.0, -8.0),
+            Align2::LEFT_BOTTOM,
+            "SEM review frame",
+            FontId::monospace(10.0),
+            Color32::from_rgb(215, 220, 216),
+        );
     }
 
     fn marker_panel(&mut self, ui: &mut egui::Ui) {
@@ -8307,12 +8576,21 @@ impl FabricadApp {
                 hovered_die = Some(die);
             }
 
-            let filtered =
-                self.metrology_failed_only && measurement.status == MeasurementStatus::Pass;
+            let filtered = self.metrology_failed_only
+                && !metrology_site_needs_attention(&self.wafer_map, die, self.metrology_kind);
             let fill = if filtered {
                 Color32::from_rgba_unmultiplied(42, 48, 50, 72)
             } else {
-                metrology_measurement_color(measurement, summary)
+                match self.metrology_map_mode {
+                    MetrologyMapMode::ValueMap => metrology_measurement_color(measurement, summary),
+                    MetrologyMapMode::DeviationMap => metrology_deviation_color(measurement),
+                    MetrologyMapMode::DefectReview => {
+                        metrology_defect_density_color(self.wafer_map.defects_for_die(die).count())
+                    }
+                    MetrologyMapMode::OverlayVectors => {
+                        Color32::from_rgba_unmultiplied(52, 66, 70, 185)
+                    }
+                }
             };
             painter.rect_filled(die_rect, 1.0, fill);
             painter.rect_stroke(
@@ -8332,9 +8610,34 @@ impl FabricadApp {
             }
         }
 
-        if self.metrology_kind == MeasurementKind::DefectCount || self.selected_die.is_some() {
+        if matches!(self.metrology_map_mode, MetrologyMapMode::OverlayVectors) {
+            for &die in &self.wafer_map.dies {
+                if (die.column + die.row).rem_euclid(2) != 0 {
+                    continue;
+                }
+                let Some(vector) = metrology_overlay_vector(&self.wafer_map, die) else {
+                    continue;
+                };
+                let origin = wafer_mm_to_screen(geometry.die_center_mm(die), center, scale);
+                let delta = vec2(vector[0], -vector[1]);
+                if delta.length_sq() <= 0.1 {
+                    continue;
+                }
+                painter.line_segment(
+                    [origin, origin + delta],
+                    Stroke::new(1.1, Color32::from_rgb(255, 222, 116)),
+                );
+                painter.circle_filled(origin + delta, 2.0, Color32::from_rgb(255, 222, 116));
+            }
+        }
+
+        if matches!(self.metrology_map_mode, MetrologyMapMode::DefectReview)
+            || self.metrology_kind == MeasurementKind::DefectCount
+            || self.selected_die.is_some()
+        {
             for defect in &self.wafer_map.defects {
-                if self.metrology_kind != MeasurementKind::DefectCount
+                if !matches!(self.metrology_map_mode, MetrologyMapMode::DefectReview)
+                    && self.metrology_kind != MeasurementKind::DefectCount
                     && Some(defect.die) != self.selected_die
                 {
                     continue;
@@ -8395,7 +8698,11 @@ impl FabricadApp {
         painter.text(
             canvas.left_top() + vec2(16.0, 36.0),
             Align2::LEFT_TOP,
-            self.metrology_kind.label(),
+            format!(
+                "{} / {}",
+                self.metrology_map_mode.label(),
+                self.metrology_kind.label()
+            ),
             FontId::proportional(18.0),
             Color32::from_rgb(240, 244, 236),
         );
@@ -8623,10 +8930,7 @@ impl FabricadApp {
     }
 
     fn rect_slab_side_faces_3d(&self) -> [u32; 2] {
-        let forward = self.camera_3d.forward();
-        let x_face = if forward.x >= 0.0 { 4 } else { 2 };
-        let y_face = if forward.y >= 0.0 { 1 } else { 3 };
-        [x_face, y_face]
+        rect_slab_side_faces_for_forward(self.camera_3d.forward())
     }
 
     fn view_projection_3d(&self, canvas: EguiRect) -> [f32; 16] {
@@ -10029,6 +10333,17 @@ impl eframe::App for FabricadApp {
             self.set_flycam_capture(ctx, false);
         }
         phase_times.overhead += take_elapsed_ms(&mut phase_cursor);
+        if self.viewport_fullscreen && self.view_mode.supports_viewport_fullscreen() {
+            self.viewport_fullscreen_ui(ctx);
+            phase_times.central += take_elapsed_ms(&mut phase_cursor);
+            let update_cpu_ms = update_start.elapsed().as_secs_f64() * 1000.0;
+            self.finish_3d_benchmark_update(update_cpu_ms, phase_times, ctx);
+            ctx.request_repaint();
+            return;
+        }
+        if self.viewport_fullscreen {
+            self.viewport_fullscreen = false;
+        }
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| self.toolbar(ui));
         phase_times.toolbar += take_elapsed_ms(&mut phase_cursor);
         self.navigation_panel(ctx);
@@ -10455,6 +10770,21 @@ fn finite_point_from_xy(x: f32, y: f32) -> Option<Point> {
         return None;
     }
     Some(Point::new(coord_from_f32(x), coord_from_f32(y)))
+}
+
+fn rect_slab_side_faces_for_forward(forward: Vec3f) -> [u32; 2] {
+    let x_face = if forward.x >= 0.0 { 4 } else { 2 };
+    let y_face = if forward.y >= 0.0 { 1 } else { 3 };
+    let abs_x = forward.x.abs();
+    let abs_y = forward.y.abs();
+    let edge_on_threshold = 0.25;
+    if abs_x < abs_y * edge_on_threshold {
+        [y_face, y_face]
+    } else if abs_y < abs_x * edge_on_threshold {
+        [x_face, x_face]
+    } else {
+        [x_face, y_face]
+    }
 }
 
 fn coord_from_f32(value: f32) -> Coord {
@@ -12336,6 +12666,82 @@ fn wafer_mm_to_screen(point_mm: [f64; 2], center: Pos2, scale: f32) -> Pos2 {
     center + vec2(point_mm[0] as f32 * scale, -(point_mm[1] as f32) * scale)
 }
 
+fn defect_local_position(map: &WaferMap, position_mm: [f64; 2], die: DieCoord) -> [f32; 2] {
+    let center = map.geometry.die_center_mm(die);
+    let x = ((position_mm[0] - center[0]) / map.geometry.die_size_mm[0] + 0.5).clamp(0.0, 1.0);
+    let y = (0.5 - (position_mm[1] - center[1]) / map.geometry.die_size_mm[1]).clamp(0.0, 1.0);
+    [x as f32, y as f32]
+}
+
+fn metrology_capability_index(summary: layout_model::metrology::MeasurementSummary) -> Option<f64> {
+    let spec = summary.kind.spec();
+    let mean = summary.mean?;
+    let stddev = summary.stddev?;
+    if stddev <= f64::EPSILON {
+        return None;
+    }
+    match (spec.lower, spec.upper) {
+        (Some(lower), Some(upper)) => {
+            Some(((upper - mean) / (3.0 * stddev)).min((mean - lower) / (3.0 * stddev)))
+        }
+        (Some(lower), None) => Some((mean - lower) / (3.0 * stddev)),
+        (None, Some(upper)) => Some((upper - mean) / (3.0 * stddev)),
+        (None, None) => None,
+    }
+}
+
+fn metrology_radial_profile(
+    map: &WaferMap,
+    kind: MeasurementKind,
+    bin_count: usize,
+) -> Vec<(f32, Option<f64>)> {
+    if bin_count == 0 {
+        return Vec::new();
+    }
+    let active_radius = map.geometry.active_radius_mm().max(1.0);
+    let mut sums = vec![0.0; bin_count];
+    let mut counts = vec![0_usize; bin_count];
+    for measurement in map
+        .measurements
+        .iter()
+        .filter(|measurement| measurement.kind == kind)
+    {
+        let [x, y] = map.geometry.die_center_mm(measurement.die);
+        let radial = (x.hypot(y) / active_radius).clamp(0.0, 1.0);
+        let index = ((radial * bin_count as f64).floor() as usize).min(bin_count - 1);
+        sums[index] += measurement.value;
+        counts[index] += 1;
+    }
+    (0..bin_count)
+        .map(|index| {
+            let radius = (index as f32 + 0.5) / bin_count as f32;
+            let value = (counts[index] > 0).then(|| sums[index] / counts[index] as f64);
+            (radius, value)
+        })
+        .collect()
+}
+
+fn metrology_site_needs_attention(map: &WaferMap, die: DieCoord, kind: MeasurementKind) -> bool {
+    let measurement_attention = map
+        .measurement_for(die, kind)
+        .is_some_and(|measurement| measurement.status != MeasurementStatus::Pass);
+    measurement_attention || map.defects_for_die(die).next().is_some()
+}
+
+fn metrology_overlay_vector(map: &WaferMap, die: DieCoord) -> Option<[f32; 2]> {
+    let cd = map
+        .measurement_for(die, MeasurementKind::CriticalDimensionNm)?
+        .value;
+    let sheet_r = map
+        .measurement_for(die, MeasurementKind::SheetResistanceOhmsPerSq)?
+        .value;
+    let cd_target = MeasurementKind::CriticalDimensionNm.spec().target?;
+    let sheet_target = MeasurementKind::SheetResistanceOhmsPerSq.spec().target?;
+    let x = ((cd - cd_target) as f32 * 3.0).clamp(-14.0, 14.0);
+    let y = ((sheet_r - sheet_target) as f32 * 3.6).clamp(-14.0, 14.0);
+    Some([x, y])
+}
+
 fn metrology_swatch(ui: &mut egui::Ui, color: Color32) {
     let (rect, _) = ui.allocate_exact_size(vec2(12.0, 12.0), Sense::hover());
     ui.painter().rect_filled(rect, 2.0, color);
@@ -12366,6 +12772,58 @@ fn format_metrology_delta(kind: MeasurementKind, value: f64) -> String {
         MeasurementKind::DefectCount => format!("{:.2}", value),
         MeasurementKind::PassFail => format!("{:.2}", value),
         _ => format!("{:.2} {}", value, kind.unit()),
+    }
+}
+
+fn metrology_deviation_color(measurement: &Measurement) -> Color32 {
+    if measurement.kind == MeasurementKind::PassFail {
+        return metrology_measurement_color(
+            measurement,
+            layout_model::metrology::MeasurementSummary {
+                kind: measurement.kind,
+                sample_count: 1,
+                pass_count: usize::from(measurement.status == MeasurementStatus::Pass),
+                fail_count: usize::from(measurement.status == MeasurementStatus::Fail),
+                outlier_count: usize::from(measurement.status == MeasurementStatus::Outlier),
+                min: Some(0.0),
+                max: Some(1.0),
+                mean: Some(measurement.value),
+                stddev: None,
+            },
+        );
+    }
+    let spec = measurement.kind.spec();
+    let target = spec.target.unwrap_or(measurement.value);
+    let lower_span = spec.lower.map_or(1.0, |lower| (target - lower).abs());
+    let upper_span = spec.upper.map_or(1.0, |upper| (upper - target).abs());
+    let span = if measurement.value < target {
+        lower_span
+    } else {
+        upper_span
+    }
+    .max(0.000_001);
+    let normalized = ((measurement.value - target) / span).clamp(-1.0, 1.0) as f32;
+    if normalized < 0.0 {
+        lerp_color(
+            Color32::from_rgb(74, 138, 214),
+            Color32::from_rgb(78, 176, 118),
+            1.0 + normalized,
+        )
+    } else {
+        lerp_color(
+            Color32::from_rgb(78, 176, 118),
+            Color32::from_rgb(224, 80, 75),
+            normalized,
+        )
+    }
+}
+
+fn metrology_defect_density_color(count: usize) -> Color32 {
+    match count {
+        0 => Color32::from_rgb(54, 82, 76),
+        1 => Color32::from_rgb(132, 128, 72),
+        2..=3 => Color32::from_rgb(196, 122, 62),
+        _ => Color32::from_rgb(224, 80, 75),
     }
 }
 
@@ -12419,6 +12877,16 @@ fn metrology_gradient_color(t: f32) -> Color32 {
             Color32::from_rgb(224, 150, 72),
             (t - 0.5) * 2.0,
         )
+    }
+}
+
+fn defect_class_label(class: DefectClass) -> &'static str {
+    match class {
+        DefectClass::Particle => "particle",
+        DefectClass::Scratch => "scratch",
+        DefectClass::PatternBridge => "pattern bridge",
+        DefectClass::MissingFeature => "missing feature",
+        DefectClass::Unknown => "unknown",
     }
 }
 
@@ -12561,13 +13029,17 @@ mod tests {
     fn side_panels_follow_view_context() {
         assert!(ViewMode::Layout2d.has_inspector_panel());
         assert!(ViewMode::Layout2d.has_secondary_panel());
+        assert!(ViewMode::Layout2d.supports_viewport_fullscreen());
         assert!(ViewMode::Layout3d.has_inspector_panel());
         assert!(ViewMode::Layout3d.has_secondary_panel());
+        assert!(ViewMode::Layout3d.supports_viewport_fullscreen());
         assert!(ViewMode::Workflow.has_inspector_panel());
         assert!(!ViewMode::Workflow.has_secondary_panel());
+        assert!(!ViewMode::Workflow.supports_viewport_fullscreen());
 
         assert!(ViewMode::MaskPrep.has_inspector_panel());
         assert!(ViewMode::MaskPrep.has_secondary_panel());
+        assert!(!ViewMode::MaskPrep.supports_viewport_fullscreen());
         assert!(ViewMode::LayoutDiff.has_inspector_panel());
         assert!(!ViewMode::LayoutDiff.has_secondary_panel());
         assert!(ViewMode::Metrology.has_inspector_panel());
@@ -12847,6 +13319,26 @@ mod tests {
         assert!(forward.y.abs() < 0.001);
         assert!(forward.z.abs() < 0.001);
         assert!(camera.up().z > 0.999);
+    }
+
+    #[test]
+    fn rect_slab_side_faces_ignore_edge_on_axis_faces() {
+        assert_eq!(
+            rect_slab_side_faces_for_forward(Vec3f::new(1.0, 0.0, 0.0)),
+            [4, 4]
+        );
+        assert_eq!(
+            rect_slab_side_faces_for_forward(Vec3f::new(0.0, 1.0, 0.0)),
+            [1, 1]
+        );
+        assert_eq!(
+            rect_slab_side_faces_for_forward(Vec3f::new(0.7, 0.7, 0.0).normalized()),
+            [4, 1]
+        );
+        assert_eq!(
+            rect_slab_side_faces_for_forward(Vec3f::new(-0.7, -0.7, 0.0).normalized()),
+            [2, 3]
+        );
     }
 
     #[test]
