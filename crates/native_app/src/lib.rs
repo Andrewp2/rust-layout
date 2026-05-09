@@ -174,15 +174,19 @@ enum ViewMode {
 enum MetrologyMapMode {
     ValueMap,
     DeviationMap,
+    SpecWindow,
     DefectReview,
+    ReviewQueue,
     OverlayVectors,
 }
 
 impl MetrologyMapMode {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 6] = [
         Self::ValueMap,
         Self::DeviationMap,
+        Self::SpecWindow,
         Self::DefectReview,
+        Self::ReviewQueue,
         Self::OverlayVectors,
     ];
 
@@ -190,8 +194,21 @@ impl MetrologyMapMode {
         match self {
             Self::ValueMap => "Value map",
             Self::DeviationMap => "Deviation map",
+            Self::SpecWindow => "Spec window",
             Self::DefectReview => "Defect review",
+            Self::ReviewQueue => "Review queue",
             Self::OverlayVectors => "Overlay vectors",
+        }
+    }
+
+    fn short_label(self) -> &'static str {
+        match self {
+            Self::ValueMap => "Value",
+            Self::DeviationMap => "Delta",
+            Self::SpecWindow => "Spec",
+            Self::DefectReview => "Defects",
+            Self::ReviewQueue => "Review",
+            Self::OverlayVectors => "Overlay",
         }
     }
 
@@ -199,7 +216,9 @@ impl MetrologyMapMode {
         match self {
             Self::ValueMap => "Color dies by the selected metrology result.",
             Self::DeviationMap => "Center color around the recipe target and spec limits.",
+            Self::SpecWindow => "Show remaining process window against lower and upper specs.",
             Self::DefectReview => "Show defect density and review markers.",
+            Self::ReviewQueue => "Prioritize sites with failed measurements, outliers, or defects.",
             Self::OverlayVectors => "Draw synthetic overlay-error vectors across the wafer.",
         }
     }
@@ -7071,19 +7090,63 @@ impl FabricadApp {
             ui_chrome::empty_state(ui, "No metrology dataset loaded");
             return;
         }
-        ui.label("FabOS Context");
-        ui.label(&self.wafer_map.name);
-        ui.separator();
         let links = &self.wafer_map.links;
-        ui.label(format!("Lot: {}", links.lot_id));
-        ui.label(format!("Wafer: {}", links.wafer_id));
-        ui.label(format!("Step: {}", links.process_step_id));
-        ui.label(format!("Recipe: {}", links.recipe_id));
-        ui.label(format!("Tool run: {}", links.tool_run_id));
+        let triage_sites = metrology_triage_sites(&self.wafer_map);
+        let pass_summary = self.wafer_map.summary(MeasurementKind::PassFail);
+        let review_annotations = self
+            .wafer_map
+            .annotations
+            .iter()
+            .filter(|annotation| {
+                matches!(
+                    annotation.kind,
+                    layout_model::metrology::AnnotationKind::Review
+                )
+            })
+            .count();
+
+        ui_chrome::section_label(ui, "FabOS Context");
+        ui.strong(&self.wafer_map.name);
+        ui.horizontal_wrapped(|ui| {
+            ui_chrome::status_pill(ui, &links.lot_id, ui_chrome::Tone::Info);
+            ui_chrome::status_pill(ui, &links.wafer_id, ui_chrome::Tone::Neutral);
+            ui_chrome::status_pill(
+                ui,
+                &format!("{} review", triage_sites.len()),
+                if triage_sites.is_empty() {
+                    ui_chrome::Tone::Success
+                } else {
+                    ui_chrome::Tone::Warning
+                },
+            );
+        });
 
         ui.separator();
+        ui_chrome::section_label(ui, "Lot / Process");
+        egui::Grid::new("metrology_context_links")
+            .num_columns(2)
+            .spacing([8.0, 4.0])
+            .show(ui, |ui| {
+                ui.label("Lot");
+                ui.label(&links.lot_id);
+                ui.end_row();
+                ui.label("Wafer");
+                ui.label(&links.wafer_id);
+                ui.end_row();
+                ui.label("Step");
+                ui.label(&links.process_step_id);
+                ui.end_row();
+                ui.label("Recipe");
+                ui.label(&links.recipe_id);
+                ui.end_row();
+                ui.label("Tool run");
+                ui.label(&links.tool_run_id);
+                ui.end_row();
+            });
+
+        ui.separator();
+        ui_chrome::section_label(ui, "Wafer");
         let geometry = self.wafer_map.geometry;
-        ui.label("Wafer");
         ui.label(format!(
             "{:.0} mm diameter, {:.1} mm edge exclusion",
             geometry.diameter_mm, geometry.edge_exclusion_mm
@@ -7096,17 +7159,60 @@ impl FabricadApp {
         ));
 
         ui.separator();
-        ui.label("Data Products");
-        ui.label(format!(
-            "{} measurement records",
-            self.wafer_map.measurements.len()
-        ));
-        ui.label(format!("{} defect records", self.wafer_map.defects.len()));
-        ui.label("Map: die/site records");
-        ui.label("Review: rendered tool image thumbnail");
+        ui_chrome::section_label(ui, "Data Products");
+        let pass_detail = format!(
+            "{} pass / {} fail / {} outlier",
+            pass_summary.pass_count, pass_summary.fail_count, pass_summary.outlier_count
+        );
+        let defect_detail = format!("{review_annotations} review annotation(s)");
+        ui_chrome::metric_tiles(
+            ui,
+            &[
+                (
+                    "Measurements",
+                    self.wafer_map.measurements.len().to_string(),
+                    pass_detail.as_str(),
+                    if pass_summary.fail_count > 0 {
+                        ui_chrome::Tone::Danger
+                    } else if pass_summary.outlier_count > 0 {
+                        ui_chrome::Tone::Warning
+                    } else {
+                        ui_chrome::Tone::Success
+                    },
+                ),
+                (
+                    "Defects",
+                    self.wafer_map.defects.len().to_string(),
+                    defect_detail.as_str(),
+                    if self.wafer_map.defects.is_empty() {
+                        ui_chrome::Tone::Success
+                    } else {
+                        ui_chrome::Tone::Warning
+                    },
+                ),
+            ],
+        );
+        ui_chrome::muted(ui, "Map data: die and site measurement records");
+        ui_chrome::muted(ui, "Review data: defect annotations and image evidence");
 
         ui.separator();
-        ui.label("Inspection Annotations");
+        ui_chrome::section_label(ui, "Review Queue");
+        if triage_sites.is_empty() {
+            ui_chrome::status_pill(ui, "No sites need review", ui_chrome::Tone::Success);
+        } else {
+            for site in triage_sites.iter().take(5) {
+                ui.label(format!(
+                    "C{} R{}  {} issue(s), {} defect(s)",
+                    site.die.column,
+                    site.die.row,
+                    site.fail_count + site.outlier_count,
+                    site.defect_count
+                ));
+            }
+        }
+
+        ui.separator();
+        ui_chrome::section_label(ui, "Inspection Annotations");
         for annotation in self.wafer_map.annotations.iter().take(5) {
             let location = annotation
                 .die
@@ -7120,12 +7226,20 @@ impl FabricadApp {
     }
 
     fn metrology_panel(&mut self, ui: &mut egui::Ui) {
-        ui.label("Metrology");
+        ui_chrome::section_label(ui, "Metrology");
         if self.wafer_map.dies.is_empty() {
             ui_chrome::empty_state(ui, "No wafer map loaded");
             return;
         }
+        let triage_sites = metrology_triage_sites(&self.wafer_map);
+
         let previous_mode = self.metrology_map_mode;
+        ui_chrome::section_label(ui, "Wafer Map Mode");
+        ui.horizontal_wrapped(|ui| {
+            for mode in MetrologyMapMode::ALL {
+                ui.selectable_value(&mut self.metrology_map_mode, mode, mode.short_label());
+            }
+        });
         egui::ComboBox::from_id_salt("metrology_map_mode_picker")
             .selected_text(self.metrology_map_mode.label())
             .show_ui(ui, |ui| {
@@ -7143,6 +7257,7 @@ impl FabricadApp {
         );
 
         let previous_kind = self.metrology_kind;
+        ui_chrome::section_label(ui, "Measurement");
         egui::ComboBox::from_id_salt("metrology_kind_picker")
             .selected_text(self.metrology_kind.label())
             .show_ui(ui, |ui| {
@@ -7154,6 +7269,26 @@ impl FabricadApp {
             self.status = format!("metrology filter: {}", self.metrology_kind.label());
         }
         ui.checkbox(&mut self.metrology_failed_only, "Fail/outlier only");
+        ui.horizontal_wrapped(|ui| {
+            ui_chrome::status_pill(
+                ui,
+                &format!("{} review site(s)", triage_sites.len()),
+                if triage_sites.is_empty() {
+                    ui_chrome::Tone::Success
+                } else {
+                    ui_chrome::Tone::Warning
+                },
+            );
+            ui_chrome::status_pill(
+                ui,
+                &format!("{} defect(s)", self.wafer_map.defects.len()),
+                if self.wafer_map.defects.is_empty() {
+                    ui_chrome::Tone::Success
+                } else {
+                    ui_chrome::Tone::Warning
+                },
+            );
+        });
 
         ui.separator();
         let summary = self.wafer_map.summary(self.metrology_kind);
@@ -7163,8 +7298,11 @@ impl FabricadApp {
         self.metrology_legend_ui(ui, summary);
 
         ui.separator();
+        self.metrology_triage_ui(ui, &triage_sites);
+
+        ui.separator();
         let histogram = self.wafer_map.histogram(self.metrology_kind, 18);
-        self.metrology_histogram_ui(ui, &histogram);
+        self.metrology_histogram_ui(ui, &histogram, summary);
 
         ui.separator();
         self.metrology_radial_profile_ui(ui);
@@ -7178,34 +7316,110 @@ impl FabricadApp {
         ui: &mut egui::Ui,
         summary: layout_model::metrology::MeasurementSummary,
     ) {
-        ui.label("Summary");
-        ui.label(format!("Samples: {}", summary.sample_count));
-        ui.label(format!(
-            "Pass: {}  Fail: {}  Outlier: {}",
+        ui_chrome::section_label(ui, "SPC Summary");
+        let issue_count = summary.fail_count + summary.outlier_count;
+        ui.horizontal_wrapped(|ui| {
+            ui_chrome::status_pill(
+                ui,
+                if issue_count == 0 {
+                    "In control"
+                } else if summary.fail_count > 0 {
+                    "Spec violation"
+                } else {
+                    "Outlier review"
+                },
+                if summary.fail_count > 0 {
+                    ui_chrome::Tone::Danger
+                } else if summary.outlier_count > 0 {
+                    ui_chrome::Tone::Warning
+                } else {
+                    ui_chrome::Tone::Success
+                },
+            );
+            ui_chrome::status_pill(
+                ui,
+                &metrology_spec_window_label(summary.kind),
+                ui_chrome::Tone::Neutral,
+            );
+        });
+
+        let pass_rate = if summary.sample_count == 0 {
+            0.0
+        } else {
+            summary.pass_count as f64 / summary.sample_count as f64
+        };
+        let pass_detail = format!(
+            "{} pass / {} fail / {} outlier",
             summary.pass_count, summary.fail_count, summary.outlier_count
-        ));
-        if let Some(mean) = summary.mean {
-            ui.label(format!(
-                "Mean: {}",
-                format_metrology_value(summary.kind, mean)
-            ));
-        }
-        if let Some(stddev) = summary.stddev {
-            ui.label(format!(
-                "Stddev: {}",
-                format_metrology_delta(summary.kind, stddev)
-            ));
-        }
-        if let (Some(min), Some(max)) = (summary.min, summary.max) {
-            ui.label(format!(
-                "Range: {} to {}",
+        );
+        let mean_text = summary
+            .mean
+            .map(|mean| format_metrology_value(summary.kind, mean))
+            .unwrap_or_else(|| "-".to_string());
+        let mean_detail = summary
+            .mean
+            .and_then(|mean| format_metrology_target_delta(summary.kind, mean))
+            .unwrap_or_else(|| "no target".to_string());
+        let spread_text = summary
+            .stddev
+            .map(|stddev| format_metrology_delta(summary.kind, stddev))
+            .unwrap_or_else(|| "-".to_string());
+        let spread_detail = summary
+            .stddev
+            .map(|stddev| format!("3s {}", format_metrology_delta(summary.kind, stddev * 3.0)))
+            .unwrap_or_else(|| "no variance".to_string());
+        let range_text = match (summary.min, summary.max) {
+            (Some(min), Some(max)) => format!(
+                "{}..{}",
                 format_metrology_value(summary.kind, min),
                 format_metrology_value(summary.kind, max)
-            ));
-        }
-        if let Some(cpk) = metrology_capability_index(summary) {
-            ui.label(format!("Cpk: {cpk:.2}"));
-        }
+            ),
+            _ => "-".to_string(),
+        };
+        let cpk = metrology_capability_index(summary);
+        let cpk_text = cpk
+            .map(|value| format!("{value:.2}"))
+            .unwrap_or_else(|| "-".to_string());
+        let cpk_detail = cpk
+            .map(metrology_capability_label)
+            .unwrap_or_else(|| "no two-sided capability".to_string());
+
+        ui_chrome::metric_tiles(
+            ui,
+            &[
+                (
+                    "Pass rate",
+                    format_percent(pass_rate),
+                    pass_detail.as_str(),
+                    if summary.fail_count > 0 {
+                        ui_chrome::Tone::Danger
+                    } else if summary.outlier_count > 0 {
+                        ui_chrome::Tone::Warning
+                    } else {
+                        ui_chrome::Tone::Success
+                    },
+                ),
+                (
+                    "Mean",
+                    mean_text,
+                    mean_detail.as_str(),
+                    ui_chrome::Tone::Info,
+                ),
+                (
+                    "Sigma",
+                    spread_text,
+                    spread_detail.as_str(),
+                    ui_chrome::Tone::Neutral,
+                ),
+                (
+                    "Cpk",
+                    cpk_text,
+                    cpk_detail.as_str(),
+                    metrology_capability_tone(cpk),
+                ),
+                ("Range", range_text, "min..max", ui_chrome::Tone::Neutral),
+            ],
+        );
     }
 
     fn metrology_legend_ui(
@@ -7213,7 +7427,7 @@ impl FabricadApp {
         ui: &mut egui::Ui,
         summary: layout_model::metrology::MeasurementSummary,
     ) {
-        ui.label("Legend");
+        ui_chrome::section_label(ui, "Legend");
         if let (Some(min), Some(max)) = (summary.min, summary.max) {
             ui.horizontal(|ui| {
                 metrology_swatch(ui, metrology_gradient_color(0.0));
@@ -7243,11 +7457,24 @@ impl FabricadApp {
             metrology_swatch(ui, metrology_status_color(MeasurementStatus::Outlier));
             ui.label("Outlier");
         });
+        ui.horizontal(|ui| {
+            metrology_swatch(ui, metrology_spec_window_color_for_ratio(0.92));
+            ui.label("Near spec limit");
+        });
+        ui.horizontal(|ui| {
+            metrology_swatch(ui, metrology_review_queue_color(85));
+            ui.label("Review priority");
+        });
     }
 
-    fn metrology_histogram_ui(&self, ui: &mut egui::Ui, bins: &[HistogramBin]) {
-        ui.label("Histogram");
-        let desired = vec2(ui.available_width().max(120.0), 120.0);
+    fn metrology_histogram_ui(
+        &self,
+        ui: &mut egui::Ui,
+        bins: &[HistogramBin],
+        summary: layout_model::metrology::MeasurementSummary,
+    ) {
+        ui_chrome::section_label(ui, "Distribution");
+        let desired = metrology_panel_plot_size(ui, 120.0, 420.0, 120.0);
         let (rect, _) = ui.allocate_exact_size(desired, Sense::hover());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 4.0, Color32::from_rgb(18, 22, 24));
@@ -7277,11 +7504,41 @@ impl FabricadApp {
                 metrology_gradient_color(index as f32 / bins.len() as f32),
             );
         }
+        if let (Some(min), Some(max)) = (summary.min, summary.max) {
+            let span = (max - min).abs().max(0.000_001);
+            let draw_limit = |value: f64, color: Color32, label: &str| {
+                if value < min || value > max {
+                    return;
+                }
+                let x = rect.left() + rect.width() * (((value - min) / span) as f32);
+                painter.line_segment(
+                    [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+                    Stroke::new(1.0, color),
+                );
+                painter.text(
+                    Pos2::new((x + 3.0).min(rect.right() - 20.0), rect.top() + 4.0),
+                    Align2::LEFT_TOP,
+                    label,
+                    FontId::monospace(9.0),
+                    color,
+                );
+            };
+            let spec = summary.kind.spec();
+            if let Some(lower) = spec.lower {
+                draw_limit(lower, Color32::from_rgb(238, 184, 72), "LSL");
+            }
+            if let Some(target) = spec.target {
+                draw_limit(target, Color32::from_rgb(180, 230, 176), "T");
+            }
+            if let Some(upper) = spec.upper {
+                draw_limit(upper, Color32::from_rgb(238, 184, 72), "USL");
+            }
+        }
     }
 
     fn metrology_radial_profile_ui(&self, ui: &mut egui::Ui) {
-        ui.label("Radial Profile");
-        let desired = vec2(ui.available_width().max(120.0), 90.0);
+        ui_chrome::section_label(ui, "Radial Profile");
+        let desired = metrology_panel_plot_size(ui, 120.0, 420.0, 96.0);
         let (rect, _) = ui.allocate_exact_size(desired, Sense::hover());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 4.0, Color32::from_rgb(18, 22, 24));
@@ -7321,19 +7578,211 @@ impl FabricadApp {
         for point in points {
             painter.circle_filled(point, 2.5, Color32::from_rgb(215, 238, 242));
         }
+        if let Some(target) = self.metrology_kind.spec().target {
+            if target >= min && target <= max {
+                let y = rect.bottom() - rect.height() * (((target - min) / span) as f32);
+                painter.line_segment(
+                    [Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)],
+                    Stroke::new(1.0, Color32::from_rgba_unmultiplied(180, 230, 176, 135)),
+                );
+            }
+        }
+        painter.text(
+            rect.left_bottom() + vec2(4.0, -4.0),
+            Align2::LEFT_BOTTOM,
+            "center",
+            FontId::monospace(9.0),
+            Color32::from_rgb(170, 180, 176),
+        );
+        painter.text(
+            rect.right_bottom() + vec2(-4.0, -4.0),
+            Align2::RIGHT_BOTTOM,
+            "edge",
+            FontId::monospace(9.0),
+            Color32::from_rgb(170, 180, 176),
+        );
     }
 
-    fn metrology_selected_die_ui(&self, ui: &mut egui::Ui) {
-        ui.label("Selected Site");
+    fn metrology_triage_ui(&mut self, ui: &mut egui::Ui, sites: &[MetrologyTriageSite]) {
+        ui_chrome::section_label(ui, "Defect / Review Triage");
+        let fail_count: usize = sites.iter().map(|site| site.fail_count).sum();
+        let outlier_count: usize = sites.iter().map(|site| site.outlier_count).sum();
+        let review_count: usize = sites.iter().map(|site| site.review_count).sum();
+        ui.horizontal_wrapped(|ui| {
+            ui_chrome::status_pill(
+                ui,
+                &format!("{fail_count} fail"),
+                if fail_count == 0 {
+                    ui_chrome::Tone::Success
+                } else {
+                    ui_chrome::Tone::Danger
+                },
+            );
+            ui_chrome::status_pill(
+                ui,
+                &format!("{outlier_count} outlier"),
+                if outlier_count == 0 {
+                    ui_chrome::Tone::Success
+                } else {
+                    ui_chrome::Tone::Warning
+                },
+            );
+            ui_chrome::status_pill(
+                ui,
+                &format!("{review_count} review mark"),
+                if review_count == 0 {
+                    ui_chrome::Tone::Neutral
+                } else {
+                    ui_chrome::Tone::Info
+                },
+            );
+        });
+
+        if sites.is_empty() {
+            ui_chrome::empty_state(ui, "No defects or metrology excursions");
+        } else {
+            if ui.button("Select highest priority").clicked() {
+                self.selected_die = sites.first().map(|site| site.die);
+                if let Some(die) = self.selected_die {
+                    self.status = format!("selected review site C{} R{}", die.column, die.row);
+                }
+            }
+            for site in sites.iter().take(7) {
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .selectable_label(
+                            self.selected_die == Some(site.die),
+                            format!("C{} R{}", site.die.column, site.die.row),
+                        )
+                        .clicked()
+                    {
+                        self.selected_die = Some(site.die);
+                        self.status = format!(
+                            "selected review site C{} R{}",
+                            site.die.column, site.die.row
+                        );
+                    }
+                    ui_chrome::status_pill(
+                        ui,
+                        metrology_triage_label(site.score),
+                        metrology_triage_tone(site.score),
+                    );
+                    ui.label(format!(
+                        "{} fail, {} outlier, {} defect",
+                        site.fail_count, site.outlier_count, site.defect_count
+                    ));
+                });
+            }
+        }
+
+        let class_counts = metrology_defect_class_counts(&self.wafer_map);
+        if class_counts.iter().any(|(_, count)| *count > 0) {
+            ui.add_space(4.0);
+            egui::Grid::new("metrology_defect_class_counts")
+                .num_columns(2)
+                .spacing([8.0, 3.0])
+                .show(ui, |ui| {
+                    for (class, count) in class_counts {
+                        if count == 0 {
+                            continue;
+                        }
+                        ui.label(defect_class_label(class));
+                        ui.label(count.to_string());
+                        ui.end_row();
+                    }
+                });
+        }
+    }
+
+    fn metrology_selected_die_ui(&mut self, ui: &mut egui::Ui) {
+        ui_chrome::section_label(ui, "Selected Site");
+        let triage_sites = metrology_triage_sites(&self.wafer_map);
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Next attention").clicked() {
+                self.selected_die = metrology_next_triage_die(&triage_sites, self.selected_die);
+                if let Some(die) = self.selected_die {
+                    self.status = format!("selected review site C{} R{}", die.column, die.row);
+                } else {
+                    self.status = "no metrology sites need review".to_string();
+                }
+            }
+            if self.selected_die.is_some() && ui.button("Clear").clicked() {
+                self.selected_die = None;
+            }
+        });
         let Some(die) = self.selected_die else {
-            ui.label("None");
+            ui_chrome::empty_state(ui, "No site selected");
             return;
         };
-        ui.label(format!("C{} R{}", die.column, die.row));
+        let site = metrology_triage_for_die(&self.wafer_map, die);
+        ui.horizontal_wrapped(|ui| {
+            ui.strong(format!("C{} R{}", die.column, die.row));
+            ui_chrome::status_pill(
+                ui,
+                metrology_triage_label(site.score),
+                metrology_triage_tone(site.score),
+            );
+        });
         self.metrology_review_image_ui(ui, die);
 
         ui.separator();
-        ui.label("Site Records");
+        ui_chrome::section_label(ui, "Measurement Data");
+        if ui.available_width() < 340.0 {
+            for kind in MeasurementKind::ALL {
+                if let Some(measurement) = self.wafer_map.measurement_for(die, kind) {
+                    ui.horizontal_wrapped(|ui| {
+                        metrology_swatch(ui, metrology_status_color(measurement.status));
+                        ui.strong(kind.label());
+                        ui.label(format_metrology_value(kind, measurement.value));
+                        ui.colored_label(
+                            metrology_status_color(measurement.status),
+                            measurement.status.label(),
+                        );
+                    });
+                    ui_chrome::muted(
+                        ui,
+                        format!(
+                            "{}  {}",
+                            format_metrology_target_delta(kind, measurement.value)
+                                .unwrap_or_else(|| "-".to_string()),
+                            metrology_compact_record_id(&measurement.id)
+                        ),
+                    );
+                }
+            }
+        } else {
+            egui::Grid::new("metrology_selected_measurement_data")
+                .striped(true)
+                .num_columns(5)
+                .spacing([8.0, 4.0])
+                .show(ui, |ui| {
+                    ui.strong("Metric");
+                    ui.strong("Value");
+                    ui.strong("Target delta");
+                    ui.strong("Status");
+                    ui.strong("Record");
+                    ui.end_row();
+                    for kind in MeasurementKind::ALL {
+                        if let Some(measurement) = self.wafer_map.measurement_for(die, kind) {
+                            ui.label(kind.label());
+                            ui.label(format_metrology_value(kind, measurement.value));
+                            ui.label(
+                                format_metrology_target_delta(kind, measurement.value)
+                                    .unwrap_or_else(|| "-".to_string()),
+                            );
+                            ui.colored_label(
+                                metrology_status_color(measurement.status),
+                                measurement.status.label(),
+                            );
+                            ui.label(metrology_compact_record_id(&measurement.id));
+                            ui.end_row();
+                        }
+                    }
+                });
+        }
+
+        ui.separator();
+        ui_chrome::section_label(ui, "Site Status");
         for kind in MeasurementKind::ALL {
             if let Some(measurement) = self.wafer_map.measurement_for(die, kind) {
                 ui.horizontal(|ui| {
@@ -7353,26 +7802,32 @@ impl FabricadApp {
 
         ui.separator();
         let defects = self.wafer_map.defects_for_die(die).collect::<Vec<_>>();
-        ui.label(format!("Defect Records: {}", defects.len()));
+        ui_chrome::section_label(ui, &format!("Defect Records: {}", defects.len()));
         for defect in defects.iter().take(5) {
             ui.label(format!(
-                "{}  {:.2} um  sev {}",
+                "{}  {:.2} um  severity {}",
                 defect_class_label(defect.class),
                 defect.size_um,
                 defect.severity
             ));
+            if let Some(linked) = &defect.linked_measurement_id {
+                ui_chrome::muted(ui, metrology_compact_record_id(linked));
+            }
         }
 
         ui.separator();
-        ui.label("Annotations");
+        ui_chrome::section_label(ui, "Annotations");
         for annotation in self.wafer_map.annotations_for_die(die) {
-            ui.label(format!("{:?}: {}", annotation.kind, annotation.note));
+            ui.label(format!(
+                "{:?}: {} ({})",
+                annotation.kind, annotation.note, annotation.author
+            ));
         }
     }
 
     fn metrology_review_image_ui(&self, ui: &mut egui::Ui, die: DieCoord) {
-        ui.label("Review Image");
-        let desired = vec2(ui.available_width().max(160.0), 132.0);
+        ui_chrome::section_label(ui, "Review Image");
+        let desired = metrology_panel_plot_size(ui, 160.0, 420.0, 138.0);
         let (rect, _) = ui.allocate_exact_size(desired, Sense::hover());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 4.0, Color32::from_rgb(36, 39, 39));
@@ -7439,6 +7894,13 @@ impl FabricadApp {
             image_rect.left_bottom() + vec2(8.0, -8.0),
             Align2::LEFT_BOTTOM,
             "SEM review frame",
+            FontId::monospace(10.0),
+            Color32::from_rgb(215, 220, 216),
+        );
+        painter.text(
+            image_rect.right_bottom() + vec2(-8.0, -8.0),
+            Align2::RIGHT_BOTTOM,
+            format!("C{} R{}", die.column, die.row),
             FontId::monospace(10.0),
             Color32::from_rgb(215, 220, 216),
         );
@@ -8831,7 +9293,11 @@ impl FabricadApp {
             );
             return;
         }
-        let side = (canvas.width().min(canvas.height()) - 56.0).max(180.0);
+        let canvas_min = canvas.width().min(canvas.height());
+        let margin = if canvas_min < 320.0 { 24.0 } else { 56.0 };
+        let side = (canvas_min - margin)
+            .max(80.0)
+            .min((canvas_min - 8.0).max(1.0));
         let wafer_rect = EguiRect::from_center_size(canvas.center(), vec2(side, side));
         let center = wafer_rect.center();
         let geometry = self.wafer_map.geometry;
@@ -8876,9 +9342,13 @@ impl FabricadApp {
                 match self.metrology_map_mode {
                     MetrologyMapMode::ValueMap => metrology_measurement_color(measurement, summary),
                     MetrologyMapMode::DeviationMap => metrology_deviation_color(measurement),
+                    MetrologyMapMode::SpecWindow => metrology_spec_window_color(measurement),
                     MetrologyMapMode::DefectReview => {
                         metrology_defect_density_color(self.wafer_map.defects_for_die(die).count())
                     }
+                    MetrologyMapMode::ReviewQueue => metrology_review_queue_color(
+                        metrology_triage_for_die(&self.wafer_map, die).score,
+                    ),
                     MetrologyMapMode::OverlayVectors => {
                         Color32::from_rgba_unmultiplied(52, 66, 70, 185)
                     }
@@ -8923,13 +9393,17 @@ impl FabricadApp {
             }
         }
 
-        if matches!(self.metrology_map_mode, MetrologyMapMode::DefectReview)
-            || self.metrology_kind == MeasurementKind::DefectCount
+        if matches!(
+            self.metrology_map_mode,
+            MetrologyMapMode::DefectReview | MetrologyMapMode::ReviewQueue
+        ) || self.metrology_kind == MeasurementKind::DefectCount
             || self.selected_die.is_some()
         {
             for defect in &self.wafer_map.defects {
-                if !matches!(self.metrology_map_mode, MetrologyMapMode::DefectReview)
-                    && self.metrology_kind != MeasurementKind::DefectCount
+                if !matches!(
+                    self.metrology_map_mode,
+                    MetrologyMapMode::DefectReview | MetrologyMapMode::ReviewQueue
+                ) && self.metrology_kind != MeasurementKind::DefectCount
                     && Some(defect.die) != self.selected_die
                 {
                     continue;
@@ -8951,6 +9425,43 @@ impl FabricadApp {
         for annotation in &self.wafer_map.annotations {
             let pos = wafer_mm_to_screen(annotation.position_mm, center, scale);
             painter.circle_stroke(pos, 7.0, Stroke::new(1.5, Color32::from_rgb(130, 210, 230)));
+        }
+
+        if let Some(die) = self.selected_die {
+            if canvas.width() > 340.0 {
+                let badge_width = (canvas.width() - 32.0).min(230.0);
+                let badge = EguiRect::from_min_size(
+                    Pos2::new(canvas.right() - badge_width - 16.0, canvas.top() + 14.0),
+                    vec2(badge_width, 58.0),
+                );
+                painter.rect_filled(badge, 4.0, Color32::from_rgba_unmultiplied(16, 19, 21, 220));
+                painter.rect_stroke(
+                    badge,
+                    4.0,
+                    Stroke::new(1.0, Color32::from_rgba_unmultiplied(210, 220, 216, 80)),
+                    StrokeKind::Inside,
+                );
+                let value = self
+                    .wafer_map
+                    .measurement_for(die, self.metrology_kind)
+                    .map(|measurement| format_metrology_value(measurement.kind, measurement.value))
+                    .unwrap_or_else(|| "no record".to_string());
+                let site = metrology_triage_for_die(&self.wafer_map, die);
+                painter.text(
+                    badge.left_top() + vec2(10.0, 9.0),
+                    Align2::LEFT_TOP,
+                    format!("Selected C{} R{}", die.column, die.row),
+                    FontId::proportional(13.0),
+                    Color32::from_rgb(238, 244, 240),
+                );
+                painter.text(
+                    badge.left_top() + vec2(10.0, 30.0),
+                    Align2::LEFT_TOP,
+                    format!("{}  {} defect(s)", value, site.defect_count),
+                    FontId::monospace(11.0),
+                    Color32::from_rgb(204, 215, 210),
+                );
+            }
         }
 
         if let Some(die) = hovered_die {
@@ -8998,6 +9509,31 @@ impl FabricadApp {
             FontId::proportional(18.0),
             Color32::from_rgb(240, 244, 236),
         );
+
+        if let Some(die) = hovered_die {
+            let measurement_text = self
+                .wafer_map
+                .measurement_for(die, self.metrology_kind)
+                .map(|measurement| {
+                    format!(
+                        "{} {} ({})",
+                        measurement.kind.label(),
+                        format_metrology_value(measurement.kind, measurement.value),
+                        measurement.status.label()
+                    )
+                })
+                .unwrap_or_else(|| "no selected measurement".to_string());
+            let site = metrology_triage_for_die(&self.wafer_map, die);
+            response.on_hover_text(format!(
+                "C{} R{}\n{}\n{} fail / {} outlier / {} defect",
+                die.column,
+                die.row,
+                measurement_text,
+                site.fail_count,
+                site.outlier_count,
+                site.defect_count
+            ));
+        }
     }
 
     fn handle_3d_input(&mut self, ui: &egui::Ui, response: &egui::Response) {
@@ -13069,6 +13605,246 @@ fn defect_local_position(map: &WaferMap, position_mm: [f64; 2], die: DieCoord) -
     [x as f32, y as f32]
 }
 
+#[derive(Clone, Copy, Debug)]
+struct MetrologyTriageSite {
+    die: DieCoord,
+    fail_count: usize,
+    outlier_count: usize,
+    defect_count: usize,
+    review_count: usize,
+    score: usize,
+}
+
+fn metrology_panel_plot_size(ui: &egui::Ui, min_width: f32, max_width: f32, height: f32) -> Vec2 {
+    let available = ui.available_width().max(1.0);
+    let width = if available < min_width {
+        available
+    } else {
+        available.min(max_width)
+    };
+    vec2(width, height)
+}
+
+fn metrology_spec_window_label(kind: MeasurementKind) -> String {
+    let spec = kind.spec();
+    let unit = kind.unit();
+    let suffix = if unit.is_empty() { "" } else { unit };
+    match (spec.lower, spec.target, spec.upper) {
+        (Some(lower), Some(target), Some(upper)) => {
+            format!(
+                "{} / {} / {} {}",
+                format_metrology_spec_bound(kind, lower),
+                format_metrology_spec_bound(kind, target),
+                format_metrology_spec_bound(kind, upper),
+                suffix
+            )
+        }
+        (Some(lower), _, Some(upper)) => {
+            format!(
+                "{}..{} {}",
+                format_metrology_spec_bound(kind, lower),
+                format_metrology_spec_bound(kind, upper),
+                suffix
+            )
+        }
+        (Some(lower), _, None) => {
+            format!(">= {} {}", format_metrology_spec_bound(kind, lower), suffix)
+        }
+        (None, _, Some(upper)) => {
+            format!("<= {} {}", format_metrology_spec_bound(kind, upper), suffix)
+        }
+        (None, Some(target), None) => {
+            format!(
+                "target {} {}",
+                format_metrology_spec_bound(kind, target),
+                suffix
+            )
+        }
+        (None, None, None) => "no spec".to_string(),
+    }
+}
+
+fn format_metrology_spec_bound(kind: MeasurementKind, value: f64) -> String {
+    match kind {
+        MeasurementKind::DefectCount => format!("{value:.0}"),
+        MeasurementKind::PassFail => {
+            if value >= 0.5 {
+                "pass".to_string()
+            } else {
+                "fail".to_string()
+            }
+        }
+        _ if value.abs() >= 100.0 => format!("{value:.0}"),
+        _ => format!("{value:.2}"),
+    }
+}
+
+fn format_metrology_target_delta(kind: MeasurementKind, value: f64) -> Option<String> {
+    let target = kind.spec().target?;
+    Some(format_metrology_signed_delta(kind, value - target))
+}
+
+fn format_metrology_signed_delta(kind: MeasurementKind, value: f64) -> String {
+    match kind {
+        MeasurementKind::DefectCount => format!("{value:+.0}"),
+        MeasurementKind::PassFail => format!("{value:+.2}"),
+        _ => format!("{value:+.2} {}", kind.unit()),
+    }
+}
+
+fn metrology_compact_record_id(id: &str) -> String {
+    const MAX_LEN: usize = 22;
+    if id.len() <= MAX_LEN {
+        id.to_string()
+    } else {
+        format!("...{}", &id[id.len() - (MAX_LEN - 3)..])
+    }
+}
+
+fn metrology_capability_label(cpk: f64) -> String {
+    if cpk >= 1.67 {
+        "high capability".to_string()
+    } else if cpk >= 1.33 {
+        "capable".to_string()
+    } else if cpk >= 1.0 {
+        "watch".to_string()
+    } else {
+        "below target".to_string()
+    }
+}
+
+fn metrology_capability_tone(cpk: Option<f64>) -> ui_chrome::Tone {
+    match cpk {
+        Some(value) if value >= 1.33 => ui_chrome::Tone::Success,
+        Some(value) if value >= 1.0 => ui_chrome::Tone::Warning,
+        Some(_) => ui_chrome::Tone::Danger,
+        None => ui_chrome::Tone::Neutral,
+    }
+}
+
+fn metrology_triage_for_die(map: &WaferMap, die: DieCoord) -> MetrologyTriageSite {
+    let mut fail_count = 0;
+    let mut outlier_count = 0;
+    for kind in MeasurementKind::NUMERIC {
+        if let Some(measurement) = map.measurement_for(die, kind) {
+            match measurement.status {
+                MeasurementStatus::Pass => {}
+                MeasurementStatus::Fail => fail_count += 1,
+                MeasurementStatus::Outlier => outlier_count += 1,
+            }
+        }
+    }
+
+    let mut defect_count = 0;
+    let mut max_severity = 0;
+    for defect in map.defects_for_die(die) {
+        defect_count += 1;
+        max_severity = max_severity.max(defect.severity as usize);
+    }
+
+    let review_count = map
+        .annotations_for_die(die)
+        .filter(|annotation| {
+            matches!(
+                annotation.kind,
+                layout_model::metrology::AnnotationKind::Review
+                    | layout_model::metrology::AnnotationKind::ProcessExcursion
+            )
+        })
+        .count();
+    let score = fail_count * 80
+        + outlier_count * 45
+        + max_severity * 12
+        + defect_count * 8
+        + review_count * 10;
+
+    MetrologyTriageSite {
+        die,
+        fail_count,
+        outlier_count,
+        defect_count,
+        review_count,
+        score,
+    }
+}
+
+fn metrology_triage_sites(map: &WaferMap) -> Vec<MetrologyTriageSite> {
+    let mut sites = map
+        .dies
+        .iter()
+        .copied()
+        .map(|die| metrology_triage_for_die(map, die))
+        .filter(|site| site.score > 0)
+        .collect::<Vec<_>>();
+    sites.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| b.fail_count.cmp(&a.fail_count))
+            .then_with(|| b.outlier_count.cmp(&a.outlier_count))
+            .then_with(|| b.defect_count.cmp(&a.defect_count))
+            .then_with(|| a.die.cmp(&b.die))
+    });
+    sites
+}
+
+fn metrology_next_triage_die(
+    sites: &[MetrologyTriageSite],
+    selected: Option<DieCoord>,
+) -> Option<DieCoord> {
+    if sites.is_empty() {
+        return None;
+    }
+    let Some(selected) = selected else {
+        return sites.first().map(|site| site.die);
+    };
+    let next_index = sites
+        .iter()
+        .position(|site| site.die == selected)
+        .map(|index| (index + 1) % sites.len())
+        .unwrap_or(0);
+    sites.get(next_index).map(|site| site.die)
+}
+
+fn metrology_triage_label(score: usize) -> &'static str {
+    match score {
+        0 => "No action",
+        1..=39 => "Low",
+        40..=99 => "Review",
+        100..=159 => "High",
+        _ => "Critical",
+    }
+}
+
+fn metrology_triage_tone(score: usize) -> ui_chrome::Tone {
+    match score {
+        0 => ui_chrome::Tone::Success,
+        1..=39 => ui_chrome::Tone::Info,
+        40..=99 => ui_chrome::Tone::Warning,
+        _ => ui_chrome::Tone::Danger,
+    }
+}
+
+fn metrology_defect_class_counts(map: &WaferMap) -> [(DefectClass, usize); 5] {
+    let mut counts = [
+        (DefectClass::Particle, 0),
+        (DefectClass::Scratch, 0),
+        (DefectClass::PatternBridge, 0),
+        (DefectClass::MissingFeature, 0),
+        (DefectClass::Unknown, 0),
+    ];
+    for defect in &map.defects {
+        let index = match defect.class {
+            DefectClass::Particle => 0,
+            DefectClass::Scratch => 1,
+            DefectClass::PatternBridge => 2,
+            DefectClass::MissingFeature => 3,
+            DefectClass::Unknown => 4,
+        };
+        counts[index].1 += 1;
+    }
+    counts
+}
+
 fn metrology_capability_index(summary: layout_model::metrology::MeasurementSummary) -> Option<f64> {
     let spec = summary.kind.spec();
     let mean = summary.mean?;
@@ -13211,6 +13987,61 @@ fn metrology_deviation_color(measurement: &Measurement) -> Color32 {
             Color32::from_rgb(224, 80, 75),
             normalized,
         )
+    }
+}
+
+fn metrology_spec_window_color(measurement: &Measurement) -> Color32 {
+    if measurement.status != MeasurementStatus::Pass {
+        return metrology_status_color(measurement.status);
+    }
+    if measurement.kind == MeasurementKind::PassFail {
+        return if measurement.value >= 0.5 {
+            Color32::from_rgb(76, 178, 116)
+        } else {
+            metrology_status_color(MeasurementStatus::Fail)
+        };
+    }
+
+    let spec = measurement.kind.spec();
+    let target = spec.target.unwrap_or(measurement.value);
+    let span = if measurement.value < target {
+        spec.lower.map(|lower| (target - lower).abs())
+    } else {
+        spec.upper.map(|upper| (upper - target).abs())
+    }
+    .unwrap_or(0.0);
+    if span <= f64::EPSILON {
+        return metrology_spec_window_color_for_ratio(0.0);
+    }
+
+    let ratio = ((measurement.value - target).abs() / span).clamp(0.0, 1.0) as f32;
+    metrology_spec_window_color_for_ratio(ratio)
+}
+
+fn metrology_spec_window_color_for_ratio(ratio: f32) -> Color32 {
+    let ratio = ratio.clamp(0.0, 1.0);
+    if ratio < 0.65 {
+        lerp_color(
+            Color32::from_rgb(68, 160, 116),
+            Color32::from_rgb(218, 190, 84),
+            ratio / 0.65,
+        )
+    } else {
+        lerp_color(
+            Color32::from_rgb(218, 190, 84),
+            Color32::from_rgb(224, 80, 75),
+            (ratio - 0.65) / 0.35,
+        )
+    }
+}
+
+fn metrology_review_queue_color(score: usize) -> Color32 {
+    match score {
+        0 => Color32::from_rgb(50, 84, 74),
+        1..=39 => Color32::from_rgb(74, 112, 142),
+        40..=99 => Color32::from_rgb(196, 150, 68),
+        100..=159 => Color32::from_rgb(214, 104, 68),
+        _ => Color32::from_rgb(226, 72, 78),
     }
 }
 
