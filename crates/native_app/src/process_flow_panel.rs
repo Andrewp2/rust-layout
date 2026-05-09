@@ -442,7 +442,7 @@ impl ProcessFlowPanel {
                         .corner_radius(6)
                         .inner_margin(egui::Margin::symmetric(8, 6))
                         .show(ui, |ui| {
-                            ui.horizontal_wrapped(|ui| {
+                            ui.horizontal(|ui| {
                                 if ui
                                     .selectable_label(
                                         selected,
@@ -453,6 +453,8 @@ impl ProcessFlowPanel {
                                     open_node = true;
                                 }
                                 ui.colored_label(kind_color(node.kind), node.kind.label());
+                            });
+                            ui.horizontal_wrapped(|ui| {
                                 if node.hold_point {
                                     ui_chrome::status_pill(ui, "hold", Tone::Warning);
                                 }

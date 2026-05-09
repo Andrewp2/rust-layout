@@ -9583,8 +9583,12 @@ impl FabricadApp {
         if let Some(die) = self.selected_die {
             if canvas.width() > 340.0 {
                 let badge_width = (canvas.width() - 32.0).min(230.0);
+                let badge_top = if canvas.width() < 560.0 { 72.0 } else { 14.0 };
                 let badge = EguiRect::from_min_size(
-                    Pos2::new(canvas.right() - badge_width - 16.0, canvas.top() + 14.0),
+                    Pos2::new(
+                        canvas.right() - badge_width - 16.0,
+                        canvas.top() + badge_top,
+                    ),
                     vec2(badge_width, 58.0),
                 );
                 painter.rect_filled(badge, 4.0, Color32::from_rgba_unmultiplied(16, 19, 21, 220));
