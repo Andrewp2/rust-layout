@@ -5,12 +5,53 @@ use layout_model::environment::{
     CleanroomEnvironment, EnvironmentAlarm, EnvironmentAlarmSeverity, EnvironmentReading,
     EnvironmentSensor, FacilityEventKind, TrendDirection,
 };
+use operad::{
+    ApproxTextMeasurer, ClipBehavior, ColorRgba, FontWeight, InputBehavior, StrokeStyle, TextStyle,
+    TextWrap, UiDocument, UiNode, UiNodeId, UiNodeStyle, UiSize, UiVisual, layout, root_style,
+    widgets,
+};
 
-use crate::ui_chrome::{self, Tone};
+use crate::{
+    operad_egui,
+    operad_sidecar::{SidecarRow, SidecarSection, render_sidecar},
+    ui_chrome::{self, Tone},
+};
+
+const OPERAD_HEADER_HEIGHT: f32 = 104.0;
+const OPERAD_METRIC_HEIGHT: f32 = 88.0;
+const OPERAD_SECTION_TITLE_HEIGHT: f32 = 26.0;
+const OPERAD_ROW_HEIGHT: f32 = 58.0;
+const OPERAD_EMPTY_ROW_HEIGHT: f32 = 44.0;
+const OPERAD_GAP: f32 = 10.0;
+const OPERAD_PAD: f32 = 12.0;
+const OPERAD_ACTION_SELECT_SENSOR: &str = "environment.action.select_sensor.";
 
 pub(crate) struct EnvironmentPanel {
     model: CleanroomEnvironment,
     selected_sensor: Option<String>,
+}
+
+#[derive(Debug)]
+struct EnvironmentOperadView {
+    document: UiDocument,
+    size: UiSize,
+}
+
+#[derive(Clone, Debug)]
+struct EnvironmentMetricTile {
+    label: String,
+    value: String,
+    detail: String,
+    tone: Tone,
+}
+
+#[derive(Clone, Debug)]
+struct EnvironmentOperadRow {
+    title: String,
+    detail: String,
+    tone: Tone,
+    action_name: Option<String>,
+    selected: bool,
 }
 
 #[derive(Default)]
@@ -38,6 +79,74 @@ impl EnvironmentPanel {
     }
 
     pub(crate) fn context_ui(&mut self, ui: &mut egui::Ui) {
+        if self.operad_context_ui(ui).is_err() {
+            self.egui_context_ui(ui);
+        }
+    }
+
+    fn operad_context_ui(&mut self, ui: &mut egui::Ui) -> Result<(), String> {
+        self.ensure_selection();
+        let active = self.model.active_alarms();
+        let mut sections = vec![
+            SidecarSection::new("Cleanroom Environment")
+                .row(SidecarRow::new(
+                    self.facility_state_label(),
+                    format!(
+                        "{} sensors | {} zones | {} active alarms",
+                        self.model.sensors.len(),
+                        self.zone_count(),
+                        active.len()
+                    ),
+                    self.facility_state_tone(),
+                ))
+                .row(SidecarRow::new(
+                    "Readings / events",
+                    format!(
+                        "{} readings | {} events",
+                        self.model.readings.len(),
+                        self.model.events.len()
+                    ),
+                    Tone::Neutral,
+                )),
+        ];
+        if let Some(sensor) = self.selected_sensor_record() {
+            let latest = self.model.latest_reading(&sensor.id);
+            let latest_detail = latest
+                .map(|reading| {
+                    format!(
+                        "{} at {}",
+                        format_reading(reading.value, &sensor.unit),
+                        format_time(reading.timestamp_min)
+                    )
+                })
+                .unwrap_or_else(|| "No samples".to_string());
+            let severity = latest.map(|reading| sensor.thresholds.evaluate(reading.value));
+            sections.push(
+                SidecarSection::new("Selected Sensor")
+                    .row(
+                        SidecarRow::new(
+                            &sensor.name,
+                            format!("{} | {}", sensor.zone, sensor.kind.label()),
+                            severity.map_or(Tone::Neutral, severity_tone),
+                        )
+                        .selected(true),
+                    )
+                    .row(SidecarRow::new(
+                        severity.map(sensor_state_label).unwrap_or("No samples"),
+                        latest_detail,
+                        severity.map_or(Tone::Neutral, severity_tone),
+                    ))
+                    .row(SidecarRow::new(
+                        "Nominal",
+                        sensor.thresholds.nominal_label(&sensor.unit),
+                        Tone::Neutral,
+                    )),
+            );
+        }
+        render_sidecar(ui, "environment.context", &sections)
+    }
+
+    fn egui_context_ui(&mut self, ui: &mut egui::Ui) {
         self.ensure_selection();
         ui_chrome::section_label(ui, "Cleanroom Environment");
         let active = self.model.active_alarms();
@@ -137,6 +246,60 @@ impl EnvironmentPanel {
 
     pub(crate) fn ui(&mut self, ui: &mut egui::Ui) {
         self.ensure_selection();
+        if let Err(error) = self.operad_ui(ui) {
+            ui.colored_label(Color32::from_rgb(226, 96, 96), error);
+            self.egui_dashboard_ui(ui);
+        }
+    }
+
+    fn operad_ui(&mut self, ui: &mut egui::Ui) -> Result<(), String> {
+        let mut result = Ok(());
+        egui::ScrollArea::vertical()
+            .id_salt("environment_dashboard_operad_scroll")
+            .show(ui, |ui| {
+                let width = ui.available_width().max(320.0);
+                let mut view = self.build_operad_view(width);
+                if let Err(error) = view
+                    .document
+                    .compute_layout(view.size, &mut ApproxTextMeasurer)
+                    .map_err(|error| error.to_string())
+                {
+                    result = Err(error);
+                    return;
+                }
+
+                let (rect, response) =
+                    ui.allocate_exact_size(vec2(width, view.size.height), Sense::click());
+                if response.clicked()
+                    && let Some(pointer) = response.interact_pointer_pos()
+                    && let Some(node_name) =
+                        operad_egui::hit_test_name(&view.document, rect, pointer)
+                    && self.handle_operad_action(&node_name)
+                {
+                    view = self.build_operad_view(width);
+                    if let Err(error) = view
+                        .document
+                        .compute_layout(view.size, &mut ApproxTextMeasurer)
+                        .map_err(|error| error.to_string())
+                    {
+                        result = Err(error);
+                        return;
+                    }
+                }
+
+                if response.hovered()
+                    && let Some(pointer) = ui.ctx().pointer_hover_pos()
+                    && operad_egui::hit_test_name(&view.document, rect, pointer).is_some()
+                {
+                    ui.output_mut(|output| output.cursor_icon = egui::CursorIcon::PointingHand);
+                }
+                operad_egui::paint_document_at(ui, &view.document, rect);
+            });
+        result
+    }
+
+    fn egui_dashboard_ui(&mut self, ui: &mut egui::Ui) {
+        self.ensure_selection();
         egui::ScrollArea::vertical()
             .id_salt("environment_dashboard_scroll")
             .show(ui, |ui| {
@@ -186,6 +349,484 @@ impl EnvironmentPanel {
                     });
                 }
             });
+    }
+
+    fn build_operad_view(&self, width: f32) -> EnvironmentOperadView {
+        let metrics = self.operad_metrics();
+        let overview_rows = self.operad_overview_rows();
+        let selected_rows = self.operad_selected_sensor_rows();
+        let alarm_rows = self.operad_alarm_rows();
+        let sensor_rows = self.operad_sensor_rows();
+        let zone_rows = self.operad_zone_rows();
+        let event_rows = self.operad_event_rows();
+        let correlation_rows = self.operad_correlation_rows();
+        let height = environment_operad_view_height(
+            width,
+            metrics.len(),
+            &[
+                overview_rows.len(),
+                selected_rows.len(),
+                alarm_rows.len(),
+                sensor_rows.len(),
+                zone_rows.len(),
+                event_rows.len(),
+                correlation_rows.len(),
+            ],
+        );
+        let size = UiSize::new(width, height);
+        let mut document = UiDocument::new(root_style(width, height));
+        let root = document.root;
+        document.set_node_visual(
+            root,
+            UiVisual::panel(
+                ColorRgba::new(15, 18, 21, 255),
+                Some(StrokeStyle::new(ColorRgba::new(39, 46, 52, 255), 1.0)),
+                0.0,
+            ),
+        );
+
+        add_environment_operad_header(
+            &mut document,
+            root,
+            "FACILITY OPERATIONS",
+            "Cleanroom Environment",
+            "Environmental sensors, excursions, zone posture, and process correlations",
+            &format!(
+                "{} active alarm(s), {} historical excursion(s), {} facility event(s)",
+                self.model.active_alarms().len(),
+                self.model.alarms.len(),
+                self.model.events.len()
+            ),
+        );
+        add_environment_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_environment_operad_metric_grid(&mut document, root, width, &metrics);
+        add_environment_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_environment_operad_section(
+            &mut document,
+            root,
+            width,
+            "environment.overview",
+            "Status Overview",
+            "No cleanroom status loaded",
+            &overview_rows,
+        );
+        add_environment_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_environment_operad_section(
+            &mut document,
+            root,
+            width,
+            "environment.selected_sensor",
+            "Selected Sensor Trend",
+            "No environmental sensors loaded",
+            &selected_rows,
+        );
+        add_environment_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_environment_operad_section(
+            &mut document,
+            root,
+            width,
+            "environment.alarms",
+            "Alarm Console",
+            "No active or historical environmental alarms",
+            &alarm_rows,
+        );
+        add_environment_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_environment_operad_section(
+            &mut document,
+            root,
+            width,
+            "environment.sensors",
+            "Sensor Trend Matrix",
+            "No environmental sensors loaded",
+            &sensor_rows,
+        );
+        add_environment_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_environment_operad_section(
+            &mut document,
+            root,
+            width,
+            "environment.zones",
+            "Zone Status",
+            "No cleanroom zones loaded",
+            &zone_rows,
+        );
+        add_environment_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_environment_operad_section(
+            &mut document,
+            root,
+            width,
+            "environment.events",
+            "Facility Event Timeline",
+            "No facility events loaded",
+            &event_rows,
+        );
+        add_environment_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_environment_operad_section(
+            &mut document,
+            root,
+            width,
+            "environment.correlations",
+            "Process Correlations",
+            "No process correlation labels loaded",
+            &correlation_rows,
+        );
+
+        EnvironmentOperadView { document, size }
+    }
+
+    fn operad_metrics(&self) -> Vec<EnvironmentMetricTile> {
+        let active_critical = self
+            .model
+            .active_alarms()
+            .into_iter()
+            .filter(|alarm| alarm.severity == EnvironmentAlarmSeverity::Critical)
+            .count();
+        vec![
+            EnvironmentMetricTile {
+                label: "Sensors online".to_string(),
+                value: self.model.sensors.len().to_string(),
+                detail: "continuous monitor".to_string(),
+                tone: Tone::Neutral,
+            },
+            EnvironmentMetricTile {
+                label: "Active excursions".to_string(),
+                value: self.model.active_alarms().len().to_string(),
+                detail: "latest sample state".to_string(),
+                tone: self.facility_state_tone(),
+            },
+            EnvironmentMetricTile {
+                label: "Critical holds".to_string(),
+                value: active_critical.to_string(),
+                detail: "needs disposition".to_string(),
+                tone: if active_critical == 0 {
+                    Tone::Success
+                } else {
+                    Tone::Danger
+                },
+            },
+            EnvironmentMetricTile {
+                label: "Correlation tags".to_string(),
+                value: self.model.correlations.len().to_string(),
+                detail: "process risk labels".to_string(),
+                tone: Tone::Neutral,
+            },
+        ]
+    }
+
+    fn operad_overview_rows(&self) -> Vec<EnvironmentOperadRow> {
+        let mut rows = vec![EnvironmentOperadRow {
+            title: self.facility_state_label().to_string(),
+            detail: format!(
+                "{} monitored zone(s), {} sensor reading(s)",
+                self.zone_count(),
+                self.model.readings.len()
+            ),
+            tone: self.facility_state_tone(),
+            action_name: None,
+            selected: false,
+        }];
+        if let Some(last_event) = self
+            .model
+            .events
+            .iter()
+            .max_by_key(|event| event.timestamp_min)
+        {
+            rows.push(EnvironmentOperadRow {
+                title: format!("Latest event · {}", last_event.kind.label()),
+                detail: format!(
+                    "{} · {} · {}",
+                    format_time(last_event.timestamp_min),
+                    last_event.zone,
+                    last_event.title
+                ),
+                tone: event_tone(last_event.kind),
+                action_name: None,
+                selected: false,
+            });
+        }
+        rows
+    }
+
+    fn operad_selected_sensor_rows(&self) -> Vec<EnvironmentOperadRow> {
+        let Some(sensor) = self.selected_sensor_record() else {
+            return Vec::new();
+        };
+        let readings = self.model.readings_for_sensor(&sensor.id);
+        let latest = self.model.latest_reading(&sensor.id);
+        let severity = latest.and_then(|reading| sensor.thresholds.evaluate(reading.value));
+        let mut rows = vec![EnvironmentOperadRow {
+            title: sensor.name.clone(),
+            detail: format!(
+                "{} · {} · nominal {}",
+                sensor.zone,
+                sensor.kind.label(),
+                sensor.thresholds.nominal_label(&sensor.unit)
+            ),
+            tone: severity_tone(severity),
+            action_name: Some(format!(
+                "{OPERAD_ACTION_SELECT_SENSOR}{}|selected",
+                sensor.id
+            )),
+            selected: true,
+        }];
+        if let Some(reading) = latest {
+            rows.push(EnvironmentOperadRow {
+                title: "Latest sample".to_string(),
+                detail: format!(
+                    "{} at {}",
+                    format_reading(reading.value, &sensor.unit),
+                    format_time(reading.timestamp_min)
+                ),
+                tone: severity_tone(severity),
+                action_name: None,
+                selected: false,
+            });
+        }
+        if let Some(summary) = self.model.trend_summary(&sensor.id) {
+            rows.push(EnvironmentOperadRow {
+                title: format!("Trend {}", summary.direction.label()),
+                detail: format!(
+                    "latest {}, avg {}, range {}..{} {}, {} excursion(s)",
+                    format_reading(summary.latest_value, &sensor.unit),
+                    format_reading(summary.average_value, &sensor.unit),
+                    compact_number(summary.min_value),
+                    compact_number(summary.max_value),
+                    sensor.unit,
+                    summary.excursion_count
+                ),
+                tone: trend_tone(summary.direction),
+                action_name: None,
+                selected: false,
+            });
+        }
+        rows.push(EnvironmentOperadRow {
+            title: "Spec band".to_string(),
+            detail: sensor.thresholds.nominal_label(&sensor.unit),
+            tone: Tone::Neutral,
+            action_name: None,
+            selected: false,
+        });
+        if !sensor.process_tags.is_empty() {
+            rows.push(EnvironmentOperadRow {
+                title: "Process tags".to_string(),
+                detail: sensor.process_tags.join(", "),
+                tone: Tone::Info,
+                action_name: None,
+                selected: false,
+            });
+        }
+        if readings.is_empty() {
+            rows.push(EnvironmentOperadRow {
+                title: "Trend samples".to_string(),
+                detail: "No samples loaded".to_string(),
+                tone: Tone::Neutral,
+                action_name: None,
+                selected: false,
+            });
+        }
+        rows
+    }
+
+    fn operad_alarm_rows(&self) -> Vec<EnvironmentOperadRow> {
+        let mut rows = Vec::new();
+        let (critical, warning, advisory) = self.alarm_counts(self.model.alarms.iter());
+        rows.push(EnvironmentOperadRow {
+            title: "Alarm counts".to_string(),
+            detail: format!("{critical} critical, {warning} warning, {advisory} advisory"),
+            tone: if critical > 0 {
+                Tone::Danger
+            } else if warning > 0 {
+                Tone::Warning
+            } else if advisory > 0 {
+                Tone::Info
+            } else {
+                Tone::Success
+            },
+            action_name: None,
+            selected: false,
+        });
+        for (index, alarm) in self.model.active_alarms().into_iter().enumerate() {
+            rows.push(self.operad_alarm_row(alarm, format!("active.{index}")));
+        }
+        for (index, alarm) in self.model.alarms.iter().take(8).enumerate() {
+            rows.push(self.operad_alarm_row(alarm, format!("recent.{index}")));
+        }
+        rows
+    }
+
+    fn operad_alarm_row(&self, alarm: &EnvironmentAlarm, suffix: String) -> EnvironmentOperadRow {
+        let sensor = self.sensor(&alarm.sensor_id);
+        EnvironmentOperadRow {
+            title: format!(
+                "{} · {}{}",
+                alarm.severity.label(),
+                format_time(alarm.timestamp_min),
+                if alarm.active { " · active" } else { "" }
+            ),
+            detail: format!(
+                "{}{} · {}",
+                sensor
+                    .map(|sensor| format!(
+                        "{} / {}",
+                        sensor.zone,
+                        format_reading(alarm.value, &sensor.unit)
+                    ))
+                    .unwrap_or_else(|| alarm.sensor_id.clone()),
+                if alarm.correlation_labels.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · {}", alarm.correlation_labels.join(", "))
+                },
+                alarm.message
+            ),
+            tone: severity_tone(Some(alarm.severity)),
+            action_name: Some(format!(
+                "{OPERAD_ACTION_SELECT_SENSOR}{}|alarm.{suffix}",
+                alarm.sensor_id
+            )),
+            selected: self.selected_sensor.as_deref() == Some(alarm.sensor_id.as_str()),
+        }
+    }
+
+    fn operad_sensor_rows(&self) -> Vec<EnvironmentOperadRow> {
+        self.model
+            .sensors
+            .iter()
+            .enumerate()
+            .map(|(index, sensor)| {
+                let latest = self.model.latest_reading(&sensor.id);
+                let severity = latest.and_then(|reading| sensor.thresholds.evaluate(reading.value));
+                let summary = self.model.trend_summary(&sensor.id);
+                EnvironmentOperadRow {
+                    title: format!("{} · {}", sensor.zone, sensor.name),
+                    detail: format!(
+                        "{} · {} · spec {}{}",
+                        sensor.kind.label(),
+                        latest
+                            .map(|reading| format!(
+                                "latest {} at {}",
+                                format_reading(reading.value, &sensor.unit),
+                                format_time(reading.timestamp_min)
+                            ))
+                            .unwrap_or_else(|| "no samples".to_string()),
+                        sensor.thresholds.nominal_label(&sensor.unit),
+                        summary
+                            .map(|summary| format!(
+                                " · trend {}, {} excursion(s)",
+                                summary.direction.label(),
+                                summary.excursion_count
+                            ))
+                            .unwrap_or_default()
+                    ),
+                    tone: severity_tone(severity),
+                    action_name: Some(format!(
+                        "{OPERAD_ACTION_SELECT_SENSOR}{}|sensor.{index}",
+                        sensor.id
+                    )),
+                    selected: self.selected_sensor.as_deref() == Some(sensor.id.as_str()),
+                }
+            })
+            .collect()
+    }
+
+    fn operad_zone_rows(&self) -> Vec<EnvironmentOperadRow> {
+        self.zone_summaries()
+            .into_iter()
+            .map(|summary| EnvironmentOperadRow {
+                title: format!("{} · {}", summary.name, zone_state_label(&summary)),
+                detail: format!(
+                    "{} sensor(s), {} historical excursion(s), latest {}",
+                    summary.sensor_count,
+                    summary.excursion_count,
+                    summary
+                        .latest_timestamp_min
+                        .map(format_time)
+                        .unwrap_or_else(|| "--:--".to_string())
+                ),
+                tone: severity_tone(summary.worst_severity()),
+                action_name: None,
+                selected: false,
+            })
+            .collect()
+    }
+
+    fn operad_event_rows(&self) -> Vec<EnvironmentOperadRow> {
+        self.model
+            .events
+            .iter()
+            .map(|event| EnvironmentOperadRow {
+                title: format!(
+                    "{} · {}",
+                    format_time(event.timestamp_min),
+                    event.kind.label()
+                ),
+                detail: format!(
+                    "{} · {}{}",
+                    event.zone,
+                    event.title,
+                    if event.linked_alarm_id.is_some() {
+                        " · linked alarm"
+                    } else {
+                        ""
+                    }
+                ),
+                tone: event_tone(event.kind),
+                action_name: None,
+                selected: false,
+            })
+            .collect()
+    }
+
+    fn operad_correlation_rows(&self) -> Vec<EnvironmentOperadRow> {
+        let related = self.selected_sensor.as_deref().map_or_else(Vec::new, |id| {
+            self.model
+                .correlations
+                .iter()
+                .filter(|label| label.sensor_ids.iter().any(|sensor_id| sensor_id == id))
+                .collect::<Vec<_>>()
+        });
+        let correlations = if related.is_empty() {
+            self.model.correlations.iter().collect::<Vec<_>>()
+        } else {
+            related
+        };
+        correlations
+            .into_iter()
+            .map(|label| EnvironmentOperadRow {
+                title: format!("{} · {}", label.process_area, label.label),
+                detail: format!(
+                    "{} · sensors {}",
+                    label.description,
+                    label.sensor_ids.join(", ")
+                ),
+                tone: Tone::Info,
+                action_name: label.sensor_ids.first().map(|sensor_id| {
+                    format!(
+                        "{OPERAD_ACTION_SELECT_SENSOR}{sensor_id}|correlation.{}",
+                        label.id
+                    )
+                }),
+                selected: label
+                    .sensor_ids
+                    .iter()
+                    .any(|sensor_id| self.selected_sensor.as_deref() == Some(sensor_id.as_str())),
+            })
+            .collect()
+    }
+
+    fn handle_operad_action(&mut self, node_name: &str) -> bool {
+        let Some(sensor_id) = node_name.strip_prefix(OPERAD_ACTION_SELECT_SENSOR) else {
+            return false;
+        };
+        let sensor_id = sensor_id
+            .split_once('|')
+            .map(|(sensor_id, _)| sensor_id)
+            .unwrap_or(sensor_id);
+        if self.sensor(sensor_id).is_some() {
+            self.selected_sensor = Some(sensor_id.to_string());
+            return true;
+        }
+        false
     }
 
     fn ensure_selection(&mut self) {
@@ -795,6 +1436,495 @@ impl ZoneSummary {
     }
 }
 
+fn environment_operad_view_height(width: f32, metric_count: usize, row_counts: &[usize]) -> f32 {
+    let mut height = OPERAD_HEADER_HEIGHT + OPERAD_GAP;
+    height += environment_operad_metric_grid_height(width, metric_count) + OPERAD_GAP;
+    for row_count in row_counts {
+        height += environment_operad_section_height(*row_count) + OPERAD_GAP;
+    }
+    height + OPERAD_PAD
+}
+
+fn environment_operad_metric_columns(width: f32) -> usize {
+    if width >= 1020.0 {
+        4
+    } else if width >= 680.0 {
+        3
+    } else if width >= 440.0 {
+        2
+    } else {
+        1
+    }
+}
+
+fn environment_operad_metric_grid_height(width: f32, metric_count: usize) -> f32 {
+    let columns = environment_operad_metric_columns(width).max(1);
+    let rows = metric_count.div_ceil(columns).max(1);
+    rows as f32 * OPERAD_METRIC_HEIGHT
+}
+
+fn environment_operad_section_height(row_count: usize) -> f32 {
+    OPERAD_PAD * 2.0
+        + OPERAD_SECTION_TITLE_HEIGHT
+        + if row_count == 0 {
+            OPERAD_EMPTY_ROW_HEIGHT
+        } else {
+            row_count as f32 * OPERAD_ROW_HEIGHT
+        }
+}
+
+fn add_environment_operad_header(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    eyebrow: &str,
+    title: &str,
+    detail: &str,
+    meta: &str,
+) {
+    let header = document.add_child(
+        parent,
+        UiNode::container(
+            "environment.header",
+            UiNodeStyle {
+                layout: layout::with_padding_all(
+                    layout::with_size(
+                        layout::column(),
+                        layout::percent(1.0),
+                        layout::px(OPERAD_HEADER_HEIGHT),
+                    ),
+                    OPERAD_PAD,
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            ColorRgba::new(22, 27, 32, 255),
+            Some(StrokeStyle::new(ColorRgba::new(46, 55, 64, 255), 1.0)),
+            6.0,
+        )),
+    );
+    add_environment_operad_text(
+        document,
+        header,
+        "environment.header.eyebrow",
+        eyebrow,
+        environment_operad_text_style(12.0, FontWeight::BOLD, ColorRgba::new(146, 154, 162, 255)),
+        16.0,
+    );
+    add_environment_operad_text(
+        document,
+        header,
+        "environment.header.title",
+        title,
+        environment_operad_text_style(24.0, FontWeight::BOLD, ColorRgba::new(242, 246, 250, 255)),
+        30.0,
+    );
+    add_environment_operad_text(
+        document,
+        header,
+        "environment.header.detail",
+        detail,
+        environment_operad_text_style(14.0, FontWeight::NORMAL, ColorRgba::new(178, 185, 194, 255)),
+        20.0,
+    );
+    add_environment_operad_text(
+        document,
+        header,
+        "environment.header.meta",
+        meta,
+        environment_operad_text_style(13.0, FontWeight::NORMAL, ColorRgba::new(112, 183, 239, 255)),
+        18.0,
+    );
+}
+
+fn add_environment_operad_metric_grid(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    width: f32,
+    metrics: &[EnvironmentMetricTile],
+) {
+    let columns = environment_operad_metric_columns(width);
+    let grid_height = environment_operad_metric_grid_height(width, metrics.len());
+    let grid = document.add_child(
+        parent,
+        UiNode::container(
+            "environment.metrics",
+            UiNodeStyle {
+                layout: layout::with_size(
+                    layout::column(),
+                    layout::percent(1.0),
+                    layout::px(grid_height),
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        ),
+    );
+    let tile_width =
+        ((width - OPERAD_GAP * (columns.saturating_sub(1) as f32)) / columns as f32).max(120.0);
+    for (row_index, chunk) in metrics.chunks(columns).enumerate() {
+        let row = document.add_child(
+            grid,
+            UiNode::container(
+                format!("environment.metrics.row.{row_index}"),
+                UiNodeStyle {
+                    layout: layout::with_size(
+                        layout::row(),
+                        layout::percent(1.0),
+                        layout::px(OPERAD_METRIC_HEIGHT),
+                    ),
+                    clip: ClipBehavior::Clip,
+                    ..Default::default()
+                },
+            ),
+        );
+        for (column, metric) in chunk.iter().enumerate() {
+            add_environment_operad_metric_tile(
+                document,
+                row,
+                &format!("environment.metrics.{row_index}.{column}"),
+                tile_width - 6.0,
+                metric,
+            );
+        }
+    }
+}
+
+fn add_environment_operad_metric_tile(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    name: &str,
+    width: f32,
+    metric: &EnvironmentMetricTile,
+) {
+    let tile = document.add_child(
+        parent,
+        UiNode::container(
+            name,
+            UiNodeStyle {
+                layout: layout::with_padding_all(
+                    layout::with_margin_all(
+                        layout::with_size(
+                            layout::column(),
+                            layout::px(width.max(116.0)),
+                            layout::px(OPERAD_METRIC_HEIGHT - 8.0),
+                        ),
+                        3.0,
+                    ),
+                    9.0,
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            ColorRgba::new(29, 35, 40, 255),
+            Some(StrokeStyle::new(
+                environment_operad_tone_color(metric.tone),
+                1.0,
+            )),
+            6.0,
+        )),
+    );
+    add_environment_operad_text(
+        document,
+        tile,
+        &format!("{name}.label"),
+        &metric.label,
+        environment_operad_text_style(12.0, FontWeight::BOLD, ColorRgba::new(158, 166, 174, 255)),
+        18.0,
+    );
+    add_environment_operad_text(
+        document,
+        tile,
+        &format!("{name}.value"),
+        &metric.value,
+        environment_operad_text_style(20.0, FontWeight::BOLD, ColorRgba::new(239, 243, 247, 255)),
+        26.0,
+    );
+    add_environment_operad_text(
+        document,
+        tile,
+        &format!("{name}.detail"),
+        truncate_middle(&metric.detail, 52),
+        environment_operad_text_style(
+            12.0,
+            FontWeight::NORMAL,
+            environment_operad_tone_color(metric.tone),
+        ),
+        18.0,
+    );
+}
+
+fn add_environment_operad_section(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    width: f32,
+    name: &str,
+    title: &str,
+    empty: &str,
+    rows: &[EnvironmentOperadRow],
+) {
+    let height = environment_operad_section_height(rows.len());
+    let section = document.add_child(
+        parent,
+        UiNode::container(
+            name,
+            UiNodeStyle {
+                layout: layout::with_padding_all(
+                    layout::with_size(layout::column(), layout::percent(1.0), layout::px(height)),
+                    OPERAD_PAD,
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            ColorRgba::new(21, 26, 31, 255),
+            Some(StrokeStyle::new(ColorRgba::new(45, 53, 61, 255), 1.0)),
+            6.0,
+        )),
+    );
+    add_environment_operad_text(
+        document,
+        section,
+        &format!("{name}.title"),
+        title,
+        environment_operad_text_style(15.0, FontWeight::BOLD, ColorRgba::new(242, 246, 250, 255)),
+        OPERAD_SECTION_TITLE_HEIGHT,
+    );
+    if rows.is_empty() {
+        add_environment_operad_empty_row(document, section, name, empty);
+    } else {
+        let row_width = (width - OPERAD_PAD * 2.0).max(240.0);
+        for (index, row) in rows.iter().enumerate() {
+            add_environment_operad_data_row(document, section, name, index, row_width, row);
+        }
+    }
+}
+
+fn add_environment_operad_empty_row(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    name: &str,
+    label: &str,
+) {
+    let row = document.add_child(
+        parent,
+        UiNode::container(
+            format!("{name}.empty"),
+            UiNodeStyle {
+                layout: layout::with_padding_all(
+                    layout::with_size(
+                        layout::row(),
+                        layout::percent(1.0),
+                        layout::px(OPERAD_EMPTY_ROW_HEIGHT),
+                    ),
+                    8.0,
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            ColorRgba::new(27, 32, 37, 255),
+            Some(StrokeStyle::new(ColorRgba::new(43, 50, 58, 255), 1.0)),
+            5.0,
+        )),
+    );
+    add_environment_operad_text(
+        document,
+        row,
+        &format!("{name}.empty.label"),
+        label,
+        environment_operad_text_style(13.0, FontWeight::NORMAL, ColorRgba::new(154, 163, 172, 255)),
+        24.0,
+    );
+}
+
+fn add_environment_operad_data_row(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    section_name: &str,
+    index: usize,
+    row_width: f32,
+    row: &EnvironmentOperadRow,
+) {
+    let row_name = row
+        .action_name
+        .clone()
+        .unwrap_or_else(|| format!("{section_name}.row.{index}"));
+    let stroke_color = if row.selected {
+        environment_operad_tone_color(Tone::Info)
+    } else {
+        ColorRgba::new(42, 50, 58, 255)
+    };
+    let fill = if row.selected {
+        ColorRgba::new(26, 42, 56, 255)
+    } else {
+        ColorRgba::new(26, 31, 36, 255)
+    };
+    let mut node = UiNode::container(
+        row_name,
+        UiNodeStyle {
+            layout: layout::with_padding_all(
+                layout::with_size(
+                    layout::row(),
+                    layout::percent(1.0),
+                    layout::px(OPERAD_ROW_HEIGHT),
+                ),
+                6.0,
+            ),
+            clip: ClipBehavior::Clip,
+            ..Default::default()
+        },
+    )
+    .with_visual(UiVisual::panel(
+        fill,
+        Some(StrokeStyle::new(stroke_color, 1.0)),
+        4.0,
+    ));
+    if row.action_name.is_some() {
+        node = node.with_input(InputBehavior::BUTTON);
+    }
+    let row_node = document.add_child(parent, node);
+    document.add_child(
+        row_node,
+        UiNode::container(
+            format!("{section_name}.row.{index}.tone"),
+            UiNodeStyle {
+                layout: layout::fixed(5.0, OPERAD_ROW_HEIGHT - 12.0),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            environment_operad_tone_color(row.tone),
+            None,
+            2.0,
+        )),
+    );
+    let text_column = document.add_child(
+        row_node,
+        UiNode::container(
+            format!("{section_name}.row.{index}.text"),
+            UiNodeStyle {
+                layout: layout::with_size(
+                    layout::column(),
+                    layout::px((row_width - 28.0).max(120.0)),
+                    layout::px(OPERAD_ROW_HEIGHT - 12.0),
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        ),
+    );
+    add_environment_operad_text(
+        document,
+        text_column,
+        &format!("{section_name}.row.{index}.title"),
+        truncate_middle(&row.title, 72),
+        environment_operad_text_style(14.0, FontWeight::BOLD, ColorRgba::new(232, 237, 242, 255)),
+        21.0,
+    );
+    add_environment_operad_text(
+        document,
+        text_column,
+        &format!("{section_name}.row.{index}.detail"),
+        truncate_middle(&row.detail, 108),
+        environment_operad_text_style(12.0, FontWeight::NORMAL, ColorRgba::new(162, 171, 180, 255)),
+        19.0,
+    );
+}
+
+fn add_environment_operad_spacer(document: &mut UiDocument, parent: UiNodeId, height: f32) {
+    document.add_child(
+        parent,
+        UiNode::container(
+            format!("environment.spacer.{}", document.node_count()),
+            UiNodeStyle {
+                layout: layout::with_size(layout::row(), layout::percent(1.0), layout::px(height)),
+                ..Default::default()
+            },
+        ),
+    );
+}
+
+fn add_environment_operad_text(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    name: &str,
+    text: impl Into<String>,
+    style: TextStyle,
+    height: f32,
+) {
+    widgets::label(
+        document,
+        parent,
+        name,
+        text,
+        style,
+        layout::with_size(layout::row(), layout::percent(1.0), layout::px(height)),
+    );
+}
+
+fn environment_operad_text_style(
+    font_size: f32,
+    weight: FontWeight,
+    color: ColorRgba,
+) -> TextStyle {
+    TextStyle {
+        font_size,
+        line_height: font_size + 4.0,
+        weight,
+        color,
+        wrap: TextWrap::None,
+        ..Default::default()
+    }
+}
+
+fn environment_operad_tone_color(tone: Tone) -> ColorRgba {
+    let color = tone.color();
+    ColorRgba::new(color.r(), color.g(), color.b(), color.a())
+}
+
+fn event_tone(kind: FacilityEventKind) -> Tone {
+    match kind {
+        FacilityEventKind::Maintenance => Tone::Info,
+        FacilityEventKind::Excursion | FacilityEventKind::ProcessHold => Tone::Warning,
+        FacilityEventKind::Recovery => Tone::Success,
+    }
+}
+
+fn trend_tone(direction: TrendDirection) -> Tone {
+    match direction {
+        TrendDirection::Falling | TrendDirection::Rising => Tone::Warning,
+        TrendDirection::Stable => Tone::Success,
+    }
+}
+
+fn truncate_middle(text: impl AsRef<str>, max_chars: usize) -> String {
+    let text = text.as_ref();
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_string();
+    }
+    let keep = max_chars.saturating_sub(3);
+    let head = keep / 2;
+    let tail = keep - head;
+    let start = text.chars().take(head).collect::<String>();
+    let end = text
+        .chars()
+        .rev()
+        .take(tail)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!("{start}...{end}")
+}
+
 fn draw_environment_plot(
     ui: &mut egui::Ui,
     readings: &[&EnvironmentReading],
@@ -1310,4 +2440,33 @@ fn compact_number(value: f64) -> String {
 
 fn format_time(timestamp_min: u32) -> String {
     format!("{:02}:{:02}", timestamp_min / 60, timestamp_min % 60)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn environment_operad_view_audits_common_widths() {
+        let mut panel = EnvironmentPanel::from_model(CleanroomEnvironment::sample());
+        panel.ensure_selection();
+        for width in [360.0, 760.0, 1200.0] {
+            let mut view = panel.build_operad_view(width);
+            view.document
+                .compute_layout(view.size, &mut ApproxTextMeasurer)
+                .unwrap();
+            let warnings = view.document.audit_layout();
+            assert!(warnings.is_empty(), "{warnings:#?}");
+            assert!(view.document.node_count() > 20);
+            assert!(!view.document.paint_list().items.is_empty());
+        }
+    }
+
+    #[test]
+    fn environment_operad_action_selects_sensor() {
+        let mut panel = EnvironmentPanel::from_model(CleanroomEnvironment::sample());
+        let target = panel.model.sensors.last().unwrap().id.clone();
+        assert!(panel.handle_operad_action(&format!("{OPERAD_ACTION_SELECT_SENSOR}{target}|test")));
+        assert_eq!(panel.selected_sensor.as_deref(), Some(target.as_str()));
+    }
 }

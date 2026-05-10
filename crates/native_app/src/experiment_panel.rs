@@ -1,17 +1,41 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui::{self, Color32, RichText, Sense, vec2};
 use layout_model::experiment::{
     ExperimentAnalysisSummary, ExperimentFactor, ExperimentPlan, ExperimentRun, ExperimentRunId,
     ExperimentRunStatus, FactorEffect, FactorId, ResponseCaptureError, ResponseSpec,
     ResponseSpecId, ResponseStats, ResponseValue, ResponseValueStatus, format_compact_number,
 };
-use layout_model::{
-    mes::{ProcessRouteId, ProcessStepId},
-    recipe::RecipeBinding,
+
+use operad::{
+    ApproxTextMeasurer, ClipBehavior, ColorRgba, FontWeight, InputBehavior, StrokeStyle, TextStyle,
+    TextWrap, UiDocument, UiNode, UiNodeId, UiNodeStyle, UiSize, UiVisual, layout, root_style,
+    widgets,
 };
 
-use crate::ui_chrome::{self, Tone};
+use crate::{
+    operad_egui,
+    operad_sidecar::{SidecarRow, SidecarSection, render_sidecar},
+    ui_chrome::{self, Tone},
+};
+
+const OPERAD_HEADER_HEIGHT: f32 = 104.0;
+const OPERAD_METRIC_HEIGHT: f32 = 88.0;
+const OPERAD_SECTION_TITLE_HEIGHT: f32 = 26.0;
+const OPERAD_ROW_HEIGHT: f32 = 62.0;
+const OPERAD_EMPTY_ROW_HEIGHT: f32 = 44.0;
+const OPERAD_GAP: f32 = 10.0;
+const OPERAD_PAD: f32 = 12.0;
+const OPERAD_RUN_ROW_LIMIT: usize = 32;
+const OPERAD_EFFECT_ROW_LIMIT: usize = 24;
+const OPERAD_ACTION_SELECT_RESPONSE: &str = "experiment.action.select_response.";
+const OPERAD_ACTION_SELECT_RUN: &str = "experiment.action.select_run.";
+const OPERAD_ACTION_SET_FILTER: &str = "experiment.action.set_filter.";
+const OPERAD_ACTION_SELECT_LOT: &str = "experiment.action.select_lot.";
+const OPERAD_ACTION_CLEAR_FILTERS: &str = "experiment.action.clear_filters";
+const OPERAD_ACTION_TOGGLE_MISSING: &str = "experiment.action.toggle_missing_only";
+const OPERAD_ACTION_QUEUE_PENDING: &str = "experiment.action.queue_pending";
+const OPERAD_ACTION_CAPTURE_DEMO: &str = "experiment.action.capture_demo";
 
 pub(crate) struct ExperimentPlannerPanel {
     plan: ExperimentPlan,
@@ -23,11 +47,30 @@ pub(crate) struct ExperimentPlannerPanel {
     lot_filter: Option<String>,
 }
 
-impl ExperimentPlannerPanel {
-    pub(crate) fn empty() -> Self {
-        Self::from_plan(blank_experiment_plan())
-    }
+#[derive(Debug)]
+struct ExperimentOperadView {
+    document: UiDocument,
+    size: UiSize,
+}
 
+#[derive(Clone, Debug)]
+struct ExperimentMetricTile {
+    label: String,
+    value: String,
+    detail: String,
+    tone: Tone,
+}
+
+#[derive(Clone, Debug)]
+struct ExperimentOperadRow {
+    title: String,
+    detail: String,
+    tone: Tone,
+    action_name: Option<String>,
+    selected: bool,
+}
+
+impl ExperimentPlannerPanel {
     pub(crate) fn from_plan(plan: ExperimentPlan) -> Self {
         let selected_run = plan.runs.first().map(|run| run.id.clone());
         let selected_response = plan
@@ -51,6 +94,71 @@ impl ExperimentPlannerPanel {
     }
 
     pub(crate) fn dashboard_ui(&mut self, ui: &mut egui::Ui, status: &mut String) {
+        self.ensure_selection();
+        if let Err(error) = self.operad_dashboard_ui(ui, status) {
+            ui.colored_label(Color32::from_rgb(226, 96, 96), error);
+            self.egui_dashboard_ui(ui, status);
+        }
+    }
+
+    fn operad_dashboard_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        status: &mut String,
+    ) -> Result<(), String> {
+        let mut action_status = None;
+        let mut result_state = Ok(());
+        egui::ScrollArea::vertical()
+            .id_salt("experiment_planner_dashboard_operad")
+            .show(ui, |ui| {
+                let width = ui.available_width().max(320.0);
+                let mut view = self.build_operad_view(width);
+                if let Err(error) = view
+                    .document
+                    .compute_layout(view.size, &mut ApproxTextMeasurer)
+                    .map_err(|error| error.to_string())
+                {
+                    result_state = Err(error);
+                    return;
+                }
+
+                let (rect, response) =
+                    ui.allocate_exact_size(vec2(width, view.size.height), Sense::click());
+                if response.clicked()
+                    && let Some(pointer) = response.interact_pointer_pos()
+                    && let Some(node_name) =
+                        operad_egui::hit_test_name(&view.document, rect, pointer)
+                    && let Some(message) = self.handle_operad_action(&node_name)
+                {
+                    if !message.is_empty() {
+                        action_status = Some(message);
+                    }
+                    view = self.build_operad_view(width);
+                    if let Err(error) = view
+                        .document
+                        .compute_layout(view.size, &mut ApproxTextMeasurer)
+                        .map_err(|error| error.to_string())
+                    {
+                        result_state = Err(error);
+                        return;
+                    }
+                }
+
+                if response.hovered()
+                    && let Some(pointer) = ui.ctx().pointer_hover_pos()
+                    && operad_egui::hit_test_name(&view.document, rect, pointer).is_some()
+                {
+                    ui.output_mut(|output| output.cursor_icon = egui::CursorIcon::PointingHand);
+                }
+                operad_egui::paint_document_at(ui, &view.document, rect);
+            });
+        if let Some(message) = action_status {
+            *status = message;
+        }
+        result_state
+    }
+
+    fn egui_dashboard_ui(&mut self, ui: &mut egui::Ui, status: &mut String) {
         self.ensure_selection();
         let primary_response_id = self.selected_response_if_valid();
         let analysis = self.plan.analysis_summary(primary_response_id.as_ref());
@@ -111,7 +219,901 @@ impl ExperimentPlannerPanel {
             });
     }
 
+    fn build_operad_view(&self, width: f32) -> ExperimentOperadView {
+        let primary_response_id = self.selected_response_if_valid();
+        let analysis = self.plan.analysis_summary(primary_response_id.as_ref());
+        let size;
+        let mut document;
+
+        if self.is_blank_plan() {
+            let height = experiment_operad_view_height(width, 0, &[0]);
+            size = UiSize::new(width, height);
+            document = UiDocument::new(root_style(width, height));
+            let root = document.root;
+            document.set_node_visual(
+                root,
+                UiVisual::panel(
+                    ColorRgba::new(15, 18, 21, 255),
+                    Some(StrokeStyle::new(ColorRgba::new(39, 46, 52, 255), 1.0)),
+                    0.0,
+                ),
+            );
+            add_experiment_operad_header(
+                &mut document,
+                root,
+                "PROCESS ENGINEERING",
+                "DOE Planner",
+                "Plan factorial splits, capture responses, and track readiness for analysis",
+                "No experiment plan loaded",
+            );
+            add_experiment_operad_spacer(&mut document, root, OPERAD_GAP);
+            add_experiment_operad_section(
+                &mut document,
+                root,
+                width,
+                "experiment.empty",
+                "Experiment Plan",
+                "No experiment plan loaded",
+                &[],
+            );
+            return ExperimentOperadView { document, size };
+        }
+
+        let metrics = self.operad_metrics(&analysis);
+        let control_rows = self.operad_control_rows();
+        let factor_rows = self.operad_factor_rows();
+        let response_rows = self.operad_response_rows(&analysis);
+        let split_rows = self.operad_split_lot_rows();
+        let run_rows = self.operad_run_rows();
+        let selected_run_rows = self.operad_selected_run_rows();
+        let readiness_rows = self.operad_readiness_rows(&analysis);
+        let response_summary_rows = self.operad_response_summary_rows(&analysis);
+        let effect_rows = self.operad_effect_rows(&analysis);
+        let height = experiment_operad_view_height(
+            width,
+            metrics.len(),
+            &[
+                control_rows.len(),
+                factor_rows.len(),
+                response_rows.len(),
+                split_rows.len(),
+                run_rows.len(),
+                selected_run_rows.len(),
+                readiness_rows.len(),
+                response_summary_rows.len(),
+                effect_rows.len(),
+            ],
+        );
+        size = UiSize::new(width, height);
+        document = UiDocument::new(root_style(width, height));
+        let root = document.root;
+        document.set_node_visual(
+            root,
+            UiVisual::panel(
+                ColorRgba::new(15, 18, 21, 255),
+                Some(StrokeStyle::new(ColorRgba::new(39, 46, 52, 255), 1.0)),
+                0.0,
+            ),
+        );
+
+        add_experiment_operad_header(
+            &mut document,
+            root,
+            "PROCESS ENGINEERING",
+            "DOE Planner",
+            &self.plan.objective,
+            &format!(
+                "{} · {} · owner {} · {} run(s)",
+                self.plan.id,
+                self.plan.status.label(),
+                self.plan.owner,
+                self.plan.runs.len()
+            ),
+        );
+        add_experiment_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_experiment_operad_metric_grid(&mut document, root, width, &metrics);
+        add_experiment_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_experiment_operad_section(
+            &mut document,
+            root,
+            width,
+            "experiment.controls",
+            "Experiment Controls",
+            "No experiment controls available",
+            &control_rows,
+        );
+        add_experiment_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_experiment_operad_section(
+            &mut document,
+            root,
+            width,
+            "experiment.factors",
+            "Factor Split",
+            "No DOE factors defined",
+            &factor_rows,
+        );
+        add_experiment_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_experiment_operad_section(
+            &mut document,
+            root,
+            width,
+            "experiment.responses",
+            "Response Plan",
+            "No DOE responses defined",
+            &response_rows,
+        );
+        add_experiment_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_experiment_operad_section(
+            &mut document,
+            root,
+            width,
+            "experiment.splits",
+            "Split Lots",
+            "No split-lot assignments in this plan",
+            &split_rows,
+        );
+        add_experiment_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_experiment_operad_section(
+            &mut document,
+            root,
+            width,
+            "experiment.runs",
+            "Run Matrix",
+            "No runs match the active DOE filters",
+            &run_rows,
+        );
+        add_experiment_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_experiment_operad_section(
+            &mut document,
+            root,
+            width,
+            "experiment.selected_run",
+            "Selected Run",
+            "No run selected",
+            &selected_run_rows,
+        );
+        add_experiment_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_experiment_operad_section(
+            &mut document,
+            root,
+            width,
+            "experiment.readiness",
+            "Analysis Readiness",
+            "No analysis readiness available",
+            &readiness_rows,
+        );
+        add_experiment_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_experiment_operad_section(
+            &mut document,
+            root,
+            width,
+            "experiment.response_summary",
+            "Response Summary",
+            "No response values captured",
+            &response_summary_rows,
+        );
+        add_experiment_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_experiment_operad_section(
+            &mut document,
+            root,
+            width,
+            "experiment.effects",
+            &format!("Main Effects: {}", self.selected_response_label()),
+            "No main-effect data captured for the selected response",
+            &effect_rows,
+        );
+
+        ExperimentOperadView { document, size }
+    }
+
+    fn operad_metrics(&self, analysis: &ExperimentAnalysisSummary) -> Vec<ExperimentMetricTile> {
+        let total_values = analysis.run_count.saturating_mul(self.plan.responses.len());
+        let captured_values = total_values.saturating_sub(analysis.missing_response_count);
+        let progress = analysis_progress(analysis, self.plan.responses.len());
+        let split_count = self.split_lot_summaries().len();
+        vec![
+            ExperimentMetricTile {
+                label: "Runs".to_string(),
+                value: format!("{} / {}", analysis.completed_runs, analysis.run_count),
+                detail: format!(
+                    "{} pending response values",
+                    analysis.missing_response_count
+                ),
+                tone: if analysis.completed_runs == analysis.run_count && analysis.run_count > 0 {
+                    Tone::Success
+                } else {
+                    Tone::Warning
+                },
+            },
+            ExperimentMetricTile {
+                label: "Responses".to_string(),
+                value: format!("{captured_values} / {total_values}"),
+                detail: format!("{} response specs", self.plan.responses.len()),
+                tone: readiness_tone(analysis),
+            },
+            ExperimentMetricTile {
+                label: "Split lots".to_string(),
+                value: split_count.to_string(),
+                detail: format!("{} factor(s) in matrix", self.plan.factors.len()),
+                tone: Tone::Info,
+            },
+            ExperimentMetricTile {
+                label: "Readiness".to_string(),
+                value: format!("{:.0}%", progress * 100.0),
+                detail: readiness_label(analysis, self.plan.responses.len()),
+                tone: readiness_tone(analysis),
+            },
+            ExperimentMetricTile {
+                label: "Primary response".to_string(),
+                value: self.selected_response_label(),
+                detail: analysis
+                    .best_run_id
+                    .as_ref()
+                    .map(|run_id| format!("best observed run {run_id}"))
+                    .unwrap_or_else(|| "best run pending".to_string()),
+                tone: Tone::Info,
+            },
+            ExperimentMetricTile {
+                label: "Matrix".to_string(),
+                value: format!("{} factors", self.plan.factors.len()),
+                detail: format!(
+                    "{} run(s) after active filters",
+                    self.filtered_run_matrix_rows().len()
+                ),
+                tone: Tone::Neutral,
+            },
+        ]
+    }
+
+    fn operad_control_rows(&self) -> Vec<ExperimentOperadRow> {
+        let mut rows = vec![
+            experiment_operad_row(
+                "Queue next pending response",
+                format!(
+                    "Selects the next missing response after {}",
+                    self.selected_run_label()
+                ),
+                Tone::Info,
+                Some(OPERAD_ACTION_QUEUE_PENDING.to_string()),
+                false,
+            ),
+            experiment_operad_row(
+                "Capture next demo response",
+                "Fills one pending demo value and advances the selected run/response",
+                Tone::Warning,
+                Some(OPERAD_ACTION_CAPTURE_DEMO.to_string()),
+                false,
+            ),
+            experiment_operad_row(
+                if self.show_missing_only {
+                    "Detail pending only: on"
+                } else {
+                    "Detail pending only: off"
+                },
+                "Controls whether selected-run detail hides completed response values",
+                Tone::Neutral,
+                Some(OPERAD_ACTION_TOGGLE_MISSING.to_string()),
+                self.show_missing_only,
+            ),
+            experiment_operad_row(
+                "Clear filters",
+                format!(
+                    "Run filter {}, lot {}",
+                    self.run_filter.label(),
+                    self.lot_filter.as_deref().unwrap_or("all lots")
+                ),
+                Tone::Neutral,
+                Some(OPERAD_ACTION_CLEAR_FILTERS.to_string()),
+                false,
+            ),
+        ];
+        rows.extend(RunMatrixFilter::ALL.into_iter().map(|filter| {
+            experiment_operad_row(
+                format!("Run filter: {}", filter.label()),
+                format!("{} matching run(s)", self.filtered_run_count_for(filter)),
+                if self.run_filter == filter {
+                    Tone::Info
+                } else {
+                    Tone::Neutral
+                },
+                Some(format!(
+                    "{OPERAD_ACTION_SET_FILTER}{}|filter",
+                    filter.slug()
+                )),
+                self.run_filter == filter,
+            )
+        }));
+        rows
+    }
+
+    fn operad_factor_rows(&self) -> Vec<ExperimentOperadRow> {
+        self.plan
+            .factors
+            .iter()
+            .map(|factor| {
+                let levels = factor
+                    .levels
+                    .iter()
+                    .map(|level| {
+                        format!(
+                            "{}: {}",
+                            level.label,
+                            level.value_label(factor.unit.as_deref())
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                experiment_operad_row(
+                    format!("{} · {} level(s)", factor.name, factor.levels.len()),
+                    format!("{} · {levels}", factor.source.label()),
+                    Tone::Neutral,
+                    None,
+                    false,
+                )
+            })
+            .collect()
+    }
+
+    fn operad_response_rows(
+        &self,
+        analysis: &ExperimentAnalysisSummary,
+    ) -> Vec<ExperimentOperadRow> {
+        self.plan
+            .responses
+            .iter()
+            .map(|response| {
+                let stats = analysis
+                    .response_stats
+                    .iter()
+                    .find(|stat| stat.response_id == response.id);
+                let stat_detail = stats
+                    .map(|stat| {
+                        format!(
+                            "N {} / missing {} / mean {}",
+                            stat.sample_count,
+                            stat.missing_count,
+                            format_optional_number(stat.mean)
+                        )
+                    })
+                    .unwrap_or_else(|| "no captured values".to_string());
+                let selected = self.selected_response == response.id;
+                experiment_operad_row(
+                    format!("{} · {}", response.name, response.goal.label()),
+                    format!(
+                        "{} · {} · {}",
+                        response_spec_label(response),
+                        response.source.label(),
+                        stat_detail
+                    ),
+                    if selected {
+                        Tone::Info
+                    } else if stats.is_some_and(|stat| stat.missing_count == 0) {
+                        Tone::Success
+                    } else {
+                        Tone::Warning
+                    },
+                    Some(format!(
+                        "{OPERAD_ACTION_SELECT_RESPONSE}{}|response",
+                        response.id.as_str()
+                    )),
+                    selected,
+                )
+            })
+            .collect()
+    }
+
+    fn operad_split_lot_rows(&self) -> Vec<ExperimentOperadRow> {
+        self.split_lot_summaries()
+            .into_iter()
+            .map(|split| {
+                let selected = self.lot_filter.as_deref() == Some(split.lot_id.as_str());
+                experiment_operad_row(
+                    format!("{} · {}", split.lot_id, split.block),
+                    format!(
+                        "{} wafer(s), {} run(s), order {}-{}, {} pending, {} out of spec",
+                        split.wafer_ids.len(),
+                        split.run_count,
+                        split.min_order,
+                        split.max_order,
+                        split.pending_values,
+                        split.out_of_spec_count
+                    ),
+                    if split.out_of_spec_count > 0 {
+                        Tone::Danger
+                    } else if split.pending_values > 0 {
+                        Tone::Warning
+                    } else {
+                        Tone::Success
+                    },
+                    Some(format!("{OPERAD_ACTION_SELECT_LOT}{}|lot", split.lot_id)),
+                    selected,
+                )
+            })
+            .collect()
+    }
+
+    fn operad_run_rows(&self) -> Vec<ExperimentOperadRow> {
+        let rows = self.filtered_run_matrix_rows();
+        let mut operad_rows = rows
+            .iter()
+            .take(OPERAD_RUN_ROW_LIMIT)
+            .map(|row| {
+                let factor_detail = self
+                    .plan
+                    .factors
+                    .iter()
+                    .map(|factor| factor.name.as_str())
+                    .zip(row.factor_values.iter().map(String::as_str))
+                    .map(|(factor, value)| format!("{factor}: {value}"))
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                experiment_operad_row(
+                    format!("{} · {}", row.run_id, row.status),
+                    format!(
+                        "order {} · {} W{:02} · split {} · captured {} · primary {} · {}",
+                        row.run_order,
+                        row.wafer_id,
+                        row.slot,
+                        row.block,
+                        row.capture_summary,
+                        row.primary_value,
+                        factor_detail
+                    ),
+                    run_status_tone(row.status_kind),
+                    Some(format!("{OPERAD_ACTION_SELECT_RUN}{}|run", row.run_id)),
+                    row.selected,
+                )
+            })
+            .collect::<Vec<_>>();
+        if rows.len() > OPERAD_RUN_ROW_LIMIT {
+            operad_rows.push(experiment_operad_row(
+                format!(
+                    "Showing first {} of {} matching runs",
+                    OPERAD_RUN_ROW_LIMIT,
+                    rows.len()
+                ),
+                "Use the run and lot filters to narrow the matrix before inspecting individual runs",
+                Tone::Info,
+                None,
+                false,
+            ));
+        }
+        operad_rows
+    }
+
+    fn operad_selected_run_rows(&self) -> Vec<ExperimentOperadRow> {
+        let Some(run) = self
+            .selected_run
+            .as_ref()
+            .and_then(|run_id| self.plan.run(run_id))
+        else {
+            return Vec::new();
+        };
+        let mut rows = vec![
+            experiment_operad_row(
+                format!("Run {} · {}", run.id, run.status.label()),
+                format!(
+                    "{} / {} slot {} / order {} / split {}",
+                    run.assignment.lot_id,
+                    run.assignment.wafer_id,
+                    run.assignment.slot,
+                    run.assignment.run_order,
+                    run.assignment.block.as_deref().unwrap_or("unblocked")
+                ),
+                run_status_tone(run.status),
+                None,
+                false,
+            ),
+            experiment_operad_row(
+                "Execution context",
+                format!(
+                    "Recipe {} · tool {}",
+                    run.recipe
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| "unassigned".to_string()),
+                    run.tool_id
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| "unassigned".to_string())
+                ),
+                Tone::Neutral,
+                None,
+                false,
+            ),
+        ];
+        rows.extend(self.plan.factors.iter().map(|factor| {
+            experiment_operad_row(
+                format!("Factor: {}", factor.name),
+                self.plan.run_factor_label(run, factor),
+                Tone::Neutral,
+                None,
+                false,
+            )
+        }));
+        for response in &self.plan.responses {
+            let captured = run.responses.get(&response.id);
+            if self.show_missing_only && captured.is_some() {
+                continue;
+            }
+            let selected = self.selected_response == response.id;
+            match captured {
+                Some(value) => {
+                    let value_status = response.value_status(value.value);
+                    rows.push(experiment_operad_row(
+                        format!(
+                            "{} · {}",
+                            format_response_value(value.value, response),
+                            response.name
+                        ),
+                        format!(
+                            "{} · captured {} · {}",
+                            value_status.label(),
+                            value.captured_at,
+                            value
+                                .measurement_id
+                                .as_deref()
+                                .unwrap_or("no measurement id")
+                        ),
+                        response_value_tone(value_status),
+                        Some(format!(
+                            "{OPERAD_ACTION_SELECT_RESPONSE}{}|selected-run-response",
+                            response.id.as_str()
+                        )),
+                        selected,
+                    ));
+                }
+                None => rows.push(experiment_operad_row(
+                    format!("pending · {}", response.name),
+                    response_spec_label(response),
+                    Tone::Warning,
+                    Some(format!(
+                        "{OPERAD_ACTION_SELECT_RESPONSE}{}|selected-run-response",
+                        response.id.as_str()
+                    )),
+                    selected,
+                )),
+            }
+        }
+        rows
+    }
+
+    fn operad_readiness_rows(
+        &self,
+        analysis: &ExperimentAnalysisSummary,
+    ) -> Vec<ExperimentOperadRow> {
+        let progress = analysis_progress(analysis, self.plan.responses.len());
+        let primary_missing = self
+            .selected_response_if_valid()
+            .as_ref()
+            .map(|response_id| {
+                self.plan
+                    .runs
+                    .iter()
+                    .filter(|run| !run.responses.contains_key(response_id))
+                    .count()
+            })
+            .unwrap_or(0);
+        let mut rows = vec![
+            experiment_operad_row(
+                readiness_label(analysis, self.plan.responses.len()),
+                format!(
+                    "{:.0}% response matrix captured · {} complete runs · {} pending values",
+                    progress * 100.0,
+                    analysis.completed_runs,
+                    analysis.missing_response_count
+                ),
+                readiness_tone(analysis),
+                None,
+                false,
+            ),
+            experiment_operad_row(
+                "Primary response coverage",
+                format!(
+                    "{primary_missing} run(s) still need {} · {} level effect(s) observed",
+                    self.selected_response_label(),
+                    analysis.factor_effects.len()
+                ),
+                if primary_missing == 0 {
+                    Tone::Success
+                } else {
+                    Tone::Warning
+                },
+                None,
+                false,
+            ),
+        ];
+        if let Some(best_run_id) = &analysis.best_run_id {
+            rows.push(experiment_operad_row(
+                "Best observed run",
+                best_run_id.to_string(),
+                Tone::Info,
+                Some(format!(
+                    "{OPERAD_ACTION_SELECT_RUN}{}|best-run",
+                    best_run_id.as_str()
+                )),
+                self.selected_run.as_ref() == Some(best_run_id),
+            ));
+        }
+        rows.extend(
+            analysis.notes.iter().map(|note| {
+                experiment_operad_row("Analysis note", note, Tone::Neutral, None, false)
+            }),
+        );
+        rows
+    }
+
+    fn operad_response_summary_rows(
+        &self,
+        analysis: &ExperimentAnalysisSummary,
+    ) -> Vec<ExperimentOperadRow> {
+        analysis
+            .response_stats
+            .iter()
+            .map(|stat| {
+                let response = self.plan.response(&stat.response_id);
+                let title = response
+                    .map(|response| response.name.clone())
+                    .unwrap_or_else(|| stat.response_id.to_string());
+                let range = match (stat.min, stat.max) {
+                    (Some(min), Some(max)) => {
+                        format!(
+                            "{}..{}",
+                            format_compact_number(min),
+                            format_compact_number(max)
+                        )
+                    }
+                    _ => "-".to_string(),
+                };
+                experiment_operad_row(
+                    title,
+                    format!(
+                        "mean {} · std dev {} · range {} · N {} / missing {} · {}",
+                        format_optional_number(stat.mean),
+                        format_optional_number(stat.std_dev),
+                        range,
+                        stat.sample_count,
+                        stat.missing_count,
+                        response
+                            .map(response_spec_label)
+                            .unwrap_or_else(|| "no spec".to_string())
+                    ),
+                    if stat.missing_count == 0 {
+                        Tone::Success
+                    } else if stat.sample_count > 0 {
+                        Tone::Warning
+                    } else {
+                        Tone::Neutral
+                    },
+                    response.map(|response| {
+                        format!(
+                            "{OPERAD_ACTION_SELECT_RESPONSE}{}|response-summary",
+                            response.id.as_str()
+                        )
+                    }),
+                    response.is_some_and(|response| self.selected_response == response.id),
+                )
+            })
+            .collect()
+    }
+
+    fn operad_effect_rows(&self, analysis: &ExperimentAnalysisSummary) -> Vec<ExperimentOperadRow> {
+        let mut rows = analysis
+            .factor_effects
+            .iter()
+            .take(OPERAD_EFFECT_ROW_LIMIT)
+            .map(|effect| {
+                experiment_operad_row(
+                    format!("{} · {}", effect.factor_name, effect.level_label),
+                    format!(
+                        "mean {} · delta {} · N {}",
+                        format_compact_number(effect.mean_response),
+                        format_signed_number(effect.delta_from_overall),
+                        effect.sample_count
+                    ),
+                    if effect.delta_from_overall.abs() < 0.01 {
+                        Tone::Neutral
+                    } else {
+                        Tone::Info
+                    },
+                    None,
+                    false,
+                )
+            })
+            .collect::<Vec<_>>();
+        if analysis.factor_effects.len() > OPERAD_EFFECT_ROW_LIMIT {
+            rows.push(experiment_operad_row(
+                format!(
+                    "Showing first {} of {} level effects",
+                    OPERAD_EFFECT_ROW_LIMIT,
+                    analysis.factor_effects.len()
+                ),
+                "Narrow the primary response or inspect the detailed table for the full effect set",
+                Tone::Info,
+                None,
+                false,
+            ));
+        }
+        rows
+    }
+
+    fn filtered_run_count_for(&self, filter: RunMatrixFilter) -> usize {
+        self.run_matrix_rows()
+            .into_iter()
+            .filter(|row| {
+                self.lot_filter
+                    .as_deref()
+                    .is_none_or(|lot_id| row.lot_id == lot_id)
+            })
+            .filter(|row| filter.matches(row))
+            .count()
+    }
+
+    fn handle_operad_action(&mut self, node_name: &str) -> Option<String> {
+        if let Some(rest) = node_name.strip_prefix(OPERAD_ACTION_SELECT_RESPONSE) {
+            let response_id = ResponseSpecId::new(rest.split('|').next().unwrap_or_default());
+            if self.plan.response(&response_id).is_some() {
+                self.selected_response = response_id.clone();
+                return Some(format!("DOE primary response set to {response_id}"));
+            }
+            return None;
+        }
+        if let Some(rest) = node_name.strip_prefix(OPERAD_ACTION_SELECT_RUN) {
+            let run_id = ExperimentRunId::new(rest.split('|').next().unwrap_or_default());
+            if self.plan.run(&run_id).is_some() {
+                self.selected_run = Some(run_id.clone());
+                return Some(format!("DOE run selected: {run_id}"));
+            }
+            return None;
+        }
+        if let Some(rest) = node_name.strip_prefix(OPERAD_ACTION_SET_FILTER) {
+            let slug = rest.split('|').next().unwrap_or_default();
+            let filter = RunMatrixFilter::from_slug(slug)?;
+            self.run_filter = filter;
+            return Some(format!("DOE run filter set to {}", filter.label()));
+        }
+        if let Some(rest) = node_name.strip_prefix(OPERAD_ACTION_SELECT_LOT) {
+            let lot_id = rest.split('|').next().unwrap_or_default();
+            if self.lot_filter.as_deref() == Some(lot_id) {
+                self.lot_filter = None;
+                return Some("DOE lot filter cleared".to_string());
+            }
+            if self.lot_options().iter().any(|option| option == lot_id) {
+                self.lot_filter = Some(lot_id.to_string());
+                return Some(format!("DOE lot filter set to {lot_id}"));
+            }
+            return None;
+        }
+        match node_name {
+            OPERAD_ACTION_CLEAR_FILTERS => {
+                self.run_filter = RunMatrixFilter::All;
+                self.lot_filter = None;
+                self.show_missing_only = false;
+                Some("DOE filters cleared".to_string())
+            }
+            OPERAD_ACTION_TOGGLE_MISSING => {
+                self.show_missing_only = !self.show_missing_only;
+                Some(format!(
+                    "DOE pending-only detail {}",
+                    if self.show_missing_only {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                ))
+            }
+            OPERAD_ACTION_QUEUE_PENDING => {
+                let mut status = String::new();
+                self.queue_next_pending_response(&mut status);
+                Some(status)
+            }
+            OPERAD_ACTION_CAPTURE_DEMO => {
+                let mut status = String::new();
+                self.capture_next_demo_response(&mut status);
+                Some(status)
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn context_ui(&mut self, ui: &mut egui::Ui, status: &mut String) {
+        if self.operad_context_ui(ui).is_err() {
+            self.egui_context_ui(ui, status);
+        }
+    }
+
+    fn operad_context_ui(&mut self, ui: &mut egui::Ui) -> Result<(), String> {
+        self.ensure_selection();
+        if self.is_blank_plan() {
+            return render_sidecar(
+                ui,
+                "experiment.context",
+                &[SidecarSection::new("DOE Planner").empty("No experiment plan loaded")],
+            );
+        }
+        let primary_response_id = self.selected_response_if_valid();
+        let analysis = self.plan.analysis_summary(primary_response_id.as_ref());
+        let progress = analysis_progress(&analysis, self.plan.responses.len());
+        let pending_values = analysis.missing_response_count;
+        let mut sections = vec![
+            SidecarSection::new("DOE Planner")
+                .row(
+                    SidecarRow::new(
+                        &self.plan.title,
+                        format!("{} | {}", self.plan.id, self.plan.status.label()),
+                        Tone::Info,
+                    )
+                    .selected(true),
+                )
+                .row(SidecarRow::new(
+                    "FabOS Links",
+                    format!(
+                        "{} | {} | {}",
+                        self.plan.route_id, self.plan.step_id, self.plan.baseline_recipe
+                    ),
+                    Tone::Neutral,
+                )),
+            SidecarSection::new("Readiness")
+                .row(SidecarRow::new(
+                    format!("{:.0}% captured", progress * 100.0),
+                    readiness_label(&analysis, self.plan.responses.len()),
+                    if progress >= 1.0 {
+                        Tone::Success
+                    } else if pending_values > 0 {
+                        Tone::Warning
+                    } else {
+                        Tone::Info
+                    },
+                ))
+                .row(SidecarRow::new(
+                    "Runs / pending",
+                    format!(
+                        "{} runs | {pending_values} pending values",
+                        self.plan.runs.len()
+                    ),
+                    if pending_values > 0 {
+                        Tone::Warning
+                    } else {
+                        Tone::Success
+                    },
+                )),
+        ];
+        let mut splits = SidecarSection::new("Split Lots").empty("No split lots");
+        for split in self.split_lot_summaries().into_iter().take(4) {
+            splits = splits.row(SidecarRow::new(
+                split.lot_id,
+                format!(
+                    "{} wafers | {} runs | {} pending values",
+                    split.wafer_ids.len(),
+                    split.run_count,
+                    split.pending_values
+                ),
+                if split.pending_values > 0 {
+                    Tone::Warning
+                } else {
+                    Tone::Success
+                },
+            ));
+        }
+        sections.push(splits);
+        let mut responses = SidecarSection::new("Responses").empty("No responses");
+        for response in self.plan.responses.iter().take(4) {
+            responses = responses.row(SidecarRow::new(
+                &response.name,
+                format!(
+                    "{} | {} | {}",
+                    response.goal.label(),
+                    response.unit,
+                    response.source.label()
+                ),
+                Tone::Info,
+            ));
+        }
+        sections.push(responses);
+        render_sidecar(ui, "experiment.context", &sections)
+    }
+
+    fn egui_context_ui(&mut self, ui: &mut egui::Ui, status: &mut String) {
         self.ensure_selection();
         ui_chrome::section_label(ui, "DOE Planner");
         if self.is_blank_plan() {
@@ -1082,23 +2084,6 @@ impl ExperimentPlannerPanel {
     }
 }
 
-fn blank_experiment_plan() -> ExperimentPlan {
-    ExperimentPlan {
-        id: Default::default(),
-        title: "No experiment plan loaded".to_string(),
-        objective: String::new(),
-        owner: String::new(),
-        status: layout_model::experiment::ExperimentStatus::Draft,
-        route_id: ProcessRouteId::default(),
-        step_id: ProcessStepId::default(),
-        baseline_recipe: RecipeBinding::new("", 0),
-        factors: Vec::new(),
-        responses: Vec::new(),
-        runs: Vec::new(),
-        notes: Vec::new(),
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RunMatrixFilter {
     All,
@@ -1130,6 +2115,31 @@ impl RunMatrixFilter {
             Self::Complete => "Complete",
             Self::OutOfSpec => "Out of spec",
             Self::Blocked => "Blocked",
+        }
+    }
+
+    fn slug(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::NeedsAnyResponse => "needs-any-response",
+            Self::NeedsSelectedResponse => "needs-selected-response",
+            Self::InProgress => "in-progress",
+            Self::Complete => "complete",
+            Self::OutOfSpec => "out-of-spec",
+            Self::Blocked => "blocked",
+        }
+    }
+
+    fn from_slug(value: &str) -> Option<Self> {
+        match value {
+            "all" => Some(Self::All),
+            "needs-any-response" => Some(Self::NeedsAnyResponse),
+            "needs-selected-response" => Some(Self::NeedsSelectedResponse),
+            "in-progress" => Some(Self::InProgress),
+            "complete" => Some(Self::Complete),
+            "out-of-spec" => Some(Self::OutOfSpec),
+            "blocked" => Some(Self::Blocked),
+            _ => None,
         }
     }
 
@@ -1193,6 +2203,516 @@ impl SplitLotSummary {
             max_order: 0,
         }
     }
+}
+
+fn experiment_operad_view_height(width: f32, metric_count: usize, row_counts: &[usize]) -> f32 {
+    let mut height = OPERAD_HEADER_HEIGHT + OPERAD_GAP;
+    if metric_count > 0 {
+        height += experiment_operad_metric_grid_height(width, metric_count) + OPERAD_GAP;
+    }
+    for row_count in row_counts {
+        height += experiment_operad_section_height(*row_count) + OPERAD_GAP;
+    }
+    height + OPERAD_PAD
+}
+
+fn experiment_operad_metric_columns(width: f32) -> usize {
+    if width >= 1020.0 {
+        4
+    } else if width >= 680.0 {
+        3
+    } else if width >= 440.0 {
+        2
+    } else {
+        1
+    }
+}
+
+fn experiment_operad_metric_grid_height(width: f32, metric_count: usize) -> f32 {
+    if metric_count == 0 {
+        return 0.0;
+    }
+    let columns = experiment_operad_metric_columns(width).max(1);
+    let rows = metric_count.div_ceil(columns).max(1);
+    rows as f32 * OPERAD_METRIC_HEIGHT
+}
+
+fn experiment_operad_section_height(row_count: usize) -> f32 {
+    OPERAD_PAD * 2.0
+        + OPERAD_SECTION_TITLE_HEIGHT
+        + if row_count == 0 {
+            OPERAD_EMPTY_ROW_HEIGHT
+        } else {
+            row_count as f32 * OPERAD_ROW_HEIGHT
+        }
+}
+
+fn add_experiment_operad_header(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    eyebrow: &str,
+    title: &str,
+    detail: &str,
+    meta: &str,
+) {
+    let header = document.add_child(
+        parent,
+        UiNode::container(
+            "experiment.header",
+            UiNodeStyle {
+                layout: layout::with_padding_all(
+                    layout::with_size(
+                        layout::column(),
+                        layout::percent(1.0),
+                        layout::px(OPERAD_HEADER_HEIGHT),
+                    ),
+                    OPERAD_PAD,
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            ColorRgba::new(22, 27, 32, 255),
+            Some(StrokeStyle::new(ColorRgba::new(46, 55, 64, 255), 1.0)),
+            6.0,
+        )),
+    );
+    add_experiment_operad_text(
+        document,
+        header,
+        "experiment.header.eyebrow",
+        eyebrow,
+        experiment_operad_text_style(12.0, FontWeight::BOLD, ColorRgba::new(146, 154, 162, 255)),
+        16.0,
+    );
+    add_experiment_operad_text(
+        document,
+        header,
+        "experiment.header.title",
+        title,
+        experiment_operad_text_style(24.0, FontWeight::BOLD, ColorRgba::new(242, 246, 250, 255)),
+        30.0,
+    );
+    add_experiment_operad_text(
+        document,
+        header,
+        "experiment.header.detail",
+        truncate_middle(detail, 120),
+        experiment_operad_text_style(14.0, FontWeight::NORMAL, ColorRgba::new(178, 185, 194, 255)),
+        20.0,
+    );
+    add_experiment_operad_text(
+        document,
+        header,
+        "experiment.header.meta",
+        meta,
+        experiment_operad_text_style(13.0, FontWeight::NORMAL, ColorRgba::new(112, 183, 239, 255)),
+        18.0,
+    );
+}
+
+fn add_experiment_operad_metric_grid(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    width: f32,
+    metrics: &[ExperimentMetricTile],
+) {
+    if metrics.is_empty() {
+        return;
+    }
+    let columns = experiment_operad_metric_columns(width);
+    let grid_height = experiment_operad_metric_grid_height(width, metrics.len());
+    let grid = document.add_child(
+        parent,
+        UiNode::container(
+            "experiment.metrics",
+            UiNodeStyle {
+                layout: layout::with_size(
+                    layout::column(),
+                    layout::percent(1.0),
+                    layout::px(grid_height),
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        ),
+    );
+    let tile_width =
+        ((width - OPERAD_GAP * (columns.saturating_sub(1) as f32)) / columns as f32).max(120.0);
+    for (row_index, chunk) in metrics.chunks(columns).enumerate() {
+        let row = document.add_child(
+            grid,
+            UiNode::container(
+                format!("experiment.metrics.row.{row_index}"),
+                UiNodeStyle {
+                    layout: layout::with_size(
+                        layout::row(),
+                        layout::percent(1.0),
+                        layout::px(OPERAD_METRIC_HEIGHT),
+                    ),
+                    clip: ClipBehavior::Clip,
+                    ..Default::default()
+                },
+            ),
+        );
+        for (column, metric) in chunk.iter().enumerate() {
+            add_experiment_operad_metric_tile(
+                document,
+                row,
+                &format!("experiment.metrics.{row_index}.{column}"),
+                tile_width - 6.0,
+                metric,
+            );
+        }
+    }
+}
+
+fn add_experiment_operad_metric_tile(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    name: &str,
+    width: f32,
+    metric: &ExperimentMetricTile,
+) {
+    let tile = document.add_child(
+        parent,
+        UiNode::container(
+            name,
+            UiNodeStyle {
+                layout: layout::with_padding_all(
+                    layout::with_margin_all(
+                        layout::with_size(
+                            layout::column(),
+                            layout::px(width.max(116.0)),
+                            layout::px(OPERAD_METRIC_HEIGHT - 8.0),
+                        ),
+                        3.0,
+                    ),
+                    9.0,
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            ColorRgba::new(29, 35, 40, 255),
+            Some(StrokeStyle::new(
+                experiment_operad_tone_color(metric.tone),
+                1.0,
+            )),
+            6.0,
+        )),
+    );
+    add_experiment_operad_text(
+        document,
+        tile,
+        &format!("{name}.label"),
+        &metric.label,
+        experiment_operad_text_style(12.0, FontWeight::BOLD, ColorRgba::new(158, 166, 174, 255)),
+        18.0,
+    );
+    add_experiment_operad_text(
+        document,
+        tile,
+        &format!("{name}.value"),
+        truncate_middle(&metric.value, 42),
+        experiment_operad_text_style(20.0, FontWeight::BOLD, ColorRgba::new(239, 243, 247, 255)),
+        26.0,
+    );
+    add_experiment_operad_text(
+        document,
+        tile,
+        &format!("{name}.detail"),
+        truncate_middle(&metric.detail, 56),
+        experiment_operad_text_style(
+            12.0,
+            FontWeight::NORMAL,
+            experiment_operad_tone_color(metric.tone),
+        ),
+        18.0,
+    );
+}
+
+fn add_experiment_operad_section(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    width: f32,
+    name: &str,
+    title: &str,
+    empty: &str,
+    rows: &[ExperimentOperadRow],
+) {
+    let height = experiment_operad_section_height(rows.len());
+    let section = document.add_child(
+        parent,
+        UiNode::container(
+            name,
+            UiNodeStyle {
+                layout: layout::with_padding_all(
+                    layout::with_size(layout::column(), layout::percent(1.0), layout::px(height)),
+                    OPERAD_PAD,
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            ColorRgba::new(21, 26, 31, 255),
+            Some(StrokeStyle::new(ColorRgba::new(45, 53, 61, 255), 1.0)),
+            6.0,
+        )),
+    );
+    add_experiment_operad_text(
+        document,
+        section,
+        &format!("{name}.title"),
+        title,
+        experiment_operad_text_style(15.0, FontWeight::BOLD, ColorRgba::new(242, 246, 250, 255)),
+        OPERAD_SECTION_TITLE_HEIGHT,
+    );
+    if rows.is_empty() {
+        add_experiment_operad_empty_row(document, section, name, empty);
+    } else {
+        let row_width = (width - OPERAD_PAD * 2.0).max(240.0);
+        for (index, row) in rows.iter().enumerate() {
+            add_experiment_operad_data_row(document, section, name, index, row_width, row);
+        }
+    }
+}
+
+fn add_experiment_operad_empty_row(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    name: &str,
+    label: &str,
+) {
+    let row = document.add_child(
+        parent,
+        UiNode::container(
+            format!("{name}.empty"),
+            UiNodeStyle {
+                layout: layout::with_padding_all(
+                    layout::with_size(
+                        layout::row(),
+                        layout::percent(1.0),
+                        layout::px(OPERAD_EMPTY_ROW_HEIGHT),
+                    ),
+                    8.0,
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            ColorRgba::new(27, 32, 37, 255),
+            Some(StrokeStyle::new(ColorRgba::new(43, 50, 58, 255), 1.0)),
+            5.0,
+        )),
+    );
+    add_experiment_operad_text(
+        document,
+        row,
+        &format!("{name}.empty.label"),
+        label,
+        experiment_operad_text_style(13.0, FontWeight::NORMAL, ColorRgba::new(154, 163, 172, 255)),
+        24.0,
+    );
+}
+
+fn add_experiment_operad_data_row(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    section_name: &str,
+    index: usize,
+    row_width: f32,
+    row: &ExperimentOperadRow,
+) {
+    let row_name = row
+        .action_name
+        .clone()
+        .unwrap_or_else(|| format!("{section_name}.row.{index}"));
+    let stroke_color = if row.selected {
+        experiment_operad_tone_color(Tone::Info)
+    } else {
+        ColorRgba::new(42, 50, 58, 255)
+    };
+    let fill = if row.selected {
+        ColorRgba::new(26, 42, 56, 255)
+    } else {
+        ColorRgba::new(26, 31, 36, 255)
+    };
+    let mut node = UiNode::container(
+        row_name,
+        UiNodeStyle {
+            layout: layout::with_padding_all(
+                layout::with_size(
+                    layout::row(),
+                    layout::percent(1.0),
+                    layout::px(OPERAD_ROW_HEIGHT),
+                ),
+                6.0,
+            ),
+            clip: ClipBehavior::Clip,
+            ..Default::default()
+        },
+    )
+    .with_visual(UiVisual::panel(
+        fill,
+        Some(StrokeStyle::new(stroke_color, 1.0)),
+        4.0,
+    ));
+    if row.action_name.is_some() {
+        node = node.with_input(InputBehavior::BUTTON);
+    }
+    let row_node = document.add_child(parent, node);
+    document.add_child(
+        row_node,
+        UiNode::container(
+            format!("{section_name}.row.{index}.tone"),
+            UiNodeStyle {
+                layout: layout::fixed(5.0, OPERAD_ROW_HEIGHT - 12.0),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            experiment_operad_tone_color(row.tone),
+            None,
+            2.0,
+        )),
+    );
+    let text_column = document.add_child(
+        row_node,
+        UiNode::container(
+            format!("{section_name}.row.{index}.text"),
+            UiNodeStyle {
+                layout: layout::with_size(
+                    layout::column(),
+                    layout::px((row_width - 28.0).max(120.0)),
+                    layout::px(OPERAD_ROW_HEIGHT - 12.0),
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        ),
+    );
+    add_experiment_operad_text(
+        document,
+        text_column,
+        &format!("{section_name}.row.{index}.title"),
+        truncate_middle(&row.title, 78),
+        experiment_operad_text_style(14.0, FontWeight::BOLD, ColorRgba::new(232, 237, 242, 255)),
+        22.0,
+    );
+    add_experiment_operad_text(
+        document,
+        text_column,
+        &format!("{section_name}.row.{index}.detail"),
+        truncate_middle(&row.detail, 116),
+        experiment_operad_text_style(12.0, FontWeight::NORMAL, ColorRgba::new(162, 171, 180, 255)),
+        20.0,
+    );
+}
+
+fn add_experiment_operad_spacer(document: &mut UiDocument, parent: UiNodeId, height: f32) {
+    document.add_child(
+        parent,
+        UiNode::container(
+            format!("experiment.spacer.{}", document.node_count()),
+            UiNodeStyle {
+                layout: layout::with_size(layout::row(), layout::percent(1.0), layout::px(height)),
+                ..Default::default()
+            },
+        ),
+    );
+}
+
+fn add_experiment_operad_text(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    name: &str,
+    text: impl Into<String>,
+    style: TextStyle,
+    height: f32,
+) {
+    widgets::label(
+        document,
+        parent,
+        name,
+        text,
+        style,
+        layout::with_size(layout::row(), layout::percent(1.0), layout::px(height)),
+    );
+}
+
+fn experiment_operad_text_style(font_size: f32, weight: FontWeight, color: ColorRgba) -> TextStyle {
+    TextStyle {
+        font_size,
+        line_height: font_size + 4.0,
+        weight,
+        color,
+        wrap: TextWrap::None,
+        ..Default::default()
+    }
+}
+
+fn experiment_operad_tone_color(tone: Tone) -> ColorRgba {
+    let color = tone.color();
+    ColorRgba::new(color.r(), color.g(), color.b(), color.a())
+}
+
+fn experiment_operad_row(
+    title: impl Into<String>,
+    detail: impl Into<String>,
+    tone: Tone,
+    action_name: Option<String>,
+    selected: bool,
+) -> ExperimentOperadRow {
+    ExperimentOperadRow {
+        title: title.into(),
+        detail: detail.into(),
+        tone,
+        action_name,
+        selected,
+    }
+}
+
+fn run_status_tone(status: ExperimentRunStatus) -> Tone {
+    match status {
+        ExperimentRunStatus::Ready => Tone::Info,
+        ExperimentRunStatus::InProgress => Tone::Warning,
+        ExperimentRunStatus::Complete => Tone::Success,
+        ExperimentRunStatus::Blocked => Tone::Danger,
+    }
+}
+
+fn response_value_tone(status: ResponseValueStatus) -> Tone {
+    match status {
+        ResponseValueStatus::InSpec => Tone::Success,
+        ResponseValueStatus::BelowSpec | ResponseValueStatus::AboveSpec => Tone::Danger,
+    }
+}
+
+fn truncate_middle(text: impl AsRef<str>, max_chars: usize) -> String {
+    let text = text.as_ref();
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_string();
+    }
+    let keep = max_chars.saturating_sub(3);
+    let head = keep / 2;
+    let tail = keep - head;
+    let start = text.chars().take(head).collect::<String>();
+    let end = text
+        .chars()
+        .rev()
+        .take(tail)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!("{start}...{end}")
 }
 
 fn factor_card_ui(ui: &mut egui::Ui, factor: &ExperimentFactor, width: f32) {
@@ -1544,5 +3064,96 @@ fn delta_color(value: f64) -> Color32 {
         Color32::LIGHT_BLUE
     } else {
         Color32::LIGHT_RED
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn experiment_operad_view_audits_common_widths() {
+        let mut panel = ExperimentPlannerPanel::from_plan(ExperimentPlan::sample());
+        panel.ensure_selection();
+        for width in [360.0, 760.0, 1200.0] {
+            let mut view = panel.build_operad_view(width);
+            view.document
+                .compute_layout(view.size, &mut ApproxTextMeasurer)
+                .unwrap();
+            let warnings = view.document.audit_layout();
+            assert!(warnings.is_empty(), "{warnings:#?}");
+            assert!(view.document.node_count() > 20);
+            assert!(!view.document.paint_list().items.is_empty());
+        }
+    }
+
+    #[test]
+    fn experiment_operad_actions_update_panel_state() {
+        let mut panel = ExperimentPlannerPanel::from_plan(ExperimentPlan::sample());
+        let target_response = panel.plan.responses.last().unwrap().id.clone();
+        let target_run = panel.plan.runs.last().unwrap().id.clone();
+        let target_lot = panel.lot_options().last().unwrap().clone();
+
+        assert_eq!(
+            panel.handle_operad_action(&format!(
+                "{OPERAD_ACTION_SELECT_RESPONSE}{}|test",
+                target_response.as_str()
+            )),
+            Some(format!("DOE primary response set to {target_response}"))
+        );
+        assert_eq!(panel.selected_response, target_response);
+
+        assert_eq!(
+            panel.handle_operad_action(&format!(
+                "{OPERAD_ACTION_SELECT_RUN}{}|test",
+                target_run.as_str()
+            )),
+            Some(format!("DOE run selected: {target_run}"))
+        );
+        assert_eq!(panel.selected_run.as_ref(), Some(&target_run));
+
+        assert_eq!(
+            panel.handle_operad_action(&format!(
+                "{OPERAD_ACTION_SET_FILTER}{}|test",
+                RunMatrixFilter::NeedsSelectedResponse.slug()
+            )),
+            Some("DOE run filter set to Needs selected response".to_string())
+        );
+        assert_eq!(panel.run_filter, RunMatrixFilter::NeedsSelectedResponse);
+
+        assert_eq!(
+            panel.handle_operad_action(&format!("{OPERAD_ACTION_SELECT_LOT}{target_lot}|test")),
+            Some(format!("DOE lot filter set to {target_lot}"))
+        );
+        assert_eq!(panel.lot_filter.as_deref(), Some(target_lot.as_str()));
+
+        assert!(!panel.show_missing_only);
+        assert_eq!(
+            panel.handle_operad_action(OPERAD_ACTION_TOGGLE_MISSING),
+            Some("DOE pending-only detail enabled".to_string())
+        );
+        assert!(panel.show_missing_only);
+
+        assert_eq!(
+            panel.handle_operad_action(OPERAD_ACTION_CLEAR_FILTERS),
+            Some("DOE filters cleared".to_string())
+        );
+        assert_eq!(panel.run_filter, RunMatrixFilter::All);
+        assert!(panel.lot_filter.is_none());
+        assert!(!panel.show_missing_only);
+
+        let before_missing = panel
+            .plan
+            .analysis_summary(panel.selected_response_if_valid().as_ref())
+            .missing_response_count;
+        let message = panel
+            .handle_operad_action(OPERAD_ACTION_CAPTURE_DEMO)
+            .unwrap();
+        let after_missing = panel
+            .plan
+            .analysis_summary(panel.selected_response_if_valid().as_ref())
+            .missing_response_count;
+        assert!(message.starts_with("DOE: captured demo"));
+        assert!(after_missing < before_missing);
     }
 }

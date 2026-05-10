@@ -1,11 +1,13 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     error::Error,
     fmt,
 };
 
 use serde::{Deserialize, Serialize};
 use tracing::warn;
+
+use crate::{mes::FabMesData, recipe::RecipeCatalog};
 
 const MAX_SENSOR_HISTORY: usize = 192;
 const MAX_RUN_LOG: usize = 24;
@@ -1181,6 +1183,146 @@ pub struct EquipmentSimulator {
     pub now_s: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EquipmentValidationSeverity {
+    Error,
+    Warning,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EquipmentValidationFinding {
+    pub severity: EquipmentValidationSeverity,
+    pub message: String,
+}
+
+impl EquipmentValidationFinding {
+    fn error(message: impl Into<String>) -> Self {
+        Self {
+            severity: EquipmentValidationSeverity::Error,
+            message: message.into(),
+        }
+    }
+
+    fn warning(message: impl Into<String>) -> Self {
+        Self {
+            severity: EquipmentValidationSeverity::Warning,
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EquipmentValidationContext {
+    lot_routes: BTreeMap<String, String>,
+    lot_wafers: BTreeMap<String, BTreeSet<String>>,
+    route_steps: BTreeMap<String, BTreeSet<String>>,
+    route_step_recipes: BTreeMap<(String, String), String>,
+    recipe_versions: BTreeMap<String, BTreeSet<u32>>,
+}
+
+impl EquipmentValidationContext {
+    pub fn from_mes_and_recipe_catalog(mes: &FabMesData, recipes: &RecipeCatalog) -> Self {
+        let mut route_steps = BTreeMap::<String, BTreeSet<String>>::new();
+        let mut route_step_recipes = BTreeMap::new();
+        for route in mes.routes.values() {
+            let route_id = route.id.as_str().to_string();
+            let steps = route_steps.entry(route_id.clone()).or_default();
+            for step in &route.steps {
+                let step_id = step.id.as_str().to_string();
+                steps.insert(step_id.clone());
+                route_step_recipes.insert(
+                    (route_id.clone(), step_id),
+                    step.required_recipe.as_str().to_string(),
+                );
+            }
+        }
+
+        Self {
+            lot_routes: mes
+                .lots
+                .values()
+                .map(|lot| {
+                    (
+                        lot.id.as_str().to_string(),
+                        lot.route_id.as_str().to_string(),
+                    )
+                })
+                .collect(),
+            lot_wafers: mes
+                .lots
+                .values()
+                .map(|lot| {
+                    (
+                        lot.id.as_str().to_string(),
+                        lot.wafers
+                            .iter()
+                            .map(|wafer| wafer.id.as_str().to_string())
+                            .collect(),
+                    )
+                })
+                .collect(),
+            route_steps,
+            route_step_recipes,
+            recipe_versions: recipes
+                .recipes
+                .values()
+                .map(|recipe| {
+                    (
+                        recipe.id.as_str().to_string(),
+                        recipe
+                            .versions
+                            .iter()
+                            .map(|version| version.version.0)
+                            .collect(),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    fn contains_lot(&self, lot_id: &str) -> bool {
+        self.lot_routes.contains_key(lot_id)
+    }
+
+    fn contains_lot_wafer(&self, lot_id: &str, wafer_id: &str) -> bool {
+        self.lot_wafers
+            .get(lot_id)
+            .is_some_and(|wafers| wafers.contains(wafer_id))
+    }
+
+    fn lot_route(&self, lot_id: &str) -> Option<&str> {
+        self.lot_routes.get(lot_id).map(String::as_str)
+    }
+
+    fn contains_step_on_route(&self, route_id: &str, step_id: &str) -> bool {
+        self.route_steps
+            .get(route_id)
+            .is_some_and(|steps| steps.contains(step_id))
+    }
+
+    fn contains_step(&self, step_id: &str) -> bool {
+        self.route_steps
+            .values()
+            .any(|steps| steps.contains(step_id))
+    }
+
+    fn step_required_recipe(&self, route_id: &str, step_id: &str) -> Option<&str> {
+        self.route_step_recipes
+            .get(&(route_id.to_string(), step_id.to_string()))
+            .map(String::as_str)
+    }
+
+    fn contains_recipe(&self, recipe_id: &str) -> bool {
+        self.recipe_versions.contains_key(recipe_id)
+    }
+
+    fn contains_recipe_version(&self, recipe_id: &str, version: u32) -> bool {
+        self.recipe_versions
+            .get(recipe_id)
+            .is_some_and(|versions| versions.contains(&version))
+    }
+}
+
 impl EquipmentSimulator {
     pub fn new(tools: Vec<SyntheticTool>) -> Self {
         Self {
@@ -1216,7 +1358,7 @@ impl EquipmentSimulator {
             simulator.command(
                 &coat,
                 HostCommand::LoadRecipe {
-                    selection: simulator.selection_for(&coat, "COAT_PR_4000"),
+                    selection: simulator.selection_for(&coat, "SPIN_PR_3000"),
                 },
             ),
             "load coat recipe",
@@ -1271,6 +1413,10 @@ impl EquipmentSimulator {
 
     pub fn tool(&self, id: &ToolId) -> Option<&Tool> {
         self.tools.get(id).map(|tool| &tool.tool)
+    }
+
+    pub fn tool_mut(&mut self, id: &ToolId) -> Option<&mut Tool> {
+        self.tools.get_mut(id).map(|tool| &mut tool.tool)
     }
 
     pub fn command(
@@ -1332,15 +1478,528 @@ impl EquipmentSimulator {
             });
         let step = self
             .tool(id)
-            .map(|tool| process_step_for_kind(tool.kind).to_string());
+            .and_then(|tool| process_step_for_kind(tool.kind).map(str::to_string));
         RecipeSelection {
             recipe_id,
             recipe_version: version,
-            lot_id: Some("LOT-FABOS-0042".to_string()),
-            wafer_id: Some(format!("W{:02}", (self.now_s % 25) + 1)),
+            lot_id: Some("L-00042".to_string()),
+            wafer_id: Some(format!("L-00042-W{:02}", (self.now_s % 25) + 1)),
             process_step_id: step,
             operator: Some("sim-host".to_string()),
         }
+    }
+
+    pub fn validate(&self) -> Vec<EquipmentValidationFinding> {
+        let mut findings = Vec::new();
+        for (tool_id, synthetic) in &self.tools {
+            let tool = &synthetic.tool;
+            if tool_id != &tool.id {
+                findings.push(EquipmentValidationFinding::error(format!(
+                    "equipment tool map key {tool_id} does not match tool id {}",
+                    tool.id
+                )));
+            }
+            validate_tool(tool, self.now_s, &mut findings);
+        }
+        findings
+    }
+
+    pub fn validate_with_context(
+        &self,
+        context: &EquipmentValidationContext,
+    ) -> Vec<EquipmentValidationFinding> {
+        let mut findings = self.validate();
+        for tool in self.tools() {
+            validate_tool_context(tool, context, &mut findings);
+        }
+        findings
+    }
+}
+
+fn validate_tool(tool: &Tool, now_s: u64, findings: &mut Vec<EquipmentValidationFinding>) {
+    if tool.id.as_str().trim().is_empty() {
+        findings.push(EquipmentValidationFinding::error(
+            "equipment tool id is empty",
+        ));
+    }
+    if tool.name.trim().is_empty() {
+        findings.push(EquipmentValidationFinding::warning(format!(
+            "equipment tool {} has an empty name",
+            tool.id
+        )));
+    }
+    if tool.class != tool.kind.class() {
+        findings.push(EquipmentValidationFinding::error(format!(
+            "equipment tool {} class {} does not match kind {}",
+            tool.id,
+            tool.class.label(),
+            tool.kind.label()
+        )));
+    }
+
+    for (recipe_id, recipe) in &tool.available_recipes {
+        validate_recipe_key(tool, recipe_id, recipe, findings);
+    }
+    if let Some(selection) = tool.selected_recipe.as_ref() {
+        validate_recipe_selection(tool, selection, findings);
+    }
+
+    match tool.state {
+        ToolState::Running => match tool.active_run.as_ref() {
+            Some(run) if run.status == RunStatus::Running => {}
+            Some(run) => findings.push(EquipmentValidationFinding::error(format!(
+                "equipment tool {} is running but active run {} has status {}",
+                tool.id,
+                run.id,
+                run.status.label()
+            ))),
+            None => findings.push(EquipmentValidationFinding::error(format!(
+                "equipment tool {} is running without an active run",
+                tool.id
+            ))),
+        },
+        ToolState::Alarm => {
+            if !tool.active_alarms.iter().any(|alarm| alarm.active) {
+                findings.push(EquipmentValidationFinding::warning(format!(
+                    "equipment tool {} is alarmed without an active alarm",
+                    tool.id
+                )));
+            }
+        }
+        ToolState::Offline | ToolState::Maintenance => {
+            if tool.active_run.is_some() {
+                findings.push(EquipmentValidationFinding::error(format!(
+                    "equipment tool {} is {} but still has an active run",
+                    tool.id,
+                    tool.state.label()
+                )));
+            }
+        }
+        ToolState::OnlineIdle | ToolState::RecipeLoaded | ToolState::Completed => {}
+    }
+
+    let mut run_ids = BTreeSet::new();
+    if let Some(run) = tool.active_run.as_ref() {
+        validate_run(tool, run, true, now_s, findings);
+        if !run.id.as_str().trim().is_empty() {
+            run_ids.insert(run.id.clone());
+        }
+    }
+    for run in &tool.recent_runs {
+        if !run.id.as_str().trim().is_empty() && !run_ids.insert(run.id.clone()) {
+            findings.push(EquipmentValidationFinding::error(format!(
+                "equipment tool {} has duplicate run {}",
+                tool.id, run.id
+            )));
+        }
+        validate_run(tool, run, false, now_s, findings);
+    }
+
+    let mut alarm_ids = BTreeSet::new();
+    for alarm in &tool.active_alarms {
+        if alarm.id.trim().is_empty() {
+            findings.push(EquipmentValidationFinding::error(format!(
+                "equipment tool {} has an alarm with empty id",
+                tool.id
+            )));
+        } else if !alarm_ids.insert(alarm.id.clone()) {
+            findings.push(EquipmentValidationFinding::error(format!(
+                "equipment tool {} has duplicate alarm {}",
+                tool.id, alarm.id
+            )));
+        }
+        if alarm.tool_id != tool.id {
+            findings.push(EquipmentValidationFinding::error(format!(
+                "equipment alarm {} belongs to {} but is stored on {}",
+                alarm.id, alarm.tool_id, tool.id
+            )));
+        }
+        if !alarm.active && alarm.cleared_at_s.is_none() {
+            findings.push(EquipmentValidationFinding::warning(format!(
+                "equipment alarm {} is inactive without a clear timestamp",
+                alarm.id
+            )));
+        }
+        if alarm
+            .cleared_at_s
+            .is_some_and(|cleared| cleared < alarm.occurred_at_s)
+        {
+            findings.push(EquipmentValidationFinding::error(format!(
+                "equipment alarm {} clears before it occurs",
+                alarm.id
+            )));
+        }
+        if alarm.occurred_at_s > now_s || alarm.cleared_at_s.is_some_and(|cleared| cleared > now_s)
+        {
+            findings.push(EquipmentValidationFinding::warning(format!(
+                "equipment alarm {} is timestamped after simulator time {}",
+                alarm.id, now_s
+            )));
+        }
+    }
+
+    for sample in &tool.recent_sensors {
+        if sample.tool_id != tool.id {
+            findings.push(EquipmentValidationFinding::error(format!(
+                "equipment sensor sample {} belongs to {} but is stored on {}",
+                sample.name, sample.tool_id, tool.id
+            )));
+        }
+        if sample.name.trim().is_empty() || sample.unit.trim().is_empty() {
+            findings.push(EquipmentValidationFinding::warning(format!(
+                "equipment sensor sample on {} has incomplete metadata",
+                tool.id
+            )));
+        }
+        if !sample.value.is_finite() {
+            findings.push(EquipmentValidationFinding::error(format!(
+                "equipment sensor sample {} on {} has non-finite value",
+                sample.name, tool.id
+            )));
+        }
+        if sample.at_s > now_s {
+            findings.push(EquipmentValidationFinding::warning(format!(
+                "equipment sensor sample {} on {} is timestamped after simulator time {}",
+                sample.name, tool.id, now_s
+            )));
+        }
+    }
+
+    for entry in &tool.event_log {
+        if entry.tool_id != tool.id {
+            findings.push(EquipmentValidationFinding::error(format!(
+                "equipment log entry on {} belongs to {}",
+                tool.id, entry.tool_id
+            )));
+        }
+        if entry.message.trim().is_empty() {
+            findings.push(EquipmentValidationFinding::warning(format!(
+                "equipment log entry on {} has an empty message",
+                tool.id
+            )));
+        }
+        if entry.at_s > now_s {
+            findings.push(EquipmentValidationFinding::warning(format!(
+                "equipment log entry on {} is timestamped after simulator time {}",
+                tool.id, now_s
+            )));
+        }
+    }
+}
+
+fn validate_recipe_key(
+    tool: &Tool,
+    recipe_id: &RecipeId,
+    recipe: &Recipe,
+    findings: &mut Vec<EquipmentValidationFinding>,
+) {
+    if recipe_id != &recipe.id {
+        findings.push(EquipmentValidationFinding::error(format!(
+            "equipment tool {} recipe map key {recipe_id} does not match recipe id {}",
+            tool.id, recipe.id
+        )));
+    }
+    if recipe.id.as_str().trim().is_empty() {
+        findings.push(EquipmentValidationFinding::error(format!(
+            "equipment tool {} has recipe with empty id",
+            tool.id
+        )));
+    }
+    if recipe.tool_kind != tool.kind {
+        findings.push(EquipmentValidationFinding::error(format!(
+            "equipment recipe {} is for {} but is available on {}",
+            recipe.id,
+            recipe.tool_kind.label(),
+            tool.kind.label()
+        )));
+    }
+    if recipe.name.trim().is_empty() {
+        findings.push(EquipmentValidationFinding::warning(format!(
+            "equipment recipe {} has an empty name",
+            recipe.id
+        )));
+    }
+    if recipe.version == 0 || recipe.duration_s == 0 {
+        findings.push(EquipmentValidationFinding::error(format!(
+            "equipment recipe {} has zero version or duration",
+            recipe.id
+        )));
+    }
+    for (key, parameter) in &recipe.parameters {
+        if key.trim().is_empty() {
+            findings.push(EquipmentValidationFinding::warning(format!(
+                "equipment recipe {} has an empty parameter key",
+                recipe.id
+            )));
+        }
+        if let RecipeParameter::Number { value, unit } = parameter {
+            if !value.is_finite() {
+                findings.push(EquipmentValidationFinding::error(format!(
+                    "equipment recipe {} parameter {key} has non-finite value",
+                    recipe.id
+                )));
+            }
+            if unit.trim().is_empty() {
+                findings.push(EquipmentValidationFinding::warning(format!(
+                    "equipment recipe {} parameter {key} has an empty unit",
+                    recipe.id
+                )));
+            }
+        }
+    }
+}
+
+fn validate_recipe_selection(
+    tool: &Tool,
+    selection: &RecipeSelection,
+    findings: &mut Vec<EquipmentValidationFinding>,
+) {
+    match tool.available_recipes.get(&selection.recipe_id) {
+        Some(recipe) if recipe.version == selection.recipe_version => {}
+        Some(recipe) => findings.push(EquipmentValidationFinding::error(format!(
+            "equipment tool {} selected recipe {} version {} but available version is {}",
+            tool.id, selection.recipe_id, selection.recipe_version, recipe.version
+        ))),
+        None => findings.push(EquipmentValidationFinding::error(format!(
+            "equipment tool {} selected missing recipe {}",
+            tool.id, selection.recipe_id
+        ))),
+    }
+}
+
+fn validate_run(
+    tool: &Tool,
+    run: &ToolRun,
+    active: bool,
+    now_s: u64,
+    findings: &mut Vec<EquipmentValidationFinding>,
+) {
+    if run.id.as_str().trim().is_empty() {
+        findings.push(EquipmentValidationFinding::error(format!(
+            "equipment tool {} has run with empty id",
+            tool.id
+        )));
+    }
+    if run.tool_id != tool.id {
+        findings.push(EquipmentValidationFinding::error(format!(
+            "equipment run {} belongs to {} but is stored on {}",
+            run.id, run.tool_id, tool.id
+        )));
+    }
+    validate_recipe_selection(tool, &run.recipe, findings);
+    match run.status {
+        RunStatus::Running => {
+            if !active {
+                findings.push(EquipmentValidationFinding::warning(format!(
+                    "equipment completed run log contains running run {}",
+                    run.id
+                )));
+            }
+            if run.completed_at_s.is_some() {
+                findings.push(EquipmentValidationFinding::error(format!(
+                    "equipment running run {} has a completion timestamp",
+                    run.id
+                )));
+            }
+        }
+        RunStatus::Completed | RunStatus::Aborted | RunStatus::Alarmed => {
+            if run.completed_at_s.is_none() {
+                findings.push(EquipmentValidationFinding::error(format!(
+                    "equipment finished run {} has no completion timestamp",
+                    run.id
+                )));
+            }
+        }
+    }
+    if run
+        .completed_at_s
+        .is_some_and(|completed| completed < run.started_at_s)
+    {
+        findings.push(EquipmentValidationFinding::error(format!(
+            "equipment run {} completes before it starts",
+            run.id
+        )));
+    }
+    if run.started_at_s > now_s
+        || run
+            .completed_at_s
+            .is_some_and(|completed| completed > now_s)
+    {
+        findings.push(EquipmentValidationFinding::warning(format!(
+            "equipment run {} is timestamped after simulator time {}",
+            run.id, now_s
+        )));
+    }
+}
+
+fn validate_tool_context(
+    tool: &Tool,
+    context: &EquipmentValidationContext,
+    findings: &mut Vec<EquipmentValidationFinding>,
+) {
+    if let Some(selection) = tool.selected_recipe.as_ref() {
+        validate_recipe_selection_context(
+            &format!("equipment tool {} selected recipe", tool.id),
+            selection,
+            context,
+            findings,
+        );
+    }
+    if let Some(run) = tool.active_run.as_ref() {
+        validate_recipe_selection_context(
+            &format!("equipment active run {}", run.id),
+            &run.recipe,
+            context,
+            findings,
+        );
+    }
+    for run in &tool.recent_runs {
+        validate_recipe_selection_context(
+            &format!("equipment recent run {}", run.id),
+            &run.recipe,
+            context,
+            findings,
+        );
+    }
+}
+
+fn validate_recipe_selection_context(
+    context_label: &str,
+    selection: &RecipeSelection,
+    context: &EquipmentValidationContext,
+    findings: &mut Vec<EquipmentValidationFinding>,
+) {
+    let lot_id = selection
+        .lot_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|lot_id| !lot_id.is_empty());
+    let wafer_id = selection
+        .wafer_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|wafer_id| !wafer_id.is_empty());
+    let step_id = selection
+        .process_step_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|step_id| !step_id.is_empty());
+    let recipe_id = selection.recipe_id.as_str();
+
+    if let Some(lot_id) = lot_id {
+        if !context.contains_lot(lot_id) {
+            findings.push(EquipmentValidationFinding::error(format!(
+                "{context_label} references missing MES lot {lot_id}"
+            )));
+        }
+    } else if wafer_id.is_some() || step_id.is_some() {
+        findings.push(EquipmentValidationFinding::warning(format!(
+            "{context_label} has MES wafer or step metadata without a lot id"
+        )));
+    }
+
+    if let Some(wafer_id) = wafer_id {
+        match lot_id {
+            Some(lot_id) if context.contains_lot(lot_id) => {
+                if !context.contains_lot_wafer(lot_id, wafer_id) {
+                    findings.push(EquipmentValidationFinding::error(format!(
+                        "{context_label} references missing MES wafer {wafer_id} on lot {lot_id}"
+                    )));
+                }
+            }
+            Some(_) | None => {}
+        }
+    }
+
+    if let Some(step_id) = step_id {
+        match lot_id.and_then(|lot_id| context.lot_route(lot_id)) {
+            Some(route_id) if !context.contains_step_on_route(route_id, step_id) => {
+                findings.push(EquipmentValidationFinding::error(format!(
+                    "{context_label} references missing MES step {step_id} on route {route_id}"
+                )));
+                validate_selection_recipe_context(
+                    context_label,
+                    recipe_id,
+                    selection.recipe_version,
+                    None,
+                    context,
+                    findings,
+                );
+            }
+            Some(route_id) => {
+                validate_selection_recipe_context(
+                    context_label,
+                    recipe_id,
+                    selection.recipe_version,
+                    Some((route_id, step_id)),
+                    context,
+                    findings,
+                );
+            }
+            None if !context.contains_step(step_id) => {
+                findings.push(EquipmentValidationFinding::error(format!(
+                    "{context_label} references missing MES step {step_id}"
+                )));
+                validate_selection_recipe_context(
+                    context_label,
+                    recipe_id,
+                    selection.recipe_version,
+                    None,
+                    context,
+                    findings,
+                );
+            }
+            None => validate_selection_recipe_context(
+                context_label,
+                recipe_id,
+                selection.recipe_version,
+                None,
+                context,
+                findings,
+            ),
+        }
+    } else {
+        validate_selection_recipe_context(
+            context_label,
+            recipe_id,
+            selection.recipe_version,
+            None,
+            context,
+            findings,
+        );
+    }
+}
+
+fn validate_selection_recipe_context(
+    context_label: &str,
+    recipe_id: &str,
+    version: u32,
+    route_step: Option<(&str, &str)>,
+    context: &EquipmentValidationContext,
+    findings: &mut Vec<EquipmentValidationFinding>,
+) {
+    if recipe_id.trim().is_empty() {
+        return;
+    }
+
+    if context.contains_recipe(recipe_id) {
+        if !context.contains_recipe_version(recipe_id, version) {
+            findings.push(EquipmentValidationFinding::error(format!(
+                "{context_label} references missing recipe catalog binding {recipe_id} v{version}"
+            )));
+        }
+        if let Some((route_id, step_id)) = route_step
+            && let Some(required_recipe) = context.step_required_recipe(route_id, step_id)
+            && required_recipe != recipe_id
+        {
+            findings.push(EquipmentValidationFinding::error(format!(
+                "{context_label} recipe {recipe_id} does not match MES step {step_id} required recipe {required_recipe}"
+            )));
+        }
+    } else {
+        findings.push(EquipmentValidationFinding::warning(format!(
+            "{context_label} uses equipment-local recipe program {recipe_id}; no recipe catalog binding was found"
+        )));
     }
 }
 
@@ -1353,14 +2012,14 @@ fn log_demo_command(
     }
 }
 
-fn process_step_for_kind(kind: ToolKind) -> &'static str {
+fn process_step_for_kind(kind: ToolKind) -> Option<&'static str> {
     match kind {
-        ToolKind::SpinCoater => "litho.coat",
-        ToolKind::HotPlate => "litho.soft_bake",
-        ToolKind::MaskAligner => "litho.expose",
-        ToolKind::Etcher => "etch.pattern_transfer",
-        ToolKind::Microscope => "metrology.visual_inspection",
-        ToolKind::ProbeStation => "metrology.parametric_probe",
+        ToolKind::SpinCoater => Some("S010-COAT"),
+        ToolKind::HotPlate => None,
+        ToolKind::MaskAligner => Some("S020-EXPOSE"),
+        ToolKind::Etcher => Some("S040-ETCH"),
+        ToolKind::Microscope => Some("S050-CD-METRO"),
+        ToolKind::ProbeStation => None,
     }
 }
 
@@ -1384,7 +2043,7 @@ fn spin_coater_recipes() -> Vec<Recipe> {
             ],
         ),
         recipe(
-            "COAT_PR_3000",
+            "SPIN_PR_3000",
             "Positive PR 3000 rpm",
             ToolKind::SpinCoater,
             1,
@@ -1617,6 +2276,173 @@ mod tests {
                 5,
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn demo_equipment_simulator_validates() {
+        let simulator = EquipmentSimulator::demo_fab();
+
+        assert_eq!(simulator.validate(), Vec::new());
+    }
+
+    fn workspace_context() -> EquipmentValidationContext {
+        EquipmentValidationContext::from_mes_and_recipe_catalog(
+            &crate::mes::FabMesData::sample(),
+            &crate::recipe::RecipeCatalog::sample(),
+        )
+    }
+
+    #[test]
+    fn demo_equipment_simulator_validates_against_workspace_context() {
+        let simulator = EquipmentSimulator::demo_fab();
+        let findings = simulator.validate_with_context(&workspace_context());
+
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.severity != EquipmentValidationSeverity::Error),
+            "{findings:?}"
+        );
+        assert!(
+            findings.iter().any(|finding| {
+                finding
+                    .message
+                    .contains("equipment-local recipe program BAKE_SOFT_095C")
+            }),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn validation_context_rejects_missing_mes_and_recipe_catalog_references() {
+        let mut simulator = EquipmentSimulator::demo_fab();
+        let coat = simulator.tool_mut(&ToolId::new("COAT-01")).unwrap();
+        let run = coat.active_run.as_mut().unwrap();
+        run.recipe.lot_id = Some("L-00042".to_string());
+        run.recipe.wafer_id = Some("L-00042-W99".to_string());
+        run.recipe.process_step_id = Some("S999-MISSING".to_string());
+        run.recipe.recipe_id = RecipeId::new("SPIN_PR_3000");
+        run.recipe.recipe_version = 99;
+
+        let findings = simulator.validate_with_context(&workspace_context());
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| { finding.message.contains("missing MES wafer L-00042-W99") }),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("missing MES step S999-MISSING")),
+            "{findings:?}"
+        );
+        assert!(
+            findings.iter().any(|finding| {
+                finding
+                    .message
+                    .contains("missing recipe catalog binding SPIN_PR_3000 v99")
+            }),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn validation_rejects_broken_tool_recipe_run_alarm_and_sensor_state() {
+        let mut simulator = EquipmentSimulator::demo_fab();
+        let future_s = simulator.now_s + 100;
+        let coat = simulator.tools.get_mut(&ToolId::new("COAT-01")).unwrap();
+        coat.tool.class = ToolClass::Etch;
+        coat.tool.selected_recipe = Some(RecipeSelection::new("MISSING_RECIPE", 1));
+        let duplicate_active_run = {
+            let run = coat.tool.active_run.as_mut().unwrap();
+            run.completed_at_s = Some(0);
+            run.recipe.recipe_id = RecipeId::new("MISSING_RECIPE");
+            run.clone()
+        };
+        coat.tool.recent_runs.push(duplicate_active_run);
+        coat.tool.active_alarms.push(Alarm {
+            id: "bad-alarm".to_string(),
+            tool_id: ToolId::new("OTHER"),
+            code: "BAD".to_string(),
+            message: "bad alarm".to_string(),
+            severity: AlarmSeverity::Warning,
+            active: false,
+            occurred_at_s: future_s,
+            cleared_at_s: Some(future_s - 1),
+        });
+        coat.tool.recent_sensors.push_back(SensorSample {
+            tool_id: ToolId::new("COAT-01"),
+            at_s: future_s,
+            name: "bad".to_string(),
+            value: f64::NAN,
+            unit: "rpm".to_string(),
+        });
+        coat.tool.event_log.push(ToolLogEntry {
+            at_s: future_s,
+            tool_id: ToolId::new("COAT-01"),
+            message: "future log".to_string(),
+        });
+
+        let findings = simulator.validate();
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("class Etch does not match kind")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("selected missing recipe")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("running run")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("duplicate run")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("clears before it occurs")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("non-finite value")),
+            "{findings:?}"
+        );
+        assert!(
+            findings.iter().any(|finding| finding
+                .message
+                .contains("alarm bad-alarm is timestamped after")),
+            "{findings:?}"
+        );
+        assert!(
+            findings.iter().any(|finding| {
+                finding
+                    .message
+                    .contains("sensor sample bad on COAT-01 is timestamped after")
+            }),
+            "{findings:?}"
+        );
+        assert!(
+            findings.iter().any(|finding| finding
+                .message
+                .contains("log entry on COAT-01 is timestamped after")),
+            "{findings:?}"
         );
     }
 }

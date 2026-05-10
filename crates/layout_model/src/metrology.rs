@@ -1,3 +1,5 @@
+use std::collections::{BTreeMap, BTreeSet};
+
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -256,6 +258,78 @@ pub struct WaferMap {
     pub annotations: Vec<InspectionAnnotation>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MetrologyValidationSeverity {
+    Error,
+    Warning,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MetrologyValidationFinding {
+    pub severity: MetrologyValidationSeverity,
+    pub message: String,
+}
+
+impl MetrologyValidationFinding {
+    fn error(message: impl Into<String>) -> Self {
+        Self {
+            severity: MetrologyValidationSeverity::Error,
+            message: message.into(),
+        }
+    }
+
+    fn warning(message: impl Into<String>) -> Self {
+        Self {
+            severity: MetrologyValidationSeverity::Warning,
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MetrologyValidationContext {
+    pub lot_ids: BTreeSet<String>,
+    pub wafer_ids_by_lot: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl MetrologyValidationContext {
+    pub fn from_mes_and_lot_wafers<I, J>(mes: &crate::mes::FabMesData, lot_wafers: I) -> Self
+    where
+        I: IntoIterator<Item = (String, J)>,
+        J: IntoIterator<Item = String>,
+    {
+        let mut context = Self::default();
+        for (lot_id, lot) in &mes.lots {
+            let lot_id = lot_id.as_str().to_string();
+            context.lot_ids.insert(lot_id.clone());
+            let wafer_ids = context.wafer_ids_by_lot.entry(lot_id).or_default();
+            for wafer in &lot.wafers {
+                wafer_ids.insert(wafer.id.as_str().to_string());
+                wafer_ids.insert(format!("W{:02}", wafer.slot));
+            }
+        }
+        for (lot_id, wafer_ids) in lot_wafers {
+            context.lot_ids.insert(lot_id.clone());
+            context
+                .wafer_ids_by_lot
+                .entry(lot_id)
+                .or_default()
+                .extend(wafer_ids);
+        }
+        context
+    }
+
+    fn contains_lot(&self, lot_id: &str) -> bool {
+        self.lot_ids.contains(lot_id)
+    }
+
+    fn contains_wafer(&self, lot_id: &str, wafer_id: &str) -> bool {
+        self.wafer_ids_by_lot
+            .get(lot_id)
+            .is_some_and(|wafer_ids| wafer_ids.contains(wafer_id))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MeasurementSummary {
     pub kind: MeasurementKind,
@@ -415,6 +489,122 @@ impl WaferMap {
         self.measurements
             .iter()
             .filter(move |measurement| measurement.die == die)
+    }
+
+    pub fn validate(&self) -> Vec<MetrologyValidationFinding> {
+        let mut findings = Vec::new();
+        self.validate_internal(&mut findings);
+        findings
+    }
+
+    pub fn validate_with_context(
+        &self,
+        context: &MetrologyValidationContext,
+    ) -> Vec<MetrologyValidationFinding> {
+        let mut findings = self.validate();
+        self.validate_context_links(context, &mut findings);
+        findings
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.validate()
+            .iter()
+            .all(|finding| finding.severity != MetrologyValidationSeverity::Error)
+    }
+
+    fn validate_internal(&self, findings: &mut Vec<MetrologyValidationFinding>) {
+        validate_geometry(self.geometry, findings);
+        if self.id.trim().is_empty()
+            && (!self.dies.is_empty()
+                || !self.measurements.is_empty()
+                || !self.defects.is_empty()
+                || !self.annotations.is_empty())
+        {
+            findings.push(MetrologyValidationFinding::warning(
+                "metrology wafer map has data but no id",
+            ));
+        }
+
+        let mut die_set = BTreeSet::new();
+        for die in &self.dies {
+            if !die_set.insert(*die) {
+                findings.push(MetrologyValidationFinding::error(format!(
+                    "metrology wafer map {} contains duplicate die C{} R{}",
+                    self.display_id(),
+                    die.column,
+                    die.row
+                )));
+            }
+            if !self.geometry.contains_die_center(*die) {
+                findings.push(MetrologyValidationFinding::error(format!(
+                    "metrology wafer map {} die C{} R{} is outside active wafer radius",
+                    self.display_id(),
+                    die.column,
+                    die.row
+                )));
+            }
+        }
+
+        let mut measurement_ids = BTreeSet::new();
+        let mut measurement_slots = BTreeSet::new();
+        for measurement in &self.measurements {
+            validate_measurement(
+                self,
+                measurement,
+                &die_set,
+                &mut measurement_ids,
+                &mut measurement_slots,
+                findings,
+            );
+        }
+
+        let mut defect_ids = BTreeSet::new();
+        for defect in &self.defects {
+            validate_defect(
+                self,
+                defect,
+                &die_set,
+                &measurement_ids,
+                &mut defect_ids,
+                findings,
+            );
+        }
+
+        let mut annotation_ids = BTreeSet::new();
+        for annotation in &self.annotations {
+            validate_annotation(
+                self,
+                annotation,
+                &die_set,
+                &measurement_ids,
+                &mut annotation_ids,
+                findings,
+            );
+        }
+    }
+
+    fn validate_context_links(
+        &self,
+        context: &MetrologyValidationContext,
+        findings: &mut Vec<MetrologyValidationFinding>,
+    ) {
+        validate_fab_links(context, &self.links, "wafer map", findings);
+        for measurement in &self.measurements {
+            validate_fab_links(
+                context,
+                &measurement.links,
+                &format!("metrology measurement {}", measurement.id),
+                findings,
+            );
+        }
+    }
+
+    fn display_id(&self) -> &str {
+        if self.id.trim().is_empty() {
+            "unnamed"
+        } else {
+            self.id.as_str()
+        }
     }
 
     pub fn defects_for_die(&self, die: DieCoord) -> impl Iterator<Item = &Defect> {
@@ -597,6 +787,254 @@ impl WaferMap {
     }
 }
 
+fn validate_geometry(geometry: WaferGeometry, findings: &mut Vec<MetrologyValidationFinding>) {
+    for (label, value) in [
+        ("wafer diameter", geometry.diameter_mm),
+        ("edge exclusion", geometry.edge_exclusion_mm),
+        ("die pitch x", geometry.die_pitch_mm[0]),
+        ("die pitch y", geometry.die_pitch_mm[1]),
+        ("die size x", geometry.die_size_mm[0]),
+        ("die size y", geometry.die_size_mm[1]),
+    ] {
+        if !value.is_finite() {
+            findings.push(MetrologyValidationFinding::error(format!(
+                "metrology geometry {label} must be finite"
+            )));
+        }
+    }
+    if geometry.diameter_mm <= 0.0 {
+        findings.push(MetrologyValidationFinding::error(
+            "metrology geometry wafer diameter must be positive",
+        ));
+    }
+    if geometry.edge_exclusion_mm < 0.0 {
+        findings.push(MetrologyValidationFinding::error(
+            "metrology geometry edge exclusion must be non-negative",
+        ));
+    }
+    if geometry.die_pitch_mm.iter().any(|value| *value <= 0.0) {
+        findings.push(MetrologyValidationFinding::error(
+            "metrology geometry die pitch must be positive",
+        ));
+    }
+    if geometry.die_size_mm.iter().any(|value| *value <= 0.0) {
+        findings.push(MetrologyValidationFinding::error(
+            "metrology geometry die size must be positive",
+        ));
+    }
+    if geometry.active_radius_mm() <= 0.0 {
+        findings.push(MetrologyValidationFinding::error(
+            "metrology geometry active wafer radius must be positive",
+        ));
+    }
+}
+
+fn validate_measurement(
+    map: &WaferMap,
+    measurement: &Measurement,
+    die_set: &BTreeSet<DieCoord>,
+    measurement_ids: &mut BTreeSet<String>,
+    measurement_slots: &mut BTreeSet<(DieCoord, MeasurementKind)>,
+    findings: &mut Vec<MetrologyValidationFinding>,
+) {
+    if measurement.id.trim().is_empty() {
+        findings.push(MetrologyValidationFinding::error(format!(
+            "metrology wafer map {} contains measurement with empty id",
+            map.display_id()
+        )));
+    } else if !measurement_ids.insert(measurement.id.clone()) {
+        findings.push(MetrologyValidationFinding::error(format!(
+            "metrology wafer map {} contains duplicate measurement {}",
+            map.display_id(),
+            measurement.id
+        )));
+    }
+    if !measurement_slots.insert((measurement.die, measurement.kind)) {
+        findings.push(MetrologyValidationFinding::error(format!(
+            "metrology wafer map {} contains duplicate {} measurement for die C{} R{}",
+            map.display_id(),
+            measurement.kind.label(),
+            measurement.die.column,
+            measurement.die.row
+        )));
+    }
+    if !die_set.contains(&measurement.die) {
+        findings.push(MetrologyValidationFinding::error(format!(
+            "metrology measurement {} references missing die C{} R{}",
+            measurement.id, measurement.die.column, measurement.die.row
+        )));
+    }
+    if !measurement.value.is_finite() {
+        findings.push(MetrologyValidationFinding::error(format!(
+            "metrology measurement {} has non-finite value",
+            measurement.id
+        )));
+    } else {
+        validate_measurement_status(measurement, findings);
+    }
+    validate_links_match_map(map, &measurement.links, &measurement.id, findings);
+}
+
+fn validate_measurement_status(
+    measurement: &Measurement,
+    findings: &mut Vec<MetrologyValidationFinding>,
+) {
+    let expected = classify_value(measurement.kind, measurement.value, None);
+    if expected == MeasurementStatus::Fail && measurement.status != MeasurementStatus::Fail {
+        findings.push(MetrologyValidationFinding::error(format!(
+            "metrology measurement {} status {} does not match hard-spec failure",
+            measurement.id,
+            measurement.status.label()
+        )));
+    }
+}
+
+fn validate_defect(
+    map: &WaferMap,
+    defect: &Defect,
+    die_set: &BTreeSet<DieCoord>,
+    measurement_ids: &BTreeSet<String>,
+    defect_ids: &mut BTreeSet<String>,
+    findings: &mut Vec<MetrologyValidationFinding>,
+) {
+    if defect.id.trim().is_empty() {
+        findings.push(MetrologyValidationFinding::error(format!(
+            "metrology wafer map {} contains defect with empty id",
+            map.display_id()
+        )));
+    } else if !defect_ids.insert(defect.id.clone()) {
+        findings.push(MetrologyValidationFinding::error(format!(
+            "metrology wafer map {} contains duplicate defect {}",
+            map.display_id(),
+            defect.id
+        )));
+    }
+    if !die_set.contains(&defect.die) {
+        findings.push(MetrologyValidationFinding::error(format!(
+            "metrology defect {} references missing die C{} R{}",
+            defect.id, defect.die.column, defect.die.row
+        )));
+    }
+    if defect.position_mm.iter().any(|value| !value.is_finite()) {
+        findings.push(MetrologyValidationFinding::error(format!(
+            "metrology defect {} has non-finite position",
+            defect.id
+        )));
+    }
+    if !defect.size_um.is_finite() || defect.size_um < 0.0 {
+        findings.push(MetrologyValidationFinding::error(format!(
+            "metrology defect {} has invalid size",
+            defect.id
+        )));
+    }
+    if let Some(measurement_id) = &defect.linked_measurement_id
+        && !measurement_ids.contains(measurement_id)
+    {
+        findings.push(MetrologyValidationFinding::error(format!(
+            "metrology defect {} references missing measurement {measurement_id}",
+            defect.id
+        )));
+    }
+}
+
+fn validate_annotation(
+    map: &WaferMap,
+    annotation: &InspectionAnnotation,
+    die_set: &BTreeSet<DieCoord>,
+    measurement_ids: &BTreeSet<String>,
+    annotation_ids: &mut BTreeSet<String>,
+    findings: &mut Vec<MetrologyValidationFinding>,
+) {
+    if annotation.id.trim().is_empty() {
+        findings.push(MetrologyValidationFinding::error(format!(
+            "metrology wafer map {} contains annotation with empty id",
+            map.display_id()
+        )));
+    } else if !annotation_ids.insert(annotation.id.clone()) {
+        findings.push(MetrologyValidationFinding::error(format!(
+            "metrology wafer map {} contains duplicate annotation {}",
+            map.display_id(),
+            annotation.id
+        )));
+    }
+    if let Some(die) = annotation.die
+        && !die_set.contains(&die)
+    {
+        findings.push(MetrologyValidationFinding::error(format!(
+            "metrology annotation {} references missing die C{} R{}",
+            annotation.id, die.column, die.row
+        )));
+    }
+    if annotation
+        .position_mm
+        .iter()
+        .any(|value| !value.is_finite())
+    {
+        findings.push(MetrologyValidationFinding::error(format!(
+            "metrology annotation {} has non-finite position",
+            annotation.id
+        )));
+    }
+    if let Some(measurement_id) = &annotation.linked_measurement_id
+        && !measurement_ids.contains(measurement_id)
+    {
+        findings.push(MetrologyValidationFinding::error(format!(
+            "metrology annotation {} references missing measurement {measurement_id}",
+            annotation.id
+        )));
+    }
+    if annotation.note.trim().is_empty() {
+        findings.push(MetrologyValidationFinding::warning(format!(
+            "metrology annotation {} has no note",
+            annotation.id
+        )));
+    }
+}
+
+fn validate_links_match_map(
+    map: &WaferMap,
+    links: &FabObjectLinks,
+    measurement_id: &str,
+    findings: &mut Vec<MetrologyValidationFinding>,
+) {
+    if !map.links.lot_id.trim().is_empty() && links.lot_id != map.links.lot_id {
+        findings.push(MetrologyValidationFinding::error(format!(
+            "metrology measurement {measurement_id} lot {} does not match wafer map lot {}",
+            links.lot_id, map.links.lot_id
+        )));
+    }
+    if !map.links.wafer_id.trim().is_empty() && links.wafer_id != map.links.wafer_id {
+        findings.push(MetrologyValidationFinding::error(format!(
+            "metrology measurement {measurement_id} wafer {} does not match wafer map wafer {}",
+            links.wafer_id, map.links.wafer_id
+        )));
+    }
+}
+
+fn validate_fab_links(
+    context: &MetrologyValidationContext,
+    links: &FabObjectLinks,
+    label: &str,
+    findings: &mut Vec<MetrologyValidationFinding>,
+) {
+    let lot_id = links.lot_id.trim();
+    if lot_id.is_empty() {
+        return;
+    }
+    if !context.contains_lot(lot_id) {
+        findings.push(MetrologyValidationFinding::error(format!(
+            "{label} references missing lot {lot_id}"
+        )));
+        return;
+    }
+    let wafer_id = links.wafer_id.trim();
+    if !wafer_id.is_empty() && !context.contains_wafer(lot_id, wafer_id) {
+        findings.push(MetrologyValidationFinding::error(format!(
+            "{label} references missing wafer {lot_id}/{wafer_id}"
+        )));
+    }
+}
+
 pub fn classify_value(
     kind: MeasurementKind,
     value: f64,
@@ -724,6 +1162,153 @@ fn stable_hash(die: DieCoord, salt: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn validation_context() -> MetrologyValidationContext {
+        MetrologyValidationContext::from_mes_and_lot_wafers(
+            &crate::mes::FabMesData::sample(),
+            std::iter::empty::<(String, Vec<String>)>(),
+        )
+    }
+
+    fn has_validation_error(findings: &[MetrologyValidationFinding], needle: &str) -> bool {
+        findings.iter().any(|finding| {
+            finding.severity == MetrologyValidationSeverity::Error
+                && finding.message.contains(needle)
+        })
+    }
+
+    #[test]
+    fn synthetic_wafer_map_validates_with_mes_context() {
+        let map = WaferMap::synthetic_demo();
+        let findings = map.validate_with_context(&validation_context());
+
+        assert!(findings.is_empty(), "{findings:?}");
+        assert!(map.is_valid());
+    }
+
+    #[test]
+    fn wafer_map_validation_rejects_geometry_and_missing_die_links() {
+        let mut map = WaferMap::synthetic_demo();
+        map.geometry.die_pitch_mm[0] = 0.0;
+        let mut measurement = map.measurements[0].clone();
+        measurement.id = "MISSING-DIE".to_string();
+        measurement.die = DieCoord::new(999, 999);
+        measurement.value = f64::NAN;
+        map.measurements.push(measurement);
+        let mut duplicate_slot = map.measurements[0].clone();
+        duplicate_slot.id = "DUPLICATE-SLOT".to_string();
+        map.measurements.push(duplicate_slot);
+
+        let findings = map.validate();
+
+        assert!(has_validation_error(
+            &findings,
+            "metrology geometry die pitch must be positive"
+        ));
+        assert!(has_validation_error(
+            &findings,
+            "metrology measurement MISSING-DIE references missing die C999 R999"
+        ));
+        assert!(has_validation_error(
+            &findings,
+            "metrology measurement MISSING-DIE has non-finite value"
+        ));
+        assert!(has_validation_error(
+            &findings,
+            "duplicate Thickness measurement"
+        ));
+    }
+
+    #[test]
+    fn wafer_map_validation_rejects_stale_hard_spec_status() {
+        let mut map = WaferMap::synthetic_demo();
+        let measurement = map
+            .measurements
+            .iter_mut()
+            .find(|measurement| measurement.kind == MeasurementKind::CriticalDimensionNm)
+            .expect("synthetic map has CD measurements");
+        measurement.id = "STALE-CD-STATUS".to_string();
+        measurement.value = MeasurementKind::CriticalDimensionNm
+            .spec()
+            .upper
+            .expect("CD spec has an upper limit")
+            + 10.0;
+        measurement.status = MeasurementStatus::Pass;
+
+        let findings = map.validate();
+
+        assert!(has_validation_error(
+            &findings,
+            "metrology measurement STALE-CD-STATUS status pass does not match hard-spec failure"
+        ));
+    }
+
+    #[test]
+    fn wafer_map_validation_rejects_broken_reference_ids() {
+        let mut map = WaferMap::synthetic_demo();
+        let missing_die = DieCoord::new(888, 888);
+        map.defects.push(Defect {
+            id: "DEF-BAD-LINK".to_string(),
+            die: missing_die,
+            class: DefectClass::Particle,
+            position_mm: [f64::INFINITY, 1.0],
+            size_um: -1.0,
+            severity: 1,
+            linked_measurement_id: Some("MEAS-MISSING".to_string()),
+        });
+        map.annotations.push(InspectionAnnotation {
+            id: "ANN-BAD-LINK".to_string(),
+            die: Some(missing_die),
+            kind: AnnotationKind::Review,
+            position_mm: [0.0, f64::NAN],
+            note: String::new(),
+            author: "qa".to_string(),
+            linked_measurement_id: Some("MEAS-MISSING".to_string()),
+        });
+
+        let findings = map.validate();
+
+        assert!(has_validation_error(
+            &findings,
+            "metrology defect DEF-BAD-LINK references missing die C888 R888"
+        ));
+        assert!(has_validation_error(
+            &findings,
+            "metrology defect DEF-BAD-LINK references missing measurement MEAS-MISSING"
+        ));
+        assert!(has_validation_error(
+            &findings,
+            "metrology annotation ANN-BAD-LINK references missing measurement MEAS-MISSING"
+        ));
+    }
+
+    #[test]
+    fn wafer_map_validation_rejects_missing_lot_and_wafer_context() {
+        let mut map = WaferMap::synthetic_demo();
+        map.links.lot_id = "L-MISSING".to_string();
+        map.links.wafer_id = "W99".to_string();
+        for measurement in &mut map.measurements {
+            measurement.links = map.links.clone();
+        }
+
+        let findings = map.validate_with_context(&validation_context());
+
+        assert!(has_validation_error(
+            &findings,
+            "wafer map references missing lot L-MISSING"
+        ));
+
+        map.links.lot_id = "L-00042".to_string();
+        map.links.wafer_id = "W99".to_string();
+        for measurement in &mut map.measurements {
+            measurement.links = map.links.clone();
+        }
+        let findings = map.validate_with_context(&validation_context());
+        assert!(has_validation_error(
+            &findings,
+            "wafer map references missing wafer L-00042/W99"
+        ));
+    }
 
     #[test]
     fn wafer_grid_contains_only_active_radius_die_centers() {

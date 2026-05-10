@@ -1,0 +1,52 @@
+{
+  "name": "gds fixture round trip",
+  "top_shapes": [
+    { "kind": "rect", "layer": "metal1", "x": -400, "y": -200, "w": 800, "h": 400 }
+  ],
+  "cells": [
+    {
+      "name": "UNIT",
+      "shapes": [
+        { "kind": "rect", "layer": "poly", "x": 0, "y": 0, "w": 300, "h": 120 },
+        { "kind": "path", "layer": "metal1", "width": 80, "points": [[0, 220], [300, 220], [450, 260]] },
+        { "kind": "label", "layer": "annotation", "x": 0, "y": 360, "text": "IN" }
+      ]
+    }
+  ],
+  "instances": [
+    {
+      "cell": "UNIT",
+      "dx": 500,
+      "dy": 600,
+      "array": {
+        "columns": 3,
+        "rows": 2,
+        "column_pitch": [200, 0],
+        "row_pitch": [0, 160]
+      }
+    }
+  ],
+  "expect": {
+    "export": {
+      "structure_count": 2,
+      "boundary_count": 2,
+      "path_count": 1,
+      "text_count": 1,
+      "sref_count": 0,
+      "aref_count": 1,
+      "skipped_count": 0,
+      "warning_count": 0
+    },
+    "import": {
+      "structure_count": 2,
+      "element_count": 5,
+      "top_shape_count": 1,
+      "top_instance_count": 1,
+      "flattened_shape_count": 19,
+      "array_columns": 3,
+      "array_rows": 2,
+      "array_column_pitch": [200, 0],
+      "array_row_pitch": [0, 160]
+    }
+  }
+}

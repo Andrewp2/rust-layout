@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use eframe::egui::{self, Color32, RichText, TextEdit};
+use eframe::egui::{self, Color32, RichText, Sense, TextEdit, vec2};
 use layout_model::{
     mes::LotId,
     notebook::{
@@ -8,8 +8,35 @@ use layout_model::{
         NotebookLinks,
     },
 };
+use operad::{
+    ApproxTextMeasurer, ClipBehavior, ColorRgba, FontWeight, InputBehavior, StrokeStyle, TextStyle,
+    TextWrap, UiDocument, UiNode, UiNodeId, UiNodeStyle, UiSize, UiVisual, layout, root_style,
+    widgets,
+};
 
-use crate::ui_chrome::{self, Tone};
+use crate::{
+    operad_egui,
+    operad_sidecar::{SidecarRow, SidecarSection, render_sidecar_interactive},
+    ui_chrome::{self, Tone},
+};
+
+const OPERAD_HEADER_HEIGHT: f32 = 104.0;
+const OPERAD_METRIC_HEIGHT: f32 = 88.0;
+const OPERAD_SECTION_TITLE_HEIGHT: f32 = 26.0;
+const OPERAD_ROW_HEIGHT: f32 = 60.0;
+const OPERAD_EMPTY_ROW_HEIGHT: f32 = 44.0;
+const OPERAD_GAP: f32 = 10.0;
+const OPERAD_PAD: f32 = 12.0;
+const OPERAD_TIMELINE_ROW_LIMIT: usize = 24;
+const OPERAD_ACTION_SELECT_ENTRY: &str = "notebook.action.select_entry.";
+const OPERAD_ACTION_CLEAR_FILTERS: &str = "notebook.action.clear_filters";
+const OPERAD_ACTION_TOGGLE_FOLLOWUPS: &str = "notebook.action.toggle_followups";
+const OPERAD_ACTION_SET_PREVIEW: &str = "notebook.action.set_preview";
+const OPERAD_ACTION_SET_EDIT: &str = "notebook.action.set_edit";
+const OPERAD_ACTION_ENTRY_ACTION: &str = "notebook.action.entry_action.";
+const OPERAD_ACTION_SET_TAG: &str = "notebook.action.set_tag.";
+const OPERAD_ACTION_SET_LINK_KIND: &str = "notebook.action.set_link_kind.";
+const OPERAD_ACTION_FOCUS_LINK: &str = "notebook.action.focus_link.";
 
 pub(crate) struct LabNotebookPanel {
     notebook: LabNotebook,
@@ -65,6 +92,29 @@ struct NotebookMetrics {
     metrology: usize,
     images: usize,
     followups: usize,
+}
+
+#[derive(Debug)]
+struct NotebookOperadView {
+    document: UiDocument,
+    size: UiSize,
+}
+
+#[derive(Clone, Debug)]
+struct NotebookMetricTile {
+    label: String,
+    value: String,
+    detail: String,
+    tone: Tone,
+}
+
+#[derive(Clone, Debug)]
+struct NotebookOperadRow {
+    title: String,
+    detail: String,
+    tone: Tone,
+    action_name: Option<String>,
+    selected: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -124,7 +174,86 @@ impl LabNotebookPanel {
         let filtered_ids = self.filtered_entry_ids();
         self.ensure_selection(&filtered_ids);
         let metrics = self.notebook_metrics();
+        if self.preview_mode {
+            if let Err(error) = self.operad_ui(ui, status, &filtered_ids, &metrics) {
+                ui.colored_label(Color32::from_rgb(226, 96, 96), error);
+                self.egui_dashboard_ui(ui, status, &filtered_ids, &metrics);
+            }
+        } else {
+            self.egui_dashboard_ui(ui, status, &filtered_ids, &metrics);
+        }
+    }
 
+    fn operad_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        status: &mut String,
+        filtered_ids: &[NotebookEntryId],
+        metrics: &NotebookMetrics,
+    ) -> Result<(), String> {
+        let mut action_status = None;
+        let mut result_state = Ok(());
+        egui::ScrollArea::vertical()
+            .id_salt("lab_notebook_dashboard_operad")
+            .show(ui, |ui| {
+                let width = ui.available_width().max(320.0);
+                let mut view = self.build_operad_view(width, filtered_ids, metrics);
+                if let Err(error) = view
+                    .document
+                    .compute_layout(view.size, &mut ApproxTextMeasurer)
+                    .map_err(|error| error.to_string())
+                {
+                    result_state = Err(error);
+                    return;
+                }
+
+                let (rect, response) =
+                    ui.allocate_exact_size(vec2(width, view.size.height), Sense::click());
+                if response.clicked()
+                    && let Some(pointer) = response.interact_pointer_pos()
+                    && let Some(node_name) =
+                        operad_egui::hit_test_name(&view.document, rect, pointer)
+                    && let Some(message) = self.handle_operad_action(&node_name)
+                {
+                    if !message.is_empty() {
+                        action_status = Some(message);
+                    }
+                    self.sync_filter_controls();
+                    let filtered_ids = self.filtered_entry_ids();
+                    self.ensure_selection(&filtered_ids);
+                    let metrics = self.notebook_metrics();
+                    view = self.build_operad_view(width, &filtered_ids, &metrics);
+                    if let Err(error) = view
+                        .document
+                        .compute_layout(view.size, &mut ApproxTextMeasurer)
+                        .map_err(|error| error.to_string())
+                    {
+                        result_state = Err(error);
+                        return;
+                    }
+                }
+
+                if response.hovered()
+                    && let Some(pointer) = ui.ctx().pointer_hover_pos()
+                    && operad_egui::hit_test_name(&view.document, rect, pointer).is_some()
+                {
+                    ui.output_mut(|output| output.cursor_icon = egui::CursorIcon::PointingHand);
+                }
+                operad_egui::paint_document_at(ui, &view.document, rect);
+            });
+        if let Some(message) = action_status {
+            *status = message;
+        }
+        result_state
+    }
+
+    fn egui_dashboard_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        status: &mut String,
+        filtered_ids: &[NotebookEntryId],
+        metrics: &NotebookMetrics,
+    ) {
         egui::ScrollArea::vertical()
             .id_salt("lab_notebook_dashboard")
             .show(ui, |ui| {
@@ -183,9 +312,658 @@ impl LabNotebookPanel {
             });
     }
 
+    fn build_operad_view(
+        &self,
+        width: f32,
+        filtered_ids: &[NotebookEntryId],
+        metrics: &NotebookMetrics,
+    ) -> NotebookOperadView {
+        let metric_tiles = self.operad_metrics(filtered_ids, metrics);
+        let control_rows = self.operad_control_rows(filtered_ids);
+        let timeline_rows = self.operad_timeline_rows(filtered_ids);
+        let selected_rows = self.operad_selected_entry_rows();
+        let link_rows = self.operad_link_rows();
+        let related_rows = self.operad_related_rows();
+        let height = notebook_operad_view_height(
+            width,
+            metric_tiles.len(),
+            &[
+                control_rows.len(),
+                timeline_rows.len(),
+                selected_rows.len(),
+                link_rows.len(),
+                related_rows.len(),
+            ],
+        );
+        let size = UiSize::new(width, height);
+        let mut document = UiDocument::new(root_style(width, height));
+        let root = document.root;
+        document.set_node_visual(
+            root,
+            UiVisual::panel(
+                ColorRgba::new(15, 18, 21, 255),
+                Some(StrokeStyle::new(ColorRgba::new(39, 46, 52, 255), 1.0)),
+                0.0,
+            ),
+        );
+
+        add_notebook_operad_header(
+            &mut document,
+            root,
+            "PROCESS ENGINEERING",
+            "Lab Notebook",
+            "Markdown notes linked to lots, wafers, recipes, tool runs, metrology, and images",
+            &format!(
+                "{} entries · {} tags · {} linked objects",
+                self.notebook.entries.len(),
+                self.notebook.tags().len(),
+                metrics.total_links
+            ),
+        );
+        add_notebook_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_notebook_operad_metric_grid(&mut document, root, width, &metric_tiles);
+        add_notebook_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_notebook_operad_section(
+            &mut document,
+            root,
+            width,
+            "notebook.controls",
+            "Notebook Controls",
+            "No notebook controls available",
+            &control_rows,
+        );
+        add_notebook_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_notebook_operad_section(
+            &mut document,
+            root,
+            width,
+            "notebook.timeline",
+            "Timeline",
+            "No matching entries",
+            &timeline_rows,
+        );
+        add_notebook_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_notebook_operad_section(
+            &mut document,
+            root,
+            width,
+            "notebook.selected",
+            "Selected Entry",
+            "No entry selected",
+            &selected_rows,
+        );
+        add_notebook_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_notebook_operad_section(
+            &mut document,
+            root,
+            width,
+            "notebook.links",
+            "Structured Links",
+            "No linked data on this entry",
+            &link_rows,
+        );
+        add_notebook_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_notebook_operad_section(
+            &mut document,
+            root,
+            width,
+            "notebook.related",
+            "Related Entries",
+            "No related notebook entries",
+            &related_rows,
+        );
+
+        NotebookOperadView { document, size }
+    }
+
+    fn operad_metrics(
+        &self,
+        filtered_ids: &[NotebookEntryId],
+        metrics: &NotebookMetrics,
+    ) -> Vec<NotebookMetricTile> {
+        vec![
+            NotebookMetricTile {
+                label: "Matches".to_string(),
+                value: filtered_ids.len().to_string(),
+                detail: if self.has_active_filters() {
+                    "current filter".to_string()
+                } else {
+                    "all entries".to_string()
+                },
+                tone: Tone::Info,
+            },
+            NotebookMetricTile {
+                label: "Structured links".to_string(),
+                value: metrics.total_links.to_string(),
+                detail: "lots, wafers, recipes, runs".to_string(),
+                tone: Tone::Success,
+            },
+            NotebookMetricTile {
+                label: "Evidence".to_string(),
+                value: format!("{} / {}", metrics.metrology, metrics.images),
+                detail: "metrology / images".to_string(),
+                tone: Tone::Neutral,
+            },
+            NotebookMetricTile {
+                label: "Follow-ups".to_string(),
+                value: metrics.followups.to_string(),
+                detail: "entries with action signals".to_string(),
+                tone: Tone::Warning,
+            },
+            NotebookMetricTile {
+                label: "Coverage".to_string(),
+                value: format!("{} lots", metrics.lots),
+                detail: format!(
+                    "{} wafers, {} recipes, {} runs",
+                    metrics.wafers, metrics.recipes, metrics.tool_runs
+                ),
+                tone: Tone::Neutral,
+            },
+        ]
+    }
+
+    fn operad_control_rows(&self, filtered_ids: &[NotebookEntryId]) -> Vec<NotebookOperadRow> {
+        let mut rows = vec![
+            notebook_operad_row(
+                "Preview mode",
+                "Use the Operad dashboard for scan and review",
+                Tone::Info,
+                Some(OPERAD_ACTION_SET_PREVIEW.to_string()),
+                self.preview_mode,
+            ),
+            notebook_operad_row(
+                "Edit selected entry",
+                "Switches to the egui markdown editor until Operad has multiline editing and focus routing",
+                Tone::Warning,
+                Some(OPERAD_ACTION_SET_EDIT.to_string()),
+                !self.preview_mode,
+            ),
+            notebook_operad_row(
+                if self.show_followups_only {
+                    "Follow-ups only: on"
+                } else {
+                    "Follow-ups only: off"
+                },
+                format!("{} matching entry row(s)", filtered_ids.len()),
+                Tone::Neutral,
+                Some(OPERAD_ACTION_TOGGLE_FOLLOWUPS.to_string()),
+                self.show_followups_only,
+            ),
+            notebook_operad_row(
+                "Clear filters",
+                self.active_filter_label(),
+                Tone::Neutral,
+                Some(OPERAD_ACTION_CLEAR_FILTERS.to_string()),
+                false,
+            ),
+        ];
+        rows.push(notebook_operad_row(
+            "Tag: All",
+            format!("{} tag option(s)", self.notebook.tags().len()),
+            Tone::Neutral,
+            Some(format!("{OPERAD_ACTION_SET_TAG}all|tag")),
+            self.selected_tag == "All tags",
+        ));
+        rows.extend(self.notebook.tags().into_iter().take(10).map(|tag| {
+            notebook_operad_row(
+                format!("Tag: #{tag}"),
+                format!("{} matching entry row(s)", self.count_entries_for_tag(&tag)),
+                Tone::Neutral,
+                Some(format!("{OPERAD_ACTION_SET_TAG}{tag}|tag")),
+                self.selected_tag == tag,
+            )
+        }));
+        rows.push(notebook_operad_row(
+            "Link type: Any",
+            "Show entries with any structured link type",
+            Tone::Neutral,
+            Some(format!("{OPERAD_ACTION_SET_LINK_KIND}any|kind")),
+            self.selected_link_kind.is_none(),
+        ));
+        rows.extend(NotebookLinkKind::ALL.into_iter().map(|kind| {
+            notebook_operad_row(
+                format!("Link type: {}", kind.label()),
+                format!(
+                    "{} linked entry row(s)",
+                    self.count_entries_for_link_kind(kind)
+                ),
+                Tone::Neutral,
+                Some(format!(
+                    "{OPERAD_ACTION_SET_LINK_KIND}{}|kind",
+                    notebook_link_kind_slug(kind)
+                )),
+                self.selected_link_kind == Some(kind),
+            )
+        }));
+        rows
+    }
+
+    fn operad_timeline_rows(&self, filtered_ids: &[NotebookEntryId]) -> Vec<NotebookOperadRow> {
+        let mut rows = filtered_ids
+            .iter()
+            .take(OPERAD_TIMELINE_ROW_LIMIT)
+            .filter_map(|entry_id| self.notebook.entry(entry_id))
+            .map(|entry| {
+                let selected = self.selected_entry.as_ref() == Some(&entry.id);
+                notebook_operad_row(
+                    format!("{} · {}", entry.id, entry.title),
+                    format!(
+                        "{} · updated {} · {} words · {} links · {}",
+                        entry.author,
+                        entry.updated_at,
+                        word_count(&entry.body_markdown),
+                        entry.link_count(),
+                        markdown_excerpt(&entry.body_markdown, 110)
+                    ),
+                    if !follow_up_actions(entry).is_empty() {
+                        Tone::Warning
+                    } else {
+                        Tone::Neutral
+                    },
+                    Some(format!(
+                        "{OPERAD_ACTION_SELECT_ENTRY}{}|timeline",
+                        entry.id.as_str()
+                    )),
+                    selected,
+                )
+            })
+            .collect::<Vec<_>>();
+        if filtered_ids.len() > OPERAD_TIMELINE_ROW_LIMIT {
+            rows.push(notebook_operad_row(
+                format!(
+                    "Showing first {} of {} entries",
+                    OPERAD_TIMELINE_ROW_LIMIT,
+                    filtered_ids.len()
+                ),
+                "Use notebook filters to narrow the timeline",
+                Tone::Info,
+                None,
+                false,
+            ));
+        }
+        rows
+    }
+
+    fn operad_selected_entry_rows(&self) -> Vec<NotebookOperadRow> {
+        let Some(entry) = self.selected_entry() else {
+            return Vec::new();
+        };
+        let mut rows = vec![
+            notebook_operad_row(
+                format!("{} · {}", entry.id, entry.title),
+                format!(
+                    "{} · created {} · updated {} · {} words",
+                    entry.author,
+                    entry.created_at,
+                    entry.updated_at,
+                    word_count(&entry.body_markdown)
+                ),
+                Tone::Info,
+                None,
+                false,
+            ),
+            notebook_operad_row(
+                "Readable preview",
+                markdown_excerpt(&entry.body_markdown, 180),
+                Tone::Neutral,
+                None,
+                false,
+            ),
+            notebook_operad_row(
+                "Tags",
+                if entry.tags.is_empty() {
+                    "none".to_string()
+                } else {
+                    entry
+                        .tags
+                        .iter()
+                        .map(|tag| format!("#{tag}"))
+                        .collect::<Vec<_>>()
+                        .join(" · ")
+                },
+                Tone::Neutral,
+                None,
+                false,
+            ),
+        ];
+        for action in [
+            NotebookEntryAction::AddFollowUpPlan,
+            NotebookEntryAction::InsertMetrologyReview,
+            NotebookEntryAction::RequestImageEvidence,
+            NotebookEntryAction::TagHandoff,
+        ] {
+            rows.push(notebook_operad_row(
+                notebook_entry_action_label(action),
+                "Apply this structured note update to the selected entry",
+                notebook_entry_action_tone(action),
+                Some(format!(
+                    "{OPERAD_ACTION_ENTRY_ACTION}{}|entry-action",
+                    notebook_entry_action_slug(action)
+                )),
+                false,
+            ));
+        }
+        let followups = follow_up_actions(entry);
+        rows.extend(followups.iter().take(5).map(|action| {
+            notebook_operad_row("Follow-up signal", action, Tone::Warning, None, false)
+        }));
+        rows
+    }
+
+    fn operad_link_rows(&self) -> Vec<NotebookOperadRow> {
+        let Some(entry) = self.selected_entry() else {
+            return Vec::new();
+        };
+        let chips = link_chip_data(&entry.links);
+        chips
+            .iter()
+            .map(|chip| {
+                notebook_operad_row(
+                    format!("{}: {}", chip.prefix, chip.value),
+                    &chip.detail,
+                    chip.tone,
+                    Some(format!(
+                        "{OPERAD_ACTION_FOCUS_LINK}{}:{}|link",
+                        notebook_link_kind_slug(chip.kind),
+                        chip.value
+                    )),
+                    self.selected_link_kind == Some(chip.kind)
+                        && self.filter.query.trim() == chip.value,
+                )
+            })
+            .collect()
+    }
+
+    fn operad_related_rows(&self) -> Vec<NotebookOperadRow> {
+        let Some(entry) = self.selected_entry() else {
+            return Vec::new();
+        };
+        self.related_entries(entry)
+            .into_iter()
+            .take(8)
+            .map(|row| {
+                notebook_operad_row(
+                    format!("{} · {}", row.id, row.title),
+                    format!("{} · score {}", row.reason, row.score),
+                    Tone::Neutral,
+                    Some(format!(
+                        "{OPERAD_ACTION_SELECT_ENTRY}{}|related",
+                        row.id.as_str()
+                    )),
+                    false,
+                )
+            })
+            .collect()
+    }
+
+    fn active_filter_label(&self) -> String {
+        if !self.has_active_filters() {
+            return "No active notebook filter".to_string();
+        }
+        let mut parts = Vec::new();
+        if !self.filter.query.trim().is_empty() {
+            parts.push(format!("search '{}'", self.filter.query.trim()));
+        }
+        if self.selected_tag != "All tags" {
+            parts.push(format!("tag #{}", self.selected_tag));
+        }
+        if let Some(kind) = self.selected_link_kind {
+            parts.push(format!("link {}", kind.label()));
+        }
+        if self.show_followups_only {
+            parts.push("follow-ups only".to_string());
+        }
+        parts.join(" · ")
+    }
+
+    fn count_entries_for_tag(&self, tag: &str) -> usize {
+        self.notebook
+            .entries
+            .iter()
+            .filter(|entry| entry.tags.iter().any(|entry_tag| entry_tag == tag))
+            .count()
+    }
+
+    fn count_entries_for_link_kind(&self, kind: NotebookLinkKind) -> usize {
+        self.notebook
+            .entries
+            .iter()
+            .filter(|entry| entry.has_link_kind(kind))
+            .count()
+    }
+
+    fn handle_operad_action(&mut self, node_name: &str) -> Option<String> {
+        if let Some(rest) = node_name.strip_prefix(OPERAD_ACTION_SELECT_ENTRY) {
+            let entry_id = NotebookEntryId::new(rest.split('|').next().unwrap_or_default());
+            if self.notebook.entry(&entry_id).is_some() {
+                self.selected_entry = Some(entry_id.clone());
+                return Some(format!("opened notebook entry {entry_id}"));
+            }
+            return None;
+        }
+        if let Some(rest) = node_name.strip_prefix(OPERAD_ACTION_ENTRY_ACTION) {
+            let action =
+                notebook_entry_action_from_slug(rest.split('|').next().unwrap_or_default())?;
+            let entry_id = self.selected_entry.clone()?;
+            return self.apply_entry_action(&entry_id, action);
+        }
+        if let Some(rest) = node_name.strip_prefix(OPERAD_ACTION_SET_TAG) {
+            let tag = rest.split('|').next().unwrap_or_default();
+            if tag == "all" {
+                self.selected_tag = "All tags".to_string();
+            } else if self
+                .notebook
+                .tags()
+                .iter()
+                .any(|candidate| candidate == tag)
+            {
+                self.selected_tag = tag.to_string();
+            } else {
+                return None;
+            }
+            self.sync_filter_controls();
+            let filtered_ids = self.filtered_entry_ids();
+            self.ensure_selection(&filtered_ids);
+            return Some(format!("notebook tag filter set to {}", self.selected_tag));
+        }
+        if let Some(rest) = node_name.strip_prefix(OPERAD_ACTION_SET_LINK_KIND) {
+            let slug = rest.split('|').next().unwrap_or_default();
+            self.selected_link_kind = if slug == "any" {
+                None
+            } else {
+                Some(notebook_link_kind_from_slug(slug)?)
+            };
+            self.sync_filter_controls();
+            let filtered_ids = self.filtered_entry_ids();
+            self.ensure_selection(&filtered_ids);
+            let label = self
+                .selected_link_kind
+                .map(|kind| kind.label())
+                .unwrap_or("Any link");
+            return Some(format!("notebook link filter set to {label}"));
+        }
+        if let Some(rest) = node_name.strip_prefix(OPERAD_ACTION_FOCUS_LINK) {
+            let token = rest.split('|').next().unwrap_or_default();
+            let (kind_slug, query) = token.split_once(':')?;
+            let kind = notebook_link_kind_from_slug(kind_slug)?;
+            self.apply_link_focus(LinkFocus {
+                kind,
+                query: query.to_string(),
+                label: format!("{} {}", kind.label(), query),
+            });
+            return Some(format!("filtered notebook to {} {query}", kind.label()));
+        }
+        match node_name {
+            OPERAD_ACTION_CLEAR_FILTERS => {
+                self.clear_filters();
+                let filtered_ids = self.filtered_entry_ids();
+                self.ensure_selection(&filtered_ids);
+                Some("notebook filters cleared".to_string())
+            }
+            OPERAD_ACTION_TOGGLE_FOLLOWUPS => {
+                self.show_followups_only = !self.show_followups_only;
+                self.sync_filter_controls();
+                let filtered_ids = self.filtered_entry_ids();
+                self.ensure_selection(&filtered_ids);
+                Some(format!(
+                    "notebook follow-up filter {}",
+                    if self.show_followups_only {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                ))
+            }
+            OPERAD_ACTION_SET_PREVIEW => {
+                self.preview_mode = true;
+                Some("notebook preview mode".to_string())
+            }
+            OPERAD_ACTION_SET_EDIT => {
+                self.preview_mode = false;
+                Some("notebook edit mode".to_string())
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn context_ui(&mut self, ui: &mut egui::Ui) {
         self.sync_filter_controls();
         let metrics = self.notebook_metrics();
+        if self.operad_context_ui(ui, &metrics).is_err() {
+            self.egui_context_ui(ui, &metrics);
+        }
+    }
+
+    fn operad_context_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        metrics: &NotebookMetrics,
+    ) -> Result<(), String> {
+        let mut sections = Vec::new();
+        sections.push(
+            SidecarSection::new("Lab Notebook")
+                .row(SidecarRow::new(
+                    "Entries",
+                    format!(
+                        "{} entries / {} tags / {} links",
+                        self.notebook.entries.len(),
+                        self.notebook.tags().len(),
+                        metrics.total_links
+                    ),
+                    Tone::Info,
+                ))
+                .row(SidecarRow::new(
+                    "Structured links",
+                    format!(
+                        "{} lots / {} wafers / {} recipes / {} runs",
+                        metrics.lots, metrics.wafers, metrics.recipes, metrics.tool_runs
+                    ),
+                    Tone::Neutral,
+                ))
+                .row(SidecarRow::new(
+                    "Evidence",
+                    format!(
+                        "{} metrology / {} images / {} follow-ups",
+                        metrics.metrology, metrics.images, metrics.followups
+                    ),
+                    if metrics.followups > 0 {
+                        Tone::Warning
+                    } else {
+                        Tone::Neutral
+                    },
+                ))
+                .row(SidecarRow::new(
+                    "Filter",
+                    self.active_filter_label(),
+                    if self.has_active_filters() {
+                        Tone::Info
+                    } else {
+                        Tone::Neutral
+                    },
+                )),
+        );
+
+        if let Some(entry) = self.selected_entry().cloned() {
+            sections.push(
+                SidecarSection::new("Selected Entry")
+                    .row(SidecarRow::new(
+                        entry.title.clone(),
+                        format!("{} / updated {}", entry.id, entry.updated_at),
+                        Tone::Info,
+                    ))
+                    .row(SidecarRow::new(
+                        "Content",
+                        format!(
+                            "{} words / {} linked objects",
+                            word_count(&entry.body_markdown),
+                            entry.link_count()
+                        ),
+                        Tone::Neutral,
+                    ))
+                    .row(SidecarRow::new(
+                        "Tags",
+                        if entry.tags.is_empty() {
+                            "none".to_string()
+                        } else {
+                            entry
+                                .tags
+                                .iter()
+                                .map(|tag| format!("#{tag}"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        },
+                        Tone::Neutral,
+                    )),
+            );
+
+            let mut followups =
+                SidecarSection::new("Follow-Up Signals").empty("No follow-up signals");
+            for action in follow_up_actions(&entry).iter().take(4) {
+                followups =
+                    followups.row(SidecarRow::new("Follow-up", action.clone(), Tone::Warning));
+            }
+            sections.push(followups);
+
+            let mut links = SidecarSection::new("Structured Links").empty("No structured links");
+            for chip in link_chip_data(&entry.links) {
+                links = links.row(
+                    SidecarRow::new(
+                        format!("{}: {}", chip.prefix, chip.value),
+                        chip.detail,
+                        chip.tone,
+                    )
+                    .action(format!(
+                        "{OPERAD_ACTION_FOCUS_LINK}{}:{}|context",
+                        notebook_link_kind_slug(chip.kind),
+                        chip.value
+                    )),
+                );
+            }
+            sections.push(links);
+
+            let mut related = SidecarSection::new("Related Entries").empty("No related entries");
+            for row in self.related_entries(&entry).into_iter().take(4) {
+                related = related.row(
+                    SidecarRow::new(
+                        format!("{} · {}", row.id, row.title),
+                        format!("{} / score {}", row.reason, row.score),
+                        Tone::Neutral,
+                    )
+                    .action(format!("{OPERAD_ACTION_SELECT_ENTRY}{}|context", row.id)),
+                );
+            }
+            sections.push(related);
+        } else {
+            sections.push(SidecarSection::new("Selected Entry").empty("No entry selected"));
+        }
+
+        if let Some(action) = render_sidecar_interactive(ui, "notebook.context", &sections)? {
+            let _ = self.handle_operad_action(&action);
+        }
+        Ok(())
+    }
+
+    fn egui_context_ui(&mut self, ui: &mut egui::Ui, metrics: &NotebookMetrics) {
         ui_chrome::section_label(ui, "Lab Notebook");
         ui.label(format!(
             "{} entries / {} tags / {} links",
@@ -779,6 +1557,553 @@ impl LabNotebookPanel {
         });
         rows
     }
+}
+
+fn notebook_operad_view_height(width: f32, metric_count: usize, row_counts: &[usize]) -> f32 {
+    let mut height = OPERAD_HEADER_HEIGHT + OPERAD_GAP;
+    height += notebook_operad_metric_grid_height(width, metric_count) + OPERAD_GAP;
+    for row_count in row_counts {
+        height += notebook_operad_section_height(*row_count) + OPERAD_GAP;
+    }
+    height + OPERAD_PAD
+}
+
+fn notebook_operad_metric_columns(width: f32) -> usize {
+    if width >= 1020.0 {
+        4
+    } else if width >= 680.0 {
+        3
+    } else if width >= 440.0 {
+        2
+    } else {
+        1
+    }
+}
+
+fn notebook_operad_metric_grid_height(width: f32, metric_count: usize) -> f32 {
+    let columns = notebook_operad_metric_columns(width).max(1);
+    let rows = metric_count.div_ceil(columns).max(1);
+    rows as f32 * OPERAD_METRIC_HEIGHT
+}
+
+fn notebook_operad_section_height(row_count: usize) -> f32 {
+    OPERAD_PAD * 2.0
+        + OPERAD_SECTION_TITLE_HEIGHT
+        + if row_count == 0 {
+            OPERAD_EMPTY_ROW_HEIGHT
+        } else {
+            row_count as f32 * OPERAD_ROW_HEIGHT
+        }
+}
+
+fn add_notebook_operad_header(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    eyebrow: &str,
+    title: &str,
+    detail: &str,
+    meta: &str,
+) {
+    let header = document.add_child(
+        parent,
+        UiNode::container(
+            "notebook.header",
+            UiNodeStyle {
+                layout: layout::with_padding_all(
+                    layout::with_size(
+                        layout::column(),
+                        layout::percent(1.0),
+                        layout::px(OPERAD_HEADER_HEIGHT),
+                    ),
+                    OPERAD_PAD,
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            ColorRgba::new(22, 27, 32, 255),
+            Some(StrokeStyle::new(ColorRgba::new(46, 55, 64, 255), 1.0)),
+            6.0,
+        )),
+    );
+    add_notebook_operad_text(
+        document,
+        header,
+        "notebook.header.eyebrow",
+        eyebrow,
+        notebook_operad_text_style(12.0, FontWeight::BOLD, ColorRgba::new(146, 154, 162, 255)),
+        16.0,
+    );
+    add_notebook_operad_text(
+        document,
+        header,
+        "notebook.header.title",
+        title,
+        notebook_operad_text_style(24.0, FontWeight::BOLD, ColorRgba::new(242, 246, 250, 255)),
+        30.0,
+    );
+    add_notebook_operad_text(
+        document,
+        header,
+        "notebook.header.detail",
+        detail,
+        notebook_operad_text_style(14.0, FontWeight::NORMAL, ColorRgba::new(178, 185, 194, 255)),
+        20.0,
+    );
+    add_notebook_operad_text(
+        document,
+        header,
+        "notebook.header.meta",
+        meta,
+        notebook_operad_text_style(13.0, FontWeight::NORMAL, ColorRgba::new(112, 183, 239, 255)),
+        18.0,
+    );
+}
+
+fn add_notebook_operad_metric_grid(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    width: f32,
+    metrics: &[NotebookMetricTile],
+) {
+    let columns = notebook_operad_metric_columns(width);
+    let grid_height = notebook_operad_metric_grid_height(width, metrics.len());
+    let grid = document.add_child(
+        parent,
+        UiNode::container(
+            "notebook.metrics",
+            UiNodeStyle {
+                layout: layout::with_size(
+                    layout::column(),
+                    layout::percent(1.0),
+                    layout::px(grid_height),
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        ),
+    );
+    let tile_width =
+        ((width - OPERAD_GAP * (columns.saturating_sub(1) as f32)) / columns as f32).max(120.0);
+    for (row_index, chunk) in metrics.chunks(columns).enumerate() {
+        let row = document.add_child(
+            grid,
+            UiNode::container(
+                format!("notebook.metrics.row.{row_index}"),
+                UiNodeStyle {
+                    layout: layout::with_size(
+                        layout::row(),
+                        layout::percent(1.0),
+                        layout::px(OPERAD_METRIC_HEIGHT),
+                    ),
+                    clip: ClipBehavior::Clip,
+                    ..Default::default()
+                },
+            ),
+        );
+        for (column, metric) in chunk.iter().enumerate() {
+            add_notebook_operad_metric_tile(
+                document,
+                row,
+                &format!("notebook.metrics.{row_index}.{column}"),
+                tile_width - 6.0,
+                metric,
+            );
+        }
+    }
+}
+
+fn add_notebook_operad_metric_tile(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    name: &str,
+    width: f32,
+    metric: &NotebookMetricTile,
+) {
+    let tile = document.add_child(
+        parent,
+        UiNode::container(
+            name,
+            UiNodeStyle {
+                layout: layout::with_padding_all(
+                    layout::with_margin_all(
+                        layout::with_size(
+                            layout::column(),
+                            layout::px(width.max(116.0)),
+                            layout::px(OPERAD_METRIC_HEIGHT - 8.0),
+                        ),
+                        3.0,
+                    ),
+                    9.0,
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            ColorRgba::new(29, 35, 40, 255),
+            Some(StrokeStyle::new(
+                notebook_operad_tone_color(metric.tone),
+                1.0,
+            )),
+            6.0,
+        )),
+    );
+    add_notebook_operad_text(
+        document,
+        tile,
+        &format!("{name}.label"),
+        &metric.label,
+        notebook_operad_text_style(12.0, FontWeight::BOLD, ColorRgba::new(158, 166, 174, 255)),
+        18.0,
+    );
+    add_notebook_operad_text(
+        document,
+        tile,
+        &format!("{name}.value"),
+        truncate_middle(&metric.value, 42),
+        notebook_operad_text_style(20.0, FontWeight::BOLD, ColorRgba::new(239, 243, 247, 255)),
+        26.0,
+    );
+    add_notebook_operad_text(
+        document,
+        tile,
+        &format!("{name}.detail"),
+        truncate_middle(&metric.detail, 56),
+        notebook_operad_text_style(
+            12.0,
+            FontWeight::NORMAL,
+            notebook_operad_tone_color(metric.tone),
+        ),
+        18.0,
+    );
+}
+
+fn add_notebook_operad_section(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    width: f32,
+    name: &str,
+    title: &str,
+    empty: &str,
+    rows: &[NotebookOperadRow],
+) {
+    let height = notebook_operad_section_height(rows.len());
+    let section = document.add_child(
+        parent,
+        UiNode::container(
+            name,
+            UiNodeStyle {
+                layout: layout::with_padding_all(
+                    layout::with_size(layout::column(), layout::percent(1.0), layout::px(height)),
+                    OPERAD_PAD,
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            ColorRgba::new(21, 26, 31, 255),
+            Some(StrokeStyle::new(ColorRgba::new(45, 53, 61, 255), 1.0)),
+            6.0,
+        )),
+    );
+    add_notebook_operad_text(
+        document,
+        section,
+        &format!("{name}.title"),
+        title,
+        notebook_operad_text_style(15.0, FontWeight::BOLD, ColorRgba::new(242, 246, 250, 255)),
+        OPERAD_SECTION_TITLE_HEIGHT,
+    );
+    if rows.is_empty() {
+        add_notebook_operad_empty_row(document, section, name, empty);
+    } else {
+        let row_width = (width - OPERAD_PAD * 2.0).max(240.0);
+        for (index, row) in rows.iter().enumerate() {
+            add_notebook_operad_data_row(document, section, name, index, row_width, row);
+        }
+    }
+}
+
+fn add_notebook_operad_empty_row(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    name: &str,
+    label: &str,
+) {
+    let row = document.add_child(
+        parent,
+        UiNode::container(
+            format!("{name}.empty"),
+            UiNodeStyle {
+                layout: layout::with_padding_all(
+                    layout::with_size(
+                        layout::row(),
+                        layout::percent(1.0),
+                        layout::px(OPERAD_EMPTY_ROW_HEIGHT),
+                    ),
+                    8.0,
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            ColorRgba::new(27, 32, 37, 255),
+            Some(StrokeStyle::new(ColorRgba::new(43, 50, 58, 255), 1.0)),
+            5.0,
+        )),
+    );
+    add_notebook_operad_text(
+        document,
+        row,
+        &format!("{name}.empty.label"),
+        label,
+        notebook_operad_text_style(13.0, FontWeight::NORMAL, ColorRgba::new(154, 163, 172, 255)),
+        24.0,
+    );
+}
+
+fn add_notebook_operad_data_row(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    section_name: &str,
+    index: usize,
+    row_width: f32,
+    row: &NotebookOperadRow,
+) {
+    let row_name = row
+        .action_name
+        .clone()
+        .unwrap_or_else(|| format!("{section_name}.row.{index}"));
+    let stroke_color = if row.selected {
+        notebook_operad_tone_color(Tone::Info)
+    } else {
+        ColorRgba::new(42, 50, 58, 255)
+    };
+    let fill = if row.selected {
+        ColorRgba::new(26, 42, 56, 255)
+    } else {
+        ColorRgba::new(26, 31, 36, 255)
+    };
+    let mut node = UiNode::container(
+        row_name,
+        UiNodeStyle {
+            layout: layout::with_padding_all(
+                layout::with_size(
+                    layout::row(),
+                    layout::percent(1.0),
+                    layout::px(OPERAD_ROW_HEIGHT),
+                ),
+                6.0,
+            ),
+            clip: ClipBehavior::Clip,
+            ..Default::default()
+        },
+    )
+    .with_visual(UiVisual::panel(
+        fill,
+        Some(StrokeStyle::new(stroke_color, 1.0)),
+        4.0,
+    ));
+    if row.action_name.is_some() {
+        node = node.with_input(InputBehavior::BUTTON);
+    }
+    let row_node = document.add_child(parent, node);
+    document.add_child(
+        row_node,
+        UiNode::container(
+            format!("{section_name}.row.{index}.tone"),
+            UiNodeStyle {
+                layout: layout::fixed(5.0, OPERAD_ROW_HEIGHT - 12.0),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            notebook_operad_tone_color(row.tone),
+            None,
+            2.0,
+        )),
+    );
+    let text_column = document.add_child(
+        row_node,
+        UiNode::container(
+            format!("{section_name}.row.{index}.text"),
+            UiNodeStyle {
+                layout: layout::with_size(
+                    layout::column(),
+                    layout::px((row_width - 28.0).max(120.0)),
+                    layout::px(OPERAD_ROW_HEIGHT - 12.0),
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        ),
+    );
+    add_notebook_operad_text(
+        document,
+        text_column,
+        &format!("{section_name}.row.{index}.title"),
+        truncate_middle(&row.title, 78),
+        notebook_operad_text_style(14.0, FontWeight::BOLD, ColorRgba::new(232, 237, 242, 255)),
+        22.0,
+    );
+    add_notebook_operad_text(
+        document,
+        text_column,
+        &format!("{section_name}.row.{index}.detail"),
+        truncate_middle(&row.detail, 116),
+        notebook_operad_text_style(12.0, FontWeight::NORMAL, ColorRgba::new(162, 171, 180, 255)),
+        20.0,
+    );
+}
+
+fn add_notebook_operad_spacer(document: &mut UiDocument, parent: UiNodeId, height: f32) {
+    document.add_child(
+        parent,
+        UiNode::container(
+            format!("notebook.spacer.{}", document.node_count()),
+            UiNodeStyle {
+                layout: layout::with_size(layout::row(), layout::percent(1.0), layout::px(height)),
+                ..Default::default()
+            },
+        ),
+    );
+}
+
+fn add_notebook_operad_text(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    name: &str,
+    text: impl Into<String>,
+    style: TextStyle,
+    height: f32,
+) {
+    widgets::label(
+        document,
+        parent,
+        name,
+        text,
+        style,
+        layout::with_size(layout::row(), layout::percent(1.0), layout::px(height)),
+    );
+}
+
+fn notebook_operad_text_style(font_size: f32, weight: FontWeight, color: ColorRgba) -> TextStyle {
+    TextStyle {
+        font_size,
+        line_height: font_size + 4.0,
+        weight,
+        color,
+        wrap: TextWrap::None,
+        ..Default::default()
+    }
+}
+
+fn notebook_operad_tone_color(tone: Tone) -> ColorRgba {
+    let color = tone.color();
+    ColorRgba::new(color.r(), color.g(), color.b(), color.a())
+}
+
+fn notebook_operad_row(
+    title: impl Into<String>,
+    detail: impl Into<String>,
+    tone: Tone,
+    action_name: Option<String>,
+    selected: bool,
+) -> NotebookOperadRow {
+    NotebookOperadRow {
+        title: title.into(),
+        detail: detail.into(),
+        tone,
+        action_name,
+        selected,
+    }
+}
+
+fn notebook_link_kind_slug(kind: NotebookLinkKind) -> &'static str {
+    match kind {
+        NotebookLinkKind::Lot => "lot",
+        NotebookLinkKind::Wafer => "wafer",
+        NotebookLinkKind::Recipe => "recipe",
+        NotebookLinkKind::ToolRun => "tool-run",
+        NotebookLinkKind::Metrology => "metrology",
+        NotebookLinkKind::Image => "image",
+    }
+}
+
+fn notebook_link_kind_from_slug(value: &str) -> Option<NotebookLinkKind> {
+    match value {
+        "lot" => Some(NotebookLinkKind::Lot),
+        "wafer" => Some(NotebookLinkKind::Wafer),
+        "recipe" => Some(NotebookLinkKind::Recipe),
+        "tool-run" => Some(NotebookLinkKind::ToolRun),
+        "metrology" => Some(NotebookLinkKind::Metrology),
+        "image" => Some(NotebookLinkKind::Image),
+        _ => None,
+    }
+}
+
+fn notebook_entry_action_slug(action: NotebookEntryAction) -> &'static str {
+    match action {
+        NotebookEntryAction::AddFollowUpPlan => "follow-up",
+        NotebookEntryAction::InsertMetrologyReview => "metrology-review",
+        NotebookEntryAction::RequestImageEvidence => "image-evidence",
+        NotebookEntryAction::TagHandoff => "handoff",
+    }
+}
+
+fn notebook_entry_action_from_slug(value: &str) -> Option<NotebookEntryAction> {
+    match value {
+        "follow-up" => Some(NotebookEntryAction::AddFollowUpPlan),
+        "metrology-review" => Some(NotebookEntryAction::InsertMetrologyReview),
+        "image-evidence" => Some(NotebookEntryAction::RequestImageEvidence),
+        "handoff" => Some(NotebookEntryAction::TagHandoff),
+        _ => None,
+    }
+}
+
+fn notebook_entry_action_label(action: NotebookEntryAction) -> &'static str {
+    match action {
+        NotebookEntryAction::AddFollowUpPlan => "Add follow-up",
+        NotebookEntryAction::InsertMetrologyReview => "Insert metrology review",
+        NotebookEntryAction::RequestImageEvidence => "Request image evidence",
+        NotebookEntryAction::TagHandoff => "Tag handoff",
+    }
+}
+
+fn notebook_entry_action_tone(action: NotebookEntryAction) -> Tone {
+    match action {
+        NotebookEntryAction::AddFollowUpPlan | NotebookEntryAction::RequestImageEvidence => {
+            Tone::Warning
+        }
+        NotebookEntryAction::InsertMetrologyReview => Tone::Info,
+        NotebookEntryAction::TagHandoff => Tone::Neutral,
+    }
+}
+
+fn truncate_middle(text: impl AsRef<str>, max_chars: usize) -> String {
+    let text = text.as_ref();
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_string();
+    }
+    let keep = max_chars.saturating_sub(3);
+    let head = keep / 2;
+    let tail = keep - head;
+    let start = text.chars().take(head).collect::<String>();
+    let end = text
+        .chars()
+        .rev()
+        .take(tail)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!("{start}...{end}")
 }
 
 fn link_count_rows(ui: &mut egui::Ui, links: &NotebookLinks) {
@@ -1389,5 +2714,98 @@ fn link_kind_short_label(kind: NotebookLinkKind) -> &'static str {
         NotebookLinkKind::ToolRun => "runs",
         NotebookLinkKind::Metrology => "metrology",
         NotebookLinkKind::Image => "images",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notebook_operad_view_audits_common_widths() {
+        let mut panel = LabNotebookPanel::from_notebook(LabNotebook::sample());
+        panel.sync_filter_controls();
+        let filtered_ids = panel.filtered_entry_ids();
+        panel.ensure_selection(&filtered_ids);
+        let metrics = panel.notebook_metrics();
+
+        for width in [360.0, 760.0, 1200.0] {
+            let mut view = panel.build_operad_view(width, &filtered_ids, &metrics);
+            view.document
+                .compute_layout(view.size, &mut ApproxTextMeasurer)
+                .unwrap();
+            let warnings = view.document.audit_layout();
+            assert!(warnings.is_empty(), "{warnings:#?}");
+            assert!(view.document.node_count() > 20);
+            assert!(!view.document.paint_list().items.is_empty());
+        }
+    }
+
+    #[test]
+    fn notebook_operad_actions_update_panel_state() {
+        let mut panel = LabNotebookPanel::from_notebook(LabNotebook::sample());
+        let target_entry = panel.notebook.entries.last().unwrap().id.clone();
+        let target_tag = panel.notebook.tags().first().unwrap().clone();
+
+        assert_eq!(
+            panel.handle_operad_action(&format!(
+                "{OPERAD_ACTION_SELECT_ENTRY}{}|test",
+                target_entry.as_str()
+            )),
+            Some(format!("opened notebook entry {target_entry}"))
+        );
+        assert_eq!(panel.selected_entry.as_ref(), Some(&target_entry));
+
+        assert_eq!(
+            panel.handle_operad_action(&format!("{OPERAD_ACTION_SET_TAG}{target_tag}|test")),
+            Some(format!("notebook tag filter set to {target_tag}"))
+        );
+        assert_eq!(panel.selected_tag, target_tag);
+        assert!(panel.filter.tag.is_some());
+
+        assert_eq!(
+            panel.handle_operad_action(&format!(
+                "{OPERAD_ACTION_SET_LINK_KIND}{}|test",
+                notebook_link_kind_slug(NotebookLinkKind::Lot)
+            )),
+            Some("notebook link filter set to lots".to_string())
+        );
+        assert_eq!(panel.selected_link_kind, Some(NotebookLinkKind::Lot));
+
+        assert!(!panel.show_followups_only);
+        assert_eq!(
+            panel.handle_operad_action(OPERAD_ACTION_TOGGLE_FOLLOWUPS),
+            Some("notebook follow-up filter enabled".to_string())
+        );
+        assert!(panel.show_followups_only);
+
+        assert_eq!(
+            panel.handle_operad_action(OPERAD_ACTION_CLEAR_FILTERS),
+            Some("notebook filters cleared".to_string())
+        );
+        assert_eq!(panel.selected_tag, "All tags");
+        assert!(panel.selected_link_kind.is_none());
+        assert!(!panel.show_followups_only);
+
+        assert!(panel.preview_mode);
+        assert_eq!(
+            panel.handle_operad_action(OPERAD_ACTION_SET_EDIT),
+            Some("notebook edit mode".to_string())
+        );
+        assert!(!panel.preview_mode);
+
+        let selected = panel.selected_entry.clone().unwrap();
+        let message = panel
+            .handle_operad_action(&format!(
+                "{OPERAD_ACTION_ENTRY_ACTION}{}|test",
+                notebook_entry_action_slug(NotebookEntryAction::TagHandoff)
+            ))
+            .unwrap();
+        assert_eq!(
+            message,
+            format!("tagged notebook entry {selected} for handoff")
+        );
+        let entry = panel.notebook.entry(&selected).unwrap();
+        assert!(entry.tags.iter().any(|tag| tag == "handoff"));
     }
 }

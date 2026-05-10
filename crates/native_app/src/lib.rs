@@ -4,53 +4,55 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     fs,
-    path::PathBuf,
+    io::Write,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
-use drc::{DrcViolation, RuleDeck, run_drc, run_drc_incremental};
+use drc::{DrcIssueStore, DrcViolation, RuleDeck, run_drc, run_drc_incremental};
 use eframe::egui::{
     self, Align, Align2, Color32, FontId, Key, Painter, PointerButton, Pos2, Rect as EguiRect,
     RichText, Sense, Stroke, StrokeKind, Vec2, vec2,
 };
 use geometry_core::{Coord, Point, Rect, Vector, distance_point_to_segment};
+#[cfg(not(target_arch = "wasm32"))]
+use layout_model::gdsii::export_gdsii;
+pub use layout_model::workspace::BuiltinDemoWorkspaceReport;
 use layout_model::{
     Cell, CellId, CellInstance, ClientMessage, CrdtApplyResult, CrdtOperation, Document,
     FlattenedShapeView, InstanceArray, InstanceId, Layer, LayerId, LayoutIndex, LoroCrdtLog,
     LoroUpdate, MarkerState, NetId, Operation, ProcessLayer, ServerMessage, Shape, ShapeId,
     ShapeKind, ShapeKindView, ShapeOccurrenceId, TechnologyFile, Transform, builtin_technologies,
-    connectivity::{ConnectivityReport, NetComponent, extract_connectivity},
-    environment::CleanroomEnvironment,
+    connectivity::{
+        ConnectivityIssue, ConnectivityIssueKind, ConnectivityReport, NetComponent,
+        extract_connectivity,
+    },
     equipment::{
         AlarmSeverity, EquipmentEvent, EquipmentSimulator, HostCommand,
         RecipeId as EquipmentRecipeId, RecipeSelection, RunStatus, SensorSample,
         Tool as EquipmentTool, ToolId as EquipmentToolId, ToolKind as EquipmentToolKind,
         ToolState as EquipmentToolState,
     },
-    experiment::ExperimentPlan,
     fab_ref::{FabObjectKind, FabObjectRef},
-    gdsii::{export_gdsii, import_gdsii},
-    genealogy::LotGenealogy,
-    inventory::Inventory,
-    maintenance::MaintenanceModel,
+    gdsii::{export_gdsii_with_report, import_gdsii_with_report},
     mes::{
         AuditOutcome, FabMesData, Lot, LotId, OperatorAction, ProcessRoute, ToolId, TravelerState,
         TravelerStatus,
     },
     metrology::{
-        DefectClass, DieCoord, FabObjectLinks, HistogramBin, Measurement, MeasurementKind,
-        MeasurementStatus, WaferGeometry, WaferMap,
+        DefectClass, DieCoord, HistogramBin, Measurement, MeasurementKind, MeasurementStatus,
+        WaferMap,
     },
-    notebook::LabNotebook,
-    process_control::ProcessControlModel,
-    process_flow::ProcessFlowModel,
-    recipe::RecipeCatalog,
-    safety::SafetySystem,
-    scheduler::DispatchSchedule,
+    workspace::{WORKSPACE_DATASET_SCHEMA_VERSION, WorkspaceDataset, WorkspaceSnapshotMetadata},
     yield_analysis::{
         CorrelationRecord, DieOutcome, FailureMode, LotComparison, ProcessMeasurement,
         YieldAnalysis, YieldSummary,
     },
+};
+use operad::{
+    ApproxTextMeasurer, ClipBehavior, ColorRgba, FontWeight, InputBehavior, StrokeStyle, TextStyle,
+    TextWrap, UiDocument, UiNode, UiNodeId, UiNodeStyle, UiSize, UiVisual, layout, root_style,
+    widgets,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use renderer::gpu::OffscreenRenderRequest;
@@ -59,7 +61,6 @@ use renderer::gpu::{
     Viewport3dRenderer, Viewport3dUniforms, viewport_3d_target_size,
 };
 use router::{RouteRequest, RouterConfig, route};
-use serde::{Deserialize, Serialize};
 use tracing::{error, warn};
 use uuid::Uuid;
 use web_time::{Duration, Instant};
@@ -73,6 +74,9 @@ mod layout_diff_panel;
 mod maintenance_panel;
 mod mask_panel;
 mod notebook_panel;
+mod operad_audit;
+mod operad_egui;
+mod operad_sidecar;
 mod process_control_panel;
 mod process_flow_panel;
 mod recipe_panel;
@@ -134,6 +138,25 @@ const PROCESS_LAYER_CHOICES: [ProcessLayer; 8] = [
     ProcessLayer::Oxide,
     ProcessLayer::Annotation,
 ];
+const FAB_OPERAD_HEADER_HEIGHT: f32 = 104.0;
+const FAB_OPERAD_METRIC_HEIGHT: f32 = 84.0;
+const FAB_OPERAD_SECTION_TITLE_HEIGHT: f32 = 26.0;
+const FAB_OPERAD_ROW_HEIGHT: f32 = 58.0;
+const FAB_OPERAD_EMPTY_ROW_HEIGHT: f32 = 44.0;
+const FAB_OPERAD_GAP: f32 = 10.0;
+const FAB_OPERAD_PAD: f32 = 12.0;
+const FAB_OPERAD_ACTION_SELECT_TOOL: &str = "fab_control.action.select_tool.";
+const FAB_OPERAD_ACTION_BRING_ONLINE: &str = "fab_control.action.bring_online.";
+const FAB_OPERAD_ACTION_LOAD_RECIPE: &str = "fab_control.action.load_recipe.";
+const FAB_OPERAD_ACTION_START: &str = "fab_control.action.start.";
+const FAB_OPERAD_ACTION_STOP: &str = "fab_control.action.stop.";
+const FAB_OPERAD_ACTION_TRIGGER_ALARM: &str = "fab_control.action.trigger_alarm.";
+const FAB_OPERAD_ACTION_CLEAR_ALARM: &str = "fab_control.action.clear_alarm.";
+const FAB_OPERAD_ACTION_RESET: &str = "fab_control.action.reset.";
+const FAB_OPERAD_ACTION_TOGGLE_MAINTENANCE: &str = "fab_control.action.toggle_maintenance.";
+const NAV_OPERAD_ROW_HEIGHT: f32 = 30.0;
+const NAV_OPERAD_PAD: f32 = 6.0;
+const NAV_OPERAD_ACTION_SELECT_VIEW: &str = "nav_rail.action.select.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Tool {
@@ -168,6 +191,42 @@ enum ViewMode {
     Traceability,
     Experiment,
     Notebook,
+}
+
+#[derive(Debug)]
+struct FabControlOperadView {
+    document: UiDocument,
+    size: UiSize,
+}
+
+#[derive(Clone, Debug)]
+struct FabControlMetricTile {
+    label: String,
+    value: String,
+    detail: String,
+    tone: ui_chrome::Tone,
+}
+
+#[derive(Clone, Debug)]
+struct FabControlOperadRow {
+    title: String,
+    detail: String,
+    tone: ui_chrome::Tone,
+    action_name: Option<String>,
+    selected: bool,
+}
+
+#[derive(Debug)]
+struct NavRailOperadView {
+    document: UiDocument,
+    size: UiSize,
+}
+
+#[derive(Clone, Debug)]
+struct NavRailOperadRow {
+    mode: ViewMode,
+    label: &'static str,
+    selected: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -323,6 +382,35 @@ impl ViewMode {
         }
     }
 
+    fn slug(self) -> &'static str {
+        match self {
+            Self::Workflow => "workflow",
+            Self::Layout2d => "layout2d",
+            Self::Layout3d => "layout3d",
+            Self::FabControl => "fab-control",
+            Self::Metrology => "metrology",
+            Self::Yield => "yield",
+            Self::MaskPrep => "mask-prep",
+            Self::LayoutDiff => "layout-diff",
+            Self::Inventory => "inventory",
+            Self::Maintenance => "maintenance",
+            Self::Environment => "environment",
+            Self::Scheduler => "scheduler",
+            Self::Safety => "safety",
+            Self::SpcFdc => "spc-fdc",
+            Self::ProcessFlow => "process-flow",
+            Self::ProcessControl => "process-control",
+            Self::CrossSection => "cross-section",
+            Self::Traceability => "traceability",
+            Self::Experiment => "experiment",
+            Self::Notebook => "notebook",
+        }
+    }
+
+    fn from_slug(value: &str) -> Option<Self> {
+        ViewMode::ALL.into_iter().find(|mode| mode.slug() == value)
+    }
+
     fn status_message(self) -> &'static str {
         match self {
             Self::Workflow => "integrated FabOS workflow",
@@ -371,7 +459,7 @@ impl ViewMode {
     }
 
     fn has_inspector_panel(self) -> bool {
-        !matches!(self, Self::FabControl | Self::Yield)
+        !matches!(self, Self::FabControl | Self::Yield | Self::Notebook)
     }
 
     fn has_secondary_panel(self) -> bool {
@@ -527,27 +615,6 @@ enum DataSource {
     Demo,
     File(String),
     Generated(String),
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct WorkspaceDataset {
-    schema_version: u32,
-    document: Document,
-    mes: FabMesData,
-    yield_analysis: YieldAnalysis,
-    wafer_map: WaferMap,
-    recipe_catalog: RecipeCatalog,
-    genealogy: LotGenealogy,
-    inventory: Inventory,
-    maintenance: MaintenanceModel,
-    environment: CleanroomEnvironment,
-    scheduler: DispatchSchedule,
-    safety: SafetySystem,
-    experiment_plan: ExperimentPlan,
-    process_control: ProcessControlModel,
-    process_flow: ProcessFlowModel,
-    lab_notebook: LabNotebook,
-    equipment: EquipmentSimulator,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -955,6 +1022,22 @@ enum MarkerAction {
     SetHidden(String, bool),
 }
 
+#[derive(Clone, Debug)]
+enum ConnectivityIssueAction {
+    Focus(Rect),
+    SetWaived(String, bool),
+    SetHidden(String, bool),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ConnectivityIssueUiRow {
+    key: String,
+    kind: ConnectivityIssueKind,
+    label: String,
+    bounds: Rect,
+    state: MarkerState,
+}
+
 #[derive(Clone, Debug, Default)]
 struct PerfStats {
     visible_count: usize,
@@ -998,6 +1081,51 @@ struct PerfStats {
     frame_ms: f64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DocumentPerformanceBudget {
+    object_count: usize,
+    rendered_shape_count_estimate: usize,
+    max_loro_seed_objects: usize,
+    max_drc_objects: usize,
+    max_connectivity_objects: usize,
+    max_3d_rendered_shapes: usize,
+    loro_seed_within_budget: bool,
+    drc_within_budget: bool,
+    connectivity_within_budget: bool,
+    three_d_shape_within_budget: bool,
+}
+
+impl DocumentPerformanceBudget {
+    fn for_counts(object_count: usize, rendered_shape_count_estimate: usize) -> Self {
+        Self {
+            object_count,
+            rendered_shape_count_estimate,
+            max_loro_seed_objects: MAX_LORO_SEED_OBJECTS,
+            max_drc_objects: MAX_DRC_OBJECTS,
+            max_connectivity_objects: MAX_CONNECTIVITY_OBJECTS,
+            max_3d_rendered_shapes: MAX_3D_RENDERED_SHAPES,
+            loro_seed_within_budget: object_count <= MAX_LORO_SEED_OBJECTS,
+            drc_within_budget: object_count <= MAX_DRC_OBJECTS,
+            connectivity_within_budget: object_count <= MAX_CONNECTIVITY_OBJECTS,
+            three_d_shape_within_budget: rendered_shape_count_estimate <= MAX_3D_RENDERED_SHAPES,
+        }
+    }
+
+    fn drc_skip_message(self) -> Option<String> {
+        (!self.drc_within_budget).then(|| {
+            format!(
+                "DRC skipped for {} objects; limit is {}",
+                self.object_count, self.max_drc_objects
+            )
+        })
+    }
+
+    fn connectivity_skip_message(self) -> Option<String> {
+        (!self.connectivity_within_budget)
+            .then(|| format!("net extraction skipped for {} objects", self.object_count))
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct RenderInvalidation {
     rects: Vec<Rect>,
@@ -1006,6 +1134,20 @@ struct RenderInvalidation {
 }
 
 impl RenderInvalidation {
+    fn merge(&mut self, other: RenderInvalidation) {
+        if self.clear_all {
+            return;
+        }
+        if other.clear_all {
+            self.rects.clear();
+            self.shape_ids.clear();
+            self.clear_all = true;
+            return;
+        }
+        self.rects.extend(other.rects);
+        self.shape_ids.extend(other.shape_ids);
+    }
+
     fn dirty_bounds(&self) -> Option<Rect> {
         if self.clear_all {
             return None;
@@ -1096,11 +1238,14 @@ pub struct FabricadApp {
     connectivity: ConnectivityReport,
     show_hidden_markers: bool,
     show_waived_markers: bool,
+    show_hidden_connectivity_issues: bool,
+    show_waived_connectivity_issues: bool,
     drc_marker_filter: String,
     connectivity_filter: String,
     nav_rail_modes: BTreeSet<ViewMode>,
     show_command_palette: bool,
     show_sidebar_modules: bool,
+    sidebar_modules_scroll_offset: f32,
     show_inspector_drawer: bool,
     show_layers_drawer: bool,
     command_palette_query: String,
@@ -1317,103 +1462,561 @@ pub fn export_demo_gds(
     let document = Document::demo();
     let technology = default_technology();
     let bytes = export_gdsii(&document, &technology)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, bytes)?;
+    atomic_write_bytes(path, &bytes)?;
     Ok(())
 }
 
-impl WorkspaceDataset {
-    fn blank() -> Self {
-        Self {
-            schema_version: 1,
-            document: blank_layout_document("Untitled layout"),
-            mes: empty_mes_data(),
-            yield_analysis: empty_yield_analysis(),
-            wafer_map: empty_wafer_map(),
-            recipe_catalog: RecipeCatalog::default(),
-            genealogy: LotGenealogy::new(),
-            inventory: Inventory::default(),
-            maintenance: MaintenanceModel::default(),
-            environment: CleanroomEnvironment::default(),
-            scheduler: SchedulerPanel::empty().schedule().clone(),
-            safety: SafetySystem::default(),
-            experiment_plan: ExperimentPlannerPanel::empty().plan().clone(),
-            process_control: ProcessControlModel::default(),
-            process_flow: ProcessFlowModel::default(),
-            lab_notebook: LabNotebook::default(),
-            equipment: EquipmentSimulator::new(Vec::new()),
-        }
-    }
-
-    fn demo() -> Self {
-        let yield_analysis = YieldAnalysis::synthetic();
-        Self {
-            schema_version: 1,
-            document: Document::demo(),
-            mes: FabMesData::sample(),
-            yield_analysis: yield_analysis.clone(),
-            wafer_map: WaferMap::synthetic_demo(),
-            recipe_catalog: RecipeCatalog::sample(),
-            genealogy: LotGenealogy::sample(),
-            inventory: Inventory::sample(),
-            maintenance: MaintenanceModel::sample(),
-            environment: CleanroomEnvironment::sample(),
-            scheduler: DispatchSchedule::sample(),
-            safety: SafetySystem::simulated_demo(),
-            experiment_plan: ExperimentPlan::sample(),
-            process_control: ProcessControlModel::from_yield_analysis(&yield_analysis),
-            process_flow: ProcessFlowModel::sample(),
-            lab_notebook: LabNotebook::sample(),
-            equipment: EquipmentSimulator::demo_fab(),
-        }
-    }
+pub fn validate_builtin_demo_workspace() -> Result<BuiltinDemoWorkspaceReport, String> {
+    builtin_demo_workspace_dataset().builtin_demo_report()
 }
 
-fn blank_layout_document(name: impl Into<String>) -> Document {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PersistenceFixtureReport {
+    pub migrated_legacy_schema_zero: usize,
+    pub rejected_future_workspace_schema: usize,
+    pub rejected_future_metadata_schema: usize,
+    pub rejected_future_document_schema: usize,
+    pub rejected_malformed_schema_fields: usize,
+    pub rejected_malformed_metadata_arrays: usize,
+    pub rejected_unsupported_feature_flags: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QualityFixtureReport {
+    pub drc_violations: usize,
+    pub drc_rule_families: usize,
+    pub connectivity_components: usize,
+    pub connectivity_shorts: usize,
+    pub connectivity_opens: usize,
+    pub connectivity_issue_keys: usize,
+    pub connectivity_issue_states: usize,
+}
+
+pub fn validate_persistence_fixtures() -> Result<PersistenceFixtureReport, String> {
+    let legacy = WorkspaceDataset::from_json_str(include_str!(
+        "../../../fixtures/persistence/workspace_legacy_schema0_blank.json"
+    ))?;
+    if legacy.schema_version != WORKSPACE_DATASET_SCHEMA_VERSION {
+        return Err(format!(
+            "legacy persistence fixture migrated to workspace schema {}, expected {}",
+            legacy.schema_version, WORKSPACE_DATASET_SCHEMA_VERSION
+        ));
+    }
+    if !legacy.validate().is_valid() {
+        return Err(format!(
+            "legacy persistence fixture migrated into invalid workspace: {}",
+            legacy.validate().error_summary()
+        ));
+    }
+
+    assert_persistence_fixture_rejected(
+        "future workspace schema",
+        include_str!("../../../fixtures/persistence/workspace_future_schema_preflight.json"),
+        &["workspace schema", "unsupported"],
+    )?;
+    assert_persistence_fixture_rejected(
+        "future metadata schema",
+        include_str!("../../../fixtures/persistence/workspace_future_metadata_preflight.json"),
+        &["metadata schema", "unsupported"],
+    )?;
+    assert_persistence_fixture_rejected(
+        "future document schema",
+        include_str!(
+            "../../../fixtures/persistence/workspace_future_document_schema_preflight.json"
+        ),
+        &["document schema", "unsupported"],
+    )?;
+    let malformed_schema_field = malformed_schema_field_workspace_json()?;
+    assert_persistence_fixture_rejected(
+        "malformed schema field",
+        &malformed_schema_field,
+        &["workspace schema version", "unsigned integer"],
+    )?;
+    assert_persistence_fixture_rejected(
+        "malformed metadata arrays",
+        include_str!(
+            "../../../fixtures/persistence/workspace_malformed_metadata_arrays_preflight.json"
+        ),
+        &[
+            "workspace metadata feature flags",
+            "entry 1",
+            "must be a string",
+        ],
+    )?;
+    assert_persistence_fixture_rejected(
+        "unsupported feature flag",
+        include_str!("../../../fixtures/persistence/workspace_unsupported_feature_flag.json"),
+        &["unsupported feature flag", "future_mask_revision_model"],
+    )?;
+
+    Ok(PersistenceFixtureReport {
+        migrated_legacy_schema_zero: 1,
+        rejected_future_workspace_schema: 1,
+        rejected_future_metadata_schema: 1,
+        rejected_future_document_schema: 1,
+        rejected_malformed_schema_fields: 1,
+        rejected_malformed_metadata_arrays: 1,
+        rejected_unsupported_feature_flags: 1,
+    })
+}
+
+fn malformed_schema_field_workspace_json() -> Result<String, String> {
+    let mut value = serde_json::to_value(WorkspaceDataset::blank())
+        .map_err(|err| format!("failed to build malformed schema fixture: {err}"))?;
+    value["schema_version"] = serde_json::Value::String("future".to_string());
+    serde_json::to_string(&value)
+        .map_err(|err| format!("failed to encode malformed schema fixture: {err}"))
+}
+
+fn assert_persistence_fixture_rejected(
+    label: &str,
+    contents: &str,
+    required_messages: &[&str],
+) -> Result<(), String> {
+    let err = WorkspaceDataset::from_json_str(contents)
+        .err()
+        .ok_or_else(|| format!("{label} persistence fixture unexpectedly loaded"))?;
+    for required in required_messages {
+        if !err.contains(required) {
+            return Err(format!(
+                "{label} persistence fixture error {err:?} did not contain {required:?}"
+            ));
+        }
+    }
+    if err.contains("missing field") {
+        return Err(format!(
+            "{label} persistence fixture failed with generic missing-field parse error: {err}"
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_quality_fixtures() -> Result<QualityFixtureReport, String> {
+    let drc = validate_drc_quality_fixture()?;
+    let connectivity = validate_connectivity_quality_fixture()?;
+    Ok(QualityFixtureReport {
+        drc_violations: drc.0,
+        drc_rule_families: drc.1,
+        connectivity_components: connectivity.component_count,
+        connectivity_shorts: connectivity.short_count,
+        connectivity_opens: connectivity.open_count,
+        connectivity_issue_keys: connectivity.issue_key_count,
+        connectivity_issue_states: connectivity.issue_state_count,
+    })
+}
+
+fn builtin_demo_workspace_dataset() -> WorkspaceDataset {
+    WorkspaceDataset::demo()
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct QualityConnectivityFixture {
+    name: String,
+    shapes: Vec<QualityFixtureShape>,
+    expect: QualityConnectivityExpectation,
+    #[serde(default)]
+    issue_states: Vec<QualityConnectivityIssueState>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct QualityConnectivityExpectation {
+    health: String,
+    component_count: usize,
+    labeled_component_count: usize,
+    short_count: usize,
+    short_names: Vec<String>,
+    short_key: String,
+    open_count: usize,
+    open_name: String,
+    open_key: String,
+    open_component_count: usize,
+    data_component_shape_count: usize,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct QualityConnectivityIssueState {
+    key: String,
+    hidden: bool,
+    waived: bool,
+    note: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ConnectivityQualityValidation {
+    component_count: usize,
+    short_count: usize,
+    open_count: usize,
+    issue_key_count: usize,
+    issue_state_count: usize,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct QualityDrcFixture {
+    name: String,
+    shapes: Vec<QualityFixtureShape>,
+    expect: QualityDrcExpectation,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct QualityDrcExpectation {
+    total_count: usize,
+    omitted_count: usize,
+    rule_counts: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum QualityFixtureShape {
+    Rect {
+        layer: String,
+        x: Coord,
+        y: Coord,
+        w: Coord,
+        h: Coord,
+    },
+    Label {
+        layer: String,
+        x: Coord,
+        y: Coord,
+        text: String,
+    },
+}
+
+fn validate_drc_quality_fixture() -> Result<(usize, usize), String> {
+    let fixture: QualityDrcFixture =
+        serde_json::from_str(include_str!("../../../fixtures/quality/drc_golden.json"))
+            .map_err(|err| format!("failed to parse DRC quality fixture: {err}"))?;
+    let document = document_from_quality_fixture(&fixture.name, &fixture.shapes)?;
+    let rules = RuleDeck::demo(&document);
+    let rule_findings = rules.validate_for_document(&document);
+    if !rule_findings.is_empty() {
+        let detail = rule_findings
+            .iter()
+            .map(|finding| format!("{:?}: {}", finding.severity, finding.message))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(format!(
+            "DRC quality fixture has an invalid rule deck: {detail}"
+        ));
+    }
+    let violations = run_drc(&document, &rules);
+    let store = DrcIssueStore::from_violations(violations.clone());
+    let validation_findings = store.validate();
+    if !validation_findings.is_empty() {
+        let detail = validation_findings
+            .iter()
+            .map(|finding| format!("{:?}: {}", finding.severity, finding.message))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(format!(
+            "DRC quality fixture generated an invalid issue store: {detail}"
+        ));
+    }
+    let summary = store.summary(16);
+    let mut rule_counts = BTreeMap::new();
+    for violation in violations {
+        *rule_counts.entry(violation.rule).or_insert(0usize) += 1;
+    }
+
+    if summary.total_count != fixture.expect.total_count {
+        return Err(format!(
+            "DRC quality fixture expected {} violations, got {}",
+            fixture.expect.total_count, summary.total_count
+        ));
+    }
+    if summary.omitted_count != fixture.expect.omitted_count {
+        return Err(format!(
+            "DRC quality fixture expected {} omitted rows, got {}",
+            fixture.expect.omitted_count, summary.omitted_count
+        ));
+    }
+    if rule_counts != fixture.expect.rule_counts {
+        return Err(format!(
+            "DRC quality fixture rule counts differ: expected {:?}, got {:?}",
+            fixture.expect.rule_counts, rule_counts
+        ));
+    }
+    Ok((summary.total_count, rule_counts.len()))
+}
+
+fn validate_connectivity_quality_fixture() -> Result<ConnectivityQualityValidation, String> {
+    let fixture: QualityConnectivityFixture = serde_json::from_str(include_str!(
+        "../../../fixtures/quality/connectivity_golden.json"
+    ))
+    .map_err(|err| format!("failed to parse connectivity quality fixture: {err}"))?;
+    let document = document_from_quality_fixture(&fixture.name, &fixture.shapes)?;
+    let report = extract_connectivity(&document, &layout_model::default_technology())
+        .map_err(|err| format!("connectivity quality fixture failed: {err}"))?;
+    let validation_findings = report.validate();
+    if !validation_findings.is_empty() {
+        let detail = validation_findings
+            .iter()
+            .map(|finding| format!("{:?}: {}", finding.severity, finding.message))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(format!(
+            "connectivity quality fixture generated an invalid report: {detail}"
+        ));
+    }
+    let summary = report.summary(8);
+
+    if summary.health.label() != fixture.expect.health {
+        return Err(format!(
+            "connectivity quality fixture expected health {:?}, got {:?}",
+            fixture.expect.health,
+            summary.health.label()
+        ));
+    }
+    if summary.component_count != fixture.expect.component_count {
+        return Err(format!(
+            "connectivity quality fixture expected {} components, got {}",
+            fixture.expect.component_count, summary.component_count
+        ));
+    }
+    if summary.labeled_component_count != fixture.expect.labeled_component_count {
+        return Err(format!(
+            "connectivity quality fixture expected {} labeled components, got {}",
+            fixture.expect.labeled_component_count, summary.labeled_component_count
+        ));
+    }
+    if report.shorts.len() != fixture.expect.short_count {
+        return Err(format!(
+            "connectivity quality fixture expected {} shorts, got {}",
+            fixture.expect.short_count,
+            report.shorts.len()
+        ));
+    }
+    if report
+        .shorts
+        .first()
+        .is_none_or(|short| short.names != fixture.expect.short_names)
+    {
+        return Err(format!(
+            "connectivity quality fixture short names differ: expected {:?}, got {:?}",
+            fixture.expect.short_names,
+            report.shorts.first().map(|short| &short.names)
+        ));
+    }
+    if report
+        .shorts
+        .first()
+        .is_none_or(|short| short.stable_key() != fixture.expect.short_key)
+    {
+        return Err(format!(
+            "connectivity quality fixture short key differs: expected {:?}, got {:?}",
+            fixture.expect.short_key,
+            report.shorts.first().map(|short| short.stable_key())
+        ));
+    }
+    if report.opens.len() != fixture.expect.open_count {
+        return Err(format!(
+            "connectivity quality fixture expected {} opens, got {}",
+            fixture.expect.open_count,
+            report.opens.len()
+        ));
+    }
+    if report.opens.first().is_none_or(|open| {
+        open.name != fixture.expect.open_name
+            || open.components.len() != fixture.expect.open_component_count
+    }) {
+        return Err(format!(
+            "connectivity quality fixture open differs: expected {} with {} components, got {:?}",
+            fixture.expect.open_name,
+            fixture.expect.open_component_count,
+            report.opens.first()
+        ));
+    }
+    if report
+        .opens
+        .first()
+        .is_none_or(|open| open.stable_key() != fixture.expect.open_key)
+    {
+        return Err(format!(
+            "connectivity quality fixture open key differs: expected {:?}, got {:?}",
+            fixture.expect.open_key,
+            report.opens.first().map(|open| open.stable_key())
+        ));
+    }
+    if !report.components.iter().any(|component| {
+        component.net_name.as_deref() == Some("DATA")
+            && component.shapes.len() == fixture.expect.data_component_shape_count
+    }) {
+        return Err(format!(
+            "connectivity quality fixture missing DATA component with {} shapes",
+            fixture.expect.data_component_shape_count
+        ));
+    }
+
+    let store = report.issue_store();
+    let states = fixture
+        .issue_states
+        .iter()
+        .map(|state| {
+            (
+                state.key.clone(),
+                MarkerState {
+                    hidden: state.hidden,
+                    waived: state.waived,
+                    note: state.note.clone(),
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    for expected in &fixture.issue_states {
+        let record = store.get(&expected.key).ok_or_else(|| {
+            format!(
+                "connectivity quality fixture missing expected issue key {:?}",
+                expected.key
+            )
+        })?;
+        if !matches!(
+            record.kind(),
+            ConnectivityIssueKind::Short | ConnectivityIssueKind::Open
+        ) {
+            return Err(format!(
+                "connectivity quality fixture issue key {:?} resolved to unexpected kind {:?}",
+                expected.key,
+                record.kind()
+            ));
+        }
+        let state = states.get(&expected.key).ok_or_else(|| {
+            format!(
+                "connectivity quality fixture missing expected issue state {:?}",
+                expected.key
+            )
+        })?;
+        if state.hidden != expected.hidden
+            || state.waived != expected.waived
+            || state.note != expected.note
+        {
+            return Err(format!(
+                "connectivity quality fixture issue state {:?} differs: expected hidden={} waived={} note={:?}, got {:?}",
+                expected.key, expected.hidden, expected.waived, expected.note, state
+            ));
+        }
+    }
+
+    Ok(ConnectivityQualityValidation {
+        component_count: summary.component_count,
+        short_count: report.shorts.len(),
+        open_count: report.opens.len(),
+        issue_key_count: fixture.issue_states.len(),
+        issue_state_count: states.len(),
+    })
+}
+
+fn document_from_quality_fixture(
+    name: &str,
+    shapes: &[QualityFixtureShape],
+) -> Result<Document, String> {
     let mut document = Document::new(name);
-    document.layers.clear();
-    document.next_layer_id = 1;
-    document
+    for shape in shapes {
+        match shape {
+            QualityFixtureShape::Rect { layer, x, y, w, h } => {
+                let layer_id = quality_fixture_layer(&document, layer)?;
+                document.insert_shape(
+                    layer_id,
+                    ShapeKind::Rectangle(Rect::from_min_size(Point::new(*x, *y), *w, *h)),
+                );
+            }
+            QualityFixtureShape::Label { layer, x, y, text } => {
+                let layer_id = quality_fixture_layer(&document, layer)?;
+                document.insert_shape(
+                    layer_id,
+                    ShapeKind::Label {
+                        position: Point::new(*x, *y),
+                        text: text.clone(),
+                    },
+                );
+            }
+        }
+    }
+    Ok(document)
 }
 
-fn empty_mes_data() -> FabMesData {
-    FabMesData {
-        routes: BTreeMap::new(),
-        lots: BTreeMap::new(),
-        travelers: BTreeMap::new(),
+fn quality_fixture_layer(document: &Document, layer: &str) -> Result<LayerId, String> {
+    let process = ProcessLayer::from_technology_name(layer)
+        .ok_or_else(|| format!("unknown fixture layer {layer:?}"))?;
+    document
+        .layer_by_process(process)
+        .ok_or_else(|| format!("fixture layer {layer:?} missing from document"))
+}
+
+fn read_workspace_dataset(path: &Path) -> Result<WorkspaceDataset, String> {
+    let contents = fs::read_to_string(path)
+        .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    WorkspaceDataset::from_json_str(&contents)
+        .map_err(|err| format!("failed to load {}: {err}", path.display()))
+}
+
+fn write_workspace_dataset(path: &Path, dataset: &WorkspaceDataset) -> Result<(), String> {
+    let validation = dataset.validate();
+    if !validation.is_valid() {
+        return Err(format!(
+            "workspace validation failed: {}",
+            validation.error_summary()
+        ));
     }
+    let bytes = serde_json::to_vec_pretty(dataset)
+        .map_err(|err| format!("failed to serialize workspace: {err}"))?;
+    atomic_write_bytes(path, &bytes)
+        .map_err(|err| format!("failed to write {}: {err}", path.display()))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn load_or_regenerate_demo_workspace(path: &Path) -> Result<WorkspaceDataset, String> {
+    match read_workspace_dataset(path) {
+        Ok(dataset) => Ok(dataset),
+        Err(err) => {
+            warn!(
+                path = %path.display(),
+                error = %err,
+                "demo workspace load failed; regenerating demo workspace"
+            );
+            let dataset = WorkspaceDataset::demo();
+            write_workspace_dataset(path, &dataset)?;
+            Ok(dataset)
+        }
+    }
+}
+
+fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    atomic_write_bytes_with_before_rename(path, bytes, |_| Ok(()))
+}
+
+fn atomic_write_bytes_with_before_rename(
+    path: &Path,
+    bytes: &[u8],
+    before_rename: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "write".into());
+    let temp_path = path.with_file_name(format!(".{file_name}.{}.tmp", Uuid::new_v4().simple()));
+    let result = (|| {
+        let mut file = fs::File::create(&temp_path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        before_rename(&temp_path)?;
+        fs::rename(&temp_path, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
 }
 
 fn default_nav_rail_modes() -> BTreeSet<ViewMode> {
     ViewMode::ALL.into_iter().collect()
-}
-
-fn empty_yield_analysis() -> YieldAnalysis {
-    YieldAnalysis {
-        lots: Vec::new(),
-        recipes: Vec::new(),
-        test_results: Vec::new(),
-        process_measurements: Vec::new(),
-        lot_summaries: Vec::new(),
-        wafer_summaries: Vec::new(),
-        lot_comparisons: Vec::new(),
-        correlations: Vec::new(),
-    }
-}
-
-fn empty_wafer_map() -> WaferMap {
-    WaferMap {
-        id: String::new(),
-        name: "No wafer map loaded".to_string(),
-        geometry: WaferGeometry::default(),
-        links: FabObjectLinks::default(),
-        dies: Vec::new(),
-        measurements: Vec::new(),
-        defects: Vec::new(),
-        annotations: Vec::new(),
-    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1500,14 +2103,15 @@ impl FabricadApp {
             GpuAdapterSummary::from_wgpu_info(info)
         });
         let mut loro_log = LoroCrdtLog::new(user_id).expect("create Loro CRDT log");
-        if document_object_count(&document) <= MAX_LORO_SEED_OBJECTS {
+        let startup_budget = performance_budget_for_document(&document);
+        if startup_budget.loro_seed_within_budget {
             loro_log
                 .seed_document_objects(&document)
                 .expect("seed Loro object store");
         } else {
             warn!(
-                object_count = document_object_count(&document),
-                max_seed_objects = MAX_LORO_SEED_OBJECTS,
+                object_count = startup_budget.object_count,
+                max_seed_objects = startup_budget.max_loro_seed_objects,
                 "document exceeds Loro startup seed budget"
             );
         }
@@ -1581,11 +2185,14 @@ impl FabricadApp {
             connectivity,
             show_hidden_markers: false,
             show_waived_markers: true,
+            show_hidden_connectivity_issues: false,
+            show_waived_connectivity_issues: true,
             drc_marker_filter: String::new(),
             connectivity_filter: String::new(),
             nav_rail_modes: default_nav_rail_modes(),
             show_command_palette: false,
             show_sidebar_modules: false,
+            sidebar_modules_scroll_offset: 0.0,
             show_inspector_drawer: false,
             show_layers_drawer: false,
             command_palette_query: String::new(),
@@ -1668,7 +2275,7 @@ impl FabricadApp {
         let mut app = Self::new(cc);
         if options.demo_workspace {
             app.apply_workspace_dataset(
-                WorkspaceDataset::demo(),
+                builtin_demo_workspace_dataset(),
                 DataSource::Demo,
                 DataSource::Demo,
                 "test workspace: demo",
@@ -1823,16 +2430,124 @@ impl FabricadApp {
     }
 
     fn set_marker_state(&mut self, key: String, update: impl FnOnce(&mut MarkerState)) {
-        let state = self.document.marker_states.entry(key.clone()).or_default();
-        update(state);
-        if *state == MarkerState::default() {
-            self.document.marker_states.remove(&key);
+        let before = self
+            .document
+            .marker_states
+            .get(&key)
+            .cloned()
+            .and_then(normalized_marker_state);
+        let mut next = before.clone().unwrap_or_default();
+        update(&mut next);
+        let after = normalized_marker_state(next);
+        if before == after {
+            return;
         }
+        self.apply_with_history(
+            Operation::SetMarkerState {
+                key: key.clone(),
+                state: after,
+            },
+            Operation::SetMarkerState { key, state: before },
+        );
     }
 
     fn clear_marker_states(&mut self) {
-        self.document.marker_states.clear();
-        self.status = "cleared marker waivers and hidden states".to_string();
+        let states = self.document.marker_states.clone();
+        if states.is_empty() {
+            return;
+        }
+        let redo = Operation::Batch {
+            operations: states
+                .keys()
+                .cloned()
+                .map(|key| Operation::SetMarkerState { key, state: None })
+                .collect(),
+        };
+        let undo = Operation::Batch {
+            operations: states
+                .into_iter()
+                .map(|(key, state)| Operation::SetMarkerState {
+                    key,
+                    state: Some(state),
+                })
+                .collect(),
+        };
+        self.apply_with_history(redo, undo);
+        if self.document.marker_states.is_empty() {
+            self.status = "cleared marker waivers and hidden states".to_string();
+        }
+    }
+
+    fn active_connectivity_issue_count(&self) -> usize {
+        let store = self.connectivity.issue_store();
+        if self.document.connectivity_issue_states.is_empty() {
+            return store.records.len();
+        }
+        store
+            .records
+            .iter()
+            .filter(|record| {
+                let state = self.connectivity_issue_state(&record.key);
+                !state.hidden && !state.waived
+            })
+            .count()
+    }
+
+    fn connectivity_issue_state(&self, key: &str) -> MarkerState {
+        self.document
+            .connectivity_issue_states
+            .get(key)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn set_connectivity_issue_state(&mut self, key: String, update: impl FnOnce(&mut MarkerState)) {
+        let before = self
+            .document
+            .connectivity_issue_states
+            .get(&key)
+            .cloned()
+            .and_then(normalized_marker_state);
+        let mut next = before.clone().unwrap_or_default();
+        update(&mut next);
+        let after = normalized_marker_state(next);
+        if before == after {
+            return;
+        }
+        self.apply_with_history(
+            Operation::SetConnectivityIssueState {
+                key: key.clone(),
+                state: after,
+            },
+            Operation::SetConnectivityIssueState { key, state: before },
+        );
+    }
+
+    fn clear_connectivity_issue_states(&mut self) {
+        let states = self.document.connectivity_issue_states.clone();
+        if states.is_empty() {
+            return;
+        }
+        let redo = Operation::Batch {
+            operations: states
+                .keys()
+                .cloned()
+                .map(|key| Operation::SetConnectivityIssueState { key, state: None })
+                .collect(),
+        };
+        let undo = Operation::Batch {
+            operations: states
+                .into_iter()
+                .map(|(key, state)| Operation::SetConnectivityIssueState {
+                    key,
+                    state: Some(state),
+                })
+                .collect(),
+        };
+        self.apply_with_history(redo, undo);
+        if self.document.connectivity_issue_states.is_empty() {
+            self.status = "cleared connectivity issue waivers and hidden states".to_string();
+        }
     }
 
     fn rebuild_connectivity(&mut self) {
@@ -2023,7 +2738,7 @@ impl FabricadApp {
                 return;
             }
         };
-        if document_object_count(&self.document) <= MAX_LORO_SEED_OBJECTS {
+        if performance_budget_for_document(&self.document).loro_seed_within_budget {
             if let Err(err) = log.seed_document_objects(&self.document) {
                 self.status = format!("failed to seed Loro object store: {err}");
                 return;
@@ -2035,8 +2750,12 @@ impl FabricadApp {
     fn render_invalidation_for_operation(&self, operation: &Operation) -> RenderInvalidation {
         let mut invalidation = RenderInvalidation::default();
         match operation {
-            Operation::Batch { .. }
-            | Operation::AddCell { .. }
+            Operation::Batch { operations } => {
+                for operation in operations {
+                    invalidation.merge(self.render_invalidation_for_operation(operation));
+                }
+            }
+            Operation::AddCell { .. }
             | Operation::DeleteCell { .. }
             | Operation::RenameCell { .. }
             | Operation::AddInstance { .. }
@@ -2086,9 +2805,36 @@ impl FabricadApp {
             Operation::AddLayer { .. } | Operation::DeleteLayer { .. } => {
                 invalidation.clear_all = true;
             }
+            Operation::SetMarkerState { .. } | Operation::SetConnectivityIssueState { .. } => {}
             Operation::Cursor { .. } => {}
         }
         invalidation
+    }
+
+    fn operation_rebuilds_layout_indexes(operation: &Operation) -> bool {
+        match operation {
+            Operation::Batch { operations } => operations
+                .iter()
+                .any(Self::operation_rebuilds_layout_indexes),
+            Operation::SetMarkerState { .. }
+            | Operation::SetConnectivityIssueState { .. }
+            | Operation::Cursor { .. } => false,
+            Operation::AddShape { .. }
+            | Operation::DeleteShape { .. }
+            | Operation::ReplaceShape { .. }
+            | Operation::MoveShape { .. }
+            | Operation::AddCell { .. }
+            | Operation::DeleteCell { .. }
+            | Operation::RenameCell { .. }
+            | Operation::AddInstance { .. }
+            | Operation::ReplaceInstance { .. }
+            | Operation::DeleteInstance { .. }
+            | Operation::RenameInstance { .. }
+            | Operation::MoveInstance { .. }
+            | Operation::AddLayer { .. }
+            | Operation::DeleteLayer { .. }
+            | Operation::SetLayerVisibility { .. } => true,
+        }
     }
 
     fn invalidate_render_cache(&mut self, invalidation: RenderInvalidation) {
@@ -2108,8 +2854,11 @@ impl FabricadApp {
 
     fn apply_operation_without_history(&mut self, operation: &Operation) {
         let invalidation = self.render_invalidation_for_operation(operation);
+        let rebuild_indexes = Self::operation_rebuilds_layout_indexes(operation);
         self.document.apply_operation_without_log(operation);
-        self.rebuild_indexes();
+        if rebuild_indexes {
+            self.rebuild_indexes();
+        }
         self.invalidate_render_cache(invalidation);
     }
 
@@ -2131,11 +2880,14 @@ impl FabricadApp {
             return false;
         }
         let invalidation = self.render_invalidation_for_operation(&operation.operation);
+        let rebuild_indexes = Self::operation_rebuilds_layout_indexes(&operation.operation);
         if self.document.apply_crdt_operation(operation) != CrdtApplyResult::Applied {
             warn!("CRDT operation did not apply and was ignored");
             return false;
         }
-        self.rebuild_indexes();
+        if rebuild_indexes {
+            self.rebuild_indexes();
+        }
         self.invalidate_render_cache(invalidation);
         true
     }
@@ -3303,9 +4055,11 @@ impl FabricadApp {
     }
 
     fn current_workspace_dataset(&self) -> WorkspaceDataset {
+        let document = self.document.clone();
         WorkspaceDataset {
-            schema_version: 1,
-            document: self.document.clone(),
+            schema_version: WORKSPACE_DATASET_SCHEMA_VERSION,
+            metadata: WorkspaceSnapshotMetadata::current(document.schema_version),
+            document,
             mes: self.mes.clone(),
             yield_analysis: self.yield_analysis.clone(),
             wafer_map: self.wafer_map.clone(),
@@ -3319,6 +4073,7 @@ impl FabricadApp {
             experiment_plan: self.experiment_panel.plan().clone(),
             process_control: self.process_control_panel.model().clone(),
             process_flow: self.process_flow_panel.model().clone(),
+            cross_section: self.cross_section_panel.process().clone(),
             lab_notebook: self.notebook_panel.notebook().clone(),
             equipment: self.equipment_sim.clone(),
         }
@@ -3331,6 +4086,15 @@ impl FabricadApp {
         fabos_source: DataSource,
         label: &str,
     ) {
+        let validation = dataset.validate();
+        if !validation.is_valid() {
+            self.set_error_status(format!(
+                "workspace validation failed: {}",
+                validation.error_summary()
+            ));
+            return;
+        }
+
         self.replace_document(dataset.document, label);
         self.layout_source = layout_source;
         self.fabos_source = fabos_source;
@@ -3352,7 +4116,7 @@ impl FabricadApp {
         self.spc_fdc_panel = SpcFdcPanel::new();
         self.process_flow_panel = ProcessFlowPanel::from_model(dataset.process_flow);
         self.process_control_panel = ProcessControlPanel::from_model(dataset.process_control);
-        self.cross_section_panel = CrossSectionPanel::sample();
+        self.cross_section_panel = CrossSectionPanel::from_process(dataset.cross_section);
         self.genealogy_panel = GenealogyPanel::from_genealogy(dataset.genealogy);
         self.experiment_panel = ExperimentPlannerPanel::from_plan(dataset.experiment_plan);
         self.notebook_panel = LabNotebookPanel::from_notebook(dataset.lab_notebook);
@@ -3660,25 +4424,15 @@ impl FabricadApp {
 
     fn save_workspace(&mut self) {
         let path = PathBuf::from(WORKSPACE_PATH);
-        if let Some(parent) = path.parent()
-            && let Err(err) = fs::create_dir_all(parent)
-        {
-            self.set_error_status(format!("workspace save failed: {err}"));
-            return;
-        }
-        match serde_json::to_string_pretty(&self.current_workspace_dataset())
-            .and_then(|contents| fs::write(&path, contents).map_err(serde_json::Error::io))
-        {
+        match write_workspace_dataset(&path, &self.current_workspace_dataset()) {
             Ok(()) => self.status = format!("saved workspace {WORKSPACE_PATH}"),
             Err(err) => self.set_error_status(format!("workspace save failed: {err}")),
         }
     }
 
     fn load_workspace(&mut self) {
-        match fs::read_to_string(WORKSPACE_PATH)
-            .map_err(serde_json::Error::io)
-            .and_then(|contents| serde_json::from_str::<WorkspaceDataset>(&contents))
-        {
+        let path = PathBuf::from(WORKSPACE_PATH);
+        match read_workspace_dataset(&path) {
             Ok(dataset) => self.apply_workspace_dataset(
                 dataset,
                 DataSource::File(WORKSPACE_PATH.to_string()),
@@ -3693,7 +4447,7 @@ impl FabricadApp {
         #[cfg(target_arch = "wasm32")]
         {
             self.apply_workspace_dataset(
-                WorkspaceDataset::demo(),
+                builtin_demo_workspace_dataset(),
                 DataSource::Demo,
                 DataSource::Demo,
                 "loaded built-in demo workspace",
@@ -3703,34 +4457,11 @@ impl FabricadApp {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let path = PathBuf::from(DEMO_WORKSPACE_PATH);
-            let dataset = match fs::read_to_string(&path)
-                .map_err(serde_json::Error::io)
-                .and_then(|contents| serde_json::from_str::<WorkspaceDataset>(&contents))
-            {
+            let dataset = match load_or_regenerate_demo_workspace(&path) {
                 Ok(dataset) => dataset,
                 Err(err) => {
-                    warn!(
-                        path = %path.display(),
-                        error = %err,
-                        "demo workspace load failed; regenerating demo workspace"
-                    );
-                    let dataset = WorkspaceDataset::demo();
-                    if let Some(parent) = path.parent()
-                        && let Err(err) = fs::create_dir_all(parent)
-                    {
-                        self.set_error_status(format!("demo workspace setup failed: {err}"));
-                        return;
-                    }
-                    match serde_json::to_string_pretty(&dataset).and_then(|contents| {
-                        fs::write(&path, contents).map_err(serde_json::Error::io)
-                    }) {
-                        Ok(()) => {}
-                        Err(err) => {
-                            self.set_error_status(format!("demo workspace setup failed: {err}"));
-                            return;
-                        }
-                    }
-                    dataset
+                    self.set_error_status(format!("demo workspace setup failed: {err}"));
+                    return;
                 }
             };
             self.apply_workspace_dataset(
@@ -3750,8 +4481,9 @@ impl FabricadApp {
                 return;
             }
         }
-        match serde_json::to_string_pretty(&self.document)
-            .and_then(|contents| fs::write(&path, contents).map_err(serde_json::Error::io))
+        match serde_json::to_vec_pretty(&self.document)
+            .map_err(|err| err.to_string())
+            .and_then(|bytes| atomic_write_bytes(&path, &bytes).map_err(|err| err.to_string()))
         {
             Ok(()) => {
                 self.last_autosave = Instant::now();
@@ -3796,13 +4528,7 @@ impl FabricadApp {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let path = PathBuf::from(SAVE_PATH);
-            if let Some(parent) = path.parent()
-                && let Err(err) = fs::create_dir_all(parent)
-            {
-                self.set_error_status(format!("autosave failed: {err}"));
-                return;
-            }
-            match fs::write(&path, contents) {
+            match atomic_write_bytes(&path, contents.as_bytes()) {
                 Ok(()) => self.status = format!("autosaved {SAVE_PATH}"),
                 Err(err) => self.set_error_status(format!("autosave failed: {err}")),
             }
@@ -3889,24 +4615,85 @@ impl FabricadApp {
 
     fn export_gds_document(&mut self) {
         let technology = self.current_technology().clone();
-        let bytes = match export_gdsii(&self.document, &technology) {
-            Ok(bytes) => bytes,
+        let result = match export_gdsii_with_report(&self.document, &technology) {
+            Ok(result) => result,
             Err(err) => {
                 self.set_error_status(format!("GDS export failed: {err}"));
                 return;
             }
         };
         let path = PathBuf::from(GDS_PATH);
-        if let Some(parent) = path.parent() {
-            if let Err(err) = fs::create_dir_all(parent) {
-                self.set_error_status(format!("GDS export failed: {err}"));
-                return;
+        match atomic_write_bytes(&path, &result.bytes) {
+            Ok(()) => {
+                let report = result.report;
+                self.status = Self::gds_export_status(GDS_PATH, &report);
             }
-        }
-        match fs::write(&path, bytes) {
-            Ok(()) => self.status = format!("exported {GDS_PATH}"),
             Err(err) => self.set_error_status(format!("GDS export failed: {err}")),
         }
+    }
+
+    fn gds_export_status(path: &str, report: &layout_model::gdsii::GdsExportReport) -> String {
+        let mut status = format!(
+            "exported {path}; {} structures, {} elements, {} skipped, {} warnings",
+            report.structure_count,
+            report.element_count(),
+            report.skipped_elements.len(),
+            report.warnings.len()
+        );
+        let warning_summary = Self::gds_export_warning_summary(report);
+        if !warning_summary.is_empty() {
+            status.push_str("; warning detail: ");
+            status.push_str(&warning_summary);
+        }
+        status
+    }
+
+    fn gds_export_warning_summary(report: &layout_model::gdsii::GdsExportReport) -> String {
+        use layout_model::gdsii::GdsExportWarningKind;
+
+        let mut fallback_mappings = 0usize;
+        let mut missing_layers = 0usize;
+        let mut ambiguous_mappings = 0usize;
+        let mut transforms = 0usize;
+        let mut normalized_path_widths = 0usize;
+        let mut metadata = 0usize;
+        let mut shape_kinds = 0usize;
+        for warning in &report.warnings {
+            match warning.kind {
+                GdsExportWarningKind::FallbackLayerMapping => fallback_mappings += 1,
+                GdsExportWarningKind::MissingLayerFallback => missing_layers += 1,
+                GdsExportWarningKind::AmbiguousDocumentLayerMapping => ambiguous_mappings += 1,
+                GdsExportWarningKind::UnsupportedInstanceTransform => transforms += 1,
+                GdsExportWarningKind::NormalizedPathWidth => normalized_path_widths += 1,
+                GdsExportWarningKind::NonRoundTrippableMetadata => metadata += 1,
+                GdsExportWarningKind::NonRoundTrippableShapeKind => shape_kinds += 1,
+            }
+        }
+        [
+            Self::count_label(fallback_mappings, "fallback mapping", "fallback mappings"),
+            Self::count_label(missing_layers, "missing layer", "missing layers"),
+            Self::count_label(
+                ambiguous_mappings,
+                "ambiguous mapping",
+                "ambiguous mappings",
+            ),
+            Self::count_label(transforms, "transform", "transforms"),
+            Self::count_label(
+                normalized_path_widths,
+                "normalized path width",
+                "normalized path widths",
+            ),
+            Self::count_label(metadata, "metadata", "metadata"),
+            Self::count_label(shape_kinds, "shape kind", "shape kinds"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(", ")
+    }
+
+    fn count_label(count: usize, singular: &str, plural: &str) -> Option<String> {
+        (count > 0).then(|| format!("{count} {}", if count == 1 { singular } else { plural }))
     }
 
     fn import_gds_document(&mut self) {
@@ -3918,13 +4705,91 @@ impl FabricadApp {
                 return;
             }
         };
-        match import_gdsii(&bytes, &technology) {
-            Ok(document) => {
-                self.replace_document(document, &format!("imported {GDS_PATH}"));
+        match import_gdsii_with_report(&bytes, &technology) {
+            Ok(result) => {
+                let status = Self::gds_import_status(GDS_PATH, &result.report);
+                self.replace_document(result.document, &status);
                 self.layout_source = DataSource::File(GDS_PATH.to_string());
+                self.status = status;
             }
             Err(err) => self.set_error_status(format!("GDS import failed: {err}")),
         }
+    }
+
+    fn gds_import_status(path: &str, report: &layout_model::gdsii::GdsImportReport) -> String {
+        let generated_layers = report.generated_layers.len();
+        let skipped_elements = report.skipped_elements.len();
+        let mut status = format!(
+            "imported {path}; {} structures, {} elements, {} generated layer{}, {} skipped",
+            report.structure_count,
+            report.element_count,
+            generated_layers,
+            if generated_layers == 1 { "" } else { "s" },
+            skipped_elements
+        );
+        let warning_summary = Self::gds_import_warning_summary(report);
+        if !warning_summary.is_empty() {
+            status.push_str("; warning detail: ");
+            status.push_str(&warning_summary);
+        }
+        status
+    }
+
+    fn gds_import_warning_summary(report: &layout_model::gdsii::GdsImportReport) -> String {
+        use layout_model::gdsii::GdsImportWarningKind;
+
+        let mut normalized_units = 0usize;
+        let mut split_layers = 0usize;
+        let mut normalized_path_widths = 0usize;
+        let mut normalized_aref_dimensions = 0usize;
+        let mut duplicate_structure_names = 0usize;
+        let mut clamped_coordinates = 0usize;
+        for warning in &report.warnings {
+            match warning.kind {
+                GdsImportWarningKind::NormalizedUnits => normalized_units += 1,
+                GdsImportWarningKind::SplitIncomingLayerMapping => split_layers += 1,
+                GdsImportWarningKind::NormalizedPathWidth => normalized_path_widths += 1,
+                GdsImportWarningKind::NormalizedArefDimensions => normalized_aref_dimensions += 1,
+                GdsImportWarningKind::DuplicateStructureName => duplicate_structure_names += 1,
+                GdsImportWarningKind::CoordinateClamped => clamped_coordinates += 1,
+            }
+        }
+        [
+            Self::count_label(
+                normalized_units,
+                "normalized unit scale",
+                "normalized unit scales",
+            ),
+            Self::count_label(
+                split_layers,
+                "split incoming layer",
+                "split incoming layers",
+            ),
+            Self::count_label(
+                normalized_path_widths,
+                "normalized path width",
+                "normalized path widths",
+            ),
+            Self::count_label(
+                normalized_aref_dimensions,
+                "normalized AREF dimension",
+                "normalized AREF dimensions",
+            ),
+            Self::count_label(
+                duplicate_structure_names,
+                "duplicate structure name",
+                "duplicate structure names",
+            ),
+            Self::count_label(
+                clamped_coordinates,
+                "clamped coordinate",
+                "clamped coordinates",
+            ),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(", ")
     }
 
     fn make_stress_document(&mut self, count: usize) {
@@ -4188,6 +5053,807 @@ impl FabricadApp {
     }
 
     fn fab_control_room(&mut self, ui: &mut egui::Ui) {
+        let tools = self.equipment_sim.tools().cloned().collect::<Vec<_>>();
+        if tools.is_empty() {
+            ui_chrome::module_header(
+                ui,
+                "Fab operations",
+                "Fab Control Room",
+                "No data loaded",
+                |_| {},
+            );
+            ui_chrome::empty_state(ui, "No equipment dataset loaded");
+            return;
+        }
+        if self
+            .selected_equipment_tool
+            .as_ref()
+            .is_none_or(|id| !tools.iter().any(|tool| &tool.id == id))
+        {
+            self.selected_equipment_tool = tools.first().map(|tool| tool.id.clone());
+        }
+
+        if let Err(error) = self.fab_control_operad_ui(ui, &tools) {
+            ui.colored_label(Color32::from_rgb(226, 96, 96), error);
+            self.egui_fab_control_room(ui);
+        }
+    }
+
+    fn fab_control_operad_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        tools: &[EquipmentTool],
+    ) -> Result<(), String> {
+        let mut result = Ok(());
+        egui::ScrollArea::vertical()
+            .id_salt("fab_control_room_operad_scroll")
+            .show(ui, |ui| {
+                let width = ui.available_width().max(320.0);
+                let mut view = self.build_fab_control_operad_view(width, tools);
+                if let Err(error) = view
+                    .document
+                    .compute_layout(view.size, &mut ApproxTextMeasurer)
+                    .map_err(|error| error.to_string())
+                {
+                    result = Err(error);
+                    return;
+                }
+
+                let (rect, response) =
+                    ui.allocate_exact_size(vec2(width, view.size.height), Sense::click());
+                if response.clicked()
+                    && let Some(pointer) = response.interact_pointer_pos()
+                    && let Some(node_name) =
+                        operad_egui::hit_test_name(&view.document, rect, pointer)
+                {
+                    self.handle_fab_control_operad_action(&node_name, tools);
+                }
+                if response.hovered()
+                    && let Some(pointer) = ui.input(|input| input.pointer.hover_pos())
+                    && operad_egui::hit_test_name(&view.document, rect, pointer).is_some()
+                {
+                    ui.output_mut(|output| output.cursor_icon = egui::CursorIcon::PointingHand);
+                }
+                operad_egui::paint_document_at(ui, &view.document, rect);
+            });
+        result
+    }
+
+    fn build_fab_control_operad_view(
+        &self,
+        width: f32,
+        tools: &[EquipmentTool],
+    ) -> FabControlOperadView {
+        let metrics = self.fab_control_operad_metrics(tools);
+        let fleet_rows = self.fab_control_operad_fleet_rows(tools);
+        let selected_tool = self
+            .selected_equipment_tool
+            .as_ref()
+            .and_then(|selected_id| tools.iter().find(|tool| &tool.id == selected_id))
+            .or_else(|| tools.first());
+        let selected_rows = selected_tool
+            .map(|tool| self.fab_control_operad_selected_rows(tool))
+            .unwrap_or_default();
+        let recipe_rows = selected_tool
+            .map(|tool| self.fab_control_operad_recipe_rows(tool))
+            .unwrap_or_default();
+        let command_rows = selected_tool
+            .map(|tool| self.fab_control_operad_command_rows(tool))
+            .unwrap_or_default();
+        let run_rows = selected_tool
+            .map(|tool| self.fab_control_operad_run_rows(tool))
+            .unwrap_or_default();
+        let sensor_rows = selected_tool
+            .map(|tool| self.fab_control_operad_sensor_rows(tool))
+            .unwrap_or_default();
+        let alarm_rows = selected_tool
+            .map(|tool| self.fab_control_operad_alarm_rows(tool))
+            .unwrap_or_default();
+        let log_rows = selected_tool
+            .map(|tool| self.fab_control_operad_log_rows(tool))
+            .unwrap_or_default();
+        let run_log_rows = self.fab_control_operad_fab_run_rows();
+        let height = fab_control_operad_view_height(
+            width,
+            metrics.len(),
+            &[
+                fleet_rows.len(),
+                selected_rows.len(),
+                recipe_rows.len(),
+                command_rows.len(),
+                run_rows.len(),
+                sensor_rows.len(),
+                alarm_rows.len(),
+                log_rows.len(),
+                run_log_rows.len(),
+            ],
+        );
+        let size = UiSize::new(width, height);
+        let mut document = UiDocument::new(root_style(width, height));
+        let root = document.root;
+        document.set_node_visual(
+            root,
+            UiVisual::panel(
+                ColorRgba::new(15, 18, 21, 255),
+                Some(StrokeStyle::new(ColorRgba::new(39, 46, 52, 255), 1.0)),
+                0.0,
+            ),
+        );
+
+        let selected_label = selected_tool
+            .map(|tool| tool.id.as_str())
+            .unwrap_or("none")
+            .to_string();
+        add_fab_control_operad_header(
+            &mut document,
+            root,
+            "FAB OPERATIONS",
+            "Fab Control Room",
+            "Host control, recipe setup, active runs, alarms, sensors, and recent tool log.",
+            format!(
+                "Sim time: {} s | Selected tool: {}",
+                self.equipment_sim.now_s, selected_label
+            ),
+        );
+        add_fab_control_operad_spacer(&mut document, root, FAB_OPERAD_GAP);
+        add_fab_control_operad_metric_grid(&mut document, root, width, &metrics);
+        add_fab_control_operad_spacer(&mut document, root, FAB_OPERAD_GAP);
+        add_fab_control_operad_section(
+            &mut document,
+            root,
+            width,
+            "fab_control.fleet",
+            "Tool Fleet",
+            "No simulator tools configured",
+            &fleet_rows,
+        );
+        add_fab_control_operad_spacer(&mut document, root, FAB_OPERAD_GAP);
+        add_fab_control_operad_section(
+            &mut document,
+            root,
+            width,
+            "fab_control.selected",
+            "Selected Tool",
+            "No selected tool",
+            &selected_rows,
+        );
+        add_fab_control_operad_spacer(&mut document, root, FAB_OPERAD_GAP);
+        add_fab_control_operad_section(
+            &mut document,
+            root,
+            width,
+            "fab_control.recipes",
+            "Recipe Setup",
+            "No recipes are available for this tool",
+            &recipe_rows,
+        );
+        add_fab_control_operad_spacer(&mut document, root, FAB_OPERAD_GAP);
+        add_fab_control_operad_section(
+            &mut document,
+            root,
+            width,
+            "fab_control.commands",
+            "Host Commands",
+            "No host commands are available",
+            &command_rows,
+        );
+        add_fab_control_operad_spacer(&mut document, root, FAB_OPERAD_GAP);
+        add_fab_control_operad_section(
+            &mut document,
+            root,
+            width,
+            "fab_control.run",
+            "Recipe / Run State",
+            "No recipe is loaded",
+            &run_rows,
+        );
+        add_fab_control_operad_spacer(&mut document, root, FAB_OPERAD_GAP);
+        add_fab_control_operad_section(
+            &mut document,
+            root,
+            width,
+            "fab_control.sensors",
+            "Sensor Streams",
+            "Waiting for sensor samples",
+            &sensor_rows,
+        );
+        add_fab_control_operad_spacer(&mut document, root, FAB_OPERAD_GAP);
+        add_fab_control_operad_section(
+            &mut document,
+            root,
+            width,
+            "fab_control.alarms",
+            "Alarms",
+            "No active alarms",
+            &alarm_rows,
+        );
+        add_fab_control_operad_spacer(&mut document, root, FAB_OPERAD_GAP);
+        add_fab_control_operad_section(
+            &mut document,
+            root,
+            width,
+            "fab_control.log",
+            "Host / Tool Log",
+            "No host events logged",
+            &log_rows,
+        );
+        add_fab_control_operad_spacer(&mut document, root, FAB_OPERAD_GAP);
+        add_fab_control_operad_section(
+            &mut document,
+            root,
+            width,
+            "fab_control.run_log",
+            "Fab Run Log",
+            "No logged runs",
+            &run_log_rows,
+        );
+
+        FabControlOperadView { document, size }
+    }
+
+    fn fab_control_operad_metrics(&self, tools: &[EquipmentTool]) -> Vec<FabControlMetricTile> {
+        let running_count = tools
+            .iter()
+            .filter(|tool| tool.state == EquipmentToolState::Running)
+            .count();
+        let ready_count = tools
+            .iter()
+            .filter(|tool| {
+                matches!(
+                    tool.state,
+                    EquipmentToolState::OnlineIdle | EquipmentToolState::Completed
+                )
+            })
+            .count();
+        let loaded_count = tools
+            .iter()
+            .filter(|tool| tool.state == EquipmentToolState::RecipeLoaded)
+            .count();
+        let alarm_count = tools
+            .iter()
+            .map(equipment_active_alarm_count)
+            .sum::<usize>();
+        let critical_count = tools
+            .iter()
+            .flat_map(|tool| tool.active_alarms.iter())
+            .filter(|alarm| alarm.active && alarm.severity == AlarmSeverity::Critical)
+            .count();
+        let sample_count = tools
+            .iter()
+            .map(|tool| tool.recent_sensors.len())
+            .sum::<usize>();
+        vec![
+            FabControlMetricTile {
+                label: "Tools".to_string(),
+                value: tools.len().to_string(),
+                detail: "simulated host endpoints".to_string(),
+                tone: ui_chrome::Tone::Neutral,
+            },
+            FabControlMetricTile {
+                label: "Running".to_string(),
+                value: running_count.to_string(),
+                detail: "active process runs".to_string(),
+                tone: ui_chrome::Tone::Success,
+            },
+            FabControlMetricTile {
+                label: "Ready".to_string(),
+                value: ready_count.to_string(),
+                detail: "idle or complete".to_string(),
+                tone: if ready_count == 0 {
+                    ui_chrome::Tone::Warning
+                } else {
+                    ui_chrome::Tone::Info
+                },
+            },
+            FabControlMetricTile {
+                label: "Loaded".to_string(),
+                value: loaded_count.to_string(),
+                detail: "waiting start".to_string(),
+                tone: ui_chrome::Tone::Info,
+            },
+            FabControlMetricTile {
+                label: "Active alarms".to_string(),
+                value: alarm_count.to_string(),
+                detail: if critical_count > 0 {
+                    "critical present".to_string()
+                } else {
+                    "interlocks".to_string()
+                },
+                tone: if alarm_count == 0 {
+                    ui_chrome::Tone::Neutral
+                } else {
+                    ui_chrome::Tone::Danger
+                },
+            },
+            FabControlMetricTile {
+                label: "Samples".to_string(),
+                value: sample_count.to_string(),
+                detail: "recent sensor points".to_string(),
+                tone: ui_chrome::Tone::Neutral,
+            },
+        ]
+    }
+
+    fn fab_control_operad_fleet_rows(&self, tools: &[EquipmentTool]) -> Vec<FabControlOperadRow> {
+        let mut ordered_tools = tools.iter().collect::<Vec<_>>();
+        ordered_tools.sort_by(|left, right| {
+            equipment_state_sort_rank(left.state)
+                .cmp(&equipment_state_sort_rank(right.state))
+                .then_with(|| left.id.as_str().cmp(right.id.as_str()))
+        });
+        ordered_tools
+            .into_iter()
+            .enumerate()
+            .map(|(index, tool)| {
+                let selected = self.selected_equipment_tool.as_ref() == Some(&tool.id);
+                FabControlOperadRow {
+                    title: format!("{} | {}", tool.name, tool.state.label()),
+                    detail: format!(
+                        "{} | {} | {} | {} | {}",
+                        tool.id,
+                        tool.kind.label(),
+                        single_line(equipment_recipe_run_summary(tool, self.equipment_sim.now_s)),
+                        equipment_tool_alarm_summary(tool),
+                        single_line(equipment_recent_sensor_summary(tool))
+                    ),
+                    tone: equipment_state_tone(tool.state),
+                    action_name: Some(format!(
+                        "{FAB_OPERAD_ACTION_SELECT_TOOL}{}|tool.{index}",
+                        tool.id
+                    )),
+                    selected,
+                }
+            })
+            .collect()
+    }
+
+    fn fab_control_operad_selected_rows(&self, tool: &EquipmentTool) -> Vec<FabControlOperadRow> {
+        vec![
+            FabControlOperadRow {
+                title: format!("{} | {}", tool.name, tool.state.label()),
+                detail: format!(
+                    "{} | {} | {} | updated {} s ago",
+                    tool.id,
+                    tool.kind.label(),
+                    tool.class.label(),
+                    self.equipment_sim
+                        .now_s
+                        .saturating_sub(tool.last_updated_at_s)
+                ),
+                tone: equipment_state_tone(tool.state),
+                action_name: None,
+                selected: true,
+            },
+            FabControlOperadRow {
+                title: "Loaded context".to_string(),
+                detail: tool
+                    .selected_recipe
+                    .as_ref()
+                    .map(equipment_selection_context)
+                    .unwrap_or_else(|| "No loaded lot / wafer context".to_string()),
+                tone: if tool.selected_recipe.is_some() {
+                    ui_chrome::Tone::Info
+                } else {
+                    ui_chrome::Tone::Neutral
+                },
+                action_name: None,
+                selected: false,
+            },
+            FabControlOperadRow {
+                title: "Run state".to_string(),
+                detail: single_line(equipment_recipe_run_summary(tool, self.equipment_sim.now_s)),
+                tone: equipment_state_tone(tool.state),
+                action_name: None,
+                selected: false,
+            },
+            FabControlOperadRow {
+                title: "Sensors".to_string(),
+                detail: format!(
+                    "{} streams, {} samples | {}",
+                    equipment_sensor_names(tool).len(),
+                    tool.recent_sensors.len(),
+                    single_line(equipment_recent_sensor_summary(tool))
+                ),
+                tone: ui_chrome::Tone::Neutral,
+                action_name: None,
+                selected: false,
+            },
+            FabControlOperadRow {
+                title: "Command guidance".to_string(),
+                detail: equipment_command_hint(tool).to_string(),
+                tone: equipment_state_tone(tool.state),
+                action_name: None,
+                selected: false,
+            },
+        ]
+    }
+
+    fn fab_control_operad_recipe_rows(&self, tool: &EquipmentTool) -> Vec<FabControlOperadRow> {
+        let selected_recipe = self.selected_recipe_for_tool(tool);
+        tool.available_recipes
+            .values()
+            .enumerate()
+            .map(|(index, recipe)| {
+                let selected = selected_recipe.as_ref() == Some(&recipe.id);
+                let loadable = tool.state.accepts_recipe_load();
+                FabControlOperadRow {
+                    title: format!("{} v{}", recipe.name, recipe.version),
+                    detail: format!(
+                        "{} | {} s process | {} parameter{}{}",
+                        recipe.id,
+                        recipe.duration_s,
+                        recipe.parameters.len(),
+                        if recipe.parameters.len() == 1 {
+                            ""
+                        } else {
+                            "s"
+                        },
+                        if loadable {
+                            " | click to load"
+                        } else {
+                            " | load disabled for current state"
+                        }
+                    ),
+                    tone: if selected {
+                        ui_chrome::Tone::Info
+                    } else if loadable {
+                        ui_chrome::Tone::Success
+                    } else {
+                        ui_chrome::Tone::Neutral
+                    },
+                    action_name: loadable.then(|| {
+                        format!(
+                            "{FAB_OPERAD_ACTION_LOAD_RECIPE}{}|{}|recipe.{index}",
+                            tool.id, recipe.id
+                        )
+                    }),
+                    selected,
+                }
+            })
+            .collect()
+    }
+
+    fn fab_control_operad_command_rows(&self, tool: &EquipmentTool) -> Vec<FabControlOperadRow> {
+        let selected_recipe = self.selected_recipe_for_tool(tool);
+        let load_action = selected_recipe.as_ref().and_then(|recipe_id| {
+            tool.state.accepts_recipe_load().then(|| {
+                format!(
+                    "{FAB_OPERAD_ACTION_LOAD_RECIPE}{}|{}|command.load",
+                    tool.id, recipe_id
+                )
+            })
+        });
+        vec![
+            FabControlOperadRow {
+                title: "Bring Online".to_string(),
+                detail: "Establish host control for an offline tool.".to_string(),
+                tone: command_tone(tool.state == EquipmentToolState::Offline),
+                action_name: (tool.state == EquipmentToolState::Offline)
+                    .then(|| format!("{FAB_OPERAD_ACTION_BRING_ONLINE}{}", tool.id)),
+                selected: false,
+            },
+            FabControlOperadRow {
+                title: "Load Recipe".to_string(),
+                detail: selected_recipe
+                    .as_ref()
+                    .map(|recipe_id| format!("Load selected recipe {recipe_id}."))
+                    .unwrap_or_else(|| "No recipe is available for this tool.".to_string()),
+                tone: command_tone(load_action.is_some()),
+                action_name: load_action,
+                selected: false,
+            },
+            FabControlOperadRow {
+                title: "Start".to_string(),
+                detail: "Start the loaded process recipe.".to_string(),
+                tone: command_tone(tool.state == EquipmentToolState::RecipeLoaded),
+                action_name: (tool.state == EquipmentToolState::RecipeLoaded)
+                    .then(|| format!("{FAB_OPERAD_ACTION_START}{}", tool.id)),
+                selected: false,
+            },
+            FabControlOperadRow {
+                title: "Stop".to_string(),
+                detail: "Abort the active process run.".to_string(),
+                tone: command_tone(tool.state == EquipmentToolState::Running),
+                action_name: (tool.state == EquipmentToolState::Running)
+                    .then(|| format!("{FAB_OPERAD_ACTION_STOP}{}", tool.id)),
+                selected: false,
+            },
+            FabControlOperadRow {
+                title: "Trigger Alarm".to_string(),
+                detail: "Inject a simulator alarm for host-response testing.".to_string(),
+                tone: command_tone(!matches!(
+                    tool.state,
+                    EquipmentToolState::Offline | EquipmentToolState::Maintenance
+                )),
+                action_name: (!matches!(
+                    tool.state,
+                    EquipmentToolState::Offline | EquipmentToolState::Maintenance
+                ))
+                .then(|| format!("{FAB_OPERAD_ACTION_TRIGGER_ALARM}{}", tool.id)),
+                selected: false,
+            },
+            FabControlOperadRow {
+                title: "Clear Alarm".to_string(),
+                detail: "Clear active alarms and return the tool to online idle.".to_string(),
+                tone: command_tone(tool.state == EquipmentToolState::Alarm),
+                action_name: (tool.state == EquipmentToolState::Alarm)
+                    .then(|| format!("{FAB_OPERAD_ACTION_CLEAR_ALARM}{}", tool.id)),
+                selected: false,
+            },
+            FabControlOperadRow {
+                title: "Reset".to_string(),
+                detail: "Clear loaded recipe and run context.".to_string(),
+                tone: command_tone(tool.state != EquipmentToolState::Running),
+                action_name: (tool.state != EquipmentToolState::Running)
+                    .then(|| format!("{FAB_OPERAD_ACTION_RESET}{}", tool.id)),
+                selected: false,
+            },
+            FabControlOperadRow {
+                title: if tool.state == EquipmentToolState::Maintenance {
+                    "Exit Maintenance".to_string()
+                } else {
+                    "Maintenance".to_string()
+                },
+                detail: "Toggle maintenance state for the selected tool.".to_string(),
+                tone: command_tone(tool.state != EquipmentToolState::Running),
+                action_name: (tool.state != EquipmentToolState::Running)
+                    .then(|| format!("{FAB_OPERAD_ACTION_TOGGLE_MAINTENANCE}{}", tool.id)),
+                selected: false,
+            },
+        ]
+    }
+
+    fn fab_control_operad_run_rows(&self, tool: &EquipmentTool) -> Vec<FabControlOperadRow> {
+        let mut rows = Vec::new();
+        if let Some(run) = &tool.active_run {
+            let elapsed_s = equipment_run_elapsed_s(run, self.equipment_sim.now_s);
+            let progress_label = equipment_run_progress(tool, self.equipment_sim.now_s)
+                .map(|(_, _, duration_s)| format!("{elapsed_s}/{duration_s} s"))
+                .unwrap_or_else(|| format!("{elapsed_s} s"));
+            rows.push(FabControlOperadRow {
+                title: format!("{} | {}", run.id, run.status.label()),
+                detail: format!(
+                    "{} | {} | {} sensor points",
+                    run.recipe.recipe_id, progress_label, run.sensor_count
+                ),
+                tone: ui_chrome::Tone::Success,
+                action_name: None,
+                selected: true,
+            });
+            rows.push(FabControlOperadRow {
+                title: "Active context".to_string(),
+                detail: equipment_selection_context(&run.recipe),
+                tone: ui_chrome::Tone::Info,
+                action_name: None,
+                selected: false,
+            });
+        } else if let Some(selection) = &tool.selected_recipe {
+            rows.push(FabControlOperadRow {
+                title: format!(
+                    "Loaded | {} v{}",
+                    selection.recipe_id, selection.recipe_version
+                ),
+                detail: equipment_selection_context(selection),
+                tone: ui_chrome::Tone::Info,
+                action_name: None,
+                selected: true,
+            });
+        }
+
+        for run in tool.recent_runs.iter().take(5) {
+            rows.push(FabControlOperadRow {
+                title: format!("{} | {}", run.id, run.status.label()),
+                detail: format!(
+                    "{} | {} s | {} samples",
+                    run.recipe.recipe_id,
+                    equipment_run_elapsed_s(run, self.equipment_sim.now_s),
+                    run.sensor_count
+                ),
+                tone: run_status_tone(run.status),
+                action_name: None,
+                selected: false,
+            });
+        }
+        rows
+    }
+
+    fn fab_control_operad_sensor_rows(&self, tool: &EquipmentTool) -> Vec<FabControlOperadRow> {
+        equipment_sensor_names(tool)
+            .into_iter()
+            .take(8)
+            .map(|name| {
+                let latest = tool.latest_sensor(&name);
+                FabControlOperadRow {
+                    title: name.clone(),
+                    detail: latest
+                        .map(|sample| {
+                            format!(
+                                "{} | {}",
+                                equipment_sensor_value(sample),
+                                equipment_sensor_age_text(sample, self.equipment_sim.now_s)
+                            )
+                        })
+                        .unwrap_or_else(|| "No value".to_string()),
+                    tone: ui_chrome::Tone::Info,
+                    action_name: None,
+                    selected: false,
+                }
+            })
+            .collect()
+    }
+
+    fn fab_control_operad_alarm_rows(&self, tool: &EquipmentTool) -> Vec<FabControlOperadRow> {
+        let mut rows = tool
+            .active_alarms
+            .iter()
+            .filter(|alarm| alarm.active)
+            .map(|alarm| FabControlOperadRow {
+                title: format!("{} | {}", alarm.severity.label(), alarm.code),
+                detail: format!("{} at t+{} s", alarm.message, alarm.occurred_at_s),
+                tone: alarm_tone(alarm.severity),
+                action_name: None,
+                selected: true,
+            })
+            .collect::<Vec<_>>();
+        rows.extend(
+            self.equipment_sim
+                .active_alarms()
+                .into_iter()
+                .filter(|alarm| alarm.tool_id != tool.id)
+                .take(4)
+                .map(|alarm| FabControlOperadRow {
+                    title: format!(
+                        "{} | {} {}",
+                        alarm.severity.label(),
+                        alarm.tool_id,
+                        alarm.code
+                    ),
+                    detail: alarm.message.clone(),
+                    tone: alarm_tone(alarm.severity),
+                    action_name: None,
+                    selected: false,
+                }),
+        );
+        rows
+    }
+
+    fn fab_control_operad_log_rows(&self, tool: &EquipmentTool) -> Vec<FabControlOperadRow> {
+        tool.event_log
+            .iter()
+            .rev()
+            .take(8)
+            .map(|entry| FabControlOperadRow {
+                title: format!("t+{} s", entry.at_s),
+                detail: entry.message.clone(),
+                tone: ui_chrome::Tone::Neutral,
+                action_name: None,
+                selected: false,
+            })
+            .collect()
+    }
+
+    fn fab_control_operad_fab_run_rows(&self) -> Vec<FabControlOperadRow> {
+        self.equipment_sim
+            .recent_runs()
+            .into_iter()
+            .take(8)
+            .map(|run| FabControlOperadRow {
+                title: format!("{} | {} | {}", run.tool_id, run.id, run.status.label()),
+                detail: format!(
+                    "{} | {} s | {} samples",
+                    run.recipe.recipe_id,
+                    equipment_run_elapsed_s(run, self.equipment_sim.now_s),
+                    run.sensor_count
+                ),
+                tone: run_status_tone(run.status),
+                action_name: None,
+                selected: false,
+            })
+            .collect()
+    }
+
+    fn handle_fab_control_operad_action(
+        &mut self,
+        node_name: &str,
+        tools: &[EquipmentTool],
+    ) -> bool {
+        if let Some(raw_tool_id) = node_name.strip_prefix(FAB_OPERAD_ACTION_SELECT_TOOL) {
+            let tool_id = action_part(raw_tool_id);
+            if tools.iter().any(|tool| tool.id.as_str() == tool_id) {
+                self.set_focus_object(FabObjectRef::tool(tool_id.to_string()));
+                return true;
+            }
+            return false;
+        }
+        if let Some(raw_tool_id) = node_name.strip_prefix(FAB_OPERAD_ACTION_BRING_ONLINE) {
+            self.send_equipment_command(
+                EquipmentToolId::new(action_part(raw_tool_id)),
+                HostCommand::BringOnline,
+            );
+            return true;
+        }
+        if let Some(raw) = node_name.strip_prefix(FAB_OPERAD_ACTION_LOAD_RECIPE) {
+            let mut parts = raw.split('|');
+            let Some(tool_id_raw) = parts.next() else {
+                return false;
+            };
+            let Some(recipe_id_raw) = parts.next() else {
+                return false;
+            };
+            let Some(tool) = tools.iter().find(|tool| tool.id.as_str() == tool_id_raw) else {
+                return false;
+            };
+            let tool_id = tool.id.clone();
+            let recipe_id = EquipmentRecipeId::new(recipe_id_raw);
+            self.equipment_recipe_drafts
+                .insert(tool_id.clone(), recipe_id.clone());
+            self.send_equipment_command(
+                tool_id,
+                HostCommand::LoadRecipe {
+                    selection: self.selection_for_tool(tool, recipe_id),
+                },
+            );
+            return true;
+        }
+        if let Some(raw_tool_id) = node_name.strip_prefix(FAB_OPERAD_ACTION_START) {
+            self.send_equipment_command(
+                EquipmentToolId::new(action_part(raw_tool_id)),
+                HostCommand::Start,
+            );
+            return true;
+        }
+        if let Some(raw_tool_id) = node_name.strip_prefix(FAB_OPERAD_ACTION_STOP) {
+            self.send_equipment_command(
+                EquipmentToolId::new(action_part(raw_tool_id)),
+                HostCommand::Stop,
+            );
+            return true;
+        }
+        if let Some(raw_tool_id) = node_name.strip_prefix(FAB_OPERAD_ACTION_TRIGGER_ALARM) {
+            self.send_equipment_command(
+                EquipmentToolId::new(action_part(raw_tool_id)),
+                HostCommand::TriggerAlarm {
+                    code: "HOST-SIM".to_string(),
+                    message: "operator injected simulator alarm".to_string(),
+                    severity: AlarmSeverity::Warning,
+                },
+            );
+            return true;
+        }
+        if let Some(raw_tool_id) = node_name.strip_prefix(FAB_OPERAD_ACTION_CLEAR_ALARM) {
+            self.send_equipment_command(
+                EquipmentToolId::new(action_part(raw_tool_id)),
+                HostCommand::ClearAlarm,
+            );
+            return true;
+        }
+        if let Some(raw_tool_id) = node_name.strip_prefix(FAB_OPERAD_ACTION_RESET) {
+            self.send_equipment_command(
+                EquipmentToolId::new(action_part(raw_tool_id)),
+                HostCommand::Reset,
+            );
+            return true;
+        }
+        if let Some(raw_tool_id) = node_name.strip_prefix(FAB_OPERAD_ACTION_TOGGLE_MAINTENANCE) {
+            let tool_id = action_part(raw_tool_id);
+            let command = tools
+                .iter()
+                .find(|tool| tool.id.as_str() == tool_id)
+                .map(|tool| {
+                    if tool.state == EquipmentToolState::Maintenance {
+                        HostCommand::ExitMaintenance
+                    } else {
+                        HostCommand::EnterMaintenance
+                    }
+                })
+                .unwrap_or(HostCommand::EnterMaintenance);
+            self.send_equipment_command(EquipmentToolId::new(tool_id), command);
+            return true;
+        }
+        false
+    }
+
+    fn egui_fab_control_room(&mut self, ui: &mut egui::Ui) {
         let tools = self.equipment_sim.tools().cloned().collect::<Vec<_>>();
         if tools.is_empty() {
             ui_chrome::module_header(
@@ -4994,38 +6660,90 @@ impl FabricadApp {
             .show(ctx, |ui| {
                 ui.set_width(width - 18.0);
                 ui.add_space(4.0);
-
-                egui::ScrollArea::vertical()
-                    .id_salt("app_navigation_scroll")
-                    .show(ui, |ui| {
-                        let visible_modes = ViewMode::ALL
-                            .iter()
-                            .copied()
-                            .filter(|mode| self.nav_rail_modes.contains(mode))
-                            .collect::<Vec<_>>();
-                        if visible_modes.is_empty() {
-                            ui_chrome::empty_state(ui, "No pinned modules");
-                        }
-                        for mode in visible_modes {
-                            let selected = self.view_mode == mode;
-                            let label = if selected {
-                                RichText::new(mode.rail_label()).strong()
-                            } else {
-                                RichText::new(mode.rail_label())
-                            };
-                            if ui
-                                .add_sized(
-                                    [ui.available_width(), 24.0],
-                                    egui::Button::selectable(selected, label),
-                                )
-                                .on_hover_text(mode.title())
-                                .clicked()
-                            {
-                                self.select_view_mode(mode);
-                            }
-                        }
-                    });
+                if self.navigation_operad_ui(ui).is_err() {
+                    self.egui_navigation_ui(ui);
+                }
             });
+    }
+
+    fn navigation_operad_ui(&mut self, ui: &mut egui::Ui) -> Result<(), String> {
+        egui::ScrollArea::vertical()
+            .id_salt("app_navigation_operad_scroll")
+            .show(ui, |ui| {
+                let width = ui.available_width().max(64.0);
+                let height = ui.available_height().max(120.0);
+                let rows = self.nav_rail_operad_rows();
+                let mut view = build_nav_rail_operad_view(width, height, &rows);
+                view.document
+                    .compute_layout(view.size, &mut ApproxTextMeasurer)
+                    .map_err(|error| error.to_string())?;
+
+                let (rect, response) =
+                    ui.allocate_exact_size(vec2(width, view.size.height), Sense::click());
+                if response.clicked()
+                    && let Some(pointer) = response.interact_pointer_pos()
+                    && let Some(node_name) =
+                        operad_egui::hit_test_name(&view.document, rect, pointer)
+                    && let Some(mode) = nav_rail_mode_for_action(&node_name)
+                {
+                    self.select_view_mode(mode);
+                }
+                if response.hovered()
+                    && let Some(pointer) = ui.input(|input| input.pointer.hover_pos())
+                    && operad_egui::hit_test_name(&view.document, rect, pointer).is_some()
+                {
+                    ui.output_mut(|output| output.cursor_icon = egui::CursorIcon::PointingHand);
+                }
+                operad_egui::paint_document_at(ui, &view.document, rect);
+                Ok(())
+            })
+            .inner
+    }
+
+    fn egui_navigation_ui(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical()
+            .id_salt("app_navigation_scroll")
+            .show(ui, |ui| {
+                let visible_modes = ViewMode::ALL
+                    .iter()
+                    .copied()
+                    .filter(|mode| self.nav_rail_modes.contains(mode))
+                    .collect::<Vec<_>>();
+                if visible_modes.is_empty() {
+                    ui_chrome::empty_state(ui, "No pinned modules");
+                }
+                for mode in visible_modes {
+                    let selected = self.view_mode == mode;
+                    let label = if selected {
+                        RichText::new(mode.rail_label()).strong()
+                    } else {
+                        RichText::new(mode.rail_label())
+                    };
+                    if ui
+                        .add_sized(
+                            [ui.available_width(), 24.0],
+                            egui::Button::selectable(selected, label),
+                        )
+                        .on_hover_text(mode.title())
+                        .clicked()
+                    {
+                        self.select_view_mode(mode);
+                    }
+                }
+            });
+    }
+
+    fn nav_rail_operad_rows(&self) -> Vec<NavRailOperadRow> {
+        ViewMode::ALL
+            .iter()
+            .copied()
+            .filter(|mode| self.nav_rail_modes.contains(mode))
+            .map(|mode| NavRailOperadRow {
+                mode,
+                label: mode.rail_label(),
+                selected: self.view_mode == mode,
+            })
+            .collect()
     }
 
     fn select_view_mode(&mut self, mode: ViewMode) {
@@ -5652,50 +7370,160 @@ impl FabricadApp {
             return;
         }
         let mut open = self.show_sidebar_modules;
+        let max_window_height = (ctx.content_rect().height() - 80.0).clamp(300.0, 560.0);
         egui::Window::new("Sidebar Modules")
             .open(&mut open)
             .resizable(true)
-            .default_size(vec2(360.0, 560.0))
+            .default_size(vec2(360.0, max_window_height))
             .min_width(300.0)
             .min_height(300.0)
+            .max_height(max_window_height)
+            .constrain_to(ctx.content_rect())
             .show(ctx, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("Default").clicked() {
-                        self.nav_rail_modes = default_nav_rail_modes();
+                let available = ui.available_size_before_wrap();
+                let size = vec2(available.x.max(300.0), available.y.max(300.0));
+                let viewport = operad::UiSize::new(size.x, size.y);
+                let (mut rows, row_modes) = self.sidebar_module_rows_and_modes();
+                let mut view = operad_audit::build_sidebar_modules_view(
+                    &rows,
+                    viewport,
+                    self.sidebar_modules_scroll_offset,
+                );
+                if let Err(error) = view
+                    .document
+                    .compute_layout(viewport, &mut operad::ApproxTextMeasurer)
+                {
+                    ui.colored_label(
+                        Color32::from_rgb(226, 96, 96),
+                        format!("sidebar modules layout failed: {error}"),
+                    );
+                    return;
+                }
+                if let Some(scroll) = view.document.scroll_state(view.list_id) {
+                    let max_offset = scroll.max_offset().y;
+                    let clamped = self.sidebar_modules_scroll_offset.clamp(0.0, max_offset);
+                    if (clamped - self.sidebar_modules_scroll_offset).abs() > f32::EPSILON {
+                        self.sidebar_modules_scroll_offset = clamped;
+                        view = operad_audit::build_sidebar_modules_view(
+                            &rows,
+                            viewport,
+                            self.sidebar_modules_scroll_offset,
+                        );
+                        if let Err(error) = view
+                            .document
+                            .compute_layout(viewport, &mut operad::ApproxTextMeasurer)
+                        {
+                            ui.colored_label(
+                                Color32::from_rgb(226, 96, 96),
+                                format!("sidebar modules layout failed: {error}"),
+                            );
+                            return;
+                        }
                     }
-                    if ui.button("All").clicked() {
-                        self.nav_rail_modes = ViewMode::ALL.into_iter().collect();
+                }
+
+                let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+                let mut rebuild = false;
+                if response.hovered() {
+                    let scroll_delta = ui.input(|input| input.raw_scroll_delta.y);
+                    if scroll_delta.abs() > f32::EPSILON
+                        && let Some(scroll) = view.document.scroll_state(view.list_id)
+                    {
+                        let max_offset = scroll.max_offset().y;
+                        let next = (self.sidebar_modules_scroll_offset - scroll_delta)
+                            .clamp(0.0, max_offset);
+                        if (next - self.sidebar_modules_scroll_offset).abs() > f32::EPSILON {
+                            self.sidebar_modules_scroll_offset = next;
+                            rebuild = true;
+                        }
                     }
-                    if ui.button("None").clicked() {
-                        self.nav_rail_modes.clear();
-                    }
-                });
-                ui.separator();
-                let scroll_width = ui.available_width();
-                egui::ScrollArea::vertical()
-                    .id_salt("sidebar_modules_scroll")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.set_min_width(scroll_width);
-                        for group in ModuleGroup::ALL {
-                            ui_chrome::section_label(ui, group.label());
-                            for mode in ViewMode::ALL
-                                .into_iter()
-                                .filter(|candidate| candidate.group() == group)
+                }
+
+                if response.clicked()
+                    && let Some(pointer) = response.interact_pointer_pos()
+                    && let Some(node_name) =
+                        operad_egui::hit_test_name(&view.document, rect, pointer)
+                {
+                    match node_name.as_str() {
+                        operad_audit::SIDEBAR_MODULES_DEFAULT_BUTTON => {
+                            self.nav_rail_modes = default_nav_rail_modes();
+                            rebuild = true;
+                        }
+                        operad_audit::SIDEBAR_MODULES_ALL_BUTTON => {
+                            self.nav_rail_modes = ViewMode::ALL.into_iter().collect();
+                            rebuild = true;
+                        }
+                        operad_audit::SIDEBAR_MODULES_NONE_BUTTON => {
+                            self.nav_rail_modes.clear();
+                            rebuild = true;
+                        }
+                        _ => {
+                            if let Some(row_index) =
+                                operad_audit::sidebar_module_row_index(&node_name)
+                                && let Some(Some(mode)) = row_modes.get(row_index).copied()
                             {
-                                let mut shown = self.nav_rail_modes.contains(&mode);
-                                if ui.checkbox(&mut shown, mode.nav_label()).changed() {
-                                    if shown {
-                                        self.nav_rail_modes.insert(mode);
-                                    } else {
-                                        self.nav_rail_modes.remove(&mode);
-                                    }
+                                if self.nav_rail_modes.contains(&mode) {
+                                    self.nav_rail_modes.remove(&mode);
+                                } else {
+                                    self.nav_rail_modes.insert(mode);
                                 }
+                                rebuild = true;
                             }
                         }
-                    });
+                    }
+                }
+
+                if rebuild {
+                    let (updated_rows, _) = self.sidebar_module_rows_and_modes();
+                    rows = updated_rows;
+                    view = operad_audit::build_sidebar_modules_view(
+                        &rows,
+                        viewport,
+                        self.sidebar_modules_scroll_offset,
+                    );
+                    if let Err(error) = view
+                        .document
+                        .compute_layout(viewport, &mut operad::ApproxTextMeasurer)
+                    {
+                        ui.colored_label(
+                            Color32::from_rgb(226, 96, 96),
+                            format!("sidebar modules layout failed: {error}"),
+                        );
+                        return;
+                    }
+                }
+
+                if response.hovered()
+                    && let Some(pointer) = ctx.pointer_hover_pos()
+                    && operad_egui::hit_test_name(&view.document, rect, pointer).is_some()
+                {
+                    ui.output_mut(|output| output.cursor_icon = egui::CursorIcon::PointingHand);
+                }
+                operad_egui::paint_document_at(ui, &view.document, rect);
             });
         self.show_sidebar_modules = open;
+    }
+
+    fn sidebar_module_rows_and_modes(
+        &self,
+    ) -> (Vec<operad_audit::SidebarModuleRow>, Vec<Option<ViewMode>>) {
+        let mut rows = Vec::new();
+        let mut row_modes = Vec::new();
+        for group in ModuleGroup::ALL {
+            rows.push(operad_audit::SidebarModuleRow::group(group.label()));
+            row_modes.push(None);
+            for mode in ViewMode::ALL
+                .into_iter()
+                .filter(|candidate| candidate.group() == group)
+            {
+                rows.push(operad_audit::SidebarModuleRow::module(
+                    mode.nav_label(),
+                    self.nav_rail_modes.contains(&mode),
+                ));
+                row_modes.push(Some(mode));
+            }
+        }
+        (rows, row_modes)
     }
 
     fn command_entries(&self) -> Vec<CommandEntry> {
@@ -6481,9 +8309,13 @@ impl FabricadApp {
     }
 
     fn inspector_panel(&mut self, ctx: &egui::Context) {
+        let max_width = (Self::viewport_width(ctx) * 0.28)
+            .clamp(ui_chrome::INSPECTOR_WIDTH, ui_chrome::INSPECTOR_MAX_WIDTH);
         egui::SidePanel::left("inspector")
             .resizable(true)
+            .min_width(ui_chrome::INSPECTOR_MIN_WIDTH)
             .default_width(ui_chrome::INSPECTOR_WIDTH)
+            .max_width(max_width)
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical()
                     .id_salt("inspector_panel_scroll")
@@ -6565,9 +8397,13 @@ impl FabricadApp {
     }
 
     fn layers_panel(&mut self, ctx: &egui::Context) {
+        let max_width = (Self::viewport_width(ctx) * 0.24)
+            .clamp(ui_chrome::LAYERS_WIDTH, ui_chrome::LAYERS_MAX_WIDTH);
         egui::SidePanel::right("layers")
             .resizable(true)
+            .min_width(ui_chrome::LAYERS_MIN_WIDTH)
             .default_width(ui_chrome::LAYERS_WIDTH)
+            .max_width(max_width)
             .show(ctx, |ui| {
                 if matches!(self.view_mode, ViewMode::Metrology) {
                     let max_height = ui.available_height();
@@ -7053,6 +8889,34 @@ impl FabricadApp {
     }
 
     fn stack_3d_panel(&self, ui: &mut egui::Ui) {
+        if self.operad_stack_3d_panel(ui).is_err() {
+            self.egui_stack_3d_panel(ui);
+        }
+    }
+
+    fn operad_stack_3d_panel(&self, ui: &mut egui::Ui) -> Result<(), String> {
+        let mut rows: Vec<_> = self
+            .document
+            .layers
+            .values()
+            .filter(|layer| !matches!(layer.process, ProcessLayer::Annotation))
+            .collect();
+        rows.sort_by_key(|layer| (layer.display_order, layer.id));
+        let mut section =
+            operad_sidecar::SidecarSection::new("3D Stack").empty("No printable layers");
+        for layer in rows {
+            let (base_z, thickness) =
+                layer_3d_stack_position_for_technology(self.current_technology(), layer.process);
+            section = section.row(operad_sidecar::SidecarRow::new(
+                format!("{} · {}", layer.name, process_layer_label(layer.process)),
+                format!("Z {base_z:.0}-{:.0}", base_z + thickness),
+                ui_chrome::Tone::Neutral,
+            ));
+        }
+        operad_sidecar::render_sidecar(ui, "layout_3d.stack", &[section])
+    }
+
+    fn egui_stack_3d_panel(&self, ui: &mut egui::Ui) {
         ui_chrome::section_label(ui, "3D Stack");
         let mut rows: Vec<_> = self
             .document
@@ -7075,7 +8939,10 @@ impl FabricadApp {
                 ui.strong("Z top");
                 ui.end_row();
                 for layer in rows {
-                    let (base_z, thickness) = layer_3d_stack_position(layer.process);
+                    let (base_z, thickness) = layer_3d_stack_position_for_technology(
+                        self.current_technology(),
+                        layer.process,
+                    );
                     ui.label(&layer.name);
                     ui.label(process_layer_label(layer.process));
                     ui.label(format!("{base_z:.0}"));
@@ -7086,6 +8953,174 @@ impl FabricadApp {
     }
 
     fn metrology_context_panel(&mut self, ui: &mut egui::Ui) {
+        if self.metrology_operad_context_panel(ui).is_err() {
+            self.egui_metrology_context_panel(ui);
+        }
+    }
+
+    fn metrology_operad_context_panel(&mut self, ui: &mut egui::Ui) -> Result<(), String> {
+        if self.wafer_map.dies.is_empty() {
+            return operad_sidecar::render_sidecar(
+                ui,
+                "metrology.context",
+                &[operad_sidecar::SidecarSection::new("FabOS Context")
+                    .empty("No metrology dataset loaded")],
+            );
+        }
+        let links = &self.wafer_map.links;
+        let triage_sites = metrology_triage_sites(&self.wafer_map);
+        let pass_summary = self.wafer_map.summary(MeasurementKind::PassFail);
+        let review_annotations = self
+            .wafer_map
+            .annotations
+            .iter()
+            .filter(|annotation| {
+                matches!(
+                    annotation.kind,
+                    layout_model::metrology::AnnotationKind::Review
+                )
+            })
+            .count();
+
+        let mut sections = Vec::new();
+        sections.push(
+            operad_sidecar::SidecarSection::new("FabOS Context")
+                .row(operad_sidecar::SidecarRow::new(
+                    self.wafer_map.name.clone(),
+                    format!("{} / {}", links.lot_id, links.wafer_id),
+                    ui_chrome::Tone::Info,
+                ))
+                .row(operad_sidecar::SidecarRow::new(
+                    "Review queue",
+                    format!("{} site(s) need review", triage_sites.len()),
+                    if triage_sites.is_empty() {
+                        ui_chrome::Tone::Success
+                    } else {
+                        ui_chrome::Tone::Warning
+                    },
+                )),
+        );
+
+        sections.push(
+            operad_sidecar::SidecarSection::new("Lot / Process")
+                .row(operad_sidecar::SidecarRow::new(
+                    "Lot",
+                    links.lot_id.to_string(),
+                    ui_chrome::Tone::Neutral,
+                ))
+                .row(operad_sidecar::SidecarRow::new(
+                    "Wafer",
+                    links.wafer_id.to_string(),
+                    ui_chrome::Tone::Neutral,
+                ))
+                .row(operad_sidecar::SidecarRow::new(
+                    "Step",
+                    links.process_step_id.to_string(),
+                    ui_chrome::Tone::Neutral,
+                ))
+                .row(operad_sidecar::SidecarRow::new(
+                    "Recipe",
+                    links.recipe_id.to_string(),
+                    ui_chrome::Tone::Neutral,
+                ))
+                .row(operad_sidecar::SidecarRow::new(
+                    "Tool run",
+                    links.tool_run_id.to_string(),
+                    ui_chrome::Tone::Neutral,
+                )),
+        );
+
+        let geometry = self.wafer_map.geometry;
+        sections.push(
+            operad_sidecar::SidecarSection::new("Wafer")
+                .row(operad_sidecar::SidecarRow::new(
+                    "Geometry",
+                    format!(
+                        "{:.0} mm diameter / {:.1} mm edge exclusion",
+                        geometry.diameter_mm, geometry.edge_exclusion_mm
+                    ),
+                    ui_chrome::Tone::Neutral,
+                ))
+                .row(operad_sidecar::SidecarRow::new(
+                    "Die grid",
+                    format!(
+                        "{} die / pitch {:.1} x {:.1} mm",
+                        self.wafer_map.dies.len(),
+                        geometry.die_pitch_mm[0],
+                        geometry.die_pitch_mm[1]
+                    ),
+                    ui_chrome::Tone::Neutral,
+                )),
+        );
+
+        sections.push(
+            operad_sidecar::SidecarSection::new("Data Products")
+                .row(operad_sidecar::SidecarRow::new(
+                    "Measurements",
+                    format!(
+                        "{} total / {} pass / {} fail / {} outlier",
+                        self.wafer_map.measurements.len(),
+                        pass_summary.pass_count,
+                        pass_summary.fail_count,
+                        pass_summary.outlier_count
+                    ),
+                    if pass_summary.fail_count > 0 {
+                        ui_chrome::Tone::Danger
+                    } else if pass_summary.outlier_count > 0 {
+                        ui_chrome::Tone::Warning
+                    } else {
+                        ui_chrome::Tone::Success
+                    },
+                ))
+                .row(operad_sidecar::SidecarRow::new(
+                    "Defects",
+                    format!(
+                        "{} defects / {} review annotations",
+                        self.wafer_map.defects.len(),
+                        review_annotations
+                    ),
+                    if self.wafer_map.defects.is_empty() {
+                        ui_chrome::Tone::Success
+                    } else {
+                        ui_chrome::Tone::Warning
+                    },
+                )),
+        );
+
+        let mut review =
+            operad_sidecar::SidecarSection::new("Review Queue").empty("No sites need review");
+        for site in triage_sites.iter().take(5) {
+            review = review.row(operad_sidecar::SidecarRow::new(
+                format!("C{} R{}", site.die.column, site.die.row),
+                format!(
+                    "{} issue(s), {} defect(s)",
+                    site.fail_count + site.outlier_count,
+                    site.defect_count
+                ),
+                ui_chrome::Tone::Warning,
+            ));
+        }
+        sections.push(review);
+
+        let mut annotations = operad_sidecar::SidecarSection::new("Inspection Annotations")
+            .empty("No inspection annotations");
+        for annotation in self.wafer_map.annotations.iter().take(5) {
+            let location = annotation
+                .die
+                .map(|die| format!("C{} R{}", die.column, die.row))
+                .unwrap_or_else(|| "wafer".to_string());
+            annotations = annotations.row(operad_sidecar::SidecarRow::new(
+                format!("{:?} {}", annotation.kind, location),
+                annotation.note.clone(),
+                ui_chrome::Tone::Neutral,
+            ));
+        }
+        sections.push(annotations);
+
+        operad_sidecar::render_sidecar(ui, "metrology.context", &sections)
+    }
+
+    fn egui_metrology_context_panel(&mut self, ui: &mut egui::Ui) {
         if self.wafer_map.dies.is_empty() {
             ui_chrome::empty_state(ui, "No metrology dataset loaded");
             return;
@@ -8056,20 +10091,25 @@ impl FabricadApp {
     }
 
     fn net_panel(&mut self, ui: &mut egui::Ui) {
-        if let Some(reason) = &self.connectivity.skipped {
+        let summary = self.connectivity.summary(MAX_CONNECTIVITY_ROWS);
+        if let Some(reason) = &summary.skipped {
             ui_chrome::empty_state(ui, reason);
             return;
         }
+        let health_tone = if summary.short_count > 0 {
+            ui_chrome::Tone::Danger
+        } else if summary.open_count > 0 {
+            ui_chrome::Tone::Warning
+        } else {
+            ui_chrome::Tone::Success
+        };
+        let active_issue_count = self.active_connectivity_issue_count();
         ui.horizontal_wrapped(|ui| {
+            ui_chrome::status_pill(ui, summary.health.label(), health_tone);
             ui_chrome::status_pill(
                 ui,
-                &format!("{} nets", self.connectivity.components.len()),
-                ui_chrome::Tone::Neutral,
-            );
-            ui_chrome::status_pill(
-                ui,
-                &format!("{} shorts", self.connectivity.shorts.len()),
-                if self.connectivity.shorts.is_empty() {
+                &format!("{active_issue_count} active issues"),
+                if active_issue_count == 0 {
                     ui_chrome::Tone::Success
                 } else {
                     ui_chrome::Tone::Danger
@@ -8077,13 +10117,51 @@ impl FabricadApp {
             );
             ui_chrome::status_pill(
                 ui,
-                &format!("{} opens", self.connectivity.opens.len()),
-                if self.connectivity.opens.is_empty() {
+                &format!("{} nets", summary.component_count),
+                ui_chrome::Tone::Neutral,
+            );
+            if !self.document.connectivity_issue_states.is_empty() {
+                ui_chrome::status_pill(
+                    ui,
+                    &format!(
+                        "{} saved states",
+                        self.document.connectivity_issue_states.len()
+                    ),
+                    ui_chrome::Tone::Neutral,
+                );
+            }
+            if summary.labeled_component_count > 0 {
+                ui_chrome::status_pill(
+                    ui,
+                    &format!("{} labeled", summary.labeled_component_count),
+                    ui_chrome::Tone::Neutral,
+                );
+            }
+            ui_chrome::status_pill(
+                ui,
+                &format!("{} shorts", summary.short_count),
+                if summary.short_count == 0 {
+                    ui_chrome::Tone::Success
+                } else {
+                    ui_chrome::Tone::Danger
+                },
+            );
+            ui_chrome::status_pill(
+                ui,
+                &format!("{} opens", summary.open_count),
+                if summary.open_count == 0 {
                     ui_chrome::Tone::Success
                 } else {
                     ui_chrome::Tone::Warning
                 },
             );
+            if summary.largest_component_shape_count > 0 {
+                ui_chrome::status_pill(
+                    ui,
+                    &format!("largest {} shapes", summary.largest_component_shape_count),
+                    ui_chrome::Tone::Neutral,
+                );
+            }
         });
         ui.horizontal(|ui| {
             ui.label("Filter");
@@ -8121,35 +10199,41 @@ impl FabricadApp {
             }
         }
 
-        let filter = self.connectivity_filter.trim().to_ascii_lowercase();
-        let short_matches: Vec<_> = self
-            .connectivity
-            .shorts
+        if !self.connectivity.shorts.is_empty() || !self.connectivity.opens.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.checkbox(&mut self.show_waived_connectivity_issues, "Show waived")
+                    .on_hover_text(
+                        "Waived connectivity issues are accepted exceptions that stay recorded.",
+                    );
+                ui.checkbox(&mut self.show_hidden_connectivity_issues, "Show hidden")
+                    .on_hover_text(
+                        "Hidden connectivity issues are suppressed from this issue list.",
+                    );
+                if ui.button("Clear states").clicked() {
+                    self.clear_connectivity_issue_states();
+                }
+            });
+        }
+
+        let filter = self.connectivity_filter.trim();
+        let issue_rows = connectivity_issue_rows(
+            &self.connectivity,
+            &self.document.connectivity_issue_states,
+            filter,
+            self.show_hidden_connectivity_issues,
+            self.show_waived_connectivity_issues,
+        );
+        let short_matches = issue_rows
             .iter()
-            .filter(|short| {
-                filter.is_empty()
-                    || short.component.to_string().contains(&filter)
-                    || short
-                        .names
-                        .iter()
-                        .any(|name| name.to_ascii_lowercase().contains(&filter))
-            })
-            .collect();
-        let open_matches: Vec<_> = self
-            .connectivity
-            .opens
+            .filter(|row| row.kind == ConnectivityIssueKind::Short)
+            .collect::<Vec<_>>();
+        let open_matches = issue_rows
             .iter()
-            .filter(|open| {
-                filter.is_empty()
-                    || open.name.to_ascii_lowercase().contains(&filter)
-                    || open
-                        .components
-                        .iter()
-                        .any(|component| component.to_string().contains(&filter))
-            })
-            .collect();
+            .filter(|row| row.kind == ConnectivityIssueKind::Open)
+            .collect::<Vec<_>>();
 
         let mut focus_target = None;
+        let mut issue_action = None;
         if !short_matches.is_empty() {
             egui::CollapsingHeader::new(format!(
                 "Shorts (showing {} of {} matching, {} total)",
@@ -8159,16 +10243,35 @@ impl FabricadApp {
             ))
             .default_open(false)
             .show(ui, |ui| {
-                for short in short_matches.iter().take(MAX_CONNECTIVITY_ROWS) {
-                    if ui
-                        .selectable_label(
-                            false,
-                            format!("Short #{} {}", short.component, short.names.join(" / ")),
-                        )
-                        .clicked()
-                    {
-                        focus_target = Some(short.bounds);
-                    }
+                for row in short_matches.iter().take(MAX_CONNECTIVITY_ROWS) {
+                    ui.horizontal_wrapped(|ui| {
+                        let label = format!("{}{}", row.label, marker_status_label(&row.state));
+                        if ui
+                            .selectable_label(false, label)
+                            .on_hover_text(row.key.as_str())
+                            .clicked()
+                        {
+                            issue_action = Some(ConnectivityIssueAction::Focus(row.bounds));
+                        }
+                        if ui
+                            .small_button(if row.state.waived { "Unwaive" } else { "Waive" })
+                            .clicked()
+                        {
+                            issue_action = Some(ConnectivityIssueAction::SetWaived(
+                                row.key.clone(),
+                                !row.state.waived,
+                            ));
+                        }
+                        if ui
+                            .small_button(if row.state.hidden { "Show" } else { "Hide" })
+                            .clicked()
+                        {
+                            issue_action = Some(ConnectivityIssueAction::SetHidden(
+                                row.key.clone(),
+                                !row.state.hidden,
+                            ));
+                        }
+                    });
                 }
             });
         }
@@ -8181,16 +10284,35 @@ impl FabricadApp {
             ))
             .default_open(false)
             .show(ui, |ui| {
-                for open in open_matches.iter().take(MAX_CONNECTIVITY_ROWS) {
-                    if ui
-                        .selectable_label(
-                            false,
-                            format!("Open {} ({} islands)", open.name, open.components.len()),
-                        )
-                        .clicked()
-                    {
-                        focus_target = Some(open.bounds);
-                    }
+                for row in open_matches.iter().take(MAX_CONNECTIVITY_ROWS) {
+                    ui.horizontal_wrapped(|ui| {
+                        let label = format!("{}{}", row.label, marker_status_label(&row.state));
+                        if ui
+                            .selectable_label(false, label)
+                            .on_hover_text(row.key.as_str())
+                            .clicked()
+                        {
+                            issue_action = Some(ConnectivityIssueAction::Focus(row.bounds));
+                        }
+                        if ui
+                            .small_button(if row.state.waived { "Unwaive" } else { "Waive" })
+                            .clicked()
+                        {
+                            issue_action = Some(ConnectivityIssueAction::SetWaived(
+                                row.key.clone(),
+                                !row.state.waived,
+                            ));
+                        }
+                        if ui
+                            .small_button(if row.state.hidden { "Show" } else { "Hide" })
+                            .clicked()
+                        {
+                            issue_action = Some(ConnectivityIssueAction::SetHidden(
+                                row.key.clone(),
+                                !row.state.hidden,
+                            ));
+                        }
+                    });
                 }
             });
         }
@@ -8201,6 +10323,20 @@ impl FabricadApp {
         }
         drop(short_matches);
         drop(open_matches);
+        drop(issue_rows);
+        if let Some(action) = issue_action {
+            match action {
+                ConnectivityIssueAction::Focus(bounds) => {
+                    focus_target = Some(bounds);
+                }
+                ConnectivityIssueAction::SetWaived(key, waived) => {
+                    self.set_connectivity_issue_state(key, |state| state.waived = waived);
+                }
+                ConnectivityIssueAction::SetHidden(key, hidden) => {
+                    self.set_connectivity_issue_state(key, |state| state.hidden = hidden);
+                }
+            }
+        }
         if let Some(bounds) = focus_target {
             self.focus_rect(bounds);
         }
@@ -9418,6 +11554,14 @@ impl FabricadApp {
             });
 
         self.append_3d_scene_guides(&mut batch);
+        if let Err(err) = batch.validate_geometry() {
+            warn!(
+                error = %err,
+                "3D scene mesh failed validation; skipping generated 3D geometry"
+            );
+            batch = renderer::RenderBatch3d::default();
+            stats = Render3dStats::default();
+        }
         let fingerprint = batch.fingerprint();
         Cached3dScene {
             batch: Arc::new(batch),
@@ -10360,7 +12504,8 @@ impl FabricadApp {
         if !layer.visible || matches!(layer.process, ProcessLayer::Annotation) {
             return None;
         }
-        let (base_z, thickness) = layer_3d_stack_position(layer.process);
+        let (base_z, thickness) =
+            layer_3d_stack_position_for_technology(self.current_technology(), layer.process);
         Some((base_z, base_z + thickness, layer_color_3d(layer.color)))
     }
 
@@ -10387,7 +12532,8 @@ impl FabricadApp {
                 if !visible {
                     return None;
                 }
-                let (base_z, thickness) = layer_3d_stack_position(*process);
+                let (base_z, thickness) =
+                    layer_3d_stack_position_for_technology(self.current_technology(), *process);
                 Some((
                     *id,
                     Layer3dStyle {
@@ -11809,16 +13955,14 @@ fn connectivity_report_for_document(
     document: &Document,
     technology: &TechnologyFile,
 ) -> ConnectivityReport {
-    let object_count = document_object_count(document);
-    if object_count > MAX_CONNECTIVITY_OBJECTS {
+    let budget = performance_budget_for_document(document);
+    if let Some(message) = budget.connectivity_skip_message() {
         warn!(
-            object_count,
-            max_connectivity_objects = MAX_CONNECTIVITY_OBJECTS,
+            object_count = budget.object_count,
+            max_connectivity_objects = budget.max_connectivity_objects,
             "net extraction skipped because document exceeds connectivity budget"
         );
-        return ConnectivityReport::skipped(format!(
-            "net extraction skipped for {object_count} objects"
-        ));
+        return ConnectivityReport::skipped(message);
     }
     extract_connectivity(document, technology).unwrap_or_else(|err| {
         error!("net extraction failed: {err}");
@@ -11827,9 +13971,7 @@ fn connectivity_report_for_document(
 }
 
 fn drc_skip_message(document: &Document) -> Option<String> {
-    let object_count = document_object_count(document);
-    (object_count > MAX_DRC_OBJECTS)
-        .then(|| format!("DRC skipped for {object_count} objects; limit is {MAX_DRC_OBJECTS}"))
+    performance_budget_for_document(document).drc_skip_message()
 }
 
 fn document_object_count(document: &Document) -> usize {
@@ -11839,6 +13981,13 @@ fn document_object_count(document: &Document) -> usize {
             .values()
             .map(|cell| 1 + cell.shapes.len() + cell.instances.len())
             .sum::<usize>()
+}
+
+fn performance_budget_for_document(document: &Document) -> DocumentPerformanceBudget {
+    DocumentPerformanceBudget::for_counts(
+        document_object_count(document),
+        document.flattened_shape_count_estimate(),
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -13720,8 +15869,12 @@ fn append_slab_to_3d_batch(
     if points.len() < 3 {
         return 0;
     }
+    let area_twice = polygon_signed_area_twice(points);
+    if area_twice == 0 {
+        return 0;
+    }
     let mut top = Vec::with_capacity(points.len());
-    if polygon_signed_area_twice(points) >= 0 {
+    if area_twice >= 0 {
         top.extend(
             points
                 .iter()
@@ -13929,6 +16082,10 @@ fn append_face_points_to_3d_batch(
     if points.len() < 3 || batch.vertices.len() > u32::MAX as usize - points.len() {
         return false;
     }
+    let triangles = triangulate_3d_face_fan(points);
+    if triangles.is_empty() {
+        return false;
+    }
     let base = batch.vertices.len() as u32;
     let color = color32_to_gpu(fill);
     let normal = face_points_normal(surface, points);
@@ -13939,10 +16096,10 @@ fn append_face_points_to_3d_batch(
             normal: [normal.x, normal.y, normal.z],
             color,
         }));
-    for index in 1..points.len().saturating_sub(1) {
+    for [a, b, c] in triangles {
         batch
             .indices
-            .extend_from_slice(&[base, base + index as u32, base + index as u32 + 1]);
+            .extend_from_slice(&[base + a as u32, base + b as u32, base + c as u32]);
     }
     true
 }
@@ -13980,12 +16137,24 @@ fn triangulate_xy_polygon(points: &[Vec3f]) -> Vec<[usize; 3]> {
     if points.len() < 3 {
         return Vec::new();
     }
-    if points.len() == 3 {
-        return vec![[0, 1, 2]];
+    let area = polygon_area_xy(points);
+    if area.abs() <= 0.001 {
+        return Vec::new();
     }
     let mut vertices: Vec<usize> = (0..points.len()).collect();
-    if polygon_area_xy(points) < 0.0 {
+    if area < 0.0 {
         vertices.reverse();
+    }
+    if vertices.len() == 3 {
+        let mut triangles = Vec::with_capacity(1);
+        push_xy_triangle_if_valid(
+            &mut triangles,
+            points,
+            vertices[0],
+            vertices[1],
+            vertices[2],
+        );
+        return triangles;
     }
     let mut triangles = Vec::with_capacity(points.len().saturating_sub(2));
     let mut guard = 0usize;
@@ -14012,25 +16181,59 @@ fn triangulate_xy_polygon(points: &[Vec3f]) -> Vec<[usize; 3]> {
             });
             if !contains_vertex {
                 ear_index = Some(index);
-                triangles.push([previous, current, next]);
+                push_xy_triangle_if_valid(&mut triangles, points, previous, current, next);
                 break;
             }
         }
         let Some(index) = ear_index else {
-            triangulate_xy_fan(&vertices, &mut triangles);
+            triangulate_xy_fan(points, &vertices, &mut triangles);
             return triangles;
         };
         vertices.remove(index);
     }
     if vertices.len() == 3 {
-        triangles.push([vertices[0], vertices[1], vertices[2]]);
+        push_xy_triangle_if_valid(
+            &mut triangles,
+            points,
+            vertices[0],
+            vertices[1],
+            vertices[2],
+        );
     }
     triangles
 }
 
-fn triangulate_xy_fan(vertices: &[usize], triangles: &mut Vec<[usize; 3]>) {
+fn triangulate_xy_fan(points: &[Vec3f], vertices: &[usize], triangles: &mut Vec<[usize; 3]>) {
     for index in 1..vertices.len().saturating_sub(1) {
-        triangles.push([vertices[0], vertices[index], vertices[index + 1]]);
+        push_xy_triangle_if_valid(
+            triangles,
+            points,
+            vertices[0],
+            vertices[index],
+            vertices[index + 1],
+        );
+    }
+}
+
+fn triangulate_3d_face_fan(points: &[Vec3f]) -> Vec<[usize; 3]> {
+    let mut triangles = Vec::new();
+    for index in 1..points.len().saturating_sub(1) {
+        if triangle_area_3d_twice(points[0], points[index], points[index + 1]) > 0.001 {
+            triangles.push([0, index, index + 1]);
+        }
+    }
+    triangles
+}
+
+fn push_xy_triangle_if_valid(
+    triangles: &mut Vec<[usize; 3]>,
+    points: &[Vec3f],
+    a: usize,
+    b: usize,
+    c: usize,
+) {
+    if triangle_area_sign_xy(points[a], points[b], points[c]).abs() > 0.001 {
+        triangles.push([a, b, c]);
     }
 }
 
@@ -14049,7 +16252,7 @@ fn polygon_area_xy(points: &[Vec3f]) -> f32 {
 
 fn is_convex_xy(a: Vec3f, b: Vec3f, c: Vec3f) -> bool {
     let cross = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
-    cross > 0.0
+    cross > 0.001
 }
 
 fn point_in_triangle_xy(point: Vec3f, a: Vec3f, b: Vec3f, c: Vec3f) -> bool {
@@ -14063,6 +16266,10 @@ fn point_in_triangle_xy(point: Vec3f, a: Vec3f, b: Vec3f, c: Vec3f) -> bool {
 
 fn triangle_area_sign_xy(a: Vec3f, b: Vec3f, c: Vec3f) -> f32 {
     (a.x - c.x) * (b.y - c.y) - (b.x - c.x) * (a.y - c.y)
+}
+
+fn triangle_area_3d_twice(a: Vec3f, b: Vec3f, c: Vec3f) -> f32 {
+    (b - a).cross(c - a).length()
 }
 
 fn append_quad_to_3d_batch(
@@ -14229,6 +16436,17 @@ fn layer_color_3d(color: [f32; 4]) -> Color32 {
     )
 }
 
+fn layer_3d_stack_position_for_technology(
+    technology: &TechnologyFile,
+    process: ProcessLayer,
+) -> (f32, f32) {
+    if let Some((base_z, top_z)) = technology.layer_stack_range_for_process(process) {
+        (base_z, top_z - base_z)
+    } else {
+        layer_3d_stack_position(process)
+    }
+}
+
 fn layer_3d_stack_position(process: ProcessLayer) -> (f32, f32) {
     match process {
         ProcessLayer::Diffusion => (0.0, 80.0),
@@ -14271,6 +16489,679 @@ fn layer_color32(color: [f32; 4], multiplier: f32) -> Color32 {
         (color[2] * 255.0 * multiplier).clamp(0.0, 255.0) as u8,
         (color[3] * 255.0).clamp(0.0, 255.0) as u8,
     )
+}
+
+fn build_nav_rail_operad_view(
+    width: f32,
+    viewport_height: f32,
+    rows: &[NavRailOperadRow],
+) -> NavRailOperadView {
+    let content_height = NAV_OPERAD_PAD * 2.0
+        + if rows.is_empty() {
+            NAV_OPERAD_ROW_HEIGHT
+        } else {
+            rows.len() as f32 * NAV_OPERAD_ROW_HEIGHT
+        };
+    let height = viewport_height.max(content_height);
+    let size = UiSize::new(width, height);
+    let mut document = UiDocument::new(root_style(width, height));
+    let root = document.root;
+    document.set_node_visual(
+        root,
+        UiVisual::panel(ColorRgba::new(17, 21, 25, 255), None, 0.0),
+    );
+    let panel = document.add_child(
+        root,
+        UiNode::container(
+            "nav_rail.panel",
+            UiNodeStyle {
+                layout: layout::with_padding_all(
+                    layout::with_size(layout::column(), layout::percent(1.0), layout::px(height)),
+                    NAV_OPERAD_PAD,
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(ColorRgba::new(17, 21, 25, 255), None, 0.0)),
+    );
+
+    if rows.is_empty() {
+        add_nav_rail_empty_row(&mut document, panel, width);
+    } else {
+        for (index, row) in rows.iter().enumerate() {
+            add_nav_rail_row(&mut document, panel, index, width, row);
+        }
+    }
+
+    NavRailOperadView { document, size }
+}
+
+fn add_nav_rail_empty_row(document: &mut UiDocument, parent: UiNodeId, width: f32) {
+    let row = document.add_child(
+        parent,
+        UiNode::container(
+            "nav_rail.empty",
+            UiNodeStyle {
+                layout: layout::with_padding_all(
+                    layout::with_size(
+                        layout::row(),
+                        layout::px((width - NAV_OPERAD_PAD * 2.0).max(40.0)),
+                        layout::px(NAV_OPERAD_ROW_HEIGHT),
+                    ),
+                    4.0,
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            ColorRgba::new(25, 30, 35, 255),
+            Some(StrokeStyle::new(ColorRgba::new(42, 49, 56, 255), 1.0)),
+            4.0,
+        )),
+    );
+    widgets::label(
+        document,
+        row,
+        "nav_rail.empty.label",
+        "No pinned modules",
+        nav_rail_text_style(12.0, FontWeight::NORMAL, ColorRgba::new(160, 168, 176, 255)),
+        layout::with_size(layout::row(), layout::percent(1.0), layout::px(20.0)),
+    );
+}
+
+fn add_nav_rail_row(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    index: usize,
+    width: f32,
+    row: &NavRailOperadRow,
+) {
+    let node_name = format!("{NAV_OPERAD_ACTION_SELECT_VIEW}{}", row.mode.slug());
+    let fill = if row.selected {
+        ColorRgba::new(48, 101, 145, 255)
+    } else {
+        ColorRgba::new(17, 21, 25, 255)
+    };
+    let stroke = if row.selected {
+        Some(StrokeStyle::new(ColorRgba::new(91, 159, 216, 255), 1.0))
+    } else {
+        None
+    };
+    let item_width = (width - NAV_OPERAD_PAD * 2.0).max(40.0);
+    let nav_row = document.add_child(
+        parent,
+        UiNode::container(
+            node_name,
+            UiNodeStyle {
+                layout: layout::with_padding_all(
+                    layout::with_margin_all(
+                        layout::with_size(
+                            layout::column(),
+                            layout::px(item_width),
+                            layout::px(NAV_OPERAD_ROW_HEIGHT - 2.0),
+                        ),
+                        1.0,
+                    ),
+                    5.0,
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_input(InputBehavior::BUTTON)
+        .with_visual(UiVisual::panel(fill, stroke, 4.0)),
+    );
+    widgets::label(
+        document,
+        nav_row,
+        format!("nav_rail.row.{index}.label"),
+        truncate_for_row(row.label, 14),
+        nav_rail_text_style(
+            14.0,
+            if row.selected {
+                FontWeight::BOLD
+            } else {
+                FontWeight::NORMAL
+            },
+            if row.selected {
+                ColorRgba::new(243, 248, 252, 255)
+            } else {
+                ColorRgba::new(184, 190, 198, 255)
+            },
+        ),
+        layout::with_size(layout::row(), layout::percent(1.0), layout::px(18.0)),
+    );
+}
+
+fn nav_rail_mode_for_action(node_name: &str) -> Option<ViewMode> {
+    let slug = node_name.strip_prefix(NAV_OPERAD_ACTION_SELECT_VIEW)?;
+    ViewMode::from_slug(action_part(slug))
+}
+
+fn nav_rail_text_style(font_size: f32, weight: FontWeight, color: ColorRgba) -> TextStyle {
+    TextStyle {
+        font_size,
+        line_height: font_size + 3.0,
+        weight,
+        color,
+        wrap: TextWrap::None,
+        ..Default::default()
+    }
+}
+
+fn fab_control_operad_metric_columns(width: f32) -> usize {
+    if width >= 1120.0 {
+        4
+    } else if width >= 780.0 {
+        3
+    } else if width >= 460.0 {
+        2
+    } else {
+        1
+    }
+}
+
+fn fab_control_operad_metric_grid_height(width: f32, metric_count: usize) -> f32 {
+    let columns = fab_control_operad_metric_columns(width).max(1);
+    let rows = metric_count.div_ceil(columns).max(1);
+    rows as f32 * FAB_OPERAD_METRIC_HEIGHT
+}
+
+fn fab_control_operad_section_height(row_count: usize) -> f32 {
+    FAB_OPERAD_PAD * 2.0
+        + FAB_OPERAD_SECTION_TITLE_HEIGHT
+        + if row_count == 0 {
+            FAB_OPERAD_EMPTY_ROW_HEIGHT
+        } else {
+            row_count as f32 * FAB_OPERAD_ROW_HEIGHT
+        }
+}
+
+fn fab_control_operad_view_height(
+    width: f32,
+    metric_count: usize,
+    section_counts: &[usize],
+) -> f32 {
+    FAB_OPERAD_HEADER_HEIGHT
+        + FAB_OPERAD_GAP
+        + fab_control_operad_metric_grid_height(width, metric_count)
+        + FAB_OPERAD_GAP
+        + section_counts
+            .iter()
+            .map(|count| fab_control_operad_section_height(*count) + FAB_OPERAD_GAP)
+            .sum::<f32>()
+}
+
+fn add_fab_control_operad_header(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    eyebrow: &str,
+    title: &str,
+    detail: &str,
+    meta: String,
+) {
+    let header = document.add_child(
+        parent,
+        UiNode::container(
+            "fab_control.header",
+            UiNodeStyle {
+                layout: layout::with_padding_all(
+                    layout::with_size(
+                        layout::column(),
+                        layout::percent(1.0),
+                        layout::px(FAB_OPERAD_HEADER_HEIGHT),
+                    ),
+                    FAB_OPERAD_PAD,
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            ColorRgba::new(22, 27, 32, 255),
+            Some(StrokeStyle::new(ColorRgba::new(46, 55, 64, 255), 1.0)),
+            6.0,
+        )),
+    );
+    add_fab_control_operad_text(
+        document,
+        header,
+        "fab_control.header.eyebrow",
+        eyebrow,
+        fab_control_operad_text_style(12.0, FontWeight::BOLD, ColorRgba::new(146, 154, 162, 255)),
+        16.0,
+    );
+    add_fab_control_operad_text(
+        document,
+        header,
+        "fab_control.header.title",
+        title,
+        fab_control_operad_text_style(24.0, FontWeight::BOLD, ColorRgba::new(242, 246, 250, 255)),
+        30.0,
+    );
+    add_fab_control_operad_text(
+        document,
+        header,
+        "fab_control.header.detail",
+        detail,
+        fab_control_operad_text_style(14.0, FontWeight::NORMAL, ColorRgba::new(178, 185, 194, 255)),
+        20.0,
+    );
+    add_fab_control_operad_text(
+        document,
+        header,
+        "fab_control.header.meta",
+        meta,
+        fab_control_operad_text_style(13.0, FontWeight::NORMAL, ColorRgba::new(112, 183, 239, 255)),
+        18.0,
+    );
+}
+
+fn add_fab_control_operad_metric_grid(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    width: f32,
+    metrics: &[FabControlMetricTile],
+) {
+    let columns = fab_control_operad_metric_columns(width);
+    let grid_height = fab_control_operad_metric_grid_height(width, metrics.len());
+    let grid = document.add_child(
+        parent,
+        UiNode::container(
+            "fab_control.metrics",
+            UiNodeStyle {
+                layout: layout::with_size(
+                    layout::column(),
+                    layout::percent(1.0),
+                    layout::px(grid_height),
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        ),
+    );
+    let tile_width =
+        ((width - FAB_OPERAD_GAP * (columns.saturating_sub(1) as f32)) / columns as f32).max(120.0);
+    for (row_index, chunk) in metrics.chunks(columns).enumerate() {
+        let row = document.add_child(
+            grid,
+            UiNode::container(
+                format!("fab_control.metrics.row.{row_index}"),
+                UiNodeStyle {
+                    layout: layout::with_size(
+                        layout::row(),
+                        layout::percent(1.0),
+                        layout::px(FAB_OPERAD_METRIC_HEIGHT),
+                    ),
+                    clip: ClipBehavior::Clip,
+                    ..Default::default()
+                },
+            ),
+        );
+        for (column, metric) in chunk.iter().enumerate() {
+            add_fab_control_operad_metric_tile(
+                document,
+                row,
+                &format!("fab_control.metrics.{row_index}.{column}"),
+                tile_width - 6.0,
+                metric,
+            );
+        }
+    }
+}
+
+fn add_fab_control_operad_metric_tile(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    name: &str,
+    width: f32,
+    metric: &FabControlMetricTile,
+) {
+    let tile = document.add_child(
+        parent,
+        UiNode::container(
+            name,
+            UiNodeStyle {
+                layout: layout::with_padding_all(
+                    layout::with_margin_all(
+                        layout::with_size(
+                            layout::column(),
+                            layout::px(width.max(116.0)),
+                            layout::px(FAB_OPERAD_METRIC_HEIGHT - 8.0),
+                        ),
+                        3.0,
+                    ),
+                    9.0,
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            ColorRgba::new(29, 35, 40, 255),
+            Some(StrokeStyle::new(
+                fab_control_operad_tone_color(metric.tone),
+                1.0,
+            )),
+            6.0,
+        )),
+    );
+    add_fab_control_operad_text(
+        document,
+        tile,
+        &format!("{name}.label"),
+        &metric.label,
+        fab_control_operad_text_style(12.0, FontWeight::BOLD, ColorRgba::new(158, 166, 174, 255)),
+        18.0,
+    );
+    add_fab_control_operad_text(
+        document,
+        tile,
+        &format!("{name}.value"),
+        &metric.value,
+        fab_control_operad_text_style(20.0, FontWeight::BOLD, ColorRgba::new(239, 243, 247, 255)),
+        26.0,
+    );
+    add_fab_control_operad_text(
+        document,
+        tile,
+        &format!("{name}.detail"),
+        truncate_for_row(&metric.detail, 52),
+        fab_control_operad_text_style(
+            12.0,
+            FontWeight::NORMAL,
+            fab_control_operad_tone_color(metric.tone),
+        ),
+        18.0,
+    );
+}
+
+fn add_fab_control_operad_section(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    width: f32,
+    name: &str,
+    title: &str,
+    empty: &str,
+    rows: &[FabControlOperadRow],
+) {
+    let height = fab_control_operad_section_height(rows.len());
+    let section = document.add_child(
+        parent,
+        UiNode::container(
+            name,
+            UiNodeStyle {
+                layout: layout::with_padding_all(
+                    layout::with_size(layout::column(), layout::percent(1.0), layout::px(height)),
+                    FAB_OPERAD_PAD,
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            ColorRgba::new(21, 26, 31, 255),
+            Some(StrokeStyle::new(ColorRgba::new(45, 53, 61, 255), 1.0)),
+            6.0,
+        )),
+    );
+    add_fab_control_operad_text(
+        document,
+        section,
+        &format!("{name}.title"),
+        title,
+        fab_control_operad_text_style(15.0, FontWeight::BOLD, ColorRgba::new(242, 246, 250, 255)),
+        FAB_OPERAD_SECTION_TITLE_HEIGHT,
+    );
+    if rows.is_empty() {
+        add_fab_control_operad_empty_row(document, section, name, empty);
+    } else {
+        let row_width = (width - FAB_OPERAD_PAD * 2.0).max(240.0);
+        for (index, row) in rows.iter().enumerate() {
+            add_fab_control_operad_data_row(document, section, name, index, row_width, row);
+        }
+    }
+}
+
+fn add_fab_control_operad_empty_row(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    name: &str,
+    label: &str,
+) {
+    let row = document.add_child(
+        parent,
+        UiNode::container(
+            format!("{name}.empty"),
+            UiNodeStyle {
+                layout: layout::with_padding_all(
+                    layout::with_size(
+                        layout::row(),
+                        layout::percent(1.0),
+                        layout::px(FAB_OPERAD_EMPTY_ROW_HEIGHT),
+                    ),
+                    8.0,
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            ColorRgba::new(27, 32, 37, 255),
+            Some(StrokeStyle::new(ColorRgba::new(43, 50, 58, 255), 1.0)),
+            5.0,
+        )),
+    );
+    add_fab_control_operad_text(
+        document,
+        row,
+        &format!("{name}.empty.label"),
+        label,
+        fab_control_operad_text_style(13.0, FontWeight::NORMAL, ColorRgba::new(154, 163, 172, 255)),
+        24.0,
+    );
+}
+
+fn add_fab_control_operad_data_row(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    section_name: &str,
+    index: usize,
+    row_width: f32,
+    row: &FabControlOperadRow,
+) {
+    let row_name = row
+        .action_name
+        .clone()
+        .unwrap_or_else(|| format!("{section_name}.row.{index}"));
+    let stroke_color = if row.selected {
+        fab_control_operad_tone_color(ui_chrome::Tone::Info)
+    } else {
+        ColorRgba::new(42, 50, 58, 255)
+    };
+    let fill = if row.selected {
+        ColorRgba::new(26, 42, 56, 255)
+    } else {
+        ColorRgba::new(26, 31, 36, 255)
+    };
+    let mut node = UiNode::container(
+        row_name,
+        UiNodeStyle {
+            layout: layout::with_padding_all(
+                layout::with_size(
+                    layout::row(),
+                    layout::percent(1.0),
+                    layout::px(FAB_OPERAD_ROW_HEIGHT),
+                ),
+                6.0,
+            ),
+            clip: ClipBehavior::Clip,
+            ..Default::default()
+        },
+    )
+    .with_visual(UiVisual::panel(
+        fill,
+        Some(StrokeStyle::new(stroke_color, 1.0)),
+        4.0,
+    ));
+    if row.action_name.is_some() {
+        node = node.with_input(InputBehavior::BUTTON);
+    }
+    let row_node = document.add_child(parent, node);
+    document.add_child(
+        row_node,
+        UiNode::container(
+            format!("{section_name}.row.{index}.tone"),
+            UiNodeStyle {
+                layout: layout::fixed(5.0, FAB_OPERAD_ROW_HEIGHT - 12.0),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            fab_control_operad_tone_color(row.tone),
+            None,
+            2.0,
+        )),
+    );
+    let text_column = document.add_child(
+        row_node,
+        UiNode::container(
+            format!("{section_name}.row.{index}.text"),
+            UiNodeStyle {
+                layout: layout::with_size(
+                    layout::column(),
+                    layout::px((row_width - 28.0).max(120.0)),
+                    layout::px(FAB_OPERAD_ROW_HEIGHT - 12.0),
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        ),
+    );
+    add_fab_control_operad_text(
+        document,
+        text_column,
+        &format!("{section_name}.row.{index}.title"),
+        truncate_for_row(&row.title, 72),
+        fab_control_operad_text_style(14.0, FontWeight::BOLD, ColorRgba::new(232, 237, 242, 255)),
+        21.0,
+    );
+    add_fab_control_operad_text(
+        document,
+        text_column,
+        &format!("{section_name}.row.{index}.detail"),
+        truncate_for_row(&row.detail, 116),
+        fab_control_operad_text_style(12.0, FontWeight::NORMAL, ColorRgba::new(162, 171, 180, 255)),
+        19.0,
+    );
+}
+
+fn add_fab_control_operad_spacer(document: &mut UiDocument, parent: UiNodeId, height: f32) {
+    document.add_child(
+        parent,
+        UiNode::container(
+            format!("fab_control.spacer.{}", document.node_count()),
+            UiNodeStyle {
+                layout: layout::with_size(layout::row(), layout::percent(1.0), layout::px(height)),
+                ..Default::default()
+            },
+        ),
+    );
+}
+
+fn add_fab_control_operad_text(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    name: &str,
+    text: impl Into<String>,
+    style: TextStyle,
+    height: f32,
+) {
+    widgets::label(
+        document,
+        parent,
+        name,
+        text,
+        style,
+        layout::with_size(layout::row(), layout::percent(1.0), layout::px(height)),
+    );
+}
+
+fn fab_control_operad_text_style(
+    font_size: f32,
+    weight: FontWeight,
+    color: ColorRgba,
+) -> TextStyle {
+    TextStyle {
+        font_size,
+        line_height: font_size + 4.0,
+        weight,
+        color,
+        wrap: TextWrap::None,
+        ..Default::default()
+    }
+}
+
+fn fab_control_operad_tone_color(tone: ui_chrome::Tone) -> ColorRgba {
+    let color = tone.color();
+    ColorRgba::new(color.r(), color.g(), color.b(), color.a())
+}
+
+fn command_tone(enabled: bool) -> ui_chrome::Tone {
+    if enabled {
+        ui_chrome::Tone::Info
+    } else {
+        ui_chrome::Tone::Neutral
+    }
+}
+
+fn run_status_tone(status: RunStatus) -> ui_chrome::Tone {
+    match status {
+        RunStatus::Running => ui_chrome::Tone::Warning,
+        RunStatus::Completed => ui_chrome::Tone::Success,
+        RunStatus::Aborted => ui_chrome::Tone::Neutral,
+        RunStatus::Alarmed => ui_chrome::Tone::Danger,
+    }
+}
+
+fn alarm_tone(severity: AlarmSeverity) -> ui_chrome::Tone {
+    match severity {
+        AlarmSeverity::Advisory => ui_chrome::Tone::Info,
+        AlarmSeverity::Warning => ui_chrome::Tone::Warning,
+        AlarmSeverity::Critical => ui_chrome::Tone::Danger,
+    }
+}
+
+fn action_part(value: &str) -> &str {
+    value.split_once('|').map(|(head, _)| head).unwrap_or(value)
+}
+
+fn single_line(value: impl AsRef<str>) -> String {
+    value.as_ref().replace('\n', " | ")
+}
+
+fn truncate_for_row(text: impl AsRef<str>, max_chars: usize) -> String {
+    let text = text.as_ref();
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_string();
+    }
+    let keep = max_chars.saturating_sub(3);
+    let head = keep / 2;
+    let tail = keep - head;
+    let start = text.chars().take(head).collect::<String>();
+    let end = text
+        .chars()
+        .rev()
+        .take(tail)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!("{start}...{end}")
 }
 
 fn equipment_process_step_label(kind: EquipmentToolKind) -> &'static str {
@@ -15048,23 +17939,70 @@ fn short_user(user: Uuid) -> String {
 }
 
 fn drc_marker_key(violation: &DrcViolation) -> String {
-    let mut shapes = violation
-        .shape_ids
-        .iter()
-        .map(|id| id.0.to_string())
-        .collect::<Vec<_>>();
-    shapes.sort();
-    format!(
-        "{}|{}|{},{},{},{}|{}|{:.3}",
-        violation.rule,
-        shapes.join(","),
-        violation.bounds.min.x,
-        violation.bounds.min.y,
-        violation.bounds.max.x,
-        violation.bounds.max.y,
-        violation.required,
-        violation.actual
-    )
+    violation.stable_key()
+}
+
+fn connectivity_issue_rows(
+    report: &ConnectivityReport,
+    states: &BTreeMap<String, MarkerState>,
+    filter: &str,
+    show_hidden: bool,
+    show_waived: bool,
+) -> Vec<ConnectivityIssueUiRow> {
+    let filter = filter.trim().to_ascii_lowercase();
+    report
+        .issue_store()
+        .records
+        .into_iter()
+        .filter_map(|record| {
+            let state = states.get(&record.key).cloned().unwrap_or_default();
+            if (state.hidden && !show_hidden) || (state.waived && !show_waived) {
+                return None;
+            }
+            if !connectivity_issue_matches_filter(&record.issue, &filter) {
+                return None;
+            }
+            let kind = record.kind();
+            let bounds = record.bounds();
+            let label = match &record.issue {
+                ConnectivityIssue::Short(short) => {
+                    format!("Short #{} {}", short.component, short.names.join(" / "))
+                }
+                ConnectivityIssue::Open(open) => {
+                    format!("Open {} ({} islands)", open.name, open.components.len())
+                }
+            };
+            Some(ConnectivityIssueUiRow {
+                key: record.key,
+                kind,
+                label,
+                bounds,
+                state,
+            })
+        })
+        .collect()
+}
+
+fn connectivity_issue_matches_filter(issue: &ConnectivityIssue, filter: &str) -> bool {
+    if filter.is_empty() {
+        return true;
+    }
+    match issue {
+        ConnectivityIssue::Short(short) => {
+            short.component.to_string().contains(filter)
+                || short
+                    .names
+                    .iter()
+                    .any(|name| name.to_ascii_lowercase().contains(filter))
+        }
+        ConnectivityIssue::Open(open) => {
+            open.name.to_ascii_lowercase().contains(filter)
+                || open
+                    .components
+                    .iter()
+                    .any(|component| component.to_string().contains(filter))
+        }
+    }
 }
 
 fn marker_status_label(state: &MarkerState) -> &'static str {
@@ -15074,6 +18012,10 @@ fn marker_status_label(state: &MarkerState) -> &'static str {
         (false, true) => " [hidden]",
         (false, false) => "",
     }
+}
+
+fn normalized_marker_state(state: MarkerState) -> Option<MarkerState> {
+    (state != MarkerState::default()).then_some(state)
 }
 
 fn is_collaboration_disconnect(message: &str) -> bool {
@@ -15099,7 +18041,205 @@ fn remote_user_color(user: Uuid) -> Color32 {
 mod tests {
     use super::*;
     use geometry_core::DBU_PER_MICRON;
-    use std::collections::BTreeSet;
+    use layout_model::connectivity::{NetOpen, NetShort};
+    use layout_model::workspace::{WORKSPACE_FEATURE_FLAGS, WORKSPACE_PRODUCER};
+    use serde::{Deserialize, Serialize};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn temp_test_path(file_name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("fabricad-test-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(file_name)
+    }
+
+    fn remove_temp_parent(path: &Path) {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct PerformanceBaselineFile {
+        schema_version: u32,
+        name: String,
+        workloads: Vec<PerformanceWorkloadBaseline>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct PerformanceWorkloadBaseline {
+        name: String,
+        metric: String,
+        min_input_size: usize,
+        max_actual: usize,
+    }
+
+    #[derive(Debug)]
+    struct PerformanceSample {
+        name: &'static str,
+        metric: &'static str,
+        input_size: usize,
+        elapsed_ms: f64,
+        actual: usize,
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    struct PerformanceObservationReport {
+        schema_version: u32,
+        baseline: String,
+        samples: Vec<PerformanceObservation>,
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    struct PerformanceObservation {
+        name: String,
+        metric: String,
+        input_size: usize,
+        min_input_size: usize,
+        input_size_passed: bool,
+        elapsed_ms: f64,
+        actual: usize,
+        max_actual: usize,
+        budget_passed: bool,
+    }
+
+    fn performance_observation_report(
+        fixture: &str,
+        expected_name: &str,
+        samples: &[PerformanceSample],
+    ) -> PerformanceObservationReport {
+        let baseline: PerformanceBaselineFile = serde_json::from_str(fixture).unwrap();
+        assert_eq!(baseline.schema_version, 1);
+        assert_eq!(baseline.name, expected_name);
+        let baselines = baseline
+            .workloads
+            .into_iter()
+            .map(|baseline| (baseline.name.clone(), baseline))
+            .collect::<BTreeMap<_, _>>();
+        let sample_names = samples
+            .iter()
+            .map(|sample| sample.name.to_string())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            baselines.keys().cloned().collect::<BTreeSet<_>>(),
+            sample_names
+        );
+
+        let samples = samples
+            .iter()
+            .map(|sample| {
+                let baseline = baselines.get(sample.name).unwrap();
+                assert_eq!(baseline.metric, sample.metric, "{sample:?}");
+                assert!(sample.elapsed_ms.is_finite(), "{sample:?}");
+                PerformanceObservation {
+                    name: sample.name.to_string(),
+                    metric: sample.metric.to_string(),
+                    input_size: sample.input_size,
+                    min_input_size: baseline.min_input_size,
+                    input_size_passed: sample.input_size >= baseline.min_input_size,
+                    elapsed_ms: sample.elapsed_ms,
+                    actual: sample.actual,
+                    max_actual: baseline.max_actual,
+                    budget_passed: sample.actual <= baseline.max_actual,
+                }
+            })
+            .collect();
+
+        PerformanceObservationReport {
+            schema_version: 1,
+            baseline: expected_name.to_string(),
+            samples,
+        }
+    }
+
+    fn performance_report_file_name(baseline: &str) -> String {
+        let sanitized = baseline
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+        format!("{sanitized}_observed.json")
+    }
+
+    fn write_performance_observation_report(
+        directory: &Path,
+        report: &PerformanceObservationReport,
+    ) -> std::io::Result<PathBuf> {
+        std::fs::create_dir_all(directory)?;
+        let path = directory.join(performance_report_file_name(&report.baseline));
+        let encoded = serde_json::to_string_pretty(report)
+            .expect("performance observation report should serialize");
+        std::fs::write(&path, encoded)?;
+        Ok(path)
+    }
+
+    fn maybe_write_performance_observation_report(report: &PerformanceObservationReport) {
+        if let Ok(directory) = std::env::var("FABRICAD_PERFORMANCE_REPORT_DIR") {
+            write_performance_observation_report(Path::new(&directory), report)
+                .expect("failed to write FABRICAD_PERFORMANCE_REPORT_DIR performance report");
+        }
+    }
+
+    fn assert_performance_samples_against_fixture(
+        fixture: &str,
+        expected_name: &str,
+        samples: &[PerformanceSample],
+    ) {
+        let report = performance_observation_report(fixture, expected_name, samples);
+        maybe_write_performance_observation_report(&report);
+        for sample in &report.samples {
+            assert!(sample.input_size_passed, "{sample:?}");
+            assert!(
+                sample.budget_passed,
+                "{} actual {} exceeded budget {} for input {} in {:.3} ms",
+                sample.name, sample.actual, sample.max_actual, sample.input_size, sample.elapsed_ms
+            );
+        }
+    }
+
+    fn validated_3d_primitive_count(scene: &Cached3dScene) -> usize {
+        let validation = scene.batch.validate_geometry().unwrap();
+        validation.mesh_triangles + validation.rect_slabs + validation.guide_segments
+    }
+
+    fn validated_3d_stack_range_count(
+        document: &Document,
+        scene: &Cached3dScene,
+        technology: &TechnologyFile,
+    ) -> usize {
+        let expected = document
+            .visible_flattened_shapes()
+            .into_iter()
+            .filter_map(|flattened| {
+                let layer = document.layers.get(&flattened.shape.layer)?;
+                if layer.process == ProcessLayer::Annotation {
+                    return None;
+                }
+                let (base_z, thickness) =
+                    layer_3d_stack_position_for_technology(technology, layer.process);
+                if thickness <= 0.0 {
+                    return None;
+                }
+                Some(stack_range_key(base_z, base_z + thickness))
+            })
+            .collect::<BTreeSet<_>>();
+        let actual = scene
+            .batch
+            .rect_slabs
+            .iter()
+            .map(|slab| stack_range_key(slab.z_range[0], slab.z_range[1]))
+            .collect::<BTreeSet<_>>();
+
+        expected.intersection(&actual).count()
+    }
+
+    fn stack_range_key(base_z: f32, top_z: f32) -> (u32, u32) {
+        (base_z.to_bits(), top_z.to_bits())
+    }
 
     #[test]
     fn navigation_metadata_covers_every_view_mode_once() {
@@ -15109,11 +18249,48 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(labels.len(), ViewMode::ALL.len());
         assert!(ViewMode::ALL.iter().all(|mode| !mode.title().is_empty()));
+        assert!(ViewMode::ALL.iter().all(|mode| !mode.slug().is_empty()));
         assert!(
             ModuleGroup::ALL
                 .iter()
                 .all(|group| ViewMode::ALL.iter().any(|mode| mode.group() == *group))
         );
+    }
+
+    #[test]
+    fn navigation_operad_view_audits_common_sizes() {
+        let rows = ViewMode::ALL
+            .iter()
+            .copied()
+            .map(|mode| NavRailOperadRow {
+                mode,
+                label: mode.rail_label(),
+                selected: mode == ViewMode::Workflow,
+            })
+            .collect::<Vec<_>>();
+
+        for (width, height) in [(72.0, 420.0), (90.0, 620.0), (108.0, 720.0)] {
+            let mut view = build_nav_rail_operad_view(width, height, &rows);
+            view.document
+                .compute_layout(view.size, &mut ApproxTextMeasurer)
+                .expect("navigation operad layout should compute");
+            let warnings = view.document.audit_layout();
+            assert!(warnings.is_empty(), "{width}x{height}: {warnings:?}");
+            assert!(view.document.paint_list().items.len() > rows.len());
+        }
+    }
+
+    #[test]
+    fn navigation_operad_action_maps_to_view_mode() {
+        assert_eq!(
+            nav_rail_mode_for_action("nav_rail.action.select.layout3d"),
+            Some(ViewMode::Layout3d)
+        );
+        assert_eq!(
+            nav_rail_mode_for_action("nav_rail.action.select.process-control"),
+            Some(ViewMode::ProcessControl)
+        );
+        assert_eq!(nav_rail_mode_for_action("other"), None);
     }
 
     #[test]
@@ -15167,6 +18344,69 @@ mod tests {
         );
     }
 
+    fn sidebar_module_rows(
+        nav_rail_modes: &BTreeSet<ViewMode>,
+    ) -> Vec<operad_audit::SidebarModuleRow> {
+        let mut rows = Vec::new();
+        for group in ModuleGroup::ALL {
+            rows.push(operad_audit::SidebarModuleRow::group(group.label()));
+            rows.extend(
+                ViewMode::ALL
+                    .into_iter()
+                    .filter(|mode| mode.group() == group)
+                    .map(|mode| {
+                        operad_audit::SidebarModuleRow::module(
+                            mode.nav_label(),
+                            nav_rail_modes.contains(&mode),
+                        )
+                    }),
+            );
+        }
+        rows
+    }
+
+    #[test]
+    fn sidebar_modules_operad_audit_covers_default_visible_modules() {
+        let rows = sidebar_module_rows(&default_nav_rail_modes());
+        let report = operad_audit::audit_sidebar_modules_layout(
+            &rows,
+            operad::UiSize::new(360.0, 560.0),
+            0.0,
+        )
+        .expect("sidebar modules operad layout should compute");
+
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        assert_eq!(report.module_count, ViewMode::ALL.len());
+        assert_eq!(
+            report.row_count,
+            ViewMode::ALL.len() + ModuleGroup::ALL.len()
+        );
+        assert_eq!(report.visible_range.start, 0);
+        assert!(report.visible_range.end < report.row_count);
+        assert!(report.modeled_content_height > report.scroll.viewport_size.height);
+        assert!(report.scroll.content_size.height > report.scroll.viewport_size.height);
+        assert!(report.node_count > report.visible_range.len());
+        assert!(report.paint_items > 0);
+    }
+
+    #[test]
+    fn sidebar_modules_operad_audit_handles_compact_scrolled_panel() {
+        let rows = sidebar_module_rows(&default_nav_rail_modes());
+        let report = operad_audit::audit_sidebar_modules_layout(
+            &rows,
+            operad::UiSize::new(300.0, 300.0),
+            240.0,
+        )
+        .expect("compact sidebar modules operad layout should compute");
+
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        assert!(report.visible_range.start > 0);
+        assert!(report.visible_range.end <= report.row_count);
+        assert!(report.scroll.offset.y > 0.0);
+        assert!(report.scroll.content_size.height > report.scroll.viewport_size.height);
+        assert!(report.paint_items > 0);
+    }
+
     #[test]
     fn side_panels_follow_view_context() {
         assert!(ViewMode::Layout2d.has_inspector_panel());
@@ -15190,7 +18430,7 @@ mod tests {
         assert!(ViewMode::CrossSection.has_secondary_panel());
         assert!(ViewMode::Experiment.has_inspector_panel());
         assert!(ViewMode::Experiment.has_secondary_panel());
-        assert!(ViewMode::Notebook.has_inspector_panel());
+        assert!(!ViewMode::Notebook.has_inspector_panel());
         assert!(ViewMode::Notebook.has_secondary_panel());
 
         assert!(!ViewMode::Yield.has_inspector_panel());
@@ -15237,6 +18477,7 @@ mod tests {
         assert!(dataset.experiment_plan.runs.is_empty());
         assert!(dataset.process_control.loops.is_empty());
         assert!(dataset.process_flow.route.nodes.is_empty());
+        assert!(dataset.cross_section.steps.is_empty());
         assert!(dataset.lab_notebook.entries.is_empty());
         assert_eq!(dataset.equipment.tools().count(), 0);
     }
@@ -15261,8 +18502,648 @@ mod tests {
         assert!(!dataset.experiment_plan.runs.is_empty());
         assert!(!dataset.process_control.loops.is_empty());
         assert!(!dataset.process_flow.route.nodes.is_empty());
+        assert!(!dataset.cross_section.steps.is_empty());
         assert!(!dataset.lab_notebook.entries.is_empty());
         assert!(dataset.equipment.tools().count() > 0);
+    }
+
+    #[test]
+    fn quality_fixture_validator_covers_drc_and_connectivity_artifacts() {
+        let report = validate_quality_fixtures().unwrap();
+
+        assert_eq!(report.drc_violations, 5);
+        assert_eq!(report.drc_rule_families, 5);
+        assert_eq!(report.connectivity_components, 4);
+        assert_eq!(report.connectivity_shorts, 1);
+        assert_eq!(report.connectivity_opens, 1);
+        assert_eq!(report.connectivity_issue_keys, 2);
+        assert_eq!(report.connectivity_issue_states, 2);
+    }
+
+    #[test]
+    fn persistence_fixture_validator_covers_schema_and_feature_compatibility() {
+        let report = validate_persistence_fixtures().unwrap();
+
+        assert_eq!(report.migrated_legacy_schema_zero, 1);
+        assert_eq!(report.rejected_future_workspace_schema, 1);
+        assert_eq!(report.rejected_future_metadata_schema, 1);
+        assert_eq!(report.rejected_future_document_schema, 1);
+        assert_eq!(report.rejected_malformed_schema_fields, 1);
+        assert_eq!(report.rejected_malformed_metadata_arrays, 1);
+        assert_eq!(report.rejected_unsupported_feature_flags, 1);
+    }
+
+    #[test]
+    fn startup_demo_workspace_option_loads_builtin_workspace() {
+        let cc = eframe::CreationContext::_new_kittest(egui::Context::default());
+        let app = FabricadApp::new_with_options(
+            &cc,
+            StartupOptions {
+                demo_workspace: true,
+                view_mode: Some(StartupView::Metrology),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(app.view_mode, ViewMode::Metrology);
+        assert_eq!(app.layout_source, DataSource::Demo);
+        assert_eq!(app.fabos_source, DataSource::Demo);
+        assert!(!app.document.shapes.is_empty());
+        assert!(!app.mes.lots.is_empty());
+        assert!(app.equipment_sim.tools().count() > 0);
+    }
+
+    #[test]
+    fn workspace_dataset_validation_accepts_blank_demo_and_json_round_trip() {
+        for dataset in [WorkspaceDataset::blank(), WorkspaceDataset::demo()] {
+            let validation = dataset.validate();
+            assert!(
+                validation.is_valid(),
+                "dataset should validate before persistence: {}",
+                validation.error_summary()
+            );
+
+            let encoded = serde_json::to_string_pretty(&dataset).unwrap();
+            let restored: WorkspaceDataset = serde_json::from_str(&encoded).unwrap();
+            let restored_validation = restored.validate();
+            assert!(
+                restored_validation.is_valid(),
+                "dataset should validate after persistence round trip: {}",
+                restored_validation.error_summary()
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_dataset_snapshot_metadata_round_trips_and_allows_legacy_snapshots() {
+        let dataset = WorkspaceDataset::demo();
+
+        assert_eq!(dataset.metadata.producer, WORKSPACE_PRODUCER);
+        assert_eq!(dataset.metadata.producer_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            dataset.metadata.workspace_schema_version,
+            WORKSPACE_DATASET_SCHEMA_VERSION
+        );
+        assert_eq!(
+            dataset.metadata.document_schema_version,
+            dataset.document.schema_version
+        );
+        assert_eq!(
+            dataset.metadata.feature_flags,
+            WORKSPACE_FEATURE_FLAGS
+                .iter()
+                .map(|flag| (*flag).to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            dataset.metadata.migration_history,
+            vec![format!(
+                "workspace_schema:{}",
+                WORKSPACE_DATASET_SCHEMA_VERSION
+            )]
+        );
+
+        let encoded = serde_json::to_string_pretty(&dataset).unwrap();
+        assert!(encoded.contains("\"metadata\""));
+        assert!(encoded.contains("\"producer_version\""));
+        let restored: WorkspaceDataset = serde_json::from_str(&encoded).unwrap();
+        assert!(restored.validate().is_valid());
+
+        let mut legacy_value = serde_json::to_value(&dataset).unwrap();
+        legacy_value.as_object_mut().unwrap().remove("metadata");
+        let legacy: WorkspaceDataset = serde_json::from_value(legacy_value).unwrap();
+        let legacy_validation = legacy.validate();
+        assert!(legacy_validation.is_valid());
+        assert!(
+            legacy_validation
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("metadata is missing")),
+            "{:?}",
+            legacy_validation.warnings
+        );
+    }
+
+    #[test]
+    fn workspace_dataset_validation_rejects_metadata_schema_mismatch() {
+        let mut dataset = WorkspaceDataset::demo();
+        dataset.metadata.workspace_schema_version = WORKSPACE_DATASET_SCHEMA_VERSION + 1;
+
+        let validation = dataset.validate();
+
+        assert!(!validation.is_valid());
+        assert!(
+            validation
+                .errors
+                .iter()
+                .any(|error| error.contains("metadata schema")),
+            "{:?}",
+            validation.errors
+        );
+    }
+
+    #[test]
+    fn workspace_dataset_validation_rejects_unsupported_feature_flags() {
+        let mut dataset = WorkspaceDataset::demo();
+        dataset
+            .metadata
+            .feature_flags
+            .push("future_collaboration_feature".to_string());
+
+        let validation = dataset.validate();
+
+        assert!(!validation.is_valid());
+        assert!(
+            validation
+                .errors
+                .iter()
+                .any(|error| error.contains("unsupported feature flag")),
+            "{:?}",
+            validation.errors
+        );
+    }
+
+    #[test]
+    fn workspace_dataset_validation_rejects_broken_cross_domain_links() {
+        let mut dataset = WorkspaceDataset::demo();
+        let binding = dataset
+            .process_flow
+            .route
+            .nodes
+            .iter_mut()
+            .find_map(|node| node.recipe.as_mut())
+            .expect("demo process flow has recipe bindings");
+        binding.recipe_id = layout_model::recipe::RecipeId::from("MISSING_RECIPE");
+
+        let validation = dataset.validate();
+        assert!(!validation.is_valid());
+        assert!(
+            validation
+                .errors
+                .iter()
+                .any(|error| error.contains("missing recipe")),
+            "{:?}",
+            validation.errors
+        );
+    }
+
+    #[test]
+    fn workspace_dataset_validation_rejects_broken_fab_support_models() {
+        let mut dataset = WorkspaceDataset::demo();
+        dataset
+            .environment
+            .readings
+            .push(layout_model::environment::EnvironmentReading {
+                sensor_id: "MISSING_SENSOR".to_string(),
+                timestamp_min: 1,
+                value: 1.0,
+            });
+        dataset
+            .maintenance
+            .downtime
+            .push(layout_model::maintenance::DowntimeRecord {
+                id: "bad-down".to_string(),
+                tool_id: layout_model::equipment::ToolId::from("MISSING_TOOL"),
+                started_at: layout_model::maintenance::FabDate::new(2026, 5, 9),
+                ended_at: Some(layout_model::maintenance::FabDate::new(2026, 5, 8)),
+                reason: "bad test record".to_string(),
+                owner: "test".to_string(),
+            });
+        dataset.safety.tool_interlocks[0]
+            .required_sensors
+            .push(layout_model::safety::SafetySensorId::from("MISSING_SENSOR"));
+        dataset.experiment_plan.runs[0]
+            .factor_levels
+            .remove(&layout_model::experiment::FactorId::new("dose"));
+        dataset.process_control.actions[0].confidence = 1.5;
+        dataset
+            .genealogy
+            .material_uses
+            .push(layout_model::genealogy::MaterialUse {
+                sequence: 999_999,
+                wafer: layout_model::genealogy::WaferRef::new("MISSING_LOT", "MISSING_WAFER"),
+                material_lot_id: layout_model::genealogy::MaterialLotId::new("MISSING_MATERIAL"),
+                step_id: layout_model::mes::ProcessStepId::new("S010-COAT"),
+                tool_run_id: layout_model::genealogy::ToolRunId::new("RUN"),
+                quantity: -1.0,
+                unit: String::new(),
+            });
+        let mut broken_tool =
+            layout_model::equipment::SyntheticTool::spin_coater("BROKEN-TOOL", "Broken tool");
+        broken_tool.tool.class = layout_model::equipment::ToolClass::Etch;
+        dataset.equipment = layout_model::equipment::EquipmentSimulator::new(vec![broken_tool]);
+
+        let validation = dataset.validate();
+
+        assert!(!validation.is_valid());
+        assert!(
+            validation
+                .errors
+                .iter()
+                .any(|error| error.contains("environment reading")),
+            "{:?}",
+            validation.errors
+        );
+        assert!(
+            validation
+                .errors
+                .iter()
+                .any(|error| error.contains("downtime record")),
+            "{:?}",
+            validation.errors
+        );
+        assert!(
+            validation
+                .errors
+                .iter()
+                .any(|error| error.contains("safety tool interlock")),
+            "{:?}",
+            validation.errors
+        );
+        assert!(
+            validation
+                .errors
+                .iter()
+                .any(|error| error.contains("experiment run")),
+            "{:?}",
+            validation.errors
+        );
+        assert!(
+            validation
+                .errors
+                .iter()
+                .any(|error| error.contains("process-control action")),
+            "{:?}",
+            validation.errors
+        );
+        assert!(
+            validation
+                .errors
+                .iter()
+                .any(|error| error.contains("genealogy material use")),
+            "{:?}",
+            validation.errors
+        );
+        assert!(
+            validation
+                .errors
+                .iter()
+                .any(|error| error.contains("equipment tool")),
+            "{:?}",
+            validation.errors
+        );
+    }
+
+    #[test]
+    fn workspace_dataset_validation_rejects_broken_document_references_before_apply() {
+        let cc = eframe::CreationContext::_new_kittest(egui::Context::default());
+        let mut app = FabricadApp::new(&cc);
+        let original_document_id = app.document.id;
+        let mut dataset = WorkspaceDataset::demo();
+        let layer = dataset
+            .document
+            .shapes
+            .values()
+            .next()
+            .expect("demo document has shapes")
+            .layer;
+        dataset.document.layers.remove(&layer);
+
+        let validation = dataset.validate();
+        assert!(!validation.is_valid());
+        assert!(
+            validation
+                .errors
+                .iter()
+                .any(|error| error.contains("missing layer")),
+            "{:?}",
+            validation.errors
+        );
+
+        app.apply_workspace_dataset(dataset, DataSource::Demo, DataSource::Demo, "invalid demo");
+        assert_eq!(app.document.id, original_document_id);
+        assert!(app.status.contains("workspace validation failed"));
+    }
+
+    #[test]
+    fn atomic_write_bytes_replaces_file_and_removes_temp_files() {
+        let path = temp_test_path("workspace.json");
+        atomic_write_bytes(&path, b"old workspace").unwrap();
+        atomic_write_bytes(&path, b"new workspace").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new workspace");
+        let entries = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec!["workspace.json"]);
+        remove_temp_parent(&path);
+    }
+
+    #[test]
+    fn atomic_write_bytes_preserves_previous_file_after_interrupted_temp_write() {
+        let path = temp_test_path("workspace.json");
+        atomic_write_bytes(&path, b"old workspace").unwrap();
+        let mut temp_path = PathBuf::new();
+
+        let err = atomic_write_bytes_with_before_rename(&path, b"new workspace", |path| {
+            temp_path = path.to_path_buf();
+            assert_eq!(std::fs::read_to_string(path).unwrap(), "new workspace");
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "injected interrupted save",
+            ))
+        })
+        .unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old workspace");
+        assert!(!temp_path.exists());
+        let entries = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec!["workspace.json"]);
+        remove_temp_parent(&path);
+    }
+
+    #[test]
+    fn workspace_dataset_write_rejects_invalid_dataset_without_replacing_file() {
+        let path = temp_test_path("workspace.json");
+        write_workspace_dataset(&path, &WorkspaceDataset::blank()).unwrap();
+        let original = std::fs::read_to_string(&path).unwrap();
+
+        let mut invalid = WorkspaceDataset::demo();
+        let layer = invalid
+            .document
+            .shapes
+            .values()
+            .next()
+            .expect("demo document has shapes")
+            .layer;
+        invalid.document.layers.remove(&layer);
+
+        let err = write_workspace_dataset(&path, &invalid).unwrap_err();
+        assert!(err.contains("workspace validation failed"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert!(
+            read_workspace_dataset(&path)
+                .unwrap()
+                .document
+                .shapes
+                .is_empty()
+        );
+        remove_temp_parent(&path);
+    }
+
+    #[test]
+    fn workspace_dataset_read_rejects_unsupported_schema_version() {
+        let path = temp_test_path("workspace.json");
+        let mut dataset = WorkspaceDataset::blank();
+        dataset.schema_version = WORKSPACE_DATASET_SCHEMA_VERSION + 1;
+        let bytes = serde_json::to_vec_pretty(&dataset).unwrap();
+        atomic_write_bytes(&path, &bytes).unwrap();
+
+        let err = read_workspace_dataset(&path).unwrap_err();
+        assert!(err.contains("unsupported"));
+        assert!(err.contains(&WORKSPACE_DATASET_SCHEMA_VERSION.to_string()));
+        remove_temp_parent(&path);
+    }
+
+    #[test]
+    fn workspace_dataset_read_migrates_legacy_schema_file() {
+        let path = temp_test_path("workspace.json");
+        let mut dataset = WorkspaceDataset::blank();
+        dataset.schema_version = 0;
+        dataset.metadata = WorkspaceSnapshotMetadata::default();
+        atomic_write_bytes(&path, &serde_json::to_vec_pretty(&dataset).unwrap()).unwrap();
+
+        let restored = read_workspace_dataset(&path).unwrap();
+
+        assert_eq!(restored.schema_version, WORKSPACE_DATASET_SCHEMA_VERSION);
+        assert!(
+            restored
+                .metadata
+                .migration_history
+                .iter()
+                .any(|entry| entry == "workspace_schema:0->1"),
+            "{:?}",
+            restored.metadata.migration_history
+        );
+        assert!(restored.validate().is_valid());
+        remove_temp_parent(&path);
+    }
+
+    #[test]
+    fn workspace_dataset_read_migrates_source_controlled_legacy_fixture() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/persistence/workspace_legacy_schema0_blank.json");
+
+        let restored = read_workspace_dataset(&path).unwrap();
+
+        assert_eq!(restored.schema_version, WORKSPACE_DATASET_SCHEMA_VERSION);
+        assert_eq!(
+            restored.metadata.workspace_schema_version,
+            WORKSPACE_DATASET_SCHEMA_VERSION
+        );
+        assert!(restored.validate().is_valid());
+        assert_eq!(
+            restored
+                .document
+                .connectivity_issue_states
+                .get("short|VDD,VSS|0,0,100,50")
+                .and_then(|state| state.note.as_deref()),
+            Some("legacy connectivity waiver")
+        );
+    }
+
+    #[test]
+    fn workspace_dataset_read_rejects_future_metadata_fixture() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/persistence/workspace_future_metadata_preflight.json");
+
+        let err = read_workspace_dataset(&path).unwrap_err();
+
+        assert!(err.contains("metadata schema 999"), "{err}");
+        assert!(err.contains(&WORKSPACE_DATASET_SCHEMA_VERSION.to_string()));
+        assert!(!err.contains("missing field"), "{err}");
+    }
+
+    #[test]
+    fn workspace_dataset_read_rejects_future_document_schema_fixture() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/persistence/workspace_future_document_schema_preflight.json");
+
+        let err = read_workspace_dataset(&path).unwrap_err();
+
+        assert!(err.contains("document schema 999"), "{err}");
+        assert!(!err.contains("missing field"), "{err}");
+    }
+
+    #[test]
+    fn workspace_dataset_read_rejects_unsupported_feature_fixture() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/persistence/workspace_unsupported_feature_flag.json");
+
+        let err = read_workspace_dataset(&path).unwrap_err();
+
+        assert!(err.contains("unsupported feature flag"), "{err}");
+        assert!(err.contains("future_mask_revision_model"), "{err}");
+        assert!(!err.contains("missing field"), "{err}");
+    }
+
+    #[test]
+    fn workspace_dataset_read_rejects_malformed_metadata_fixture() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/persistence/workspace_malformed_metadata_arrays_preflight.json");
+
+        let err = read_workspace_dataset(&path).unwrap_err();
+
+        assert!(err.contains("workspace metadata feature flags"), "{err}");
+        assert!(err.contains("entry 1"), "{err}");
+        assert!(!err.contains("missing field"), "{err}");
+    }
+
+    #[test]
+    fn workspace_dataset_read_rejects_empty_migration_history_entry() {
+        let path = temp_test_path("workspace.json");
+        let mut dataset = WorkspaceDataset::blank();
+        dataset.metadata.migration_history.push(String::new());
+        atomic_write_bytes(&path, &serde_json::to_vec_pretty(&dataset).unwrap()).unwrap();
+
+        let err = read_workspace_dataset(&path).unwrap_err();
+
+        assert!(err.contains("empty migration history entry"), "{err}");
+        remove_temp_parent(&path);
+    }
+
+    #[test]
+    fn workspace_dataset_read_rejects_empty_metadata_producer_version() {
+        let path = temp_test_path("workspace.json");
+        let mut dataset = WorkspaceDataset::blank();
+        dataset.metadata.producer_version = String::new();
+        atomic_write_bytes(&path, &serde_json::to_vec_pretty(&dataset).unwrap()).unwrap();
+
+        let err = read_workspace_dataset(&path).unwrap_err();
+
+        assert!(err.contains("producer version is empty"), "{err}");
+        remove_temp_parent(&path);
+    }
+
+    #[test]
+    fn demo_workspace_loader_regenerates_malformed_file() {
+        let path = temp_test_path("demo-workspace.json");
+        atomic_write_bytes(&path, b"not valid json").unwrap();
+
+        let dataset = load_or_regenerate_demo_workspace(&path).unwrap();
+        assert!(dataset.validate().is_valid());
+        assert!(!dataset.document.shapes.is_empty());
+
+        let restored = read_workspace_dataset(&path).unwrap();
+        assert!(restored.validate().is_valid());
+        assert!(!restored.document.shapes.is_empty());
+        remove_temp_parent(&path);
+    }
+
+    #[test]
+    fn demo_workspace_loader_regenerates_invalid_schema_file() {
+        let path = temp_test_path("demo-workspace.json");
+        let mut dataset = WorkspaceDataset::demo();
+        dataset.schema_version = WORKSPACE_DATASET_SCHEMA_VERSION + 1;
+        atomic_write_bytes(&path, &serde_json::to_vec_pretty(&dataset).unwrap()).unwrap();
+
+        let restored = load_or_regenerate_demo_workspace(&path).unwrap();
+        assert_eq!(restored.schema_version, WORKSPACE_DATASET_SCHEMA_VERSION);
+        assert!(restored.validate().is_valid());
+        assert_eq!(
+            read_workspace_dataset(&path).unwrap().schema_version,
+            WORKSPACE_DATASET_SCHEMA_VERSION
+        );
+        remove_temp_parent(&path);
+    }
+
+    #[test]
+    fn demo_workspace_loader_regenerates_cross_domain_invalid_file() {
+        let path = temp_test_path("demo-workspace.json");
+        let mut dataset = WorkspaceDataset::demo();
+        dataset.recipe_catalog.recipes.clear();
+        atomic_write_bytes(&path, &serde_json::to_vec_pretty(&dataset).unwrap()).unwrap();
+
+        let restored = load_or_regenerate_demo_workspace(&path).unwrap();
+
+        assert!(restored.validate().is_valid());
+        assert!(!restored.recipe_catalog.recipes.is_empty());
+        let on_disk = read_workspace_dataset(&path).unwrap();
+        assert!(on_disk.validate().is_valid());
+        assert!(!on_disk.recipe_catalog.recipes.is_empty());
+        remove_temp_parent(&path);
+    }
+
+    #[test]
+    fn fab_control_operad_view_audits_common_widths() {
+        let cc = eframe::CreationContext::_new_kittest(egui::Context::default());
+        let mut app = FabricadApp::new(&cc);
+        app.apply_workspace_dataset(
+            WorkspaceDataset::demo(),
+            DataSource::Demo,
+            DataSource::Demo,
+            "demo",
+        );
+        let tools = app.equipment_sim.tools().cloned().collect::<Vec<_>>();
+        assert!(!tools.is_empty());
+
+        for width in [320.0, 480.0, 760.0, 1120.0, 1440.0] {
+            let mut view = app.build_fab_control_operad_view(width, &tools);
+            view.document
+                .compute_layout(view.size, &mut ApproxTextMeasurer)
+                .expect("fab control operad layout should compute");
+            let warnings = view.document.audit_layout();
+            assert!(warnings.is_empty(), "{width}: {warnings:?}");
+            assert!(view.document.paint_list().items.len() > 0);
+        }
+    }
+
+    #[test]
+    fn fab_control_operad_actions_update_state() {
+        let cc = eframe::CreationContext::_new_kittest(egui::Context::default());
+        let mut app = FabricadApp::new(&cc);
+        app.apply_workspace_dataset(
+            WorkspaceDataset::demo(),
+            DataSource::Demo,
+            DataSource::Demo,
+            "demo",
+        );
+        let tools = app.equipment_sim.tools().cloned().collect::<Vec<_>>();
+        let selected_id = tools
+            .iter()
+            .find(|tool| app.selected_equipment_tool.as_ref() != Some(&tool.id))
+            .map(|tool| tool.id.clone())
+            .expect("demo fab has multiple tools");
+
+        assert!(app.handle_fab_control_operad_action(
+            &format!("{FAB_OPERAD_ACTION_SELECT_TOOL}{}", selected_id),
+            &tools,
+        ));
+        assert_eq!(app.selected_equipment_tool.as_ref(), Some(&selected_id));
+
+        let offline_id = app
+            .equipment_sim
+            .tools()
+            .find(|tool| tool.state == EquipmentToolState::Offline)
+            .map(|tool| tool.id.clone())
+            .expect("demo fab has an offline tool");
+        let tools = app.equipment_sim.tools().cloned().collect::<Vec<_>>();
+        assert!(app.handle_fab_control_operad_action(
+            &format!("{FAB_OPERAD_ACTION_BRING_ONLINE}{}", offline_id),
+            &tools,
+        ));
+        assert_eq!(
+            app.equipment_sim
+                .tool(&offline_id)
+                .expect("tool remains present")
+                .state,
+            EquipmentToolState::OnlineIdle
+        );
     }
 
     #[test]
@@ -15401,6 +19282,668 @@ mod tests {
     }
 
     #[test]
+    fn performance_budget_report_tracks_thresholds_without_timing() {
+        let within_loro = DocumentPerformanceBudget::for_counts(MAX_LORO_SEED_OBJECTS, 0);
+        assert!(within_loro.loro_seed_within_budget);
+        assert!(within_loro.drc_within_budget);
+        assert!(within_loro.connectivity_within_budget);
+
+        let over_loro = DocumentPerformanceBudget::for_counts(MAX_LORO_SEED_OBJECTS + 1, 0);
+        assert!(!over_loro.loro_seed_within_budget);
+        assert!(over_loro.drc_within_budget);
+        assert!(over_loro.connectivity_within_budget);
+
+        let over_drc = DocumentPerformanceBudget::for_counts(MAX_DRC_OBJECTS + 1, 0);
+        assert!(!over_drc.drc_within_budget);
+        assert!(
+            over_drc
+                .drc_skip_message()
+                .unwrap()
+                .contains(&MAX_DRC_OBJECTS.to_string())
+        );
+
+        let over_connectivity =
+            DocumentPerformanceBudget::for_counts(MAX_CONNECTIVITY_OBJECTS + 1, 0);
+        assert!(!over_connectivity.connectivity_within_budget);
+        assert!(
+            over_connectivity
+                .connectivity_skip_message()
+                .unwrap()
+                .contains(&(MAX_CONNECTIVITY_OBJECTS + 1).to_string())
+        );
+
+        let over_3d = DocumentPerformanceBudget::for_counts(1, MAX_3D_RENDERED_SHAPES + 1);
+        assert!(!over_3d.three_d_shape_within_budget);
+        assert_eq!(over_3d.max_3d_rendered_shapes, MAX_3D_RENDERED_SHAPES);
+    }
+
+    #[test]
+    fn performance_observation_report_keeps_elapsed_time_diagnostic() {
+        let fixture = r#"{
+          "schema_version": 1,
+          "name": "observed_report_example",
+          "workloads": [
+            {
+              "name": "synthetic_elapsed",
+              "metric": "items",
+              "min_input_size": 8,
+              "max_actual": 8
+            }
+          ]
+        }"#;
+        let samples = [PerformanceSample {
+            name: "synthetic_elapsed",
+            metric: "items",
+            input_size: 64,
+            elapsed_ms: 4242.25,
+            actual: 7,
+        }];
+
+        let report = performance_observation_report(fixture, "observed_report_example", &samples);
+        let encoded = serde_json::to_string_pretty(&report).unwrap();
+        let expected = include_str!("../../../fixtures/performance/observed_report_example.json");
+
+        assert_eq!(encoded, expected.trim_end());
+        assert!(report.samples[0].budget_passed);
+        assert_eq!(report.samples[0].elapsed_ms, 4242.25);
+    }
+
+    #[test]
+    fn performance_observation_report_can_be_written_as_ci_artifact() {
+        let report = PerformanceObservationReport {
+            schema_version: 1,
+            baseline: "demo workload/baseline".to_string(),
+            samples: vec![PerformanceObservation {
+                name: "startup".to_string(),
+                metric: "document_objects".to_string(),
+                input_size: 128,
+                min_input_size: 1,
+                input_size_passed: true,
+                elapsed_ms: 12.5,
+                actual: 64,
+                max_actual: 128,
+                budget_passed: true,
+            }],
+        };
+        let anchor = temp_test_path("anchor");
+        let directory = anchor.parent().unwrap();
+
+        let path = write_performance_observation_report(directory, &report).unwrap();
+        let encoded = std::fs::read_to_string(&path).unwrap();
+        let restored: PerformanceObservationReport = serde_json::from_str(&encoded).unwrap();
+
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("demo_workload_baseline_observed.json")
+        );
+        assert_eq!(restored.baseline, report.baseline);
+        assert_eq!(restored.samples[0].elapsed_ms, 12.5);
+        assert!(restored.samples[0].budget_passed);
+
+        remove_temp_parent(&anchor);
+    }
+
+    #[test]
+    fn demo_workload_performance_fixture_reports_explicit_budgets() {
+        let started = Instant::now();
+        let dataset = WorkspaceDataset::demo();
+        let demo_load_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let encoded_workspace_bytes = serde_json::to_vec(&dataset).unwrap().len();
+        let started = Instant::now();
+        let validation = dataset.validate();
+        let validation_ms = started.elapsed().as_secs_f64() * 1000.0;
+        assert!(validation.is_valid(), "{}", validation.error_summary());
+        let validation_errors = validation.errors.len();
+
+        let cc = eframe::CreationContext::_new_kittest(egui::Context::default());
+        let mut app = FabricadApp::new(&cc);
+        app.apply_workspace_dataset(dataset, DataSource::Demo, DataSource::Demo, "demo");
+        let object_count = document_object_count(&app.document);
+        let budget = performance_budget_for_document(&app.document);
+        assert!(budget.loro_seed_within_budget);
+        assert!(budget.drc_within_budget);
+        assert!(budget.connectivity_within_budget);
+        assert!(budget.three_d_shape_within_budget);
+
+        let technology = layout_model::default_technology();
+        let rules = RuleDeck::demo(&app.document);
+
+        let started = Instant::now();
+        let drc_violations = run_drc(&app.document, &rules);
+        let drc_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+        let started = Instant::now();
+        let connectivity = extract_connectivity(&app.document, &technology).unwrap();
+        let connectivity_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+        let mut candidate = app.document.clone();
+        let first_shape = candidate.shapes.keys().next().copied().unwrap();
+        candidate.apply_operation_without_log(&Operation::MoveShape {
+            id: first_shape,
+            delta: Vector::new(10, 0),
+        });
+        let started = Instant::now();
+        let diff = layout_model::layout_diff::diff_documents(
+            "demo baseline",
+            &app.document,
+            "demo candidate",
+            &candidate,
+        );
+        let diff_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+        let started = Instant::now();
+        let reticle = layout_model::mask::ReticlePrep::from_document(&app.document);
+        let reticle_report = reticle.validate_document(&app.document);
+        let reticle_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+        let started = Instant::now();
+        let scene = app.build_cached_3d_scene();
+        let mesh_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let validated_3d_primitives = validated_3d_primitive_count(&scene);
+
+        let samples = [
+            PerformanceSample {
+                name: "demo_load",
+                metric: "document_objects",
+                input_size: encoded_workspace_bytes,
+                elapsed_ms: demo_load_ms,
+                actual: object_count,
+            },
+            PerformanceSample {
+                name: "workspace_validation",
+                metric: "errors",
+                input_size: encoded_workspace_bytes,
+                elapsed_ms: validation_ms,
+                actual: validation_errors,
+            },
+            PerformanceSample {
+                name: "drc",
+                metric: "violations",
+                input_size: object_count,
+                elapsed_ms: drc_ms,
+                actual: drc_violations.len(),
+            },
+            PerformanceSample {
+                name: "connectivity",
+                metric: "shorts_plus_opens",
+                input_size: object_count,
+                elapsed_ms: connectivity_ms,
+                actual: connectivity.shorts.len() + connectivity.opens.len(),
+            },
+            PerformanceSample {
+                name: "layout_diff",
+                metric: "changes",
+                input_size: app.document.shapes.len() + candidate.shapes.len(),
+                elapsed_ms: diff_ms,
+                actual: diff.changes.len(),
+            },
+            PerformanceSample {
+                name: "reticle_checks",
+                metric: "issues",
+                input_size: app.document.shapes.len(),
+                elapsed_ms: reticle_ms,
+                actual: reticle_report.total_issue_count(),
+            },
+            PerformanceSample {
+                name: "3d_mesh_build",
+                metric: "faces",
+                input_size: object_count,
+                elapsed_ms: mesh_ms,
+                actual: scene.stats.faces,
+            },
+            PerformanceSample {
+                name: "3d_mesh_validation",
+                metric: "validated_primitives",
+                input_size: object_count,
+                elapsed_ms: 0.0,
+                actual: validated_3d_primitives,
+            },
+        ];
+        assert_performance_samples_against_fixture(
+            include_str!("../../../fixtures/performance/demo_workload_baseline.json"),
+            "demo_workload_baseline",
+            &samples,
+        );
+    }
+
+    #[test]
+    fn hierarchy_workload_performance_fixture_reports_explicit_budgets() {
+        let cc = eframe::CreationContext::_new_kittest(egui::Context::default());
+        let started = Instant::now();
+        let app = FabricadApp::new_with_options(
+            &cc,
+            StartupOptions {
+                hierarchy_demo: true,
+                view_3d: true,
+                ..Default::default()
+            },
+        );
+        let startup_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let object_count = document_object_count(&app.document);
+        let budget = performance_budget_for_document(&app.document);
+        assert!(budget.loro_seed_within_budget);
+        assert!(budget.drc_within_budget);
+        assert!(budget.connectivity_within_budget);
+        assert!(budget.three_d_shape_within_budget);
+
+        let technology = layout_model::default_technology();
+        let rules = rule_deck_for_document(&app.document, &technology);
+
+        let started = Instant::now();
+        let drc_violations = run_drc(&app.document, &rules);
+        let drc_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+        let started = Instant::now();
+        let connectivity = extract_connectivity(&app.document, &technology).unwrap();
+        let connectivity_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+        let mut candidate = app.document.clone();
+        let metal1 = candidate.layer_by_process(ProcessLayer::Metal1).unwrap();
+        candidate.insert_shape(
+            metal1,
+            ShapeKind::Rectangle(Rect::from_min_size(Point::new(50_000, 0), 200, 200)),
+        );
+        let started = Instant::now();
+        let diff = layout_model::layout_diff::diff_documents(
+            "hierarchy baseline",
+            &app.document,
+            "hierarchy candidate",
+            &candidate,
+        );
+        let diff_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+        let started = Instant::now();
+        let reticle = layout_model::mask::ReticlePrep::from_document(&app.document);
+        let reticle_report = reticle.validate_document(&app.document);
+        let reticle_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+        let started = Instant::now();
+        let scene = app.build_cached_3d_scene();
+        let mesh_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let validated_3d_primitives = validated_3d_primitive_count(&scene);
+
+        let samples = [
+            PerformanceSample {
+                name: "hierarchy_startup",
+                metric: "document_objects",
+                input_size: object_count,
+                elapsed_ms: startup_ms,
+                actual: object_count,
+            },
+            PerformanceSample {
+                name: "drc",
+                metric: "violations",
+                input_size: object_count,
+                elapsed_ms: drc_ms,
+                actual: drc_violations.len(),
+            },
+            PerformanceSample {
+                name: "connectivity",
+                metric: "shorts_plus_opens",
+                input_size: object_count,
+                elapsed_ms: connectivity_ms,
+                actual: connectivity.shorts.len() + connectivity.opens.len(),
+            },
+            PerformanceSample {
+                name: "layout_diff",
+                metric: "changes",
+                input_size: object_count + document_object_count(&candidate),
+                elapsed_ms: diff_ms,
+                actual: diff.changes.len(),
+            },
+            PerformanceSample {
+                name: "reticle_checks",
+                metric: "issues",
+                input_size: object_count,
+                elapsed_ms: reticle_ms,
+                actual: reticle_report.total_issue_count(),
+            },
+            PerformanceSample {
+                name: "3d_mesh_build",
+                metric: "faces",
+                input_size: object_count,
+                elapsed_ms: mesh_ms,
+                actual: scene.stats.faces,
+            },
+            PerformanceSample {
+                name: "3d_mesh_validation",
+                metric: "validated_primitives",
+                input_size: object_count,
+                elapsed_ms: 0.0,
+                actual: validated_3d_primitives,
+            },
+        ];
+        assert_performance_samples_against_fixture(
+            include_str!("../../../fixtures/performance/hierarchy_workload_baseline.json"),
+            "hierarchy_workload_baseline",
+            &samples,
+        );
+    }
+
+    #[test]
+    fn imported_layout_workload_performance_fixture_reports_explicit_budgets() {
+        let cc = eframe::CreationContext::_new_kittest(egui::Context::default());
+        let technology = layout_model::default_technology();
+        let mut document = Document::new("imported performance fixture");
+        let poly = document.layer_by_process(ProcessLayer::Poly).unwrap();
+        let metal1 = document.layer_by_process(ProcessLayer::Metal1).unwrap();
+        let child = document.create_cell("UNIT");
+
+        document.insert_shape(
+            poly,
+            ShapeKind::Rectangle(Rect::from_min_size(Point::new(0, 0), 320, 160)),
+        );
+        document.insert_shape(
+            metal1,
+            ShapeKind::Path {
+                points: vec![
+                    Point::new(0, 280),
+                    Point::new(280, 280),
+                    Point::new(420, 320),
+                ],
+                width: 80,
+            },
+        );
+        document
+            .insert_shape_in_cell(
+                child,
+                metal1,
+                ShapeKind::Rectangle(Rect::from_min_size(Point::new(0, 0), 120, 90)),
+            )
+            .unwrap();
+        document
+            .insert_instance_in_top(child, Transform::translate(600, 200))
+            .unwrap();
+
+        let object_count = document_object_count(&document);
+        let budget = performance_budget_for_document(&document);
+        assert!(budget.loro_seed_within_budget);
+        assert!(budget.drc_within_budget);
+        assert!(budget.connectivity_within_budget);
+        assert!(budget.three_d_shape_within_budget);
+
+        let started = Instant::now();
+        let exported = export_gdsii_with_report(&document, &technology).unwrap();
+        let export_ms = started.elapsed().as_secs_f64() * 1000.0;
+        assert!(exported.report.skipped_elements.is_empty());
+
+        let started = Instant::now();
+        let imported = import_gdsii_with_report(&exported.bytes, &technology).unwrap();
+        let import_ms = started.elapsed().as_secs_f64() * 1000.0;
+        assert!(
+            imported.report.skipped_elements.is_empty(),
+            "{:?}",
+            imported.report.skipped_elements
+        );
+        assert!(imported.report.generated_layers.is_empty());
+
+        let imported_report = imported.report;
+        let imported_document = imported.document;
+        let imported_object_count = document_object_count(&imported_document);
+        let mut candidate = imported_document.clone();
+        let first_shape = candidate
+            .shapes
+            .keys()
+            .next()
+            .copied()
+            .expect("imported layout should have top-level geometry");
+        candidate.apply_operation_without_log(&Operation::MoveShape {
+            id: first_shape,
+            delta: Vector::new(20, 0),
+        });
+        let started = Instant::now();
+        let diff = layout_model::layout_diff::diff_documents(
+            "imported baseline",
+            &imported_document,
+            "imported candidate",
+            &candidate,
+        );
+        let diff_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+        let mut app = FabricadApp::new(&cc);
+        app.replace_document(imported_document, "imported performance fixture");
+        let started = Instant::now();
+        let scene = app.build_cached_3d_scene();
+        let mesh_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let validated_3d_primitives = validated_3d_primitive_count(&scene);
+        let validated_3d_stack_ranges =
+            validated_3d_stack_range_count(&app.document, &scene, &technology);
+        assert_eq!(validated_3d_stack_ranges, 2);
+
+        let samples = [
+            PerformanceSample {
+                name: "gds_export",
+                metric: "elements",
+                input_size: object_count,
+                elapsed_ms: export_ms,
+                actual: exported.report.element_count(),
+            },
+            PerformanceSample {
+                name: "gds_import",
+                metric: "document_objects",
+                input_size: exported.bytes.len(),
+                elapsed_ms: import_ms,
+                actual: imported_object_count,
+            },
+            PerformanceSample {
+                name: "generated_layers",
+                metric: "layers",
+                input_size: exported.bytes.len(),
+                elapsed_ms: 0.0,
+                actual: imported_report.generated_layers.len(),
+            },
+            PerformanceSample {
+                name: "skipped_import_elements",
+                metric: "elements",
+                input_size: exported.bytes.len(),
+                elapsed_ms: 0.0,
+                actual: imported_report.skipped_elements.len(),
+            },
+            PerformanceSample {
+                name: "layout_diff",
+                metric: "changes",
+                input_size: imported_object_count + document_object_count(&candidate),
+                elapsed_ms: diff_ms,
+                actual: diff.changes.len(),
+            },
+            PerformanceSample {
+                name: "3d_mesh_build",
+                metric: "faces",
+                input_size: imported_object_count,
+                elapsed_ms: mesh_ms,
+                actual: scene.stats.faces,
+            },
+            PerformanceSample {
+                name: "3d_stack_ranges",
+                metric: "validated_ranges",
+                input_size: imported_object_count,
+                elapsed_ms: 0.0,
+                actual: validated_3d_stack_ranges,
+            },
+            PerformanceSample {
+                name: "3d_mesh_validation",
+                metric: "validated_primitives",
+                input_size: imported_object_count,
+                elapsed_ms: 0.0,
+                actual: validated_3d_primitives,
+            },
+        ];
+        assert_performance_samples_against_fixture(
+            include_str!("../../../fixtures/performance/imported_layout_workload_baseline.json"),
+            "imported_layout_workload_baseline",
+            &samples,
+        );
+    }
+
+    #[test]
+    fn stress_workload_performance_fixture_reports_explicit_budgets() {
+        let cc = eframe::CreationContext::_new_kittest(egui::Context::default());
+        let started = Instant::now();
+        let app = FabricadApp::new_with_options(
+            &cc,
+            StartupOptions {
+                stress_count: Some(60_000),
+                view_3d: true,
+                ..Default::default()
+            },
+        );
+        let startup_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let object_count = document_object_count(&app.document);
+        let budget = performance_budget_for_document(&app.document);
+        assert!(!budget.loro_seed_within_budget);
+        assert!(!budget.drc_within_budget);
+        assert!(!budget.connectivity_within_budget);
+        assert!(budget.three_d_shape_within_budget);
+
+        let started = Instant::now();
+        let scene = app.build_cached_3d_scene();
+        let mesh_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let validated_3d_primitives = validated_3d_primitive_count(&scene);
+
+        let samples = [
+            PerformanceSample {
+                name: "stress_startup",
+                metric: "document_objects",
+                input_size: object_count,
+                elapsed_ms: startup_ms,
+                actual: object_count,
+            },
+            PerformanceSample {
+                name: "loro_seed_skipped",
+                metric: "flag",
+                input_size: object_count,
+                elapsed_ms: 0.0,
+                actual: usize::from(!budget.loro_seed_within_budget),
+            },
+            PerformanceSample {
+                name: "drc_skipped",
+                metric: "flag",
+                input_size: object_count,
+                elapsed_ms: 0.0,
+                actual: usize::from(drc_skip_message(&app.document).is_some()),
+            },
+            PerformanceSample {
+                name: "connectivity_skipped",
+                metric: "flag",
+                input_size: object_count,
+                elapsed_ms: 0.0,
+                actual: usize::from(!budget.connectivity_within_budget),
+            },
+            PerformanceSample {
+                name: "3d_mesh_build",
+                metric: "faces",
+                input_size: object_count,
+                elapsed_ms: mesh_ms,
+                actual: scene.stats.faces,
+            },
+            PerformanceSample {
+                name: "3d_mesh_validation",
+                metric: "validated_primitives",
+                input_size: object_count,
+                elapsed_ms: 0.0,
+                actual: validated_3d_primitives,
+            },
+        ];
+        assert_performance_samples_against_fixture(
+            include_str!("../../../fixtures/performance/stress_workload_baseline.json"),
+            "stress_workload_baseline",
+            &samples,
+        );
+    }
+
+    #[test]
+    fn hierarchy_fanout_workload_performance_fixture_reports_flattened_render_budget() {
+        let mut document = Document::new("hierarchy fanout performance");
+        let metal1 = document.layer_by_process(ProcessLayer::Metal1).unwrap();
+        let leaf = document.create_cell("leaf");
+        document
+            .insert_shape_in_cell(
+                leaf,
+                metal1,
+                ShapeKind::Rectangle(Rect::from_min_size(Point::new(0, 0), 100, 100)),
+            )
+            .unwrap();
+        let instance_id = document
+            .insert_instance_in_top(leaf, Transform::translate(0, 0))
+            .unwrap();
+        let mut instance = document
+            .instance(document.top_cell, instance_id)
+            .expect("inserted instance should exist");
+        instance.array = InstanceArray {
+            columns: 1024,
+            rows: 1024,
+            column_pitch: Vector::new(200, 0),
+            row_pitch: Vector::new(0, 200),
+        };
+        document.apply_operation_without_log(&Operation::ReplaceInstance {
+            parent: document.top_cell,
+            id: instance_id,
+            instance,
+        });
+
+        let object_count = document_object_count(&document);
+        let flattened_count = document.flattened_shape_count_estimate();
+        let budget = performance_budget_for_document(&document);
+        assert!(object_count < MAX_LORO_SEED_OBJECTS);
+        assert_eq!(flattened_count, 1_048_576);
+        assert_eq!(budget.rendered_shape_count_estimate, flattened_count);
+        assert!(budget.loro_seed_within_budget);
+        assert!(budget.drc_within_budget);
+        assert!(budget.connectivity_within_budget);
+        assert!(!budget.three_d_shape_within_budget);
+
+        let samples = [
+            PerformanceSample {
+                name: "compact_document_objects",
+                metric: "document_objects",
+                input_size: object_count,
+                elapsed_ms: 0.0,
+                actual: object_count,
+            },
+            PerformanceSample {
+                name: "flattened_shape_estimate",
+                metric: "rendered_shapes",
+                input_size: flattened_count,
+                elapsed_ms: 0.0,
+                actual: flattened_count,
+            },
+            PerformanceSample {
+                name: "loro_seed_within_budget",
+                metric: "flag",
+                input_size: object_count,
+                elapsed_ms: 0.0,
+                actual: usize::from(budget.loro_seed_within_budget),
+            },
+            PerformanceSample {
+                name: "drc_within_budget",
+                metric: "flag",
+                input_size: object_count,
+                elapsed_ms: 0.0,
+                actual: usize::from(budget.drc_within_budget),
+            },
+            PerformanceSample {
+                name: "connectivity_within_budget",
+                metric: "flag",
+                input_size: object_count,
+                elapsed_ms: 0.0,
+                actual: usize::from(budget.connectivity_within_budget),
+            },
+            PerformanceSample {
+                name: "3d_render_budget_exceeded",
+                metric: "flag",
+                input_size: flattened_count,
+                elapsed_ms: 0.0,
+                actual: usize::from(!budget.three_d_shape_within_budget),
+            },
+        ];
+        assert_performance_samples_against_fixture(
+            include_str!("../../../fixtures/performance/hierarchy_fanout_workload_baseline.json"),
+            "hierarchy_fanout_workload_baseline",
+            &samples,
+        );
+    }
+
+    #[test]
     fn scale_bar_picks_readable_lengths() {
         assert_eq!(nice_scale_length_dbu(80.0), 100);
         assert_eq!(nice_scale_length_dbu(1_600.0), 2_000);
@@ -15516,6 +20059,79 @@ mod tests {
     }
 
     #[test]
+    fn fly_camera_axis_aligned_views_keep_finite_basis_projection_and_frustum() {
+        let cc = eframe::CreationContext::_new_kittest(egui::Context::default());
+        let mut app = FabricadApp::new_with_options(
+            &cc,
+            StartupOptions {
+                demo_workspace: true,
+                view_3d: true,
+                ..Default::default()
+            },
+        );
+        let canvas = EguiRect::from_min_size(Pos2::ZERO, vec2(1_280.0, 720.0));
+        let cases = [
+            ("+x", Vec3f::new(-4_000.0, 0.0, 600.0), Vec3f::ZERO),
+            ("-x", Vec3f::new(4_000.0, 0.0, 600.0), Vec3f::ZERO),
+            ("+y", Vec3f::new(0.0, -4_000.0, 600.0), Vec3f::ZERO),
+            ("-y", Vec3f::new(0.0, 4_000.0, 600.0), Vec3f::ZERO),
+            (
+                "steep-z",
+                Vec3f::new(0.0, 0.0, 6_000.0),
+                Vec3f::new(0.0, 0.0, 0.0),
+            ),
+        ];
+
+        for (label, position, target) in cases {
+            app.camera_3d = Camera3d::look_at(position, target, 2_000.0);
+            let basis = app.camera_3d.basis();
+
+            for (axis, vector) in [
+                ("forward", basis.forward),
+                ("right", basis.right),
+                ("up", basis.up),
+            ] {
+                assert!(vector.x.is_finite(), "{label} {axis} x");
+                assert!(vector.y.is_finite(), "{label} {axis} y");
+                assert!(vector.z.is_finite(), "{label} {axis} z");
+                assert!(
+                    (vector.length() - 1.0).abs() < 0.001,
+                    "{label} {axis} length {}",
+                    vector.length()
+                );
+            }
+            assert!(
+                basis.forward.dot(basis.right).abs() < 0.001,
+                "{label} forward/right not orthogonal"
+            );
+            assert!(
+                basis.forward.dot(basis.up).abs() < 0.001,
+                "{label} forward/up not orthogonal"
+            );
+            assert!(
+                basis.right.dot(basis.up).abs() < 0.001,
+                "{label} right/up not orthogonal"
+            );
+
+            let view_projection = app.view_projection_3d(canvas);
+            assert!(
+                view_projection.iter().all(|value| value.is_finite()),
+                "{label} view-projection contained non-finite values: {view_projection:?}"
+            );
+
+            let query = app
+                .visible_3d_query_rect(canvas)
+                .unwrap_or_else(|| panic!("{label} query rect should cover the demo layout"));
+            assert!(query.width() > 0, "{label} query width");
+            assert!(query.height() > 0, "{label} query height");
+            assert!(
+                query.contains_point(Point::ZERO),
+                "{label} query misses origin"
+            );
+        }
+    }
+
+    #[test]
     fn camera_3d_far_plane_scales_with_large_layouts() {
         let cc = eframe::CreationContext::_new_kittest(egui::Context::default());
         let mut app = FabricadApp::new(&cc);
@@ -15601,6 +20217,91 @@ mod tests {
         assert_eq!(color.r(), 51);
         assert_eq!(color.g(), 102);
         assert_eq!(color.b(), 153);
+    }
+
+    #[test]
+    fn layer_3d_stack_ranges_are_ordered_and_non_overlapping() {
+        let expected_order = [
+            ProcessLayer::Diffusion,
+            ProcessLayer::Oxide,
+            ProcessLayer::Poly,
+            ProcessLayer::Contact,
+            ProcessLayer::Metal1,
+            ProcessLayer::Via1,
+            ProcessLayer::Metal2,
+        ];
+        let mut previous_top = f32::NEG_INFINITY;
+
+        for process in expected_order {
+            let (base_z, thickness) = layer_3d_stack_position(process);
+            let top_z = base_z + thickness;
+
+            assert!(base_z.is_finite(), "{process:?} base should be finite");
+            assert!(top_z.is_finite(), "{process:?} top should be finite");
+            assert!(thickness > 0.0, "{process:?} thickness should be positive");
+            assert!(
+                base_z >= previous_top,
+                "{process:?} overlaps or crosses the preceding 3D layer"
+            );
+            previous_top = top_z;
+        }
+
+        assert_eq!(
+            layer_3d_stack_position(ProcessLayer::Annotation),
+            (0.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn layer_3d_stack_prefers_technology_metadata_with_legacy_fallback() {
+        let mut technology = layout_model::default_technology();
+        {
+            let metal1 = technology
+                .layers
+                .iter_mut()
+                .find(|layer| layer.process == "metal1")
+                .unwrap();
+            metal1.z_base = Some(1_000.0);
+            metal1.z_thickness = Some(25.0);
+        }
+
+        assert_eq!(
+            layer_3d_stack_position_for_technology(&technology, ProcessLayer::Metal1),
+            (1_000.0, 25.0)
+        );
+
+        {
+            let metal1 = technology
+                .layers
+                .iter_mut()
+                .find(|layer| layer.process == "metal1")
+                .unwrap();
+            metal1.z_base = None;
+            metal1.z_thickness = None;
+        }
+        assert_eq!(
+            layer_3d_stack_position_for_technology(&technology, ProcessLayer::Metal1),
+            layer_3d_stack_position(ProcessLayer::Metal1)
+        );
+    }
+
+    #[test]
+    fn layer_3d_stack_interconnects_touch_their_adjacent_layers() {
+        let (poly_base, poly_thickness) = layer_3d_stack_position(ProcessLayer::Poly);
+        let (contact_base, contact_thickness) = layer_3d_stack_position(ProcessLayer::Contact);
+        let (metal1_base, metal1_thickness) = layer_3d_stack_position(ProcessLayer::Metal1);
+        let (via1_base, via1_thickness) = layer_3d_stack_position(ProcessLayer::Via1);
+        let (metal2_base, _) = layer_3d_stack_position(ProcessLayer::Metal2);
+
+        let poly_top = poly_base + poly_thickness;
+        let contact_top = contact_base + contact_thickness;
+        let metal1_top = metal1_base + metal1_thickness;
+        let via1_top = via1_base + via1_thickness;
+
+        assert_eq!(contact_base, poly_top);
+        assert_eq!(contact_top, metal1_base);
+        assert_eq!(via1_base, metal1_top);
+        assert_eq!(via1_top, metal2_base);
     }
 
     #[test]
@@ -15768,6 +20469,7 @@ mod tests {
         assert!(batch.rect_slabs.is_empty());
         assert_eq!(batch.vertices.len(), 20);
         assert_eq!(batch.indices.len(), 30);
+        assert!(batch.validate_geometry().is_ok());
     }
 
     #[test]
@@ -15780,6 +20482,7 @@ mod tests {
         assert_eq!(top_faces, 1);
         assert_eq!(top_only.vertices.len(), 4);
         assert_eq!(top_only.indices.len(), 6);
+        assert!(top_only.validate_geometry().is_ok());
 
         let mut full_slab = renderer::RenderBatch3d::default();
         let slab_faces = append_rect_slab_to_3d_batch(&mut full_slab, rect, 0.0, 20.0, color, true);
@@ -15788,6 +20491,7 @@ mod tests {
         assert_eq!(full_slab.rect_slabs.len(), 1);
         assert!(full_slab.vertices.is_empty());
         assert!(full_slab.indices.is_empty());
+        assert!(full_slab.validate_geometry().is_ok());
     }
 
     #[test]
@@ -15841,6 +20545,40 @@ mod tests {
     }
 
     #[test]
+    fn degenerate_3d_polygons_do_not_emit_invalid_mesh() {
+        let colinear = [Point::new(0, 0), Point::new(50, 0), Point::new(100, 0)];
+        let mut empty_batch = renderer::RenderBatch3d::default();
+        let empty_faces =
+            append_slab_to_3d_batch(&mut empty_batch, &colinear, 0.0, 20.0, Color32::WHITE, true);
+
+        assert_eq!(empty_faces, 0);
+        assert!(empty_batch.vertices.is_empty());
+        assert!(empty_batch.indices.is_empty());
+        assert!(empty_batch.validate_geometry().is_ok());
+
+        let duplicate_vertex = [
+            Point::new(0, 0),
+            Point::new(100, 0),
+            Point::new(100, 0),
+            Point::new(100, 60),
+            Point::new(0, 60),
+        ];
+        let mut salvaged_batch = renderer::RenderBatch3d::default();
+        let salvaged_faces = append_slab_to_3d_batch(
+            &mut salvaged_batch,
+            &duplicate_vertex,
+            0.0,
+            20.0,
+            Color32::WHITE,
+            true,
+        );
+
+        assert!(salvaged_faces > 0);
+        assert!(salvaged_batch.validate_geometry().is_ok());
+        assert_triangle_winding_matches_vertex_normals(&salvaged_batch);
+    }
+
+    #[test]
     fn default_3d_shape_budget_covers_million_shape_stress_scene() {
         assert!(MAX_3D_RENDERED_SHAPES >= 1_000_000);
     }
@@ -15865,6 +20603,7 @@ mod tests {
         assert_eq!(first.batch.rect_slabs.len(), 10_000);
         assert!(first.batch.vertices.is_empty());
         assert!(first.batch.indices.is_empty());
+        assert!(first.batch.validate_geometry().is_ok());
 
         let second = app.cached_3d_scene();
         assert!(Arc::ptr_eq(&first.batch, &second.batch));
@@ -15891,6 +20630,285 @@ mod tests {
         assert_eq!(scene.batch.rect_slabs.len(), 60_000);
         assert!(scene.batch.vertices.is_empty());
         assert!(scene.batch.indices.is_empty());
+        assert!(scene.batch.validate_geometry().is_ok());
+    }
+
+    #[test]
+    fn generated_startup_3d_scenes_build_valid_geometry() {
+        let cc = eframe::CreationContext::_new_kittest(egui::Context::default());
+        let cases = [
+            (
+                "demo workspace",
+                StartupOptions {
+                    demo_workspace: true,
+                    view_3d: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "hierarchy scene",
+                StartupOptions {
+                    hierarchy_demo: true,
+                    view_3d: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "stress scene",
+                StartupOptions {
+                    stress_count: Some(512),
+                    view_3d: true,
+                    ..Default::default()
+                },
+            ),
+        ];
+
+        for (label, options) in cases {
+            let mut app = FabricadApp::new_with_options(&cc, options);
+
+            assert_eq!(app.view_mode, ViewMode::Layout3d, "{label}");
+            let scene = app.cached_3d_scene();
+            assert!(
+                scene.stats.shapes > 0,
+                "{label}: expected generated 3D shapes"
+            );
+            assert!(
+                scene.stats.faces >= scene.stats.shapes,
+                "{label}: expected at least one generated face per shape, got {:?}",
+                scene.stats
+            );
+            assert!(
+                scene.batch.validate_geometry().is_ok(),
+                "{label}: generated 3D geometry should validate"
+            );
+            assert!(
+                !scene.batch.vertices.is_empty() || !scene.batch.rect_slabs.is_empty(),
+                "{label}: expected generated mesh vertices or rect slabs"
+            );
+
+            let cached = app.cached_3d_scene();
+            assert!(
+                Arc::ptr_eq(&scene.batch, &cached.batch),
+                "{label}: repeated scene access should reuse the cached batch"
+            );
+            assert_eq!(scene.fingerprint, cached.fingerprint, "{label}");
+        }
+    }
+
+    #[test]
+    fn imported_gds_layout_builds_valid_3d_geometry() {
+        let cc = eframe::CreationContext::_new_kittest(egui::Context::default());
+        let technology = layout_model::default_technology();
+        let mut document = Document::new("imported 3D fixture");
+        let poly = document.layer_by_process(ProcessLayer::Poly).unwrap();
+        let metal1 = document.layer_by_process(ProcessLayer::Metal1).unwrap();
+        let child = document.create_cell("UNIT");
+
+        document.insert_shape(
+            poly,
+            ShapeKind::Rectangle(Rect::from_min_size(Point::new(0, 0), 320, 160)),
+        );
+        document.insert_shape(
+            metal1,
+            ShapeKind::Path {
+                points: vec![
+                    Point::new(0, 280),
+                    Point::new(280, 280),
+                    Point::new(420, 320),
+                ],
+                width: 80,
+            },
+        );
+        document
+            .insert_shape_in_cell(
+                child,
+                metal1,
+                ShapeKind::Rectangle(Rect::from_min_size(Point::new(0, 0), 120, 90)),
+            )
+            .unwrap();
+        document
+            .insert_instance_in_top(child, Transform::translate(600, 200))
+            .unwrap();
+
+        let exported = export_gdsii_with_report(&document, &technology).unwrap();
+        assert!(exported.report.skipped_elements.is_empty());
+        let imported = import_gdsii_with_report(&exported.bytes, &technology).unwrap();
+        assert!(
+            imported.report.skipped_elements.is_empty(),
+            "{:?}",
+            imported.report.skipped_elements
+        );
+
+        let mut app = FabricadApp::new(&cc);
+        app.replace_document(imported.document, "imported GDS 3D fixture");
+        let scene = app.build_cached_3d_scene();
+
+        assert!(scene.stats.shapes >= 3, "{:?}", scene.stats);
+        assert!(scene.stats.faces >= scene.stats.shapes, "{:?}", scene.stats);
+        assert!(scene.batch.validate_geometry().is_ok());
+        assert!(!scene.batch.vertices.is_empty() || !scene.batch.rect_slabs.is_empty());
+    }
+
+    #[test]
+    fn gds_import_status_reports_generated_and_skipped_counts() {
+        let report = layout_model::gdsii::GdsImportReport {
+            library_name: "IMPORT_STATUS".to_string(),
+            source_dbu_per_micron: 1_000,
+            structure_count: 2,
+            element_count: 5,
+            generated_layers: vec![layout_model::gdsii::GdsGeneratedLayer {
+                gds_layer: 99,
+                gds_type: 3,
+                is_text: false,
+                layer_id: LayerId(99),
+                name: "gds_99_3".to_string(),
+            }],
+            skipped_elements: vec![
+                layout_model::gdsii::GdsImportSkippedElement {
+                    cell_id: CellId(1),
+                    element_kind: "BOUNDARY".to_string(),
+                    gds_layer: Some(4),
+                    gds_type: Some(0),
+                    reason: "degenerate".to_string(),
+                },
+                layout_model::gdsii::GdsImportSkippedElement {
+                    cell_id: CellId(1),
+                    element_kind: "PATH".to_string(),
+                    gds_layer: Some(5),
+                    gds_type: Some(0),
+                    reason: "too few points".to_string(),
+                },
+            ],
+            warnings: vec![
+                layout_model::gdsii::GdsImportWarning {
+                    kind: layout_model::gdsii::GdsImportWarningKind::NormalizedUnits,
+                    gds_layer: None,
+                    gds_type: None,
+                    is_text: None,
+                    layer_id: None,
+                    message: "unit scale normalized".to_string(),
+                },
+                layout_model::gdsii::GdsImportWarning {
+                    kind: layout_model::gdsii::GdsImportWarningKind::SplitIncomingLayerMapping,
+                    gds_layer: Some(99),
+                    gds_type: None,
+                    is_text: None,
+                    layer_id: None,
+                    message: "fixture warning".to_string(),
+                },
+                layout_model::gdsii::GdsImportWarning {
+                    kind: layout_model::gdsii::GdsImportWarningKind::NormalizedPathWidth,
+                    gds_layer: Some(7),
+                    gds_type: Some(0),
+                    is_text: Some(false),
+                    layer_id: Some(LayerId(7)),
+                    message: "path width normalized".to_string(),
+                },
+                layout_model::gdsii::GdsImportWarning {
+                    kind: layout_model::gdsii::GdsImportWarningKind::NormalizedArefDimensions,
+                    gds_layer: None,
+                    gds_type: None,
+                    is_text: None,
+                    layer_id: None,
+                    message: "AREF dimensions normalized".to_string(),
+                },
+                layout_model::gdsii::GdsImportWarning {
+                    kind: layout_model::gdsii::GdsImportWarningKind::CoordinateClamped,
+                    gds_layer: Some(8),
+                    gds_type: Some(0),
+                    is_text: Some(false),
+                    layer_id: Some(LayerId(8)),
+                    message: "coordinate clamped".to_string(),
+                },
+            ],
+        };
+
+        assert_eq!(
+            FabricadApp::gds_import_status(GDS_PATH, &report),
+            "imported examples/fabricad_layout.gds; 2 structures, 5 elements, 1 generated layer, 2 skipped; warning detail: 1 normalized unit scale, 1 split incoming layer, 1 normalized path width, 1 normalized AREF dimension, 1 clamped coordinate"
+        );
+    }
+
+    #[test]
+    fn gds_export_status_reports_warning_classes() {
+        use layout_model::gdsii::{GdsExportReport, GdsExportWarning, GdsExportWarningKind};
+
+        let warning = |kind| GdsExportWarning {
+            kind,
+            cell_id: CellId(1),
+            shape_id: None,
+            instance_id: None,
+            layer_id: None,
+            message: "fixture warning".to_string(),
+        };
+        let report = GdsExportReport {
+            library_name: "EXPORT_STATUS".to_string(),
+            dbu_per_micron: 1_000,
+            structure_count: 2,
+            boundary_count: 2,
+            path_count: 1,
+            text_count: 1,
+            sref_count: 1,
+            aref_count: 0,
+            skipped_elements: Vec::new(),
+            warnings: vec![
+                warning(GdsExportWarningKind::FallbackLayerMapping),
+                warning(GdsExportWarningKind::MissingLayerFallback),
+                warning(GdsExportWarningKind::AmbiguousDocumentLayerMapping),
+                warning(GdsExportWarningKind::UnsupportedInstanceTransform),
+                warning(GdsExportWarningKind::NormalizedPathWidth),
+                warning(GdsExportWarningKind::NonRoundTrippableMetadata),
+                warning(GdsExportWarningKind::NonRoundTrippableMetadata),
+                warning(GdsExportWarningKind::NonRoundTrippableShapeKind),
+            ],
+        };
+
+        assert_eq!(
+            FabricadApp::gds_export_status(GDS_PATH, &report),
+            "exported examples/fabricad_layout.gds; 2 structures, 5 elements, 0 skipped, 8 warnings; warning detail: 1 fallback mapping, 1 missing layer, 1 ambiguous mapping, 1 transform, 1 normalized path width, 2 metadata, 1 shape kind"
+        );
+    }
+
+    #[test]
+    fn cached_3d_scene_uses_declared_stack_ranges_for_overlapping_layers() {
+        let cc = eframe::CreationContext::_new_kittest(egui::Context::default());
+        let mut app = FabricadApp::new(&cc);
+        let mut document = Document::new("3D stack fixture");
+        let rect = Rect::from_min_size(Point::new(0, 0), 400, 400);
+        let processes = [
+            ProcessLayer::Poly,
+            ProcessLayer::Contact,
+            ProcessLayer::Metal1,
+            ProcessLayer::Via1,
+            ProcessLayer::Metal2,
+        ];
+
+        for process in processes {
+            let layer = document.layer_by_process(process).unwrap();
+            document.insert_shape(layer, ShapeKind::Rectangle(rect));
+        }
+        app.document = document;
+
+        let scene = app.build_cached_3d_scene();
+        let mut z_ranges = scene
+            .batch
+            .rect_slabs
+            .iter()
+            .map(|slab| slab.z_range)
+            .collect::<Vec<_>>();
+        z_ranges.sort_by(|a, b| a[0].total_cmp(&b[0]));
+        let expected = processes
+            .into_iter()
+            .map(|process| {
+                let (base_z, thickness) = layer_3d_stack_position(process);
+                [base_z, base_z + thickness]
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(scene.stats.shapes, expected.len());
+        assert_eq!(scene.stats.faces, expected.len() * 5);
+        assert_eq!(z_ranges, expected);
+        assert!(scene.batch.validate_geometry().is_ok());
     }
 
     #[test]
@@ -15927,6 +20945,7 @@ mod tests {
             batch.vertices[0].color,
             [64.0 / 255.0, 128.0 / 255.0, 1.0, 1.0]
         );
+        assert!(batch.validate_geometry().is_ok());
     }
 
     #[test]
@@ -15949,6 +20968,7 @@ mod tests {
                 .iter()
                 .all(|vertex| vertex.normal == [0.0, 0.0, 0.0])
         );
+        assert!(batch.validate_geometry().is_ok());
     }
 
     #[test]
@@ -16009,6 +21029,236 @@ mod tests {
         );
         first.actual = 121.0;
         assert_ne!(drc_marker_key(&first), drc_marker_key(&second));
+    }
+
+    #[test]
+    fn connectivity_issue_rows_use_backend_stable_keys_and_filtering() {
+        let short = NetShort {
+            component: 7,
+            names: vec!["VDD".to_string(), "VSS".to_string()],
+            bounds: Rect::from_min_size(Point::new(0, 0), 100, 50),
+        };
+        let open = NetOpen {
+            name: "CLK".to_string(),
+            components: vec![2, 4],
+            bounds: Rect::from_min_size(Point::new(500, 0), 140, 60),
+        };
+        let short_key = short.stable_key();
+        let open_key = open.stable_key();
+        let report = ConnectivityReport {
+            shorts: vec![short],
+            opens: vec![open],
+            ..Default::default()
+        };
+
+        let rows = connectivity_issue_rows(&report, &BTreeMap::new(), "", false, true);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].key, short_key);
+        assert_eq!(rows[0].kind, ConnectivityIssueKind::Short);
+        assert!(rows[0].label.contains("VDD / VSS"));
+        assert_eq!(rows[1].key, open_key);
+        assert_eq!(rows[1].kind, ConnectivityIssueKind::Open);
+        assert!(rows[1].label.contains("CLK"));
+
+        let open_rows = connectivity_issue_rows(&report, &BTreeMap::new(), "clk", false, true);
+        assert_eq!(open_rows.len(), 1);
+        assert_eq!(open_rows[0].key, open_key);
+
+        let short_rows = connectivity_issue_rows(&report, &BTreeMap::new(), "7", false, true);
+        assert_eq!(short_rows.len(), 1);
+        assert_eq!(short_rows[0].key, short_key);
+
+        let mut states = BTreeMap::new();
+        states.insert(
+            open_key.clone(),
+            MarkerState {
+                hidden: true,
+                waived: false,
+                note: None,
+            },
+        );
+        let visible_rows = connectivity_issue_rows(&report, &states, "", false, true);
+        assert_eq!(visible_rows.len(), 1);
+        assert_eq!(visible_rows[0].key, short_key);
+
+        let hidden_rows = connectivity_issue_rows(&report, &states, "", true, true);
+        assert_eq!(hidden_rows.len(), 2);
+        assert!(hidden_rows.iter().any(|row| row.state.hidden));
+    }
+
+    #[test]
+    fn connectivity_issue_state_survives_recomputed_component_ids() {
+        let cc = eframe::CreationContext::_new_kittest(egui::Context::default());
+        let mut app = FabricadApp::new(&cc);
+        let baseline = NetShort {
+            component: 1,
+            names: vec!["VDD".to_string(), "VSS".to_string()],
+            bounds: Rect::from_min_size(Point::new(0, 0), 100, 50),
+        };
+        let recomputed = NetShort {
+            component: 42,
+            names: vec!["VSS".to_string(), "VDD".to_string()],
+            bounds: baseline.bounds,
+        };
+        let key = baseline.stable_key();
+        assert_eq!(key, recomputed.stable_key());
+
+        app.connectivity = ConnectivityReport {
+            shorts: vec![baseline],
+            ..Default::default()
+        };
+        app.set_connectivity_issue_state(key.clone(), |state| {
+            state.hidden = true;
+            state.waived = true;
+            state.note = Some("accepted test fixture short".to_string());
+        });
+        assert_eq!(app.active_connectivity_issue_count(), 0);
+        app.undo();
+        assert!(app.document.connectivity_issue_states.is_empty());
+        assert_eq!(app.active_connectivity_issue_count(), 1);
+        app.redo();
+        assert_eq!(
+            app.connectivity_issue_state(&key),
+            MarkerState {
+                hidden: true,
+                waived: true,
+                note: Some("accepted test fixture short".to_string())
+            }
+        );
+        assert_eq!(app.active_connectivity_issue_count(), 0);
+
+        app.connectivity = ConnectivityReport {
+            shorts: vec![recomputed],
+            ..Default::default()
+        };
+        assert_eq!(
+            app.connectivity_issue_state(&key),
+            MarkerState {
+                hidden: true,
+                waived: true,
+                note: Some("accepted test fixture short".to_string())
+            }
+        );
+        assert_eq!(app.active_connectivity_issue_count(), 0);
+
+        app.set_connectivity_issue_state(key, |state| {
+            state.hidden = false;
+            state.waived = false;
+            state.note = None;
+        });
+        assert!(app.document.connectivity_issue_states.is_empty());
+        assert_eq!(app.active_connectivity_issue_count(), 1);
+    }
+
+    #[test]
+    fn drc_marker_state_survives_recomputed_row_ids() {
+        let cc = eframe::CreationContext::_new_kittest(egui::Context::default());
+        let mut app = FabricadApp::new(&cc);
+        let mut document = Document::new("marker state");
+        let metal1 = document.layer_by_process(ProcessLayer::Metal1).unwrap();
+        let metal2 = document.layer_by_process(ProcessLayer::Metal2).unwrap();
+        let target_shape = document.insert_shape(
+            metal1,
+            ShapeKind::Rectangle(Rect::from_min_size(Point::new(10_000, 0), 100, 200)),
+        );
+        app.document = document;
+        app.rules = RuleDeck::demo(&app.document);
+        app.rerun_drc();
+
+        let target_violation = app
+            .violations
+            .iter()
+            .find(|violation| violation.shape_ids == vec![target_shape])
+            .cloned()
+            .expect("target shape should violate min width");
+        assert_eq!(target_violation.id, 1);
+        let key = drc_marker_key(&target_violation);
+        app.set_marker_state(key.clone(), |state| {
+            state.hidden = true;
+            state.waived = true;
+        });
+        assert_eq!(app.active_marker_count(), 0);
+        app.undo();
+        assert!(app.document.marker_states.is_empty());
+        assert_eq!(app.active_marker_count(), 1);
+        app.redo();
+        assert_eq!(
+            app.marker_state(&target_violation),
+            MarkerState {
+                hidden: true,
+                waived: true,
+                note: None
+            }
+        );
+        assert_eq!(app.active_marker_count(), 0);
+
+        app.document.insert_shape(
+            metal2,
+            ShapeKind::Rectangle(Rect::from_min_size(Point::new(3, 0), 300, 300)),
+        );
+        app.rerun_drc();
+        let recomputed = app
+            .violations
+            .iter()
+            .find(|violation| drc_marker_key(violation) == key)
+            .expect("stable marker key should find recomputed violation");
+
+        assert_ne!(recomputed.id, target_violation.id);
+        assert_eq!(
+            app.marker_state(recomputed),
+            MarkerState {
+                hidden: true,
+                waived: true,
+                note: None
+            }
+        );
+        assert_eq!(app.active_marker_count(), 1);
+
+        app.set_marker_state(key, |state| {
+            state.hidden = false;
+            state.waived = false;
+        });
+        assert!(app.document.marker_states.is_empty());
+    }
+
+    #[test]
+    fn clearing_review_states_is_undoable() {
+        let cc = eframe::CreationContext::_new_kittest(egui::Context::default());
+        let mut app = FabricadApp::new(&cc);
+        let marker_key = "rule|shape|bounds".to_string();
+        let issue_key = "short|VDD,VSS|0,0,100,50".to_string();
+        let marker_state = MarkerState {
+            hidden: true,
+            waived: false,
+            note: Some("temporarily hidden".to_string()),
+        };
+        let issue_state = MarkerState {
+            hidden: false,
+            waived: true,
+            note: Some("accepted exception".to_string()),
+        };
+        app.document
+            .marker_states
+            .insert(marker_key.clone(), marker_state.clone());
+        app.document
+            .connectivity_issue_states
+            .insert(issue_key.clone(), issue_state.clone());
+
+        app.clear_marker_states();
+        assert!(app.document.marker_states.is_empty());
+        app.undo();
+        assert_eq!(
+            app.document.marker_states.get(&marker_key),
+            Some(&marker_state)
+        );
+
+        app.clear_connectivity_issue_states();
+        assert!(app.document.connectivity_issue_states.is_empty());
+        app.undo();
+        assert_eq!(
+            app.document.connectivity_issue_states.get(&issue_key),
+            Some(&issue_state)
+        );
     }
 
     #[test]

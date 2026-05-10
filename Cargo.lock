@@ -721,6 +721,7 @@ dependencies = [
  "geometry_core",
  "layout_model",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1336,6 +1337,12 @@ checksum = "fdf242682df893b86f33a73828fb09ca4b2d3bb6cc95249707fc684d27484b91"
 dependencies = [
  "bitflags 2.11.1",
 ]
+
+[[package]]
+name = "grid"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b40ca9252762c466af32d0b1002e91e4e1bc5398f77455e55474deb466355ff5"
 
 [[package]]
 name = "half"
@@ -2216,6 +2223,7 @@ dependencies = [
  "futures-util",
  "geometry_core",
  "layout_model",
+ "operad",
  "pollster",
  "renderer",
  "router",
@@ -2663,6 +2671,14 @@ name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
+
+[[package]]
+name = "operad"
+version = "2.0.0"
+source = "git+ssh://git@github.com/Andrewp2/Operad.git?rev=07061e2#07061e22364c7d9b15b0aeebb152e113331addd7"
+dependencies = [
+ "taffy",
+]
 
 [[package]]
 name = "orbclient"
@@ -3607,6 +3623,18 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "taffy"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aea22054047c16c3f34d3ac473a2170be1424b1115b2a3adcf28cfb067c88859"
+dependencies = [
+ "arrayvec",
+ "grid",
+ "serde",
+ "slotmap",
 ]
 
 [[package]]

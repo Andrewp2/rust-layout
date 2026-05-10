@@ -1,4 +1,7 @@
-use std::fmt;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -85,6 +88,121 @@ impl LabNotebook {
 
     pub fn entry_mut(&mut self, id: &NotebookEntryId) -> Option<&mut NotebookEntry> {
         self.entries.iter_mut().find(|entry| &entry.id == id)
+    }
+
+    pub fn validate(&self) -> Vec<NotebookValidationFinding> {
+        let mut findings = Vec::new();
+        let mut entry_ids = BTreeSet::new();
+        for entry in &self.entries {
+            validate_entry(entry, &mut entry_ids, &mut findings);
+        }
+        findings
+    }
+
+    pub fn validate_with_context(
+        &self,
+        context: &NotebookValidationContext,
+    ) -> Vec<NotebookValidationFinding> {
+        let mut findings = self.validate();
+        for entry in &self.entries {
+            validate_entry_links_with_context(entry, context, &mut findings);
+        }
+        findings
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.validate()
+            .iter()
+            .all(|finding| finding.severity != NotebookValidationSeverity::Error)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotebookValidationSeverity {
+    Error,
+    Warning,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NotebookValidationFinding {
+    pub severity: NotebookValidationSeverity,
+    pub message: String,
+}
+
+impl NotebookValidationFinding {
+    fn error(message: impl Into<String>) -> Self {
+        Self {
+            severity: NotebookValidationSeverity::Error,
+            message: message.into(),
+        }
+    }
+
+    fn warning(message: impl Into<String>) -> Self {
+        Self {
+            severity: NotebookValidationSeverity::Warning,
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NotebookValidationContext {
+    pub lot_ids: BTreeSet<String>,
+    pub wafer_ids: BTreeSet<String>,
+    pub wafer_ids_by_lot: BTreeMap<String, BTreeSet<String>>,
+    pub recipe_ids: BTreeSet<String>,
+    pub metrology_ids: BTreeSet<String>,
+}
+
+impl NotebookValidationContext {
+    pub fn from_mes_recipes_and_metrology<I, J>(
+        mes: &crate::mes::FabMesData,
+        recipe_ids: I,
+        metrology_ids: J,
+    ) -> Self
+    where
+        I: IntoIterator<Item = String>,
+        J: IntoIterator<Item = String>,
+    {
+        let mut context = Self {
+            recipe_ids: recipe_ids.into_iter().collect(),
+            metrology_ids: metrology_ids.into_iter().collect(),
+            ..Self::default()
+        };
+        for (lot_id, lot) in &mes.lots {
+            let lot_id = lot_id.as_str().to_string();
+            context.lot_ids.insert(lot_id.clone());
+            let wafer_ids = context.wafer_ids_by_lot.entry(lot_id).or_default();
+            for wafer in &lot.wafers {
+                let wafer_id = wafer.id.as_str().to_string();
+                context.wafer_ids.insert(wafer_id.clone());
+                wafer_ids.insert(wafer_id);
+                wafer_ids.insert(format!("W{:02}", wafer.slot));
+            }
+        }
+        context
+    }
+
+    fn contains_lot(&self, lot_id: &LotId) -> bool {
+        self.lot_ids.contains(lot_id.as_str())
+    }
+
+    fn contains_wafer(&self, wafer_id: &WaferId) -> bool {
+        self.wafer_ids.contains(wafer_id.as_str())
+    }
+
+    fn contains_wafer_in_lot(&self, lot_id: &LotId, wafer_id: &WaferId) -> bool {
+        self.wafer_ids_by_lot
+            .get(lot_id.as_str())
+            .is_some_and(|wafer_ids| wafer_ids.contains(wafer_id.as_str()))
+    }
+
+    fn contains_recipe(&self, recipe_id: &RecipeId) -> bool {
+        self.recipe_ids.contains(recipe_id.as_str())
+    }
+
+    fn contains_metrology(&self, metrology_id: &MetrologyLinkId) -> bool {
+        self.metrology_ids.contains(metrology_id.as_str())
     }
 }
 
@@ -273,6 +391,248 @@ impl NotebookFilter {
     }
 }
 
+fn validate_entry(
+    entry: &NotebookEntry,
+    entry_ids: &mut BTreeSet<NotebookEntryId>,
+    findings: &mut Vec<NotebookValidationFinding>,
+) {
+    if entry.id.as_str().trim().is_empty() {
+        findings.push(NotebookValidationFinding::error(
+            "notebook entry id cannot be empty",
+        ));
+    } else if !entry_ids.insert(entry.id.clone()) {
+        findings.push(NotebookValidationFinding::error(format!(
+            "notebook contains duplicate entry {}",
+            entry.id
+        )));
+    }
+    if entry.title.trim().is_empty() {
+        findings.push(NotebookValidationFinding::warning(format!(
+            "notebook entry {} has no title",
+            entry.id
+        )));
+    }
+    if entry.author.trim().is_empty() {
+        findings.push(NotebookValidationFinding::warning(format!(
+            "notebook entry {} has no author",
+            entry.id
+        )));
+    }
+    if entry.created_at.trim().is_empty() {
+        findings.push(NotebookValidationFinding::warning(format!(
+            "notebook entry {} has no created timestamp",
+            entry.id
+        )));
+    }
+    if entry.updated_at.trim().is_empty() {
+        findings.push(NotebookValidationFinding::warning(format!(
+            "notebook entry {} has no updated timestamp",
+            entry.id
+        )));
+    }
+    if !entry.created_at.trim().is_empty()
+        && !entry.updated_at.trim().is_empty()
+        && entry.updated_at < entry.created_at
+    {
+        findings.push(NotebookValidationFinding::error(format!(
+            "notebook entry {} updated timestamp is before created timestamp",
+            entry.id
+        )));
+    }
+    if entry.body_markdown.trim().is_empty() {
+        findings.push(NotebookValidationFinding::warning(format!(
+            "notebook entry {} has no body",
+            entry.id
+        )));
+    }
+
+    let mut tags = BTreeSet::new();
+    for tag in &entry.tags {
+        if tag.trim().is_empty() {
+            findings.push(NotebookValidationFinding::warning(format!(
+                "notebook entry {} has an empty tag",
+                entry.id
+            )));
+        } else if !tags.insert(tag.clone()) {
+            findings.push(NotebookValidationFinding::warning(format!(
+                "notebook entry {} repeats tag {tag}",
+                entry.id
+            )));
+        }
+    }
+    validate_links(entry, findings);
+}
+
+fn validate_links(entry: &NotebookEntry, findings: &mut Vec<NotebookValidationFinding>) {
+    warn_duplicate_ids(
+        &entry.id,
+        "lot",
+        entry.links.lots.iter().map(LotId::as_str),
+        findings,
+    );
+    warn_duplicate_ids(
+        &entry.id,
+        "wafer",
+        entry.links.wafers.iter().map(WaferId::as_str),
+        findings,
+    );
+    warn_duplicate_ids(
+        &entry.id,
+        "recipe",
+        entry.links.recipes.iter().map(RecipeId::as_str),
+        findings,
+    );
+    warn_duplicate_ids(
+        &entry.id,
+        "tool run",
+        entry
+            .links
+            .tool_runs
+            .iter()
+            .map(|tool_run| tool_run.0.as_str()),
+        findings,
+    );
+
+    let mut metrology_ids = BTreeSet::new();
+    for link in &entry.links.metrology {
+        if link.id.as_str().trim().is_empty() {
+            findings.push(NotebookValidationFinding::error(format!(
+                "notebook entry {} has metrology link with empty id",
+                entry.id
+            )));
+        } else if !metrology_ids.insert(link.id.clone()) {
+            findings.push(NotebookValidationFinding::warning(format!(
+                "notebook entry {} repeats metrology link {}",
+                entry.id, link.id
+            )));
+        }
+        if link.summary.trim().is_empty() {
+            findings.push(NotebookValidationFinding::warning(format!(
+                "notebook entry {} metrology link {} has no summary",
+                entry.id, link.id
+            )));
+        }
+        if link.wafer_id.is_some() && link.lot_id.is_none() {
+            findings.push(NotebookValidationFinding::error(format!(
+                "notebook entry {} metrology link {} references a wafer without a lot",
+                entry.id, link.id
+            )));
+        }
+    }
+
+    let mut image_ids = BTreeSet::new();
+    for link in &entry.links.images {
+        if link.id.as_str().trim().is_empty() {
+            findings.push(NotebookValidationFinding::error(format!(
+                "notebook entry {} has image link with empty id",
+                entry.id
+            )));
+        } else if !image_ids.insert(link.id.clone()) {
+            findings.push(NotebookValidationFinding::warning(format!(
+                "notebook entry {} repeats image link {}",
+                entry.id, link.id
+            )));
+        }
+        if link.label.trim().is_empty() {
+            findings.push(NotebookValidationFinding::warning(format!(
+                "notebook entry {} image link {} has no label",
+                entry.id, link.id
+            )));
+        }
+        if link.uri.trim().is_empty() {
+            findings.push(NotebookValidationFinding::error(format!(
+                "notebook entry {} image link {} has no URI",
+                entry.id, link.id
+            )));
+        }
+    }
+}
+
+fn warn_duplicate_ids<'a>(
+    entry_id: &NotebookEntryId,
+    label: &str,
+    ids: impl Iterator<Item = &'a str>,
+    findings: &mut Vec<NotebookValidationFinding>,
+) {
+    let mut seen = BTreeSet::new();
+    for id in ids {
+        if id.trim().is_empty() {
+            findings.push(NotebookValidationFinding::error(format!(
+                "notebook entry {entry_id} has empty {label} link"
+            )));
+        } else if !seen.insert(id.to_string()) {
+            findings.push(NotebookValidationFinding::warning(format!(
+                "notebook entry {entry_id} repeats {label} link {id}"
+            )));
+        }
+    }
+}
+
+fn validate_entry_links_with_context(
+    entry: &NotebookEntry,
+    context: &NotebookValidationContext,
+    findings: &mut Vec<NotebookValidationFinding>,
+) {
+    for lot_id in &entry.links.lots {
+        if !context.contains_lot(lot_id) {
+            findings.push(NotebookValidationFinding::warning(format!(
+                "notebook entry {} references external lot {lot_id}",
+                entry.id
+            )));
+        }
+    }
+    for wafer_id in &entry.links.wafers {
+        if !context.contains_wafer(wafer_id) {
+            findings.push(NotebookValidationFinding::warning(format!(
+                "notebook entry {} references external wafer {wafer_id}",
+                entry.id
+            )));
+        }
+    }
+    for recipe_id in &entry.links.recipes {
+        if !context.contains_recipe(recipe_id) {
+            findings.push(NotebookValidationFinding::warning(format!(
+                "notebook entry {} references external recipe {recipe_id}",
+                entry.id
+            )));
+        }
+    }
+    for link in &entry.links.metrology {
+        if !context.contains_metrology(&link.id) {
+            findings.push(NotebookValidationFinding::warning(format!(
+                "notebook entry {} references external metrology {}",
+                entry.id, link.id
+            )));
+        }
+        if let Some(lot_id) = &link.lot_id
+            && !context.contains_lot(lot_id)
+        {
+            findings.push(NotebookValidationFinding::warning(format!(
+                "notebook entry {} metrology link {} references external lot {lot_id}",
+                entry.id, link.id
+            )));
+        }
+        if let Some(wafer_id) = &link.wafer_id
+            && !context.contains_wafer(wafer_id)
+        {
+            findings.push(NotebookValidationFinding::warning(format!(
+                "notebook entry {} metrology link {} references external wafer {wafer_id}",
+                entry.id, link.id
+            )));
+        }
+        if let (Some(lot_id), Some(wafer_id)) = (&link.lot_id, &link.wafer_id)
+            && context.contains_lot(lot_id)
+            && context.contains_wafer(wafer_id)
+            && !context.contains_wafer_in_lot(lot_id, wafer_id)
+        {
+            findings.push(NotebookValidationFinding::error(format!(
+                "notebook entry {} metrology link {} references wafer {wafer_id} outside lot {lot_id}",
+                entry.id, link.id
+            )));
+        }
+    }
+}
+
 pub fn sample_lab_notebook() -> LabNotebook {
     LabNotebook {
         entries: vec![
@@ -353,6 +713,137 @@ pub fn sample_lab_notebook() -> LabNotebook {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn validation_context() -> NotebookValidationContext {
+        NotebookValidationContext::from_mes_recipes_and_metrology(
+            &crate::mes::FabMesData::sample(),
+            crate::recipe::RecipeCatalog::sample()
+                .recipes
+                .keys()
+                .map(|recipe_id| recipe_id.as_str().to_string()),
+            std::iter::empty::<String>(),
+        )
+    }
+
+    fn has_validation_error(findings: &[NotebookValidationFinding], needle: &str) -> bool {
+        findings.iter().any(|finding| {
+            finding.severity == NotebookValidationSeverity::Error
+                && finding.message.contains(needle)
+        })
+    }
+
+    fn has_validation_warning(findings: &[NotebookValidationFinding], needle: &str) -> bool {
+        findings.iter().any(|finding| {
+            finding.severity == NotebookValidationSeverity::Warning
+                && finding.message.contains(needle)
+        })
+    }
+
+    #[test]
+    fn sample_notebook_validates_internally_and_allows_external_context_links() {
+        let notebook = LabNotebook::sample();
+        let findings = notebook.validate();
+
+        assert!(findings.is_empty(), "{findings:?}");
+        assert!(notebook.is_valid());
+
+        let context_findings = notebook.validate_with_context(&validation_context());
+        assert!(
+            !context_findings
+                .iter()
+                .any(|finding| finding.severity == NotebookValidationSeverity::Error),
+            "{context_findings:?}"
+        );
+        assert!(has_validation_warning(
+            &context_findings,
+            "notebook entry E-0042 references external lot L-00100"
+        ));
+    }
+
+    #[test]
+    fn notebook_validation_rejects_duplicate_entries_and_empty_required_links() {
+        let mut notebook = LabNotebook::sample();
+        notebook.entries.push(notebook.entries[0].clone());
+        notebook.entries[0].updated_at = "2026-04-20T00:00:00Z".to_string();
+        notebook.entries[0].links.images[0].uri.clear();
+        notebook.entries[0].links.metrology.push(MetrologyLink {
+            id: MetrologyLinkId::from(""),
+            kind: MeasurementKind::ThicknessNm,
+            lot_id: None,
+            wafer_id: None,
+            summary: String::new(),
+        });
+
+        let findings = notebook.validate();
+
+        assert!(has_validation_error(
+            &findings,
+            "notebook contains duplicate entry E-0042"
+        ));
+        assert!(has_validation_error(
+            &findings,
+            "notebook entry E-0042 image link IMG-ETCH-0042-A has no URI"
+        ));
+        assert!(has_validation_error(
+            &findings,
+            "notebook entry E-0042 has metrology link with empty id"
+        ));
+        assert!(has_validation_error(
+            &findings,
+            "notebook entry E-0042 updated timestamp is before created timestamp"
+        ));
+        let mut wafer_without_lot = notebook.entries[0].links.metrology[0].clone();
+        wafer_without_lot.id = MetrologyLinkId::from("MET-WAFER-WITHOUT-LOT");
+        wafer_without_lot.lot_id = None;
+        wafer_without_lot.wafer_id = Some(WaferId::from("L-00101-W11"));
+        notebook.entries[0].links.metrology.push(wafer_without_lot);
+
+        let findings = notebook.validate();
+        assert!(has_validation_error(
+            &findings,
+            "metrology link MET-WAFER-WITHOUT-LOT references a wafer without a lot"
+        ));
+    }
+
+    #[test]
+    fn notebook_validation_warns_about_external_context_links() {
+        let mut notebook = LabNotebook::sample();
+        notebook.entries[1].links.metrology[0].id = MetrologyLinkId::from("MET-MISSING");
+
+        let findings = notebook.validate_with_context(&validation_context());
+
+        assert!(has_validation_warning(
+            &findings,
+            "notebook entry E-0043 references external metrology MET-MISSING"
+        ));
+        assert!(has_validation_warning(
+            &findings,
+            "notebook entry E-0042 references external wafer L-00100-W07"
+        ));
+    }
+
+    #[test]
+    fn notebook_validation_rejects_internal_lot_wafer_mismatch() {
+        let mut notebook = LabNotebook::sample();
+        notebook.entries[1].links.metrology[0].id = MetrologyLinkId::from("MET-MISMATCHED-PAIR");
+        notebook.entries[1].links.metrology[0].lot_id = Some(LotId::from("L-00042"));
+        notebook.entries[1].links.metrology[0].wafer_id = Some(WaferId::from("L-OTHER-W01"));
+        let mut context = validation_context();
+        context.lot_ids.insert("L-OTHER".to_string());
+        context.wafer_ids.insert("L-OTHER-W01".to_string());
+        context
+            .wafer_ids_by_lot
+            .entry("L-OTHER".to_string())
+            .or_default()
+            .insert("L-OTHER-W01".to_string());
+
+        let findings = notebook.validate_with_context(&context);
+
+        assert!(has_validation_error(
+            &findings,
+            "metrology link MET-MISMATCHED-PAIR references wafer L-OTHER-W01 outside lot L-00042"
+        ));
+    }
 
     #[test]
     fn search_matches_markdown_tags_and_link_targets() {

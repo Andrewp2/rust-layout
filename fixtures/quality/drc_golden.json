@@ -1,0 +1,24 @@
+{
+  "name": "drc golden",
+  "shapes": [
+    { "kind": "rect", "layer": "metal2", "x": 20003, "y": 0, "w": 300, "h": 300 },
+    { "kind": "rect", "layer": "metal1", "x": 50000, "y": 0, "w": 100, "h": 200 },
+    { "kind": "rect", "layer": "poly", "x": 40000, "y": 0, "w": 200, "h": 200 },
+    { "kind": "rect", "layer": "poly", "x": 40300, "y": 0, "w": 200, "h": 200 },
+    { "kind": "rect", "layer": "poly", "x": 30000, "y": 0, "w": 300, "h": 300 },
+    { "kind": "rect", "layer": "metal2", "x": 30000, "y": 0, "w": 300, "h": 300 },
+    { "kind": "rect", "layer": "via1", "x": 60000, "y": 0, "w": 200, "h": 200 },
+    { "kind": "rect", "layer": "metal1", "x": 59900, "y": -100, "w": 400, "h": 400 }
+  ],
+  "expect": {
+    "total_count": 5,
+    "omitted_count": 0,
+    "rule_counts": {
+      "off_grid": 1,
+      "min_width": 1,
+      "min_spacing": 1,
+      "poly_metal2_forbidden_overlap": 1,
+      "via_enclosure": 1
+    }
+  }
+}

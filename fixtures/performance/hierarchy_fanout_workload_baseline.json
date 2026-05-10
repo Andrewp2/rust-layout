@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "name": "hierarchy_fanout_workload_baseline",
+  "workloads": [
+    {
+      "name": "compact_document_objects",
+      "metric": "document_objects",
+      "min_input_size": 1,
+      "max_actual": 16
+    },
+    {
+      "name": "flattened_shape_estimate",
+      "metric": "rendered_shapes",
+      "min_input_size": 1048576,
+      "max_actual": 1048576
+    },
+    {
+      "name": "loro_seed_within_budget",
+      "metric": "flag",
+      "min_input_size": 1,
+      "max_actual": 1
+    },
+    {
+      "name": "drc_within_budget",
+      "metric": "flag",
+      "min_input_size": 1,
+      "max_actual": 1
+    },
+    {
+      "name": "connectivity_within_budget",
+      "metric": "flag",
+      "min_input_size": 1,
+      "max_actual": 1
+    },
+    {
+      "name": "3d_render_budget_exceeded",
+      "metric": "flag",
+      "min_input_size": 1048576,
+      "max_actual": 1
+    }
+  ]
+}

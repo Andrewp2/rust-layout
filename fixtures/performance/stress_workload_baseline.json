@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "name": "stress_workload_baseline",
+  "workloads": [
+    {
+      "name": "stress_startup",
+      "metric": "document_objects",
+      "min_input_size": 60000,
+      "max_actual": 60010
+    },
+    {
+      "name": "loro_seed_skipped",
+      "metric": "flag",
+      "min_input_size": 60000,
+      "max_actual": 1
+    },
+    {
+      "name": "drc_skipped",
+      "metric": "flag",
+      "min_input_size": 60000,
+      "max_actual": 1
+    },
+    {
+      "name": "connectivity_skipped",
+      "metric": "flag",
+      "min_input_size": 60000,
+      "max_actual": 1
+    },
+    {
+      "name": "3d_mesh_build",
+      "metric": "faces",
+      "min_input_size": 60000,
+      "max_actual": 300000
+    },
+    {
+      "name": "3d_mesh_validation",
+      "metric": "validated_primitives",
+      "min_input_size": 60000,
+      "max_actual": 300000
+    }
+  ]
+}

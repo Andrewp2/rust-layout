@@ -1,3 +1,5 @@
+use std::collections::{BTreeMap, BTreeSet};
+
 use serde::{Deserialize, Serialize};
 
 use crate::equipment::ToolId;
@@ -249,6 +251,71 @@ pub struct MaintenanceModel {
     pub spare_parts: Vec<SparePartUse>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MaintenanceValidationSeverity {
+    Error,
+    Warning,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MaintenanceValidationFinding {
+    pub severity: MaintenanceValidationSeverity,
+    pub message: String,
+}
+
+impl MaintenanceValidationFinding {
+    fn error(message: impl Into<String>) -> Self {
+        Self {
+            severity: MaintenanceValidationSeverity::Error,
+            message: message.into(),
+        }
+    }
+
+    fn warning(message: impl Into<String>) -> Self {
+        Self {
+            severity: MaintenanceValidationSeverity::Warning,
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MaintenanceValidationContext {
+    pub tool_ids: BTreeSet<ToolId>,
+    pub recipe_ids_by_tool: BTreeMap<ToolId, BTreeSet<String>>,
+}
+
+impl MaintenanceValidationContext {
+    pub fn from_equipment(equipment: &crate::equipment::EquipmentSimulator) -> Self {
+        let mut tool_ids = BTreeSet::new();
+        let mut recipe_ids_by_tool = BTreeMap::new();
+        for tool in equipment.tools() {
+            tool_ids.insert(tool.id.clone());
+            recipe_ids_by_tool.insert(
+                tool.id.clone(),
+                tool.available_recipes
+                    .keys()
+                    .map(|recipe_id| recipe_id.as_str().to_string())
+                    .collect(),
+            );
+        }
+        Self {
+            tool_ids,
+            recipe_ids_by_tool,
+        }
+    }
+
+    fn contains_tool(&self, tool_id: &ToolId) -> bool {
+        self.tool_ids.contains(tool_id)
+    }
+
+    fn contains_recipe_for_tool(&self, tool_id: &ToolId, recipe_id: &str) -> bool {
+        self.recipe_ids_by_tool
+            .get(tool_id)
+            .is_some_and(|recipe_ids| recipe_ids.contains(recipe_id))
+    }
+}
+
 impl MaintenanceModel {
     pub fn sample() -> Self {
         sample_maintenance_model()
@@ -408,6 +475,483 @@ impl MaintenanceModel {
             reasons,
         }
     }
+
+    pub fn validate(&self) -> Vec<MaintenanceValidationFinding> {
+        let mut findings = Vec::new();
+        if let Some(today) = self.today
+            && !valid_date(today)
+        {
+            findings.push(MaintenanceValidationFinding::error(format!(
+                "maintenance today date {today} is invalid"
+            )));
+        }
+
+        let mut tool_ids = BTreeSet::new();
+        let mut schedule_ids = BTreeSet::new();
+        for tool in &self.tools {
+            if tool.tool_id.as_str().trim().is_empty() {
+                findings.push(MaintenanceValidationFinding::error(
+                    "maintenance tool id is empty",
+                ));
+                continue;
+            }
+            if !tool_ids.insert(tool.tool_id.clone()) {
+                findings.push(MaintenanceValidationFinding::error(format!(
+                    "maintenance tool {} is duplicated",
+                    tool.tool_id
+                )));
+            }
+            if tool.tool_name.trim().is_empty() {
+                findings.push(MaintenanceValidationFinding::warning(format!(
+                    "maintenance tool {} has an empty name",
+                    tool.tool_id
+                )));
+            }
+            for schedule in &tool.schedules {
+                validate_schedule(
+                    schedule,
+                    &tool.tool_id,
+                    tool.run_count,
+                    &mut schedule_ids,
+                    &mut findings,
+                );
+            }
+        }
+
+        let mut calibration_ids = BTreeSet::new();
+        for record in &self.calibration_records {
+            validate_record_id(
+                "calibration record",
+                &record.id,
+                &mut calibration_ids,
+                &mut findings,
+            );
+            validate_known_tool(
+                "calibration record",
+                &record.id,
+                &record.tool_id,
+                &tool_ids,
+                &mut findings,
+            );
+            if !valid_date(record.performed_at) {
+                findings.push(MaintenanceValidationFinding::error(format!(
+                    "calibration record {} has invalid performed date {}",
+                    record.id, record.performed_at
+                )));
+            }
+            validate_not_future(
+                "calibration record",
+                &record.id,
+                "performed date",
+                record.performed_at,
+                self.today,
+                &mut findings,
+            );
+            if !record.measured_value.is_finite() {
+                findings.push(MaintenanceValidationFinding::error(format!(
+                    "calibration record {} has non-finite measured value",
+                    record.id
+                )));
+            }
+            if record.instrument.trim().is_empty() || record.parameter.trim().is_empty() {
+                findings.push(MaintenanceValidationFinding::warning(format!(
+                    "calibration record {} has incomplete instrument metadata",
+                    record.id
+                )));
+            }
+            if record.tolerance.trim().is_empty() {
+                findings.push(MaintenanceValidationFinding::warning(format!(
+                    "calibration record {} has an empty tolerance",
+                    record.id
+                )));
+            }
+            if record.technician.trim().is_empty() {
+                findings.push(MaintenanceValidationFinding::warning(format!(
+                    "calibration record {} has no technician",
+                    record.id
+                )));
+            }
+        }
+
+        let mut qualification_ids = BTreeSet::new();
+        for record in &self.qualification_results {
+            validate_record_id(
+                "qualification result",
+                &record.id,
+                &mut qualification_ids,
+                &mut findings,
+            );
+            validate_known_tool(
+                "qualification result",
+                &record.id,
+                &record.tool_id,
+                &tool_ids,
+                &mut findings,
+            );
+            if !valid_date(record.performed_at) {
+                findings.push(MaintenanceValidationFinding::error(format!(
+                    "qualification result {} has invalid performed date {}",
+                    record.id, record.performed_at
+                )));
+            }
+            validate_not_future(
+                "qualification result",
+                &record.id,
+                "performed date",
+                record.performed_at,
+                self.today,
+                &mut findings,
+            );
+            if !record.value.is_finite() {
+                findings.push(MaintenanceValidationFinding::error(format!(
+                    "qualification result {} has non-finite value",
+                    record.id
+                )));
+            }
+            if record.wafer_id.trim().is_empty() || record.recipe_id.trim().is_empty() {
+                findings.push(MaintenanceValidationFinding::warning(format!(
+                    "qualification result {} has incomplete wafer or recipe metadata",
+                    record.id
+                )));
+            }
+            if record.metric.trim().is_empty() {
+                findings.push(MaintenanceValidationFinding::warning(format!(
+                    "qualification result {} has an empty metric",
+                    record.id
+                )));
+            }
+            if record.spec.trim().is_empty() {
+                findings.push(MaintenanceValidationFinding::warning(format!(
+                    "qualification result {} has an empty spec",
+                    record.id
+                )));
+            }
+        }
+
+        let mut downtime_ids = BTreeSet::new();
+        let mut open_downtime_tools = BTreeSet::new();
+        for record in &self.downtime {
+            validate_record_id(
+                "downtime record",
+                &record.id,
+                &mut downtime_ids,
+                &mut findings,
+            );
+            validate_known_tool(
+                "downtime record",
+                &record.id,
+                &record.tool_id,
+                &tool_ids,
+                &mut findings,
+            );
+            if !valid_date(record.started_at) {
+                findings.push(MaintenanceValidationFinding::error(format!(
+                    "downtime record {} has invalid start date {}",
+                    record.id, record.started_at
+                )));
+            }
+            validate_not_future(
+                "downtime record",
+                &record.id,
+                "start date",
+                record.started_at,
+                self.today,
+                &mut findings,
+            );
+            if let Some(ended_at) = record.ended_at {
+                if !valid_date(ended_at) {
+                    findings.push(MaintenanceValidationFinding::error(format!(
+                        "downtime record {} has invalid end date {}",
+                        record.id, ended_at
+                    )));
+                }
+                validate_not_future(
+                    "downtime record",
+                    &record.id,
+                    "end date",
+                    ended_at,
+                    self.today,
+                    &mut findings,
+                );
+                if ended_at < record.started_at {
+                    findings.push(MaintenanceValidationFinding::error(format!(
+                        "downtime record {} ends before it starts",
+                        record.id
+                    )));
+                }
+            } else if !open_downtime_tools.insert(record.tool_id.clone()) {
+                findings.push(MaintenanceValidationFinding::error(format!(
+                    "downtime record {} creates multiple open downtime events for tool {}",
+                    record.id, record.tool_id
+                )));
+            }
+            if record.reason.trim().is_empty() {
+                findings.push(MaintenanceValidationFinding::warning(format!(
+                    "downtime record {} has an empty reason",
+                    record.id
+                )));
+            }
+            if record.owner.trim().is_empty() {
+                findings.push(MaintenanceValidationFinding::warning(format!(
+                    "downtime record {} has no owner",
+                    record.id
+                )));
+            }
+        }
+
+        let mut spare_part_ids = BTreeSet::new();
+        for record in &self.spare_parts {
+            validate_record_id(
+                "spare part record",
+                &record.id,
+                &mut spare_part_ids,
+                &mut findings,
+            );
+            validate_known_tool(
+                "spare part record",
+                &record.id,
+                &record.tool_id,
+                &tool_ids,
+                &mut findings,
+            );
+            if !valid_date(record.used_at) {
+                findings.push(MaintenanceValidationFinding::error(format!(
+                    "spare part record {} has invalid used date {}",
+                    record.id, record.used_at
+                )));
+            }
+            validate_not_future(
+                "spare part record",
+                &record.id,
+                "used date",
+                record.used_at,
+                self.today,
+                &mut findings,
+            );
+            if record.quantity == 0 {
+                findings.push(MaintenanceValidationFinding::error(format!(
+                    "spare part record {} has zero quantity",
+                    record.id
+                )));
+            }
+            if !record.unit_cost.is_finite() || record.unit_cost < 0.0 {
+                findings.push(MaintenanceValidationFinding::error(format!(
+                    "spare part record {} has invalid unit cost",
+                    record.id
+                )));
+            }
+            if record.part_number.trim().is_empty() {
+                findings.push(MaintenanceValidationFinding::warning(format!(
+                    "spare part record {} has an empty part number",
+                    record.id
+                )));
+            }
+            if record.description.trim().is_empty() {
+                findings.push(MaintenanceValidationFinding::warning(format!(
+                    "spare part record {} has an empty description",
+                    record.id
+                )));
+            }
+        }
+
+        findings
+    }
+
+    pub fn validate_with_context(
+        &self,
+        context: &MaintenanceValidationContext,
+    ) -> Vec<MaintenanceValidationFinding> {
+        let mut findings = self.validate();
+        self.validate_context_links(context, &mut findings);
+        findings
+    }
+
+    fn validate_context_links(
+        &self,
+        context: &MaintenanceValidationContext,
+        findings: &mut Vec<MaintenanceValidationFinding>,
+    ) {
+        for tool in &self.tools {
+            if !context.contains_tool(&tool.tool_id) {
+                findings.push(MaintenanceValidationFinding::error(format!(
+                    "maintenance tool {} is missing from equipment simulator",
+                    tool.tool_id
+                )));
+            }
+        }
+
+        for record in &self.qualification_results {
+            if record.recipe_id.trim().is_empty() {
+                continue;
+            }
+            if context.contains_tool(&record.tool_id)
+                && !context.contains_recipe_for_tool(&record.tool_id, &record.recipe_id)
+            {
+                findings.push(MaintenanceValidationFinding::error(format!(
+                    "qualification result {} references recipe {} that is not available on equipment tool {}",
+                    record.id, record.recipe_id, record.tool_id
+                )));
+            }
+        }
+    }
+}
+
+fn validate_schedule(
+    schedule: &MaintenanceSchedule,
+    parent_tool_id: &ToolId,
+    current_run_count: u32,
+    schedule_ids: &mut BTreeSet<String>,
+    findings: &mut Vec<MaintenanceValidationFinding>,
+) {
+    if schedule.id.trim().is_empty() {
+        findings.push(MaintenanceValidationFinding::error(format!(
+            "maintenance schedule on tool {parent_tool_id} has an empty id"
+        )));
+    } else if !schedule_ids.insert(schedule.id.clone()) {
+        findings.push(MaintenanceValidationFinding::error(format!(
+            "maintenance schedule {} is duplicated",
+            schedule.id
+        )));
+    }
+    if &schedule.tool_id != parent_tool_id {
+        findings.push(MaintenanceValidationFinding::error(format!(
+            "maintenance schedule {} belongs to tool {} but is nested under {}",
+            schedule.id, schedule.tool_id, parent_tool_id
+        )));
+    }
+    if schedule.task.trim().is_empty() {
+        findings.push(MaintenanceValidationFinding::warning(format!(
+            "maintenance schedule {} has an empty task",
+            schedule.id
+        )));
+    }
+    if schedule.interval_days.is_none() && schedule.interval_runs.is_none() {
+        findings.push(MaintenanceValidationFinding::error(format!(
+            "maintenance schedule {} has no calendar or run interval",
+            schedule.id
+        )));
+    }
+    if schedule.interval_days == Some(0) {
+        findings.push(MaintenanceValidationFinding::error(format!(
+            "maintenance schedule {} has zero calendar interval",
+            schedule.id
+        )));
+    }
+    if schedule.interval_runs == Some(0) {
+        findings.push(MaintenanceValidationFinding::error(format!(
+            "maintenance schedule {} has zero run interval",
+            schedule.id
+        )));
+    }
+    if !valid_date(schedule.last_completed) {
+        findings.push(MaintenanceValidationFinding::error(format!(
+            "maintenance schedule {} has invalid last completed date {}",
+            schedule.id, schedule.last_completed
+        )));
+    }
+    if !valid_date(schedule.next_due) {
+        findings.push(MaintenanceValidationFinding::error(format!(
+            "maintenance schedule {} has invalid next due date {}",
+            schedule.id, schedule.next_due
+        )));
+    }
+    if schedule.next_due < schedule.last_completed {
+        findings.push(MaintenanceValidationFinding::error(format!(
+            "maintenance schedule {} is due before it was last completed",
+            schedule.id
+        )));
+    }
+    if schedule.last_completed_run_count > current_run_count {
+        findings.push(MaintenanceValidationFinding::warning(format!(
+            "maintenance schedule {} was completed at run count {} but tool is at {}",
+            schedule.id, schedule.last_completed_run_count, current_run_count
+        )));
+    }
+    if schedule.checklist.is_empty() {
+        findings.push(MaintenanceValidationFinding::warning(format!(
+            "maintenance schedule {} has an empty checklist",
+            schedule.id
+        )));
+    }
+    let mut checklist_items = BTreeSet::new();
+    for item in &schedule.checklist {
+        if item.trim().is_empty() {
+            findings.push(MaintenanceValidationFinding::warning(format!(
+                "maintenance schedule {} has an empty checklist item",
+                schedule.id
+            )));
+        } else if !checklist_items.insert(item.trim().to_string()) {
+            findings.push(MaintenanceValidationFinding::warning(format!(
+                "maintenance schedule {} repeats checklist item {item}",
+                schedule.id
+            )));
+        }
+    }
+}
+
+fn validate_record_id(
+    kind: &str,
+    id: &str,
+    ids: &mut BTreeSet<String>,
+    findings: &mut Vec<MaintenanceValidationFinding>,
+) {
+    if id.trim().is_empty() {
+        findings.push(MaintenanceValidationFinding::error(format!(
+            "{kind} id is empty"
+        )));
+    } else if !ids.insert(id.to_string()) {
+        findings.push(MaintenanceValidationFinding::error(format!(
+            "{kind} {id} is duplicated"
+        )));
+    }
+}
+
+fn validate_known_tool(
+    kind: &str,
+    id: &str,
+    tool_id: &ToolId,
+    tool_ids: &BTreeSet<ToolId>,
+    findings: &mut Vec<MaintenanceValidationFinding>,
+) {
+    if !tool_ids.contains(tool_id) {
+        findings.push(MaintenanceValidationFinding::error(format!(
+            "{kind} {id} references missing tool {tool_id}"
+        )));
+    }
+}
+
+fn validate_not_future(
+    kind: &str,
+    id: &str,
+    label: &str,
+    date: FabDate,
+    today: Option<FabDate>,
+    findings: &mut Vec<MaintenanceValidationFinding>,
+) {
+    if let Some(today) = today
+        && valid_date(date)
+        && date > today
+    {
+        findings.push(MaintenanceValidationFinding::warning(format!(
+            "{kind} {id} has {label} {date} after maintenance today {today}"
+        )));
+    }
+}
+
+fn valid_date(date: FabDate) -> bool {
+    let max_day = match date.month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(date.year) => 29,
+        2 => 28,
+        _ => return false,
+    };
+
+    date.year > 0 && (1..=max_day).contains(&date.day)
+}
+
+fn is_leap_year(year: i32) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
 }
 
 pub fn sample_maintenance_model() -> MaintenanceModel {
@@ -767,5 +1311,272 @@ mod tests {
         let release = model.release_for_tool(&ToolId::from("MET-01"), FabDate::new(2026, 5, 8));
 
         assert_eq!(release.state, ToolReleaseState::QualificationLockout);
+    }
+
+    #[test]
+    fn sample_maintenance_model_validates() {
+        let findings = MaintenanceModel::sample().validate();
+
+        assert_eq!(findings, Vec::new());
+    }
+
+    #[test]
+    fn sample_maintenance_model_validates_against_equipment_context() {
+        let context = MaintenanceValidationContext::from_equipment(
+            &crate::equipment::EquipmentSimulator::demo_fab(),
+        );
+        let findings = MaintenanceModel::sample().validate_with_context(&context);
+
+        assert_eq!(findings, Vec::new());
+    }
+
+    #[test]
+    fn maintenance_date_validation_rejects_impossible_calendar_days() {
+        assert!(valid_date(FabDate::new(2024, 2, 29)));
+        assert!(!valid_date(FabDate::new(2026, 2, 29)));
+        assert!(!valid_date(FabDate::new(2026, 4, 31)));
+        assert!(!valid_date(FabDate::new(0, 1, 1)));
+
+        let mut model = MaintenanceModel::sample();
+        model.today = Some(FabDate::new(2026, 2, 29));
+        model.tools[0].schedules[0].next_due = FabDate::new(2026, 4, 31);
+        model.calibration_records[0].performed_at = FabDate::new(2026, 2, 29);
+
+        let findings = model.validate();
+
+        assert!(
+            findings.iter().any(|finding| finding
+                .message
+                .contains("maintenance today date 2026-02-29 is invalid")),
+            "{findings:?}"
+        );
+        assert!(
+            findings.iter().any(|finding| finding
+                .message
+                .contains("maintenance schedule pm-etch-01 has invalid next due date 2026-04-31")),
+            "{findings:?}"
+        );
+        assert!(
+            findings.iter().any(|finding| finding
+                .message
+                .contains("calibration record cal-rec-1 has invalid performed date 2026-02-29")),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn validation_rejects_incomplete_schedule_history_and_record_metadata() {
+        let mut model = MaintenanceModel::sample();
+        model.tools[0].schedules[0].interval_days = Some(0);
+        model.tools[0].schedules[0].interval_runs = Some(0);
+        model.tools[0].schedules[0].checklist.push(String::new());
+        model.tools[0].schedules[0]
+            .checklist
+            .push("Leak check chamber".to_string());
+        model.calibration_records[0].tolerance.clear();
+        model.calibration_records[0].technician.clear();
+        model.qualification_results[0].metric.clear();
+        model.qualification_results[0].spec.clear();
+        model.downtime[0].owner.clear();
+        model.downtime.push(DowntimeRecord {
+            id: "down-second-open".to_string(),
+            tool_id: ToolId::from("MET-01"),
+            started_at: FabDate::new(2026, 5, 8),
+            ended_at: None,
+            reason: "second open event".to_string(),
+            owner: "maintenance.lead".to_string(),
+        });
+        model.spare_parts[0].part_number.clear();
+        model.spare_parts[0].description.clear();
+
+        let findings = model.validate();
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("zero calendar interval")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("zero run interval")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("empty checklist item")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("repeats checklist item")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("empty tolerance")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("has no technician")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("empty metric")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("empty spec")),
+            "{findings:?}"
+        );
+        assert!(
+            findings.iter().any(|finding| finding
+                .message
+                .contains("multiple open downtime events for tool MET-01")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("has no owner")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("empty part number")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("empty description")),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn validation_context_rejects_missing_equipment_tools_and_recipes() {
+        let mut context = MaintenanceValidationContext::from_equipment(
+            &crate::equipment::EquipmentSimulator::demo_fab(),
+        );
+        context.tool_ids.remove(&ToolId::from("ETCH-01"));
+        let mut model = MaintenanceModel::sample();
+        model.qualification_results[1].recipe_id = "NO_SUCH_RECIPE".to_string();
+
+        let findings = model.validate_with_context(&context);
+
+        assert!(
+            findings.iter().any(|finding| {
+                finding
+                    .message
+                    .contains("maintenance tool ETCH-01 is missing from equipment simulator")
+            }),
+            "{findings:?}"
+        );
+        assert!(
+            findings.iter().any(|finding| {
+                finding
+                    .message
+                    .contains("qualification result qual-2 references recipe NO_SUCH_RECIPE")
+            }),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn validation_rejects_broken_tool_references_dates_and_amounts() {
+        let mut model = MaintenanceModel::sample();
+        model.tools[0].schedules[0].tool_id = ToolId::from("MISSING-TOOL");
+        model.calibration_records[0].measured_value = f64::NAN;
+        model.calibration_records[0].performed_at = FabDate::new(2026, 5, 9);
+        model.qualification_results[0].performed_at = FabDate::new(2026, 5, 10);
+        model.downtime.push(DowntimeRecord {
+            id: "bad-down".to_string(),
+            tool_id: ToolId::from("MISSING-TOOL"),
+            started_at: FabDate::new(2026, 5, 9),
+            ended_at: Some(FabDate::new(2026, 5, 8)),
+            reason: String::new(),
+            owner: "maintenance.tech".to_string(),
+        });
+        model.spare_parts.push(SparePartUse {
+            id: "bad-part".to_string(),
+            tool_id: ToolId::from("ETCH-01"),
+            used_at: FabDate::new(2026, 13, 1),
+            part_number: "BAD".to_string(),
+            description: "invalid quantity".to_string(),
+            quantity: 0,
+            unit_cost: -1.0,
+        });
+        model.spare_parts.push(SparePartUse {
+            id: "future-part".to_string(),
+            tool_id: ToolId::from("ETCH-01"),
+            used_at: FabDate::new(2026, 5, 11),
+            part_number: "SHIELD-ETCH-200".to_string(),
+            description: "future usage".to_string(),
+            quantity: 1,
+            unit_cost: 820.0,
+        });
+
+        let findings = model.validate();
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("nested under")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("non-finite measured value")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("ends before it starts")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("zero quantity")),
+            "{findings:?}"
+        );
+        assert!(
+            findings.iter().any(|finding| finding.message.contains(
+                "calibration record cal-rec-1 has performed date 2026-05-09 after maintenance today"
+            )),
+            "{findings:?}"
+        );
+        assert!(
+            findings.iter().any(|finding| finding.message.contains(
+                "qualification result qual-1 has performed date 2026-05-10 after maintenance today"
+            )),
+            "{findings:?}"
+        );
+        assert!(
+            findings.iter().any(|finding| finding.message.contains(
+                "downtime record bad-down has start date 2026-05-09 after maintenance today"
+            )),
+            "{findings:?}"
+        );
+        assert!(
+            findings.iter().any(|finding| finding.message.contains(
+                "spare part record future-part has used date 2026-05-11 after maintenance today"
+            )),
+            "{findings:?}"
+        );
     }
 }

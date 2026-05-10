@@ -1,18 +1,59 @@
 use std::collections::BTreeMap;
 
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui::{self, Color32, RichText, Sense, vec2};
 use layout_model::inventory::{
     Inventory, InventoryAlert, InventoryAlertKind, MaterialLot, MaterialLotId, format_date,
 };
+use operad::{
+    ApproxTextMeasurer, ClipBehavior, ColorRgba, FontWeight, InputBehavior, StrokeStyle, TextStyle,
+    TextWrap, UiDocument, UiNode, UiNodeId, UiNodeStyle, UiSize, UiVisual, layout, root_style,
+    widgets,
+};
 
-use crate::ui_chrome::{self, Tone};
+use crate::{
+    operad_egui,
+    operad_sidecar::{SidecarRow, SidecarSection, render_sidecar},
+    ui_chrome::{self, Tone},
+};
 
 const DEMO_TODAY: u32 = 20260508;
+const OPERAD_HEADER_HEIGHT: f32 = 104.0;
+const OPERAD_METRIC_HEIGHT: f32 = 88.0;
+const OPERAD_SECTION_TITLE_HEIGHT: f32 = 26.0;
+const OPERAD_ROW_HEIGHT: f32 = 58.0;
+const OPERAD_EMPTY_ROW_HEIGHT: f32 = 44.0;
+const OPERAD_GAP: f32 = 10.0;
+const OPERAD_PAD: f32 = 12.0;
+const OPERAD_ACTION_FILTER: &str = "inventory.action.filter.";
+const OPERAD_ACTION_SELECT_LOT: &str = "inventory.action.select_lot.";
 
 pub(crate) struct InventoryPanel {
     inventory: Inventory,
     selected_lot: Option<MaterialLotId>,
     quick_filter: InventoryQuickFilter,
+}
+
+#[derive(Debug)]
+struct InventoryOperadView {
+    document: UiDocument,
+    size: UiSize,
+}
+
+#[derive(Clone, Debug)]
+struct InventoryMetricTile {
+    label: String,
+    value: String,
+    detail: String,
+    tone: Tone,
+}
+
+#[derive(Clone, Debug)]
+struct InventoryOperadRow {
+    title: String,
+    detail: String,
+    tone: Tone,
+    action_name: Option<String>,
+    selected: bool,
 }
 
 impl InventoryPanel {
@@ -30,6 +71,60 @@ impl InventoryPanel {
     }
 
     pub(crate) fn ui(&mut self, ui: &mut egui::Ui, status: &mut String) {
+        self.ensure_selection();
+        if let Err(error) = self.operad_ui(ui, status) {
+            ui.colored_label(Color32::from_rgb(226, 96, 96), error);
+            self.egui_dashboard_ui(ui, status);
+        }
+    }
+
+    fn operad_ui(&mut self, ui: &mut egui::Ui, status: &mut String) -> Result<(), String> {
+        let mut result = Ok(());
+        egui::ScrollArea::vertical()
+            .id_salt("inventory_panel_operad_scroll")
+            .show(ui, |ui| {
+                let width = ui.available_width().max(320.0);
+                let mut view = self.build_operad_view(width);
+                if let Err(error) = view
+                    .document
+                    .compute_layout(view.size, &mut ApproxTextMeasurer)
+                    .map_err(|error| error.to_string())
+                {
+                    result = Err(error);
+                    return;
+                }
+
+                let (rect, response) =
+                    ui.allocate_exact_size(vec2(width, view.size.height), Sense::click());
+                if response.clicked()
+                    && let Some(pointer) = response.interact_pointer_pos()
+                    && let Some(node_name) =
+                        operad_egui::hit_test_name(&view.document, rect, pointer)
+                    && self.handle_operad_action(&node_name, status)
+                {
+                    view = self.build_operad_view(width);
+                    if let Err(error) = view
+                        .document
+                        .compute_layout(view.size, &mut ApproxTextMeasurer)
+                        .map_err(|error| error.to_string())
+                    {
+                        result = Err(error);
+                        return;
+                    }
+                }
+
+                if response.hovered()
+                    && let Some(pointer) = ui.ctx().pointer_hover_pos()
+                    && operad_egui::hit_test_name(&view.document, rect, pointer).is_some()
+                {
+                    ui.output_mut(|output| output.cursor_icon = egui::CursorIcon::PointingHand);
+                }
+                operad_egui::paint_document_at(ui, &view.document, rect);
+            });
+        result
+    }
+
+    fn egui_dashboard_ui(&mut self, ui: &mut egui::Ui, status: &mut String) {
         self.ensure_selection();
         egui::ScrollArea::vertical()
             .id_salt("inventory_panel")
@@ -65,7 +160,535 @@ impl InventoryPanel {
             });
     }
 
+    fn build_operad_view(&self, width: f32) -> InventoryOperadView {
+        let metrics = self.operad_metrics();
+        let filter_rows = self.operad_filter_rows();
+        let alert_rows = self.operad_alert_rows();
+        let location_rows = self.operad_location_rows();
+        let lot_rows = self.operad_lot_rows();
+        let detail_rows = self.operad_detail_rows();
+        let usage_rows = self.operad_usage_rows();
+        let height = inventory_operad_view_height(
+            width,
+            metrics.len(),
+            &[
+                filter_rows.len(),
+                alert_rows.len(),
+                location_rows.len(),
+                lot_rows.len(),
+                detail_rows.len(),
+                usage_rows.len(),
+            ],
+        );
+        let size = UiSize::new(width, height);
+        let mut document = UiDocument::new(root_style(width, height));
+        let root = document.root;
+        document.set_node_visual(
+            root,
+            UiVisual::panel(
+                ColorRgba::new(15, 18, 21, 255),
+                Some(StrokeStyle::new(ColorRgba::new(39, 46, 52, 255), 1.0)),
+                0.0,
+            ),
+        );
+
+        let alert_count = self.inventory.alerts(DEMO_TODAY).len();
+        add_inventory_operad_header(
+            &mut document,
+            root,
+            "MATERIALS CONTROL",
+            "Inventory Tracker",
+            "Material lots, storage posture, usage links, certificates, and release cues",
+            &format!(
+                "{} visible of {} lots · {} alert(s)",
+                lot_rows.len(),
+                self.inventory.lots.len(),
+                alert_count
+            ),
+        );
+        add_inventory_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_inventory_operad_metric_grid(&mut document, root, width, &metrics);
+        add_inventory_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_inventory_operad_section(
+            &mut document,
+            root,
+            width,
+            "inventory.filters",
+            "Quick Filters",
+            "No filters available",
+            &filter_rows,
+        );
+        add_inventory_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_inventory_operad_section(
+            &mut document,
+            root,
+            width,
+            "inventory.alerts",
+            "Alerts",
+            "No low-stock or expiration alerts",
+            &alert_rows,
+        );
+        add_inventory_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_inventory_operad_section(
+            &mut document,
+            root,
+            width,
+            "inventory.locations",
+            "Locations",
+            "No storage locations loaded",
+            &location_rows,
+        );
+        add_inventory_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_inventory_operad_section(
+            &mut document,
+            root,
+            width,
+            "inventory.lots",
+            "Material Lots",
+            "No material lots match this filter",
+            &lot_rows,
+        );
+        add_inventory_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_inventory_operad_section(
+            &mut document,
+            root,
+            width,
+            "inventory.detail",
+            "Selected Material",
+            "No material lot selected",
+            &detail_rows,
+        );
+        add_inventory_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_inventory_operad_section(
+            &mut document,
+            root,
+            width,
+            "inventory.usage",
+            "Usage History",
+            "No usage recorded",
+            &usage_rows,
+        );
+
+        InventoryOperadView { document, size }
+    }
+
+    fn operad_metrics(&self) -> Vec<InventoryMetricTile> {
+        let lots = self.inventory.lots.values().collect::<Vec<_>>();
+        let action_lots = lots
+            .iter()
+            .filter(|lot| InventoryQuickFilter::NeedsAction.matches(lot))
+            .count();
+        let product_hold = lots.iter().filter(|lot| lot.is_expired(DEMO_TODAY)).count();
+        let shortages = lots.iter().filter(|lot| lot.is_low_stock()).count();
+        let expiring = lots.iter().filter(|lot| is_expiring_soon(lot)).count();
+        let usage_count = lots.iter().map(|lot| lot.usage.len()).sum::<usize>();
+        let storage_areas = self.location_counts().len();
+        vec![
+            InventoryMetricTile {
+                label: "Material lots".to_string(),
+                value: self.inventory.lots.len().to_string(),
+                detail: "tracked".to_string(),
+                tone: Tone::Neutral,
+            },
+            InventoryMetricTile {
+                label: "Action required".to_string(),
+                value: action_lots.to_string(),
+                detail: "hold, reorder, or use-first".to_string(),
+                tone: if action_lots > 0 {
+                    Tone::Warning
+                } else {
+                    Tone::Success
+                },
+            },
+            InventoryMetricTile {
+                label: "Product hold".to_string(),
+                value: product_hold.to_string(),
+                detail: "expired lots".to_string(),
+                tone: if product_hold > 0 {
+                    Tone::Danger
+                } else {
+                    Tone::Success
+                },
+            },
+            InventoryMetricTile {
+                label: "Shortages".to_string(),
+                value: shortages.to_string(),
+                detail: "below reorder point".to_string(),
+                tone: if shortages > 0 {
+                    Tone::Warning
+                } else {
+                    Tone::Success
+                },
+            },
+            InventoryMetricTile {
+                label: "Use first".to_string(),
+                value: expiring.to_string(),
+                detail: "within 30 days".to_string(),
+                tone: Tone::Info,
+            },
+            InventoryMetricTile {
+                label: "Locations".to_string(),
+                value: storage_areas.to_string(),
+                detail: "storage areas".to_string(),
+                tone: Tone::Neutral,
+            },
+            InventoryMetricTile {
+                label: "Usage links".to_string(),
+                value: usage_count.to_string(),
+                detail: "fab objects".to_string(),
+                tone: Tone::Neutral,
+            },
+        ]
+    }
+
+    fn operad_filter_rows(&self) -> Vec<InventoryOperadRow> {
+        InventoryQuickFilter::ALL
+            .into_iter()
+            .map(|filter| {
+                let count = self
+                    .inventory
+                    .lots
+                    .values()
+                    .filter(|lot| filter.matches(lot))
+                    .count();
+                InventoryOperadRow {
+                    title: format!("{} ({count})", filter.label()),
+                    detail: if filter == self.quick_filter {
+                        "Current inventory filter".to_string()
+                    } else {
+                        "Click to filter material lots".to_string()
+                    },
+                    tone: if filter == self.quick_filter {
+                        Tone::Info
+                    } else {
+                        Tone::Neutral
+                    },
+                    action_name: Some(format!("{OPERAD_ACTION_FILTER}{}", filter.slug())),
+                    selected: filter == self.quick_filter,
+                }
+            })
+            .collect()
+    }
+
+    fn operad_alert_rows(&self) -> Vec<InventoryOperadRow> {
+        self.inventory
+            .alerts(DEMO_TODAY)
+            .into_iter()
+            .enumerate()
+            .map(|(index, alert)| InventoryOperadRow {
+                title: format!("{} · {}", alert.kind.label(), alert.lot_id),
+                detail: format!("{} · {}", alert.material_name, alert.message),
+                tone: alert_tone(alert.kind),
+                action_name: Some(format!(
+                    "{OPERAD_ACTION_SELECT_LOT}{}|alert.{index}",
+                    alert.lot_id
+                )),
+                selected: self.selected_lot.as_ref() == Some(&alert.lot_id),
+            })
+            .collect()
+    }
+
+    fn operad_location_rows(&self) -> Vec<InventoryOperadRow> {
+        self.location_counts()
+            .into_iter()
+            .map(|(area, summary)| InventoryOperadRow {
+                title: area,
+                detail: if summary.action_required > 0 {
+                    format!(
+                        "{} lot(s), {} need action",
+                        summary.total, summary.action_required
+                    )
+                } else {
+                    format!("{} lot(s), released stock", summary.total)
+                },
+                tone: if summary.action_required > 0 {
+                    Tone::Warning
+                } else {
+                    Tone::Success
+                },
+                action_name: None,
+                selected: false,
+            })
+            .collect()
+    }
+
+    fn operad_lot_rows(&self) -> Vec<InventoryOperadRow> {
+        self.visible_lots()
+            .into_iter()
+            .enumerate()
+            .map(|(index, lot)| InventoryOperadRow {
+                title: format!("{} · {}", lot.id, material_status_label(lot)),
+                detail: format!(
+                    "{} · {} · {} · {}",
+                    truncate_middle(&lot.material_name, 34),
+                    lot.stock.format(),
+                    expiration_label(lot),
+                    lot.location.label()
+                ),
+                tone: material_status_tone(lot),
+                action_name: Some(format!("{OPERAD_ACTION_SELECT_LOT}{}|lot.{index}", lot.id)),
+                selected: self.selected_lot.as_ref() == Some(&lot.id),
+            })
+            .collect()
+    }
+
+    fn operad_detail_rows(&self) -> Vec<InventoryOperadRow> {
+        let Some(lot) = self.selected_lot() else {
+            return Vec::new();
+        };
+        let mut rows = vec![
+            InventoryOperadRow {
+                title: lot.material_name.clone(),
+                detail: format!("{} · {}", lot.id, material_status_label(lot)),
+                tone: material_status_tone(lot),
+                action_name: None,
+                selected: true,
+            },
+            InventoryOperadRow {
+                title: "Stock".to_string(),
+                detail: format!(
+                    "{} on hand · reorder {}{}",
+                    lot.stock.format(),
+                    lot.reorder_threshold.format(),
+                    shortage_label(lot)
+                        .map(|shortage| format!(" · {shortage}"))
+                        .unwrap_or_default()
+                ),
+                tone: if lot.is_low_stock() {
+                    Tone::Warning
+                } else {
+                    Tone::Success
+                },
+                action_name: None,
+                selected: false,
+            },
+            InventoryOperadRow {
+                title: "Expiration".to_string(),
+                detail: expiration_label(lot),
+                tone: if lot.is_expired(DEMO_TODAY) {
+                    Tone::Danger
+                } else if is_expiring_soon(lot) {
+                    Tone::Info
+                } else {
+                    Tone::Neutral
+                },
+                action_name: None,
+                selected: false,
+            },
+            InventoryOperadRow {
+                title: "Release cue".to_string(),
+                detail: release_cue(lot),
+                tone: material_status_tone(lot),
+                action_name: None,
+                selected: false,
+            },
+            InventoryOperadRow {
+                title: "Location / handling".to_string(),
+                detail: format!(
+                    "{} · cabinet {} · bin {} · {}",
+                    lot.location.area,
+                    lot.location.cabinet,
+                    lot.location.bin,
+                    lot.location.temperature
+                ),
+                tone: Tone::Neutral,
+                action_name: None,
+                selected: false,
+            },
+            InventoryOperadRow {
+                title: "Supplier".to_string(),
+                detail: format!(
+                    "{} · lot {} · received {} by {}",
+                    lot.supplier.supplier,
+                    lot.supplier.supplier_lot,
+                    format_date(lot.supplier.received_date),
+                    lot.supplier.received_by
+                ),
+                tone: Tone::Neutral,
+                action_name: None,
+                selected: false,
+            },
+        ];
+        if let Some(certificate_id) = &lot.supplier.certificate_id {
+            rows.push(InventoryOperadRow {
+                title: "Certificate".to_string(),
+                detail: certificate_id.clone(),
+                tone: Tone::Info,
+                action_name: None,
+                selected: false,
+            });
+        }
+        if let Some(certificate_url) = &lot.supplier.certificate_url {
+            rows.push(InventoryOperadRow {
+                title: "Record".to_string(),
+                detail: certificate_url.clone(),
+                tone: Tone::Info,
+                action_name: None,
+                selected: false,
+            });
+        }
+        if !lot.notes.is_empty() {
+            rows.push(InventoryOperadRow {
+                title: "Notes".to_string(),
+                detail: lot.notes.clone(),
+                tone: Tone::Neutral,
+                action_name: None,
+                selected: false,
+            });
+        }
+        rows
+    }
+
+    fn operad_usage_rows(&self) -> Vec<InventoryOperadRow> {
+        let Some(lot) = self.selected_lot() else {
+            return Vec::new();
+        };
+        lot.usage
+            .iter()
+            .map(|usage| InventoryOperadRow {
+                title: format!(
+                    "{} · {}",
+                    format_date(usage.timestamp),
+                    usage.quantity.format()
+                ),
+                detail: format!(
+                    "{} · {} · {}",
+                    usage.actor,
+                    usage
+                        .links
+                        .iter()
+                        .map(|link| link.label())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    usage.note
+                ),
+                tone: Tone::Neutral,
+                action_name: None,
+                selected: false,
+            })
+            .collect()
+    }
+
+    fn handle_operad_action(&mut self, node_name: &str, status: &mut String) -> bool {
+        if let Some(slug) = node_name.strip_prefix(OPERAD_ACTION_FILTER)
+            && let Some(filter) = InventoryQuickFilter::from_slug(slug)
+        {
+            if self.quick_filter != filter {
+                self.quick_filter = filter;
+                self.ensure_selection();
+                *status = format!("inventory filter: {}", self.quick_filter.label());
+            }
+            return true;
+        }
+        if let Some(lot_id) = node_name.strip_prefix(OPERAD_ACTION_SELECT_LOT) {
+            let lot_id = lot_id
+                .split_once('|')
+                .map(|(lot_id, _)| lot_id)
+                .unwrap_or(lot_id);
+            let lot_id = MaterialLotId::new(lot_id.to_string());
+            if self.inventory.lot(&lot_id).is_some() {
+                self.select_alert_lot(lot_id, status);
+                return true;
+            }
+        }
+        false
+    }
+
     pub(crate) fn context_ui(&mut self, ui: &mut egui::Ui) {
+        if self.operad_context_ui(ui).is_err() {
+            self.egui_context_ui(ui);
+        }
+    }
+
+    fn operad_context_ui(&mut self, ui: &mut egui::Ui) -> Result<(), String> {
+        self.ensure_selection();
+        let sections = self.context_sections();
+        render_sidecar(ui, "inventory.context", &sections)
+    }
+
+    fn context_sections(&self) -> Vec<SidecarSection> {
+        let alerts = self.inventory.alerts(DEMO_TODAY);
+        let needs_action = self
+            .inventory
+            .lots
+            .values()
+            .filter(|lot| InventoryQuickFilter::NeedsAction.matches(lot))
+            .count();
+        let low_stock = alerts
+            .iter()
+            .filter(|alert| alert.kind == InventoryAlertKind::LowStock)
+            .count();
+        let expired = alerts
+            .iter()
+            .filter(|alert| alert.kind == InventoryAlertKind::Expired)
+            .count();
+        let mut sections = vec![
+            SidecarSection::new("Inventory")
+                .row(SidecarRow::new(
+                    format!("{} material lots", self.inventory.lots.len()),
+                    format!("{needs_action} need action | {} alerts", alerts.len()),
+                    if needs_action > 0 {
+                        Tone::Warning
+                    } else {
+                        Tone::Neutral
+                    },
+                ))
+                .row(SidecarRow::new(
+                    "Stock alerts",
+                    format!("{low_stock} low stock | {expired} expired"),
+                    if expired > 0 {
+                        Tone::Danger
+                    } else if low_stock > 0 {
+                        Tone::Warning
+                    } else {
+                        Tone::Success
+                    },
+                )),
+        ];
+
+        let selected = self
+            .selected_lot()
+            .map(|lot| {
+                SidecarSection::new("Selected Lot")
+                    .row(
+                        SidecarRow::new(
+                            &lot.material_name,
+                            format!("Lot {} | {}", lot.id, material_status_label(lot)),
+                            if InventoryQuickFilter::NeedsAction.matches(lot) {
+                                Tone::Warning
+                            } else {
+                                Tone::Info
+                            },
+                        )
+                        .selected(true),
+                    )
+                    .row(SidecarRow::new(
+                        "Stock",
+                        lot.stock.format(),
+                        if lot.is_low_stock() {
+                            Tone::Warning
+                        } else {
+                            Tone::Neutral
+                        },
+                    ))
+                    .row(SidecarRow::new(
+                        "Location / expiry",
+                        format!("{} | {}", lot.location.label(), expiration_label(lot)),
+                        if lot.is_expired(DEMO_TODAY) {
+                            Tone::Danger
+                        } else {
+                            Tone::Neutral
+                        },
+                    ))
+            })
+            .unwrap_or_else(|| {
+                SidecarSection::new("Selected Lot").empty("No material lot selected")
+            });
+        sections.push(selected);
+        sections
+    }
+
+    fn egui_context_ui(&mut self, ui: &mut egui::Ui) {
         self.ensure_selection();
         let alerts = self.inventory.alerts(DEMO_TODAY);
         ui_chrome::section_label(ui, "Inventory");
@@ -629,6 +1252,484 @@ impl InventoryPanel {
     }
 }
 
+fn inventory_operad_view_height(width: f32, metric_count: usize, row_counts: &[usize]) -> f32 {
+    let mut height = OPERAD_HEADER_HEIGHT + OPERAD_GAP;
+    height += inventory_operad_metric_grid_height(width, metric_count) + OPERAD_GAP;
+    for row_count in row_counts {
+        height += inventory_operad_section_height(*row_count) + OPERAD_GAP;
+    }
+    height + OPERAD_PAD
+}
+
+fn inventory_operad_metric_columns(width: f32) -> usize {
+    if width >= 1020.0 {
+        4
+    } else if width >= 680.0 {
+        3
+    } else if width >= 440.0 {
+        2
+    } else {
+        1
+    }
+}
+
+fn inventory_operad_metric_grid_height(width: f32, metric_count: usize) -> f32 {
+    let columns = inventory_operad_metric_columns(width).max(1);
+    let rows = metric_count.div_ceil(columns).max(1);
+    rows as f32 * OPERAD_METRIC_HEIGHT
+}
+
+fn inventory_operad_section_height(row_count: usize) -> f32 {
+    OPERAD_PAD * 2.0
+        + OPERAD_SECTION_TITLE_HEIGHT
+        + if row_count == 0 {
+            OPERAD_EMPTY_ROW_HEIGHT
+        } else {
+            row_count as f32 * OPERAD_ROW_HEIGHT
+        }
+}
+
+fn add_inventory_operad_header(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    eyebrow: &str,
+    title: &str,
+    detail: &str,
+    meta: &str,
+) {
+    let header = document.add_child(
+        parent,
+        UiNode::container(
+            "inventory.header",
+            UiNodeStyle {
+                layout: layout::with_padding_all(
+                    layout::with_size(
+                        layout::column(),
+                        layout::percent(1.0),
+                        layout::px(OPERAD_HEADER_HEIGHT),
+                    ),
+                    OPERAD_PAD,
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            ColorRgba::new(22, 27, 32, 255),
+            Some(StrokeStyle::new(ColorRgba::new(46, 55, 64, 255), 1.0)),
+            6.0,
+        )),
+    );
+    add_inventory_operad_text(
+        document,
+        header,
+        "inventory.header.eyebrow",
+        eyebrow,
+        inventory_operad_text_style(12.0, FontWeight::BOLD, ColorRgba::new(146, 154, 162, 255)),
+        16.0,
+    );
+    add_inventory_operad_text(
+        document,
+        header,
+        "inventory.header.title",
+        title,
+        inventory_operad_text_style(24.0, FontWeight::BOLD, ColorRgba::new(242, 246, 250, 255)),
+        30.0,
+    );
+    add_inventory_operad_text(
+        document,
+        header,
+        "inventory.header.detail",
+        detail,
+        inventory_operad_text_style(14.0, FontWeight::NORMAL, ColorRgba::new(178, 185, 194, 255)),
+        20.0,
+    );
+    add_inventory_operad_text(
+        document,
+        header,
+        "inventory.header.meta",
+        meta,
+        inventory_operad_text_style(13.0, FontWeight::NORMAL, ColorRgba::new(112, 183, 239, 255)),
+        18.0,
+    );
+}
+
+fn add_inventory_operad_metric_grid(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    width: f32,
+    metrics: &[InventoryMetricTile],
+) {
+    let columns = inventory_operad_metric_columns(width);
+    let grid_height = inventory_operad_metric_grid_height(width, metrics.len());
+    let grid = document.add_child(
+        parent,
+        UiNode::container(
+            "inventory.metrics",
+            UiNodeStyle {
+                layout: layout::with_size(
+                    layout::column(),
+                    layout::percent(1.0),
+                    layout::px(grid_height),
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        ),
+    );
+    let tile_width =
+        ((width - OPERAD_GAP * (columns.saturating_sub(1) as f32)) / columns as f32).max(120.0);
+    for (row_index, chunk) in metrics.chunks(columns).enumerate() {
+        let row = document.add_child(
+            grid,
+            UiNode::container(
+                format!("inventory.metrics.row.{row_index}"),
+                UiNodeStyle {
+                    layout: layout::with_size(
+                        layout::row(),
+                        layout::percent(1.0),
+                        layout::px(OPERAD_METRIC_HEIGHT),
+                    ),
+                    clip: ClipBehavior::Clip,
+                    ..Default::default()
+                },
+            ),
+        );
+        for (column, metric) in chunk.iter().enumerate() {
+            add_inventory_operad_metric_tile(
+                document,
+                row,
+                &format!("inventory.metrics.{row_index}.{column}"),
+                tile_width - 6.0,
+                metric,
+            );
+        }
+    }
+}
+
+fn add_inventory_operad_metric_tile(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    name: &str,
+    width: f32,
+    metric: &InventoryMetricTile,
+) {
+    let tile = document.add_child(
+        parent,
+        UiNode::container(
+            name,
+            UiNodeStyle {
+                layout: layout::with_padding_all(
+                    layout::with_margin_all(
+                        layout::with_size(
+                            layout::column(),
+                            layout::px(width.max(116.0)),
+                            layout::px(OPERAD_METRIC_HEIGHT - 8.0),
+                        ),
+                        3.0,
+                    ),
+                    9.0,
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            ColorRgba::new(29, 35, 40, 255),
+            Some(StrokeStyle::new(
+                inventory_operad_tone_color(metric.tone),
+                1.0,
+            )),
+            6.0,
+        )),
+    );
+    add_inventory_operad_text(
+        document,
+        tile,
+        &format!("{name}.label"),
+        &metric.label,
+        inventory_operad_text_style(12.0, FontWeight::BOLD, ColorRgba::new(158, 166, 174, 255)),
+        18.0,
+    );
+    add_inventory_operad_text(
+        document,
+        tile,
+        &format!("{name}.value"),
+        &metric.value,
+        inventory_operad_text_style(20.0, FontWeight::BOLD, ColorRgba::new(239, 243, 247, 255)),
+        26.0,
+    );
+    add_inventory_operad_text(
+        document,
+        tile,
+        &format!("{name}.detail"),
+        truncate_middle(&metric.detail, 52),
+        inventory_operad_text_style(
+            12.0,
+            FontWeight::NORMAL,
+            inventory_operad_tone_color(metric.tone),
+        ),
+        18.0,
+    );
+}
+
+fn add_inventory_operad_section(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    width: f32,
+    name: &str,
+    title: &str,
+    empty: &str,
+    rows: &[InventoryOperadRow],
+) {
+    let height = inventory_operad_section_height(rows.len());
+    let section = document.add_child(
+        parent,
+        UiNode::container(
+            name,
+            UiNodeStyle {
+                layout: layout::with_padding_all(
+                    layout::with_size(layout::column(), layout::percent(1.0), layout::px(height)),
+                    OPERAD_PAD,
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            ColorRgba::new(21, 26, 31, 255),
+            Some(StrokeStyle::new(ColorRgba::new(45, 53, 61, 255), 1.0)),
+            6.0,
+        )),
+    );
+    add_inventory_operad_text(
+        document,
+        section,
+        &format!("{name}.title"),
+        title,
+        inventory_operad_text_style(15.0, FontWeight::BOLD, ColorRgba::new(242, 246, 250, 255)),
+        OPERAD_SECTION_TITLE_HEIGHT,
+    );
+    if rows.is_empty() {
+        add_inventory_operad_empty_row(document, section, name, empty);
+    } else {
+        let row_width = (width - OPERAD_PAD * 2.0).max(240.0);
+        for (index, row) in rows.iter().enumerate() {
+            add_inventory_operad_data_row(document, section, name, index, row_width, row);
+        }
+    }
+}
+
+fn add_inventory_operad_empty_row(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    name: &str,
+    label: &str,
+) {
+    let row = document.add_child(
+        parent,
+        UiNode::container(
+            format!("{name}.empty"),
+            UiNodeStyle {
+                layout: layout::with_padding_all(
+                    layout::with_size(
+                        layout::row(),
+                        layout::percent(1.0),
+                        layout::px(OPERAD_EMPTY_ROW_HEIGHT),
+                    ),
+                    8.0,
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            ColorRgba::new(27, 32, 37, 255),
+            Some(StrokeStyle::new(ColorRgba::new(43, 50, 58, 255), 1.0)),
+            5.0,
+        )),
+    );
+    add_inventory_operad_text(
+        document,
+        row,
+        &format!("{name}.empty.label"),
+        label,
+        inventory_operad_text_style(13.0, FontWeight::NORMAL, ColorRgba::new(154, 163, 172, 255)),
+        24.0,
+    );
+}
+
+fn add_inventory_operad_data_row(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    section_name: &str,
+    index: usize,
+    row_width: f32,
+    row: &InventoryOperadRow,
+) {
+    let row_name = row
+        .action_name
+        .clone()
+        .unwrap_or_else(|| format!("{section_name}.row.{index}"));
+    let stroke_color = if row.selected {
+        inventory_operad_tone_color(Tone::Info)
+    } else {
+        ColorRgba::new(42, 50, 58, 255)
+    };
+    let fill = if row.selected {
+        ColorRgba::new(26, 42, 56, 255)
+    } else {
+        ColorRgba::new(26, 31, 36, 255)
+    };
+    let mut node = UiNode::container(
+        row_name,
+        UiNodeStyle {
+            layout: layout::with_padding_all(
+                layout::with_size(
+                    layout::row(),
+                    layout::percent(1.0),
+                    layout::px(OPERAD_ROW_HEIGHT),
+                ),
+                6.0,
+            ),
+            clip: ClipBehavior::Clip,
+            ..Default::default()
+        },
+    )
+    .with_visual(UiVisual::panel(
+        fill,
+        Some(StrokeStyle::new(stroke_color, 1.0)),
+        4.0,
+    ));
+    if row.action_name.is_some() {
+        node = node.with_input(InputBehavior::BUTTON);
+    }
+    let row_node = document.add_child(parent, node);
+    document.add_child(
+        row_node,
+        UiNode::container(
+            format!("{section_name}.row.{index}.tone"),
+            UiNodeStyle {
+                layout: layout::fixed(5.0, OPERAD_ROW_HEIGHT - 12.0),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            inventory_operad_tone_color(row.tone),
+            None,
+            2.0,
+        )),
+    );
+    let text_column = document.add_child(
+        row_node,
+        UiNode::container(
+            format!("{section_name}.row.{index}.text"),
+            UiNodeStyle {
+                layout: layout::with_size(
+                    layout::column(),
+                    layout::px((row_width - 28.0).max(120.0)),
+                    layout::px(OPERAD_ROW_HEIGHT - 12.0),
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        ),
+    );
+    add_inventory_operad_text(
+        document,
+        text_column,
+        &format!("{section_name}.row.{index}.title"),
+        truncate_middle(&row.title, 72),
+        inventory_operad_text_style(14.0, FontWeight::BOLD, ColorRgba::new(232, 237, 242, 255)),
+        21.0,
+    );
+    add_inventory_operad_text(
+        document,
+        text_column,
+        &format!("{section_name}.row.{index}.detail"),
+        truncate_middle(&row.detail, 108),
+        inventory_operad_text_style(12.0, FontWeight::NORMAL, ColorRgba::new(162, 171, 180, 255)),
+        19.0,
+    );
+}
+
+fn add_inventory_operad_spacer(document: &mut UiDocument, parent: UiNodeId, height: f32) {
+    document.add_child(
+        parent,
+        UiNode::container(
+            format!("inventory.spacer.{}", document.node_count()),
+            UiNodeStyle {
+                layout: layout::with_size(layout::row(), layout::percent(1.0), layout::px(height)),
+                ..Default::default()
+            },
+        ),
+    );
+}
+
+fn add_inventory_operad_text(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    name: &str,
+    text: impl Into<String>,
+    style: TextStyle,
+    height: f32,
+) {
+    widgets::label(
+        document,
+        parent,
+        name,
+        text,
+        style,
+        layout::with_size(layout::row(), layout::percent(1.0), layout::px(height)),
+    );
+}
+
+fn inventory_operad_text_style(font_size: f32, weight: FontWeight, color: ColorRgba) -> TextStyle {
+    TextStyle {
+        font_size,
+        line_height: font_size + 4.0,
+        weight,
+        color,
+        wrap: TextWrap::None,
+        ..Default::default()
+    }
+}
+
+fn inventory_operad_tone_color(tone: Tone) -> ColorRgba {
+    let color = tone.color();
+    ColorRgba::new(color.r(), color.g(), color.b(), color.a())
+}
+
+fn alert_tone(kind: InventoryAlertKind) -> Tone {
+    match kind {
+        InventoryAlertKind::LowStock => Tone::Warning,
+        InventoryAlertKind::Expired => Tone::Danger,
+        InventoryAlertKind::ExpiringSoon => Tone::Info,
+    }
+}
+
+fn truncate_middle(text: impl AsRef<str>, max_chars: usize) -> String {
+    let text = text.as_ref();
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_string();
+    }
+    let keep = max_chars.saturating_sub(3);
+    let head = keep / 2;
+    let tail = keep - head;
+    let start = text.chars().take(head).collect::<String>();
+    let end = text
+        .chars()
+        .rev()
+        .take(tail)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!("{start}...{end}")
+}
+
 fn stock_color(lot: &MaterialLot) -> Color32 {
     if lot.is_low_stock() {
         Color32::from_rgb(220, 176, 72)
@@ -673,6 +1774,29 @@ impl InventoryQuickFilter {
             Self::LowStock => "Low stock",
             Self::ExpiringSoon => "Expiring",
             Self::InUse => "In use",
+        }
+    }
+
+    fn slug(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::NeedsAction => "action",
+            Self::ProductHold => "hold",
+            Self::LowStock => "low-stock",
+            Self::ExpiringSoon => "expiring",
+            Self::InUse => "in-use",
+        }
+    }
+
+    fn from_slug(slug: &str) -> Option<Self> {
+        match slug {
+            "all" => Some(Self::All),
+            "action" => Some(Self::NeedsAction),
+            "hold" => Some(Self::ProductHold),
+            "low-stock" => Some(Self::LowStock),
+            "expiring" => Some(Self::ExpiringSoon),
+            "in-use" => Some(Self::InUse),
+            _ => None,
         }
     }
 
@@ -858,4 +1982,44 @@ fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
     let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     i64::from(era * 146_097 + doe - 719_468)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inventory_operad_view_audits_common_widths() {
+        let panel = InventoryPanel::from_inventory(Inventory::sample());
+        for width in [360.0, 760.0, 1200.0] {
+            let mut view = panel.build_operad_view(width);
+            view.document
+                .compute_layout(view.size, &mut ApproxTextMeasurer)
+                .unwrap();
+            let warnings = view.document.audit_layout();
+            assert!(warnings.is_empty(), "{warnings:#?}");
+            assert!(view.document.node_count() > 20);
+            assert!(!view.document.paint_list().items.is_empty());
+        }
+    }
+
+    #[test]
+    fn inventory_operad_actions_update_panel_state() {
+        let mut panel = InventoryPanel::from_inventory(Inventory::sample());
+        let mut status = String::new();
+
+        assert!(
+            panel.handle_operad_action(&format!("{OPERAD_ACTION_FILTER}low-stock"), &mut status)
+        );
+        assert_eq!(panel.quick_filter, InventoryQuickFilter::LowStock);
+        assert!(status.contains("Low stock"));
+
+        let target_lot = panel.visible_lots().first().unwrap().id.clone();
+        assert!(panel.handle_operad_action(
+            &format!("{OPERAD_ACTION_SELECT_LOT}{target_lot}"),
+            &mut status
+        ));
+        assert_eq!(panel.selected_lot.as_ref(), Some(&target_lot));
+        assert!(status.contains(&target_lot.to_string()));
+    }
 }

@@ -2,7 +2,11 @@ use eframe::egui::{self, Color32, Margin, RichText, Stroke, StrokeKind, Vec2, ve
 
 pub(crate) const NAV_WIDTH: f32 = 108.0;
 pub(crate) const INSPECTOR_WIDTH: f32 = 268.0;
+pub(crate) const INSPECTOR_MIN_WIDTH: f32 = 220.0;
+pub(crate) const INSPECTOR_MAX_WIDTH: f32 = 360.0;
 pub(crate) const LAYERS_WIDTH: f32 = 228.0;
+pub(crate) const LAYERS_MIN_WIDTH: f32 = 200.0;
+pub(crate) const LAYERS_MAX_WIDTH: f32 = 320.0;
 pub(crate) const INLINE_SIDE_PANEL_MIN_WIDTH: f32 = 980.0;
 pub(crate) const COMPACT_MENU_WIDTH: f32 = 720.0;
 pub(crate) const COMPACT_TOOL_STRIP_WIDTH: f32 = 620.0;

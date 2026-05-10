@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, error::Error, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt,
+};
 
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -924,9 +928,518 @@ pub struct FabMesData {
     pub travelers: BTreeMap<LotId, TravelerState>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FabMesValidationSeverity {
+    Error,
+    Warning,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FabMesValidationFinding {
+    pub severity: FabMesValidationSeverity,
+    pub message: String,
+}
+
+impl FabMesValidationFinding {
+    fn error(message: impl Into<String>) -> Self {
+        Self {
+            severity: FabMesValidationSeverity::Error,
+            message: message.into(),
+        }
+    }
+
+    fn warning(message: impl Into<String>) -> Self {
+        Self {
+            severity: FabMesValidationSeverity::Warning,
+            message: message.into(),
+        }
+    }
+}
+
 impl FabMesData {
     pub fn sample() -> Self {
         sample_fab_data()
+    }
+
+    pub fn validate(&self) -> Vec<FabMesValidationFinding> {
+        let mut findings = Vec::new();
+
+        for (route_id, route) in &self.routes {
+            validate_route(route_id, route, &mut findings);
+        }
+        for (lot_id, lot) in &self.lots {
+            validate_lot(lot_id, lot, self.routes.get(&lot.route_id), &mut findings);
+        }
+        for (traveler_id, traveler) in &self.travelers {
+            validate_traveler(
+                traveler_id,
+                traveler,
+                self.lots.get(&traveler.lot_id),
+                self.routes.get(&traveler.route_id),
+                &mut findings,
+            );
+        }
+
+        findings
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.validate()
+            .iter()
+            .all(|finding| finding.severity != FabMesValidationSeverity::Error)
+    }
+}
+
+fn validate_route(
+    route_id: &ProcessRouteId,
+    route: &ProcessRoute,
+    findings: &mut Vec<FabMesValidationFinding>,
+) {
+    if route_id.as_str().trim().is_empty() {
+        findings.push(FabMesValidationFinding::error("MES route id is empty"));
+    }
+    if route.id != *route_id {
+        findings.push(FabMesValidationFinding::error(format!(
+            "MES route key {route_id} does not match route id {}",
+            route.id
+        )));
+    }
+    if route.steps.is_empty() {
+        findings.push(FabMesValidationFinding::error(format!(
+            "MES route {route_id} has no process steps"
+        )));
+    }
+
+    let mut step_ids = BTreeSet::new();
+    let mut sequences = BTreeMap::new();
+    for step in &route.steps {
+        if step.id.as_str().trim().is_empty() {
+            findings.push(FabMesValidationFinding::error(format!(
+                "MES route {route_id} contains an empty step id"
+            )));
+        }
+        if !step_ids.insert(step.id.clone()) {
+            findings.push(FabMesValidationFinding::error(format!(
+                "MES route {route_id} contains duplicate step id {}",
+                step.id
+            )));
+        }
+        if let Some(previous_step) = sequences.insert(step.sequence, step.id.clone()) {
+            findings.push(FabMesValidationFinding::error(format!(
+                "MES route {route_id} steps {previous_step} and {} share sequence {}",
+                step.id, step.sequence
+            )));
+        }
+        if step.sequence == 0 {
+            findings.push(FabMesValidationFinding::error(format!(
+                "MES route {route_id} step {} has invalid sequence 0",
+                step.id
+            )));
+        }
+        if step.name.trim().is_empty() {
+            findings.push(FabMesValidationFinding::warning(format!(
+                "MES route {route_id} step {} has no display name",
+                step.id
+            )));
+        }
+        if step.area.trim().is_empty() {
+            findings.push(FabMesValidationFinding::warning(format!(
+                "MES route {route_id} step {} has no area",
+                step.id
+            )));
+        }
+        if step.required_recipe.as_str().trim().is_empty() {
+            findings.push(FabMesValidationFinding::error(format!(
+                "MES route {route_id} step {} has no required recipe",
+                step.id
+            )));
+        }
+
+        let mut eligible_tools = BTreeSet::new();
+        for tool_id in &step.eligible_tools {
+            if tool_id.as_str().trim().is_empty() {
+                findings.push(FabMesValidationFinding::error(format!(
+                    "MES route {route_id} step {} has an empty eligible tool id",
+                    step.id
+                )));
+            }
+            if !eligible_tools.insert(tool_id.clone()) {
+                findings.push(FabMesValidationFinding::warning(format!(
+                    "MES route {route_id} step {} repeats eligible tool {tool_id}",
+                    step.id
+                )));
+            }
+        }
+    }
+}
+
+fn validate_lot(
+    lot_id: &LotId,
+    lot: &Lot,
+    route: Option<&ProcessRoute>,
+    findings: &mut Vec<FabMesValidationFinding>,
+) {
+    if lot_id.as_str().trim().is_empty() {
+        findings.push(FabMesValidationFinding::error("MES lot id is empty"));
+    }
+    if lot.id != *lot_id {
+        findings.push(FabMesValidationFinding::error(format!(
+            "MES lot key {lot_id} does not match lot id {}",
+            lot.id
+        )));
+    }
+    let Some(route) = route else {
+        findings.push(FabMesValidationFinding::error(format!(
+            "MES lot {lot_id} references missing route {}",
+            lot.route_id
+        )));
+        return;
+    };
+
+    if lot.wafers.is_empty() {
+        findings.push(FabMesValidationFinding::warning(format!(
+            "MES lot {lot_id} has no wafers"
+        )));
+    }
+
+    let mut wafer_ids = BTreeSet::new();
+    let mut slots = BTreeSet::new();
+    for wafer in &lot.wafers {
+        if wafer.id.as_str().trim().is_empty() {
+            findings.push(FabMesValidationFinding::error(format!(
+                "MES lot {lot_id} contains an empty wafer id"
+            )));
+        }
+        if !wafer_ids.insert(wafer.id.clone()) {
+            findings.push(FabMesValidationFinding::error(format!(
+                "MES lot {lot_id} contains duplicate wafer id {}",
+                wafer.id
+            )));
+        }
+        if wafer.slot == 0 {
+            findings.push(FabMesValidationFinding::error(format!(
+                "MES lot {lot_id} wafer {} has invalid slot 0",
+                wafer.id
+            )));
+        }
+        if !slots.insert(wafer.slot) {
+            findings.push(FabMesValidationFinding::error(format!(
+                "MES lot {lot_id} contains duplicate wafer slot {}",
+                wafer.slot
+            )));
+        }
+        match &wafer.status {
+            WaferStatus::InRework {
+                from_step,
+                target_step,
+                reason,
+            } => {
+                validate_optional_step_ref(
+                    route,
+                    from_step.as_ref(),
+                    format!("MES lot {lot_id} wafer {} rework source", wafer.id),
+                    findings,
+                );
+                validate_step_ref(
+                    route,
+                    target_step,
+                    format!("MES lot {lot_id} wafer {} rework target", wafer.id),
+                    findings,
+                );
+                if reason.trim().is_empty() {
+                    findings.push(FabMesValidationFinding::warning(format!(
+                        "MES lot {lot_id} wafer {} is in rework without a reason",
+                        wafer.id
+                    )));
+                }
+            }
+            WaferStatus::Scrapped { step_id, reason } => {
+                validate_optional_step_ref(
+                    route,
+                    step_id.as_ref(),
+                    format!("MES lot {lot_id} wafer {} scrap step", wafer.id),
+                    findings,
+                );
+                if reason.trim().is_empty() {
+                    findings.push(FabMesValidationFinding::warning(format!(
+                        "MES lot {lot_id} wafer {} is scrapped without a reason",
+                        wafer.id
+                    )));
+                }
+            }
+            WaferStatus::Active => {}
+        }
+    }
+}
+
+fn validate_traveler(
+    traveler_id: &LotId,
+    traveler: &TravelerState,
+    lot: Option<&Lot>,
+    route: Option<&ProcessRoute>,
+    findings: &mut Vec<FabMesValidationFinding>,
+) {
+    if traveler_id.as_str().trim().is_empty() {
+        findings.push(FabMesValidationFinding::error("MES traveler id is empty"));
+    }
+    if traveler.lot_id != *traveler_id {
+        findings.push(FabMesValidationFinding::error(format!(
+            "MES traveler key {traveler_id} does not match traveler lot {}",
+            traveler.lot_id
+        )));
+    }
+    let Some(lot) = lot else {
+        findings.push(FabMesValidationFinding::error(format!(
+            "MES traveler {traveler_id} references missing lot {}",
+            traveler.lot_id
+        )));
+        return;
+    };
+    if traveler.route_id != lot.route_id {
+        findings.push(FabMesValidationFinding::error(format!(
+            "MES traveler {traveler_id} route {} does not match lot route {}",
+            traveler.route_id, lot.route_id
+        )));
+    }
+    let Some(route) = route else {
+        findings.push(FabMesValidationFinding::error(format!(
+            "MES traveler {traveler_id} references missing route {}",
+            traveler.route_id
+        )));
+        return;
+    };
+
+    validate_optional_step_ref(
+        route,
+        traveler.current_step_id.as_ref(),
+        format!("MES traveler {traveler_id} current step"),
+        findings,
+    );
+
+    if traveler.active_run.is_some() && traveler.pending_signoff.is_some() {
+        findings.push(FabMesValidationFinding::error(format!(
+            "MES traveler {traveler_id} has both an active run and a pending signoff"
+        )));
+    }
+    match traveler.status {
+        TravelerStatus::Running if traveler.active_run.is_none() => {
+            findings.push(FabMesValidationFinding::error(format!(
+                "MES traveler {traveler_id} is running without an active run"
+            )));
+        }
+        TravelerStatus::WaitingForSignoff if traveler.pending_signoff.is_none() => {
+            findings.push(FabMesValidationFinding::error(format!(
+                "MES traveler {traveler_id} is waiting for signoff without pending signoff data"
+            )));
+        }
+        TravelerStatus::OnHold if traveler.hold.is_none() => {
+            findings.push(FabMesValidationFinding::error(format!(
+                "MES traveler {traveler_id} is on hold without hold details"
+            )));
+        }
+        TravelerStatus::Complete | TravelerStatus::Scrapped
+            if traveler.current_step_id.is_some()
+                || traveler.active_run.is_some()
+                || traveler.pending_signoff.is_some() =>
+        {
+            findings.push(FabMesValidationFinding::error(format!(
+                "MES traveler {traveler_id} has terminal status with active step state"
+            )));
+        }
+        _ => {}
+    }
+    if traveler.status != TravelerStatus::OnHold && traveler.hold.is_some() {
+        findings.push(FabMesValidationFinding::error(format!(
+            "MES traveler {traveler_id} has hold details while status is {:?}",
+            traveler.status
+        )));
+    }
+    if let Some(hold) = &traveler.hold
+        && hold.previous_status == TravelerStatus::OnHold
+    {
+        findings.push(FabMesValidationFinding::error(format!(
+            "MES traveler {traveler_id} hold state cannot resume to OnHold"
+        )));
+    }
+
+    if let Some(run) = &traveler.active_run {
+        if !traveler_can_carry_state(&traveler.status, &traveler.hold, TravelerStatus::Running) {
+            findings.push(FabMesValidationFinding::error(format!(
+                "MES traveler {traveler_id} has active run while status is {:?}",
+                traveler.status
+            )));
+        }
+        validate_active_run(route, traveler_id, "active run", run, findings);
+    }
+    if let Some(signoff) = &traveler.pending_signoff {
+        if !traveler_can_carry_state(
+            &traveler.status,
+            &traveler.hold,
+            TravelerStatus::WaitingForSignoff,
+        ) {
+            findings.push(FabMesValidationFinding::error(format!(
+                "MES traveler {traveler_id} has pending signoff while status is {:?}",
+                traveler.status
+            )));
+        }
+        validate_active_run(
+            route,
+            traveler_id,
+            "pending signoff",
+            &signoff.run,
+            findings,
+        );
+        if let Some(step) = route.step(&signoff.run.step_id)
+            && !step.signoff_required
+        {
+            findings.push(FabMesValidationFinding::error(format!(
+                "MES traveler {traveler_id} has pending signoff for non-signoff step {}",
+                signoff.run.step_id
+            )));
+        }
+    }
+    for completed in &traveler.completed_steps {
+        validate_completed_step(route, traveler_id, lot, completed, findings);
+    }
+}
+
+fn validate_completed_step(
+    route: &ProcessRoute,
+    traveler_id: &LotId,
+    lot: &Lot,
+    completed: &CompletedStep,
+    findings: &mut Vec<FabMesValidationFinding>,
+) {
+    let Some(step) = route.step(&completed.step_id) else {
+        findings.push(FabMesValidationFinding::error(format!(
+            "MES traveler {traveler_id} completed step {} is missing from route {}",
+            completed.step_id, route.id
+        )));
+        return;
+    };
+    if completed.recipe_id != step.required_recipe {
+        findings.push(FabMesValidationFinding::error(format!(
+            "MES traveler {traveler_id} completed step {} used recipe {}, but step requires {}",
+            completed.step_id, completed.recipe_id, step.required_recipe
+        )));
+    }
+    if !step.eligible_tools.is_empty() && !step.eligible_tools.contains(&completed.tool_id) {
+        findings.push(FabMesValidationFinding::error(format!(
+            "MES traveler {traveler_id} completed step {} used ineligible tool {}",
+            completed.step_id, completed.tool_id
+        )));
+    }
+    if step.signoff_required && completed.signed_off_by.is_none() {
+        findings.push(FabMesValidationFinding::error(format!(
+            "MES traveler {traveler_id} completed signoff step {} has no signoff operator",
+            completed.step_id
+        )));
+    }
+    if !step.signoff_required && completed.signed_off_by.is_some() {
+        findings.push(FabMesValidationFinding::warning(format!(
+            "MES traveler {traveler_id} completed non-signoff step {} carries signoff metadata",
+            completed.step_id
+        )));
+    }
+    if completed.reworked_wafers > lot.wafers.len() {
+        findings.push(FabMesValidationFinding::error(format!(
+            "MES traveler {traveler_id} completed step {} reports {} reworked wafers for {} wafer lot",
+            completed.step_id,
+            completed.reworked_wafers,
+            lot.wafers.len()
+        )));
+    }
+    if completed.completed_by.trim().is_empty() {
+        findings.push(FabMesValidationFinding::warning(format!(
+            "MES traveler {traveler_id} completed step {} has no completing operator",
+            completed.step_id
+        )));
+    }
+    if completed
+        .signed_off_by
+        .as_deref()
+        .is_some_and(|actor| actor.trim().is_empty())
+    {
+        findings.push(FabMesValidationFinding::warning(format!(
+            "MES traveler {traveler_id} completed step {} has empty signoff operator",
+            completed.step_id
+        )));
+    }
+}
+
+fn validate_active_run(
+    route: &ProcessRoute,
+    traveler_id: &LotId,
+    label: &str,
+    run: &ActiveStepRun,
+    findings: &mut Vec<FabMesValidationFinding>,
+) {
+    let Some(step) = route.step(&run.step_id) else {
+        findings.push(FabMesValidationFinding::error(format!(
+            "MES traveler {traveler_id} {label} step {} is missing from route {}",
+            run.step_id, route.id
+        )));
+        return;
+    };
+    if step.required_tool_class != run.tool_class {
+        findings.push(FabMesValidationFinding::error(format!(
+            "MES traveler {traveler_id} {label} uses tool class {}, but step {} requires {}",
+            run.tool_class, run.step_id, step.required_tool_class
+        )));
+    }
+    if step.required_recipe != run.recipe_id {
+        findings.push(FabMesValidationFinding::error(format!(
+            "MES traveler {traveler_id} {label} uses recipe {}, but step {} requires {}",
+            run.recipe_id, run.step_id, step.required_recipe
+        )));
+    }
+    if !step.eligible_tools.is_empty() && !step.eligible_tools.contains(&run.tool_id) {
+        findings.push(FabMesValidationFinding::error(format!(
+            "MES traveler {traveler_id} {label} uses ineligible tool {} for step {}",
+            run.tool_id, run.step_id
+        )));
+    }
+    if run.operator.trim().is_empty() {
+        findings.push(FabMesValidationFinding::warning(format!(
+            "MES traveler {traveler_id} {label} has no operator"
+        )));
+    }
+}
+
+fn traveler_can_carry_state(
+    status: &TravelerStatus,
+    hold: &Option<HoldState>,
+    active_status: TravelerStatus,
+) -> bool {
+    status == &active_status
+        || matches!(
+            (status, hold),
+            (TravelerStatus::OnHold, Some(hold)) if hold.previous_status == active_status
+        )
+}
+
+fn validate_optional_step_ref(
+    route: &ProcessRoute,
+    step_id: Option<&ProcessStepId>,
+    label: String,
+    findings: &mut Vec<FabMesValidationFinding>,
+) {
+    if let Some(step_id) = step_id {
+        validate_step_ref(route, step_id, label, findings);
+    }
+}
+
+fn validate_step_ref(
+    route: &ProcessRoute,
+    step_id: &ProcessStepId,
+    label: String,
+    findings: &mut Vec<FabMesValidationFinding>,
+) {
+    if route.step(step_id).is_none() {
+        findings.push(FabMesValidationFinding::error(format!(
+            "{label} {step_id} is missing from route {}",
+            route.id
+        )));
     }
 }
 
@@ -1067,6 +1580,178 @@ mod tests {
             recipe_id: step.required_recipe.clone(),
             operator: "op.test".to_string(),
         }
+    }
+
+    fn has_validation_error(findings: &[FabMesValidationFinding], needle: &str) -> bool {
+        findings.iter().any(|finding| {
+            finding.severity == FabMesValidationSeverity::Error && finding.message.contains(needle)
+        })
+    }
+
+    fn has_validation_warning(findings: &[FabMesValidationFinding], needle: &str) -> bool {
+        findings.iter().any(|finding| {
+            finding.severity == FabMesValidationSeverity::Warning
+                && finding.message.contains(needle)
+        })
+    }
+
+    #[test]
+    fn fab_mes_validation_accepts_sample_data() {
+        let data = sample_fab_data();
+        let findings = data.validate();
+
+        assert!(findings.is_empty(), "{findings:?}");
+        assert!(data.is_valid());
+    }
+
+    #[test]
+    fn fab_mes_validation_rejects_broken_lot_route() {
+        let mut data = sample_fab_data();
+        let lot_id = LotId::new("L-00042");
+        data.lots.get_mut(&lot_id).unwrap().route_id = ProcessRouteId::new("ROUTE-MISSING");
+
+        let findings = data.validate();
+
+        assert!(has_validation_error(
+            &findings,
+            "MES lot L-00042 references missing route ROUTE-MISSING"
+        ));
+        assert!(!data.is_valid());
+    }
+
+    #[test]
+    fn fab_mes_validation_rejects_mismatched_traveler_key_and_step() {
+        let mut data = sample_fab_data();
+        let lot_id = LotId::new("L-00042");
+        let mut traveler = data.travelers.remove(&lot_id).unwrap();
+        traveler.current_step_id = Some(ProcessStepId::new("S999-MISSING"));
+        data.travelers
+            .insert(LotId::new("L-TRAVELER-KEY-MISMATCH"), traveler);
+
+        let findings = data.validate();
+
+        assert!(has_validation_error(
+            &findings,
+            "MES traveler key L-TRAVELER-KEY-MISMATCH does not match traveler lot L-00042"
+        ));
+        assert!(has_validation_error(
+            &findings,
+            "MES traveler L-TRAVELER-KEY-MISMATCH current step S999-MISSING"
+        ));
+    }
+
+    #[test]
+    fn fab_mes_validation_rejects_empty_ids_and_invalid_completed_steps() {
+        let mut data = sample_fab_data();
+        let route = data
+            .routes
+            .get_mut(&ProcessRouteId::new("ROUTE-DEMO-INVERTER-POLY-A"))
+            .unwrap();
+        route.steps[0].sequence = 0;
+        route.steps[0].eligible_tools.push(ToolId::new(""));
+        let lot_id = LotId::new("L-00042");
+        let lot = data.lots.get_mut(&lot_id).unwrap();
+        lot.wafers[0].id = WaferId::new("");
+        lot.wafers[0].slot = 0;
+        lot.wafers[1].status = WaferStatus::Scrapped {
+            step_id: Some(ProcessStepId::new("S010-COAT")),
+            reason: String::new(),
+        };
+        lot.wafers[2].status = WaferStatus::InRework {
+            from_step: Some(ProcessStepId::new("S010-COAT")),
+            target_step: ProcessStepId::new("S010-COAT"),
+            reason: String::new(),
+        };
+        let traveler = data.travelers.get_mut(&lot_id).unwrap();
+        traveler.completed_steps[0].recipe_id = RecipeId::new("ETCH_CF4_POLY_001");
+        traveler.completed_steps[0].tool_id = ToolId::new("ETCH-99");
+        traveler.completed_steps[0].signed_off_by = Some("qa.lead".to_string());
+        traveler.completed_steps[0].reworked_wafers = 26;
+        traveler.completed_steps.push(CompletedStep {
+            step_id: ProcessStepId::new("S020-EXPOSE"),
+            tool_id: ToolId::new("ALIGNER-01"),
+            recipe_id: RecipeId::new("LITHO_POLY_EXPOSE_001"),
+            completed_by: "op.litho".to_string(),
+            signed_off_by: None,
+            reworked_wafers: 0,
+        });
+
+        let findings = data.validate();
+
+        assert!(has_validation_error(
+            &findings,
+            "MES route ROUTE-DEMO-INVERTER-POLY-A step S010-COAT has invalid sequence 0"
+        ));
+        assert!(has_validation_error(
+            &findings,
+            "MES route ROUTE-DEMO-INVERTER-POLY-A step S010-COAT has an empty eligible tool id"
+        ));
+        assert!(has_validation_error(
+            &findings,
+            "MES lot L-00042 contains an empty wafer id"
+        ));
+        assert!(has_validation_error(
+            &findings,
+            "MES lot L-00042 wafer  has invalid slot 0"
+        ));
+        assert!(has_validation_error(
+            &findings,
+            "MES traveler L-00042 completed step S010-COAT used recipe ETCH_CF4_POLY_001"
+        ));
+        assert!(has_validation_error(
+            &findings,
+            "MES traveler L-00042 completed step S010-COAT used ineligible tool ETCH-99"
+        ));
+        assert!(has_validation_error(
+            &findings,
+            "MES traveler L-00042 completed step S010-COAT reports 26 reworked wafers for 25 wafer lot"
+        ));
+        assert!(has_validation_error(
+            &findings,
+            "MES traveler L-00042 completed signoff step S020-EXPOSE has no signoff operator"
+        ));
+        assert!(has_validation_warning(
+            &findings,
+            "MES lot L-00042 wafer L-00042-W02 is scrapped without a reason"
+        ));
+        assert!(has_validation_warning(
+            &findings,
+            "MES lot L-00042 wafer L-00042-W03 is in rework without a reason"
+        ));
+        assert!(has_validation_warning(
+            &findings,
+            "MES traveler L-00042 completed non-signoff step S010-COAT carries signoff metadata"
+        ));
+    }
+
+    #[test]
+    fn fab_mes_validation_rejects_impossible_active_state() {
+        let mut data = sample_fab_data();
+        let lot_id = LotId::new("L-00042");
+        let traveler = data.travelers.get_mut(&lot_id).unwrap();
+        traveler.status = TravelerStatus::Running;
+        traveler.active_run = Some(ActiveStepRun {
+            step_id: ProcessStepId::new("S010-COAT"),
+            tool_id: ToolId::new("TRACK-01"),
+            tool_class: ToolClass::LithographyTrack,
+            recipe_id: RecipeId::new("SPIN_PR_3000"),
+            operator: String::new(),
+        });
+
+        let findings = data.validate();
+
+        assert!(has_validation_warning(
+            &findings,
+            "MES traveler L-00042 active run has no operator"
+        ));
+
+        let traveler = data.travelers.get_mut(&lot_id).unwrap();
+        traveler.active_run = None;
+        let findings = data.validate();
+        assert!(has_validation_error(
+            &findings,
+            "MES traveler L-00042 is running without an active run"
+        ));
     }
 
     #[test]

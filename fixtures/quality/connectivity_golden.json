@@ -1,0 +1,45 @@
+{
+  "name": "connectivity golden",
+  "shapes": [
+    { "kind": "rect", "layer": "metal1", "x": 0, "y": 0, "w": 500, "h": 500 },
+    { "kind": "rect", "layer": "via1", "x": 200, "y": 200, "w": 100, "h": 100 },
+    { "kind": "rect", "layer": "metal2", "x": 150, "y": 150, "w": 500, "h": 500 },
+    { "kind": "label", "layer": "annotation", "x": 250, "y": 250, "text": "DATA" },
+
+    { "kind": "rect", "layer": "metal1", "x": 2000, "y": 0, "w": 500, "h": 300 },
+    { "kind": "label", "layer": "annotation", "x": 2050, "y": 100, "text": "VDD" },
+    { "kind": "label", "layer": "annotation", "x": 2350, "y": 100, "text": "VSS" },
+
+    { "kind": "rect", "layer": "metal1", "x": 4000, "y": 0, "w": 300, "h": 300 },
+    { "kind": "label", "layer": "annotation", "x": 4100, "y": 100, "text": "CLK" },
+    { "kind": "rect", "layer": "metal1", "x": 5000, "y": 0, "w": 300, "h": 300 },
+    { "kind": "label", "layer": "annotation", "x": 5100, "y": 100, "text": "CLK" }
+  ],
+  "expect": {
+    "health": "shorts and opens",
+    "component_count": 4,
+    "labeled_component_count": 3,
+    "short_count": 1,
+    "short_names": ["VDD", "VSS"],
+    "short_key": "short|VDD,VSS|2000,0,2500,300",
+    "open_count": 1,
+    "open_name": "CLK",
+    "open_key": "open|CLK|4000,0,5300,300",
+    "open_component_count": 2,
+    "data_component_shape_count": 3
+  },
+  "issue_states": [
+    {
+      "key": "short|VDD,VSS|2000,0,2500,300",
+      "hidden": true,
+      "waived": true,
+      "note": "fixture short reviewed"
+    },
+    {
+      "key": "open|CLK|4000,0,5300,300",
+      "hidden": false,
+      "waived": true,
+      "note": "fixture open accepted for demo"
+    }
+  ]
+}

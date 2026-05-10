@@ -8,9 +8,29 @@ use layout_model::{
     recipe::{RecipeUnit, format_parameter_value},
     yield_analysis::YieldAnalysis,
 };
+use operad::{
+    ApproxTextMeasurer, ClipBehavior, ColorRgba, FontWeight, InputBehavior, StrokeStyle, TextStyle,
+    TextWrap, UiDocument, UiNode, UiNodeId, UiNodeStyle, UiSize, UiVisual, layout, root_style,
+    widgets,
+};
 use web_time::Instant;
 
-use crate::ui_chrome;
+use crate::{
+    operad_egui,
+    operad_sidecar::{SidecarRow, SidecarSection, render_sidecar},
+    ui_chrome::{self, Tone},
+};
+
+const OPERAD_HEADER_HEIGHT: f32 = 104.0;
+const OPERAD_METRIC_HEIGHT: f32 = 88.0;
+const OPERAD_SECTION_TITLE_HEIGHT: f32 = 26.0;
+const OPERAD_ROW_HEIGHT: f32 = 58.0;
+const OPERAD_EMPTY_ROW_HEIGHT: f32 = 44.0;
+const OPERAD_GAP: f32 = 10.0;
+const OPERAD_PAD: f32 = 12.0;
+const OPERAD_ACTION_SELECT_LOOP: &str = "process_control.action.select_loop.";
+const OPERAD_ACTION_SELECT_RECOMMENDATION: &str = "process_control.action.select_recommendation.";
+const OPERAD_ACTION_TRANSITION: &str = "process_control.action.transition.";
 
 pub(crate) struct ProcessControlPanel {
     model: ProcessControlModel,
@@ -18,6 +38,29 @@ pub(crate) struct ProcessControlPanel {
     selected_action: Option<ControlActionId>,
     actor: String,
     session_started: Instant,
+}
+
+#[derive(Debug)]
+struct ProcessControlOperadView {
+    document: UiDocument,
+    size: UiSize,
+}
+
+#[derive(Clone, Debug)]
+struct ProcessControlMetricTile {
+    label: String,
+    value: String,
+    detail: String,
+    tone: Tone,
+}
+
+#[derive(Clone, Debug)]
+struct ProcessControlOperadRow {
+    title: String,
+    detail: String,
+    tone: Tone,
+    action_name: Option<String>,
+    selected: bool,
 }
 
 impl ProcessControlPanel {
@@ -46,6 +89,138 @@ impl ProcessControlPanel {
     }
 
     pub(crate) fn context_ui(&mut self, ui: &mut egui::Ui, analysis: &YieldAnalysis) {
+        if self.operad_context_ui(ui, analysis).is_err() {
+            self.egui_context_ui(ui, analysis);
+        }
+    }
+
+    fn operad_context_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        analysis: &YieldAnalysis,
+    ) -> Result<(), String> {
+        self.ensure_selection();
+        let Some(loop_id) = self.selected_loop.clone() else {
+            return render_sidecar(
+                ui,
+                "process_control.context",
+                &[SidecarSection::new("Process Control").empty("No control loops loaded")],
+            );
+        };
+        let Some(loop_definition) = self.model.loop_by_id(&loop_id).cloned() else {
+            return render_sidecar(
+                ui,
+                "process_control.context",
+                &[
+                    SidecarSection::new("Process Control")
+                        .empty("Selected control loop is missing"),
+                ],
+            );
+        };
+        let trend = self.model.trend_for_loop(&loop_id).to_vec();
+        let actions = self
+            .model
+            .actions_for_loop(&loop_id)
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let (state_label, state_tone, state_detail) =
+            loop_control_state(&loop_definition, &trend, &actions);
+        let mut sections = vec![
+            SidecarSection::new("Process Control")
+                .row(
+                    SidecarRow::new(
+                        &loop_definition.name,
+                        format!(
+                            "{} | {}",
+                            loop_definition.output.measurement_name, state_detail
+                        ),
+                        state_tone,
+                    )
+                    .selected(true),
+                )
+                .row(SidecarRow::new(
+                    state_label,
+                    latest_control_point_label(&loop_definition, trend.last()),
+                    state_tone,
+                )),
+        ];
+
+        sections.push(
+            SidecarSection::new("Loop Limits")
+                .row(SidecarRow::new(
+                    "Target / deadband",
+                    format!(
+                        "{} {} | +/-{} {}",
+                        format_number(loop_definition.output.target),
+                        loop_definition.output.unit,
+                        format_number(loop_definition.deadband.abs()),
+                        loop_definition.output.unit
+                    ),
+                    Tone::Info,
+                ))
+                .row(SidecarRow::new(
+                    "Manipulated parameters",
+                    format!(
+                        "{} guarded recipe parameters",
+                        loop_definition.manipulated_parameters.len()
+                    ),
+                    if loop_definition.manipulated_parameters.is_empty() {
+                        Tone::Neutral
+                    } else {
+                        Tone::Success
+                    },
+                )),
+        );
+
+        let yield_section = if let Some(correlation) = analysis
+            .correlations
+            .iter()
+            .find(|record| record.measurement_name == loop_definition.output.measurement_name)
+        {
+            SidecarSection::new("Yield Link")
+                .row(SidecarRow::new(
+                    "Failure correlation",
+                    format!("{:+.2}", correlation.correlation_to_failure_rate),
+                    if correlation.correlation_to_failure_rate.abs() >= 0.45 {
+                        Tone::Warning
+                    } else {
+                        Tone::Neutral
+                    },
+                ))
+                .row(SidecarRow::new(
+                    "Root cause hint",
+                    &correlation.root_cause_hint,
+                    Tone::Info,
+                ))
+        } else {
+            SidecarSection::new("Yield Link").empty("No yield correlation loaded for this output")
+        };
+        sections.push(yield_section);
+
+        let mut audit_section = SidecarSection::new("Audit Trail").empty("No control audit events");
+        for event in self
+            .model
+            .audit_for_loop(&loop_id)
+            .into_iter()
+            .rev()
+            .take(4)
+        {
+            audit_section = audit_section.row(SidecarRow::new(
+                format!("#{} {}", event.sequence, event.kind.label()),
+                if event.note.is_empty() {
+                    event.timestamp.clone()
+                } else {
+                    event.note.clone()
+                },
+                audit_tone(event.kind),
+            ));
+        }
+        sections.push(audit_section);
+        render_sidecar(ui, "process_control.context", &sections)
+    }
+
+    fn egui_context_ui(&mut self, ui: &mut egui::Ui, analysis: &YieldAnalysis) {
         self.ensure_selection();
         ui_chrome::section_label(ui, "Process Control");
         let Some(loop_id) = self.selected_loop.clone() else {
@@ -138,8 +313,77 @@ impl ProcessControlPanel {
 
     pub(crate) fn ui(&mut self, ui: &mut egui::Ui, analysis: &YieldAnalysis, status: &mut String) {
         self.ensure_selection();
-        let mut requested_transition = None;
+        if let Err(error) = self.operad_ui(ui, analysis, status) {
+            ui.colored_label(Color32::from_rgb(226, 96, 96), error);
+            self.egui_dashboard_ui(ui, analysis, status);
+        }
+    }
 
+    fn operad_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        analysis: &YieldAnalysis,
+        status: &mut String,
+    ) -> Result<(), String> {
+        let mut action_status = None;
+        let mut result_state = Ok(());
+        egui::ScrollArea::vertical()
+            .id_salt("process_control_dashboard_operad_scroll")
+            .show(ui, |ui| {
+                let width = ui.available_width().max(320.0);
+                let mut view = self.build_operad_view(width, analysis);
+                if let Err(error) = view
+                    .document
+                    .compute_layout(view.size, &mut ApproxTextMeasurer)
+                    .map_err(|error| error.to_string())
+                {
+                    result_state = Err(error);
+                    return;
+                }
+
+                let (rect, response) =
+                    ui.allocate_exact_size(vec2(width, view.size.height), Sense::click());
+                if response.clicked()
+                    && let Some(pointer) = response.interact_pointer_pos()
+                    && let Some(node_name) =
+                        operad_egui::hit_test_name(&view.document, rect, pointer)
+                    && let Some(message) = self.handle_operad_action(&node_name)
+                {
+                    if !message.is_empty() {
+                        action_status = Some(message);
+                    }
+                    view = self.build_operad_view(width, analysis);
+                    if let Err(error) = view
+                        .document
+                        .compute_layout(view.size, &mut ApproxTextMeasurer)
+                        .map_err(|error| error.to_string())
+                    {
+                        result_state = Err(error);
+                        return;
+                    }
+                }
+
+                if response.hovered()
+                    && let Some(pointer) = ui.ctx().pointer_hover_pos()
+                    && operad_egui::hit_test_name(&view.document, rect, pointer).is_some()
+                {
+                    ui.output_mut(|output| output.cursor_icon = egui::CursorIcon::PointingHand);
+                }
+                operad_egui::paint_document_at(ui, &view.document, rect);
+            });
+        if let Some(message) = action_status {
+            *status = message;
+        }
+        result_state
+    }
+
+    fn egui_dashboard_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        analysis: &YieldAnalysis,
+        status: &mut String,
+    ) {
+        let mut requested_transition = None;
         egui::ScrollArea::vertical()
             .id_salt("process_control_dashboard_scroll")
             .show(ui, |ui| {
@@ -250,6 +494,643 @@ impl ProcessControlPanel {
         if let Some((action_id, transition)) = requested_transition {
             self.apply_requested_transition(action_id, transition, status);
         }
+    }
+
+    fn build_operad_view(&self, width: f32, analysis: &YieldAnalysis) -> ProcessControlOperadView {
+        let selected = self.selected_loop.as_ref().and_then(|loop_id| {
+            self.model.loop_by_id(loop_id).map(|loop_definition| {
+                let trend = self.model.trend_for_loop(loop_id).to_vec();
+                let actions = self
+                    .model
+                    .actions_for_loop(loop_id)
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                (loop_definition, trend, actions)
+            })
+        });
+        let metrics = selected
+            .as_ref()
+            .map(|(loop_definition, trend, actions)| {
+                self.operad_metrics(analysis, loop_definition, trend, actions)
+            })
+            .unwrap_or_default();
+        let loop_rows = self.operad_loop_rows();
+        let health_rows = selected
+            .as_ref()
+            .map(|(loop_definition, trend, actions)| {
+                self.operad_health_rows(analysis, loop_definition, trend, actions)
+            })
+            .unwrap_or_default();
+        let recommendation_rows = selected
+            .as_ref()
+            .map(|(loop_definition, _trend, actions)| {
+                self.operad_recommendation_rows(loop_definition, actions)
+            })
+            .unwrap_or_default();
+        let selected_action_rows = selected
+            .as_ref()
+            .map(|(loop_definition, _trend, actions)| {
+                self.operad_selected_action_rows(loop_definition, actions)
+            })
+            .unwrap_or_default();
+        let guardrail_rows = selected
+            .as_ref()
+            .map(|(loop_definition, _trend, actions)| {
+                self.operad_guardrail_rows(loop_definition, actions)
+            })
+            .unwrap_or_default();
+        let feedback_rows = selected
+            .as_ref()
+            .map(|(loop_definition, trend, _actions)| {
+                self.operad_feedback_rows(analysis, loop_definition, trend)
+            })
+            .unwrap_or_default();
+        let audit_rows = self.operad_audit_rows();
+        let height = process_control_operad_view_height(
+            width,
+            metrics.len(),
+            &[
+                loop_rows.len(),
+                health_rows.len(),
+                recommendation_rows.len(),
+                selected_action_rows.len(),
+                guardrail_rows.len(),
+                feedback_rows.len(),
+                audit_rows.len(),
+            ],
+        );
+        let size = UiSize::new(width, height);
+        let mut document = UiDocument::new(root_style(width, height));
+        let root = document.root;
+        document.set_node_visual(
+            root,
+            UiVisual::panel(
+                ColorRgba::new(15, 18, 21, 255),
+                Some(StrokeStyle::new(ColorRgba::new(39, 46, 52, 255), 1.0)),
+                0.0,
+            ),
+        );
+
+        let selected_name = selected
+            .as_ref()
+            .map(|(loop_definition, _, _)| loop_definition.name.as_str())
+            .unwrap_or("No loop selected");
+        add_process_control_operad_header(
+            &mut document,
+            root,
+            "PROCESS ENGINEERING",
+            "Run-to-Run Control",
+            "EWMA process loops, metrology feedback, recipe guardrails, and action audit trail",
+            &format!("{selected_name} · {} loop(s)", self.model.loops.len()),
+        );
+        add_process_control_operad_spacer(&mut document, root, OPERAD_GAP);
+        if !metrics.is_empty() {
+            add_process_control_operad_metric_grid(&mut document, root, width, &metrics);
+            add_process_control_operad_spacer(&mut document, root, OPERAD_GAP);
+        }
+        add_process_control_operad_section(
+            &mut document,
+            root,
+            width,
+            "process_control.loops",
+            "Control Loops",
+            "No process-control loops loaded",
+            &loop_rows,
+        );
+        add_process_control_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_process_control_operad_section(
+            &mut document,
+            root,
+            width,
+            "process_control.health",
+            "Control Health",
+            "No selected loop health loaded",
+            &health_rows,
+        );
+        add_process_control_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_process_control_operad_section(
+            &mut document,
+            root,
+            width,
+            "process_control.recommendations",
+            "Recommendations",
+            "No recommended adjustments for the selected loop",
+            &recommendation_rows,
+        );
+        add_process_control_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_process_control_operad_section(
+            &mut document,
+            root,
+            width,
+            "process_control.selected_action",
+            "Selected Recommendation",
+            "No recommendation selected",
+            &selected_action_rows,
+        );
+        add_process_control_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_process_control_operad_section(
+            &mut document,
+            root,
+            width,
+            "process_control.guardrails",
+            "Pre-Apply Checks and Recipe Correction",
+            "No recipe correction loaded",
+            &guardrail_rows,
+        );
+        add_process_control_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_process_control_operad_section(
+            &mut document,
+            root,
+            width,
+            "process_control.feedback",
+            "Metrology Feedback and Yield Link",
+            "No metrology feedback loaded for this loop",
+            &feedback_rows,
+        );
+        add_process_control_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_process_control_operad_section(
+            &mut document,
+            root,
+            width,
+            "process_control.audit",
+            "Audit Trail",
+            "No process-control audit events",
+            &audit_rows,
+        );
+
+        ProcessControlOperadView { document, size }
+    }
+
+    fn operad_metrics(
+        &self,
+        analysis: &YieldAnalysis,
+        loop_definition: &ControlLoop,
+        trend: &[ControlTrendPoint],
+        actions: &[ControlAction],
+    ) -> Vec<ProcessControlMetricTile> {
+        let (state_label, state_tone, state_detail) =
+            loop_control_state(loop_definition, trend, actions);
+        let latest = trend.last();
+        let counts = action_counts(actions);
+        vec![
+            ProcessControlMetricTile {
+                label: "Loop state".to_string(),
+                value: state_label,
+                detail: state_detail,
+                tone: state_tone,
+            },
+            ProcessControlMetricTile {
+                label: "Latest output".to_string(),
+                value: latest
+                    .map(|point| format_measurement(point.value, &point.unit))
+                    .unwrap_or_else(|| "-".to_string()),
+                detail: latest
+                    .map(|point| {
+                        format!(
+                            "target {}, {}",
+                            format_measurement(point.target, &point.unit),
+                            point.source.tool_run_id
+                        )
+                    })
+                    .unwrap_or_else(|| "waiting for metrology".to_string()),
+                tone: latest
+                    .map(|point| point_tone(point, loop_definition))
+                    .unwrap_or(Tone::Neutral),
+            },
+            ProcessControlMetricTile {
+                label: "EWMA error".to_string(),
+                value: latest
+                    .map(|point| format!("{} {}", format_signed(point.ewma_error), point.unit))
+                    .unwrap_or_else(|| "-".to_string()),
+                detail: format!(
+                    "deadband +/-{} {}",
+                    format_number(loop_definition.deadband.abs()),
+                    loop_definition.output.unit
+                ),
+                tone: latest
+                    .map(|point| {
+                        if point.ewma_error.abs() > loop_definition.deadband.abs() {
+                            Tone::Warning
+                        } else {
+                            Tone::Success
+                        }
+                    })
+                    .unwrap_or(Tone::Neutral),
+            },
+            ProcessControlMetricTile {
+                label: "Yield context".to_string(),
+                value: latest
+                    .and_then(|point| point.yield_fraction)
+                    .map(format_percent)
+                    .unwrap_or_else(|| "-".to_string()),
+                detail: latest
+                    .map(|point| yield_context_detail(analysis, point))
+                    .unwrap_or_else(|| "no wafer summary".to_string()),
+                tone: Tone::Neutral,
+            },
+            ProcessControlMetricTile {
+                label: "Recommendations".to_string(),
+                value: if counts.active() > 0 {
+                    format!("{} active", counts.active())
+                } else {
+                    "none".to_string()
+                },
+                detail: format!(
+                    "{} proposed / {} approved / {} held / {} applied / {} rejected",
+                    counts.proposed, counts.approved, counts.held, counts.applied, counts.rejected
+                ),
+                tone: action_queue_tone(&counts),
+            },
+        ]
+    }
+
+    fn operad_loop_rows(&self) -> Vec<ProcessControlOperadRow> {
+        self.model
+            .loops
+            .iter()
+            .map(|loop_definition| {
+                let actions = self
+                    .model
+                    .actions_for_loop(&loop_definition.id)
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let trend = self.model.trend_for_loop(&loop_definition.id);
+                let (state_label, state_tone, state_detail) =
+                    loop_control_state(loop_definition, trend, &actions);
+                process_control_operad_row(
+                    format!("{} · {}", loop_definition.name, state_label),
+                    format!(
+                        "{} · {} · {} · {}",
+                        loop_definition.id,
+                        loop_definition.process_step_id,
+                        loop_definition.output.label,
+                        state_detail
+                    ),
+                    state_tone,
+                    Some(format!(
+                        "{OPERAD_ACTION_SELECT_LOOP}{}|loop",
+                        loop_definition.id.as_str()
+                    )),
+                    self.selected_loop.as_ref() == Some(&loop_definition.id),
+                )
+            })
+            .collect()
+    }
+
+    fn operad_health_rows(
+        &self,
+        analysis: &YieldAnalysis,
+        loop_definition: &ControlLoop,
+        trend: &[ControlTrendPoint],
+        actions: &[ControlAction],
+    ) -> Vec<ProcessControlOperadRow> {
+        let (state_label, state_tone, state_detail) =
+            loop_control_state(loop_definition, trend, actions);
+        let mut rows = vec![
+            process_control_operad_row(state_label, state_detail, state_tone, None, false),
+            process_control_operad_row(
+                "Identity".to_string(),
+                format!(
+                    "{} · {} · {} · {}",
+                    loop_definition.route_id,
+                    loop_definition.process_step_id,
+                    loop_definition.tool_id,
+                    loop_definition.recipe
+                ),
+                Tone::Neutral,
+                None,
+                false,
+            ),
+            process_control_operad_row(
+                "Output limits".to_string(),
+                format!(
+                    "{} target {}, spec {}, deadband +/-{} {}",
+                    loop_definition.output.label,
+                    format_measurement(loop_definition.output.target, &loop_definition.output.unit),
+                    spec_label(loop_definition),
+                    format_number(loop_definition.deadband.abs()),
+                    loop_definition.output.unit
+                ),
+                Tone::Neutral,
+                None,
+                false,
+            ),
+        ];
+        if let Some(correlation) = analysis
+            .correlations
+            .iter()
+            .find(|record| record.measurement_name == loop_definition.output.measurement_name)
+        {
+            rows.push(process_control_operad_row(
+                "Yield link".to_string(),
+                format!(
+                    "failure-rate correlation {:+.2} · {}",
+                    correlation.correlation_to_failure_rate, correlation.root_cause_hint
+                ),
+                Tone::Info,
+                None,
+                false,
+            ));
+        }
+        rows
+    }
+
+    fn operad_recommendation_rows(
+        &self,
+        loop_definition: &ControlLoop,
+        actions: &[ControlAction],
+    ) -> Vec<ProcessControlOperadRow> {
+        let counts = action_counts(actions);
+        let mut rows = vec![process_control_operad_row(
+            format!("{} active recommendation(s)", counts.active()),
+            format!(
+                "{} proposed / {} approved / {} held / {} applied / {} rejected",
+                counts.proposed, counts.approved, counts.held, counts.applied, counts.rejected
+            ),
+            action_queue_tone(&counts),
+            None,
+            false,
+        )];
+        rows.extend(actions.iter().map(|action| {
+            process_control_operad_row(
+                format!(
+                    "{} · {}",
+                    short_action_id(action.id.as_str()),
+                    action.state.label()
+                ),
+                format!(
+                    "{} {} · EWMA {} {} · confidence {} · {}",
+                    action.source.lot_id,
+                    action.source.wafer_id,
+                    format_signed(action.ewma_error),
+                    loop_definition.output.unit,
+                    format_percent(action.confidence),
+                    recommendation_reason(action, loop_definition)
+                ),
+                recommendation_tone(action, loop_definition),
+                Some(format!(
+                    "{OPERAD_ACTION_SELECT_RECOMMENDATION}{}|recommendation",
+                    action.id.as_str()
+                )),
+                self.selected_action.as_ref() == Some(&action.id),
+            )
+        }));
+        rows
+    }
+
+    fn operad_selected_action_rows(
+        &self,
+        loop_definition: &ControlLoop,
+        actions: &[ControlAction],
+    ) -> Vec<ProcessControlOperadRow> {
+        let Some(action) = self
+            .selected_action
+            .as_ref()
+            .and_then(|id| actions.iter().find(|action| &action.id == id))
+            .or_else(|| actions.first())
+        else {
+            return Vec::new();
+        };
+        let mut rows = vec![
+            process_control_operad_row(
+                format!("{} · {}", action.id, action.state.label()),
+                recommendation_reason(action, loop_definition),
+                recommendation_tone(action, loop_definition),
+                Some(format!(
+                    "{OPERAD_ACTION_SELECT_RECOMMENDATION}{}|selected",
+                    action.id.as_str()
+                )),
+                true,
+            ),
+            process_control_operad_row(
+                "Instant error".to_string(),
+                format!(
+                    "{} {}, measured {}, target {}",
+                    format_signed(action.error),
+                    loop_definition.output.unit,
+                    format_measurement(action.measured_value, &loop_definition.output.unit),
+                    format_measurement(action.target_value, &loop_definition.output.unit)
+                ),
+                if action_in_spec(action, loop_definition) {
+                    Tone::Success
+                } else {
+                    Tone::Danger
+                },
+                None,
+                false,
+            ),
+            process_control_operad_row(
+                "Confidence".to_string(),
+                format!(
+                    "{} observed, {} required",
+                    format_percent(action.confidence),
+                    format_percent(loop_definition.minimum_confidence)
+                ),
+                confidence_tone(action.confidence, loop_definition.minimum_confidence),
+                None,
+                false,
+            ),
+            process_control_operad_row(
+                "Rationale".to_string(),
+                action.rationale.clone(),
+                Tone::Neutral,
+                None,
+                false,
+            ),
+        ];
+        for transition in transition_options_for_action(action.state) {
+            rows.push(process_control_operad_row(
+                format!("{} recommendation", transition.command_label()),
+                format!("Move {} to {}", action.id, transition.result_label()),
+                transition.tone(),
+                Some(format!(
+                    "{OPERAD_ACTION_TRANSITION}{}|{}",
+                    action.id.as_str(),
+                    transition.slug()
+                )),
+                false,
+            ));
+        }
+        rows
+    }
+
+    fn operad_guardrail_rows(
+        &self,
+        loop_definition: &ControlLoop,
+        actions: &[ControlAction],
+    ) -> Vec<ProcessControlOperadRow> {
+        let Some(action) = self
+            .selected_action
+            .as_ref()
+            .and_then(|id| actions.iter().find(|action| &action.id == id))
+            .or_else(|| actions.first())
+        else {
+            return loop_definition
+                .manipulated_parameters
+                .iter()
+                .map(|parameter| parameter_guardrail_row(parameter, &loop_definition.output.unit))
+                .collect();
+        };
+        let mut rows = action_guardrail_checks(action, loop_definition)
+            .into_iter()
+            .map(|check| {
+                process_control_operad_row(
+                    format!("{} · {}", check.label, check.status),
+                    check.detail,
+                    check.tone,
+                    None,
+                    false,
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.extend(action.adjustments.iter().map(|adjustment| {
+            process_control_operad_row(
+                adjustment.label.clone(),
+                format!(
+                    "{} -> {} · delta {} {} · bounds {}..{} {}",
+                    format_parameter_value(&adjustment.previous_value, adjustment.unit),
+                    format_parameter_value(&adjustment.proposed_value, adjustment.unit),
+                    format_signed(adjustment.delta),
+                    adjustment.unit.map(RecipeUnit::symbol).unwrap_or(""),
+                    format_number(adjustment.lower_bound),
+                    format_number(adjustment.upper_bound),
+                    parameter_unit(adjustment.unit)
+                ),
+                Tone::Info,
+                None,
+                false,
+            )
+        }));
+        rows
+    }
+
+    fn operad_feedback_rows(
+        &self,
+        analysis: &YieldAnalysis,
+        loop_definition: &ControlLoop,
+        trend: &[ControlTrendPoint],
+    ) -> Vec<ProcessControlOperadRow> {
+        let mut rows = Vec::new();
+        if let Some(latest) = trend.last() {
+            rows.push(process_control_operad_row(
+                if latest.in_spec {
+                    "Latest feedback inside spec"
+                } else {
+                    "Latest feedback outside spec"
+                },
+                format!(
+                    "{} {} · value {} · EWMA {} {} · {}",
+                    latest.source.lot_id,
+                    latest.source.wafer_id,
+                    format_measurement(latest.value, &latest.unit),
+                    format_signed(latest.ewma_error),
+                    latest.unit,
+                    yield_context_detail(analysis, latest)
+                ),
+                point_tone(latest, loop_definition),
+                None,
+                false,
+            ));
+        }
+        rows.extend(trend.iter().rev().take(10).map(|point| {
+            process_control_operad_row(
+                format!("Run {} · {}", point.source.run_index, point.source.wafer_id),
+                format!(
+                    "value {}, error {} {}, EWMA {} {}, yield {}",
+                    format_measurement(point.value, &point.unit),
+                    format_signed(point.error),
+                    point.unit,
+                    format_signed(point.ewma_error),
+                    point.unit,
+                    point
+                        .yield_fraction
+                        .map(format_percent)
+                        .unwrap_or_else(|| "-".to_string())
+                ),
+                point_tone(point, loop_definition),
+                None,
+                false,
+            )
+        }));
+        rows
+    }
+
+    fn operad_audit_rows(&self) -> Vec<ProcessControlOperadRow> {
+        let Some(loop_id) = self.selected_loop.as_ref() else {
+            return Vec::new();
+        };
+        self.model
+            .audit_for_loop(loop_id)
+            .into_iter()
+            .rev()
+            .take(16)
+            .map(|event| {
+                process_control_operad_row(
+                    format!("#{} · {}", event.sequence, event.kind.label()),
+                    format!(
+                        "{} · {}{}{} · {}",
+                        event.actor,
+                        event.timestamp,
+                        event
+                            .action_id
+                            .as_ref()
+                            .map(|id| format!(" · {}", short_action_id(id.as_str())))
+                            .unwrap_or_default(),
+                        event
+                            .to_state
+                            .map(|state| format!(" -> {}", state.label()))
+                            .unwrap_or_default(),
+                        event.note
+                    ),
+                    audit_tone(event.kind),
+                    None,
+                    false,
+                )
+            })
+            .collect()
+    }
+
+    fn handle_operad_action(&mut self, node_name: &str) -> Option<String> {
+        if let Some(value) = node_name.strip_prefix(OPERAD_ACTION_SELECT_LOOP) {
+            let loop_id = value.split_once('|').map(|(id, _)| id).unwrap_or(value);
+            let loop_id = ControlLoopId::new(loop_id);
+            if self.model.loop_by_id(&loop_id).is_some() {
+                self.selected_loop = Some(loop_id);
+                self.selected_action = None;
+                self.ensure_selection();
+                return Some("process control loop selected".to_string());
+            }
+        }
+        if let Some(value) = node_name.strip_prefix(OPERAD_ACTION_SELECT_RECOMMENDATION) {
+            let action_id = value.split_once('|').map(|(id, _)| id).unwrap_or(value);
+            let action_id = ControlActionId::new(action_id);
+            if self
+                .model
+                .actions
+                .iter()
+                .any(|action| action.id == action_id)
+            {
+                self.selected_action = Some(action_id.clone());
+                return Some(format!(
+                    "process control recommendation selected: {action_id}"
+                ));
+            }
+        }
+        if let Some(value) = node_name.strip_prefix(OPERAD_ACTION_TRANSITION)
+            && let Some((action_id, transition_slug)) = value.split_once('|')
+            && let Some(transition) = RequestedTransition::from_slug(transition_slug)
+        {
+            let mut status = String::new();
+            self.apply_requested_transition(
+                ControlActionId::new(action_id),
+                transition,
+                &mut status,
+            );
+            return Some(status);
+        }
+        None
     }
 
     fn loop_portfolio_ui(&mut self, ui: &mut egui::Ui, status: &mut String) {
@@ -523,6 +1404,46 @@ impl RequestedTransition {
             Self::Apply => "applied",
         }
     }
+
+    fn slug(self) -> &'static str {
+        match self {
+            Self::Approve => "approve",
+            Self::Reject => "reject",
+            Self::Apply => "apply",
+        }
+    }
+
+    fn from_slug(slug: &str) -> Option<Self> {
+        match slug {
+            "approve" => Some(Self::Approve),
+            "reject" => Some(Self::Reject),
+            "apply" => Some(Self::Apply),
+            _ => None,
+        }
+    }
+
+    fn command_label(self) -> &'static str {
+        match self {
+            Self::Approve => "Approve",
+            Self::Reject => "Reject",
+            Self::Apply => "Apply",
+        }
+    }
+
+    fn result_label(self) -> &'static str {
+        match self {
+            Self::Approve => "approved",
+            Self::Reject => "rejected",
+            Self::Apply => "applied",
+        }
+    }
+
+    fn tone(self) -> Tone {
+        match self {
+            Self::Approve | Self::Apply => Tone::Success,
+            Self::Reject => Tone::Danger,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -546,6 +1467,612 @@ struct GuardrailCheck {
     status: &'static str,
     tone: ui_chrome::Tone,
     detail: String,
+}
+
+fn transition_options_for_action(state: ControlActionState) -> Vec<RequestedTransition> {
+    match state {
+        ControlActionState::Proposed => {
+            vec![RequestedTransition::Approve, RequestedTransition::Reject]
+        }
+        ControlActionState::Approved => {
+            vec![RequestedTransition::Apply, RequestedTransition::Reject]
+        }
+        ControlActionState::Held => vec![RequestedTransition::Reject],
+        ControlActionState::Rejected | ControlActionState::Applied => Vec::new(),
+    }
+}
+
+fn parameter_guardrail_row(
+    parameter: &ManipulatedParameter,
+    output_unit: &str,
+) -> ProcessControlOperadRow {
+    let unit = parameter_unit(parameter.unit);
+    process_control_operad_row(
+        parameter.label.clone(),
+        format!(
+            "current {} {}, bounds {}..{} {}, max step +/-{} {}, sensitivity {} {} / {}",
+            format_number(parameter.current_value),
+            unit,
+            format_number(parameter.lower_bound),
+            format_number(parameter.upper_bound),
+            unit,
+            format_number(parameter.max_delta.abs()),
+            unit,
+            format_signed(parameter.output_sensitivity),
+            output_unit,
+            unit
+        ),
+        Tone::Neutral,
+        None,
+        false,
+    )
+}
+
+fn audit_tone(kind: ControlAuditKind) -> Tone {
+    match kind {
+        ControlAuditKind::Proposed => Tone::Info,
+        ControlAuditKind::Approved | ControlAuditKind::Applied => Tone::Success,
+        ControlAuditKind::Rejected => Tone::Danger,
+        ControlAuditKind::Held => Tone::Warning,
+    }
+}
+
+fn latest_control_point_label(
+    loop_definition: &ControlLoop,
+    latest: Option<&ControlTrendPoint>,
+) -> String {
+    latest
+        .map(|point| {
+            format!(
+                "Latest {} from {} {} | EWMA {} {}",
+                format_measurement(point.value, &point.unit),
+                point.source.lot_id,
+                point.source.wafer_id,
+                format_signed(point.ewma_error),
+                point.unit
+            )
+        })
+        .unwrap_or_else(|| {
+            format!(
+                "Target {} {} | no trend points",
+                format_number(loop_definition.output.target),
+                loop_definition.output.unit
+            )
+        })
+}
+
+fn process_control_operad_view_height(
+    width: f32,
+    metric_count: usize,
+    row_counts: &[usize],
+) -> f32 {
+    let mut height = OPERAD_HEADER_HEIGHT + OPERAD_GAP;
+    height += process_control_operad_metric_grid_height(width, metric_count) + OPERAD_GAP;
+    for row_count in row_counts {
+        height += process_control_operad_section_height(*row_count) + OPERAD_GAP;
+    }
+    height + OPERAD_PAD
+}
+
+fn process_control_operad_metric_columns(width: f32) -> usize {
+    if width >= 1020.0 {
+        4
+    } else if width >= 680.0 {
+        3
+    } else if width >= 440.0 {
+        2
+    } else {
+        1
+    }
+}
+
+fn process_control_operad_metric_grid_height(width: f32, metric_count: usize) -> f32 {
+    let columns = process_control_operad_metric_columns(width).max(1);
+    let rows = metric_count.div_ceil(columns).max(1);
+    rows as f32 * OPERAD_METRIC_HEIGHT
+}
+
+fn process_control_operad_section_height(row_count: usize) -> f32 {
+    OPERAD_PAD * 2.0
+        + OPERAD_SECTION_TITLE_HEIGHT
+        + if row_count == 0 {
+            OPERAD_EMPTY_ROW_HEIGHT
+        } else {
+            row_count as f32 * OPERAD_ROW_HEIGHT
+        }
+}
+
+fn add_process_control_operad_header(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    eyebrow: &str,
+    title: &str,
+    detail: &str,
+    meta: &str,
+) {
+    let header = document.add_child(
+        parent,
+        UiNode::container(
+            "process_control.header",
+            UiNodeStyle {
+                layout: layout::with_padding_all(
+                    layout::with_size(
+                        layout::column(),
+                        layout::percent(1.0),
+                        layout::px(OPERAD_HEADER_HEIGHT),
+                    ),
+                    OPERAD_PAD,
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            ColorRgba::new(22, 27, 32, 255),
+            Some(StrokeStyle::new(ColorRgba::new(46, 55, 64, 255), 1.0)),
+            6.0,
+        )),
+    );
+    add_process_control_operad_text(
+        document,
+        header,
+        "process_control.header.eyebrow",
+        eyebrow,
+        process_control_operad_text_style(
+            12.0,
+            FontWeight::BOLD,
+            ColorRgba::new(146, 154, 162, 255),
+        ),
+        16.0,
+    );
+    add_process_control_operad_text(
+        document,
+        header,
+        "process_control.header.title",
+        title,
+        process_control_operad_text_style(
+            24.0,
+            FontWeight::BOLD,
+            ColorRgba::new(242, 246, 250, 255),
+        ),
+        30.0,
+    );
+    add_process_control_operad_text(
+        document,
+        header,
+        "process_control.header.detail",
+        detail,
+        process_control_operad_text_style(
+            14.0,
+            FontWeight::NORMAL,
+            ColorRgba::new(178, 185, 194, 255),
+        ),
+        20.0,
+    );
+    add_process_control_operad_text(
+        document,
+        header,
+        "process_control.header.meta",
+        meta,
+        process_control_operad_text_style(
+            13.0,
+            FontWeight::NORMAL,
+            ColorRgba::new(112, 183, 239, 255),
+        ),
+        18.0,
+    );
+}
+
+fn add_process_control_operad_metric_grid(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    width: f32,
+    metrics: &[ProcessControlMetricTile],
+) {
+    let columns = process_control_operad_metric_columns(width);
+    let grid_height = process_control_operad_metric_grid_height(width, metrics.len());
+    let grid = document.add_child(
+        parent,
+        UiNode::container(
+            "process_control.metrics",
+            UiNodeStyle {
+                layout: layout::with_size(
+                    layout::column(),
+                    layout::percent(1.0),
+                    layout::px(grid_height),
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        ),
+    );
+    let tile_width =
+        ((width - OPERAD_GAP * (columns.saturating_sub(1) as f32)) / columns as f32).max(120.0);
+    for (row_index, chunk) in metrics.chunks(columns).enumerate() {
+        let row = document.add_child(
+            grid,
+            UiNode::container(
+                format!("process_control.metrics.row.{row_index}"),
+                UiNodeStyle {
+                    layout: layout::with_size(
+                        layout::row(),
+                        layout::percent(1.0),
+                        layout::px(OPERAD_METRIC_HEIGHT),
+                    ),
+                    clip: ClipBehavior::Clip,
+                    ..Default::default()
+                },
+            ),
+        );
+        for (column, metric) in chunk.iter().enumerate() {
+            add_process_control_operad_metric_tile(
+                document,
+                row,
+                &format!("process_control.metrics.{row_index}.{column}"),
+                tile_width - 6.0,
+                metric,
+            );
+        }
+    }
+}
+
+fn add_process_control_operad_metric_tile(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    name: &str,
+    width: f32,
+    metric: &ProcessControlMetricTile,
+) {
+    let tile = document.add_child(
+        parent,
+        UiNode::container(
+            name,
+            UiNodeStyle {
+                layout: layout::with_padding_all(
+                    layout::with_margin_all(
+                        layout::with_size(
+                            layout::column(),
+                            layout::px(width.max(116.0)),
+                            layout::px(OPERAD_METRIC_HEIGHT - 8.0),
+                        ),
+                        3.0,
+                    ),
+                    9.0,
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            ColorRgba::new(29, 35, 40, 255),
+            Some(StrokeStyle::new(
+                process_control_operad_tone_color(metric.tone),
+                1.0,
+            )),
+            6.0,
+        )),
+    );
+    add_process_control_operad_text(
+        document,
+        tile,
+        &format!("{name}.label"),
+        &metric.label,
+        process_control_operad_text_style(
+            12.0,
+            FontWeight::BOLD,
+            ColorRgba::new(158, 166, 174, 255),
+        ),
+        18.0,
+    );
+    add_process_control_operad_text(
+        document,
+        tile,
+        &format!("{name}.value"),
+        &metric.value,
+        process_control_operad_text_style(
+            20.0,
+            FontWeight::BOLD,
+            ColorRgba::new(239, 243, 247, 255),
+        ),
+        26.0,
+    );
+    add_process_control_operad_text(
+        document,
+        tile,
+        &format!("{name}.detail"),
+        truncate_middle(&metric.detail, 52),
+        process_control_operad_text_style(
+            12.0,
+            FontWeight::NORMAL,
+            process_control_operad_tone_color(metric.tone),
+        ),
+        18.0,
+    );
+}
+
+fn add_process_control_operad_section(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    width: f32,
+    name: &str,
+    title: &str,
+    empty: &str,
+    rows: &[ProcessControlOperadRow],
+) {
+    let height = process_control_operad_section_height(rows.len());
+    let section = document.add_child(
+        parent,
+        UiNode::container(
+            name,
+            UiNodeStyle {
+                layout: layout::with_padding_all(
+                    layout::with_size(layout::column(), layout::percent(1.0), layout::px(height)),
+                    OPERAD_PAD,
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            ColorRgba::new(21, 26, 31, 255),
+            Some(StrokeStyle::new(ColorRgba::new(45, 53, 61, 255), 1.0)),
+            6.0,
+        )),
+    );
+    add_process_control_operad_text(
+        document,
+        section,
+        &format!("{name}.title"),
+        title,
+        process_control_operad_text_style(
+            15.0,
+            FontWeight::BOLD,
+            ColorRgba::new(242, 246, 250, 255),
+        ),
+        OPERAD_SECTION_TITLE_HEIGHT,
+    );
+    if rows.is_empty() {
+        add_process_control_operad_empty_row(document, section, name, empty);
+    } else {
+        let row_width = (width - OPERAD_PAD * 2.0).max(240.0);
+        for (index, row) in rows.iter().enumerate() {
+            add_process_control_operad_data_row(document, section, name, index, row_width, row);
+        }
+    }
+}
+
+fn add_process_control_operad_empty_row(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    name: &str,
+    label: &str,
+) {
+    let row = document.add_child(
+        parent,
+        UiNode::container(
+            format!("{name}.empty"),
+            UiNodeStyle {
+                layout: layout::with_padding_all(
+                    layout::with_size(
+                        layout::row(),
+                        layout::percent(1.0),
+                        layout::px(OPERAD_EMPTY_ROW_HEIGHT),
+                    ),
+                    8.0,
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            ColorRgba::new(27, 32, 37, 255),
+            Some(StrokeStyle::new(ColorRgba::new(43, 50, 58, 255), 1.0)),
+            5.0,
+        )),
+    );
+    add_process_control_operad_text(
+        document,
+        row,
+        &format!("{name}.empty.label"),
+        label,
+        process_control_operad_text_style(
+            13.0,
+            FontWeight::NORMAL,
+            ColorRgba::new(154, 163, 172, 255),
+        ),
+        24.0,
+    );
+}
+
+fn add_process_control_operad_data_row(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    section_name: &str,
+    index: usize,
+    row_width: f32,
+    row: &ProcessControlOperadRow,
+) {
+    let row_name = row
+        .action_name
+        .clone()
+        .unwrap_or_else(|| format!("{section_name}.row.{index}"));
+    let stroke_color = if row.selected {
+        process_control_operad_tone_color(Tone::Info)
+    } else {
+        ColorRgba::new(42, 50, 58, 255)
+    };
+    let fill = if row.selected {
+        ColorRgba::new(26, 42, 56, 255)
+    } else {
+        ColorRgba::new(26, 31, 36, 255)
+    };
+    let mut node = UiNode::container(
+        row_name,
+        UiNodeStyle {
+            layout: layout::with_padding_all(
+                layout::with_size(
+                    layout::row(),
+                    layout::percent(1.0),
+                    layout::px(OPERAD_ROW_HEIGHT),
+                ),
+                6.0,
+            ),
+            clip: ClipBehavior::Clip,
+            ..Default::default()
+        },
+    )
+    .with_visual(UiVisual::panel(
+        fill,
+        Some(StrokeStyle::new(stroke_color, 1.0)),
+        4.0,
+    ));
+    if row.action_name.is_some() {
+        node = node.with_input(InputBehavior::BUTTON);
+    }
+    let row_node = document.add_child(parent, node);
+    document.add_child(
+        row_node,
+        UiNode::container(
+            format!("{section_name}.row.{index}.tone"),
+            UiNodeStyle {
+                layout: layout::fixed(5.0, OPERAD_ROW_HEIGHT - 12.0),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            process_control_operad_tone_color(row.tone),
+            None,
+            2.0,
+        )),
+    );
+    let text_column = document.add_child(
+        row_node,
+        UiNode::container(
+            format!("{section_name}.row.{index}.text"),
+            UiNodeStyle {
+                layout: layout::with_size(
+                    layout::column(),
+                    layout::px((row_width - 28.0).max(120.0)),
+                    layout::px(OPERAD_ROW_HEIGHT - 12.0),
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        ),
+    );
+    add_process_control_operad_text(
+        document,
+        text_column,
+        &format!("{section_name}.row.{index}.title"),
+        truncate_middle(&row.title, 72),
+        process_control_operad_text_style(
+            14.0,
+            FontWeight::BOLD,
+            ColorRgba::new(232, 237, 242, 255),
+        ),
+        21.0,
+    );
+    add_process_control_operad_text(
+        document,
+        text_column,
+        &format!("{section_name}.row.{index}.detail"),
+        truncate_middle(&row.detail, 108),
+        process_control_operad_text_style(
+            12.0,
+            FontWeight::NORMAL,
+            ColorRgba::new(162, 171, 180, 255),
+        ),
+        19.0,
+    );
+}
+
+fn add_process_control_operad_spacer(document: &mut UiDocument, parent: UiNodeId, height: f32) {
+    document.add_child(
+        parent,
+        UiNode::container(
+            format!("process_control.spacer.{}", document.node_count()),
+            UiNodeStyle {
+                layout: layout::with_size(layout::row(), layout::percent(1.0), layout::px(height)),
+                ..Default::default()
+            },
+        ),
+    );
+}
+
+fn add_process_control_operad_text(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    name: &str,
+    text: impl Into<String>,
+    style: TextStyle,
+    height: f32,
+) {
+    widgets::label(
+        document,
+        parent,
+        name,
+        text,
+        style,
+        layout::with_size(layout::row(), layout::percent(1.0), layout::px(height)),
+    );
+}
+
+fn process_control_operad_text_style(
+    font_size: f32,
+    weight: FontWeight,
+    color: ColorRgba,
+) -> TextStyle {
+    TextStyle {
+        font_size,
+        line_height: font_size + 4.0,
+        weight,
+        color,
+        wrap: TextWrap::None,
+        ..Default::default()
+    }
+}
+
+fn process_control_operad_tone_color(tone: Tone) -> ColorRgba {
+    let color = tone.color();
+    ColorRgba::new(color.r(), color.g(), color.b(), color.a())
+}
+
+fn process_control_operad_row(
+    title: impl Into<String>,
+    detail: impl Into<String>,
+    tone: Tone,
+    action_name: Option<String>,
+    selected: bool,
+) -> ProcessControlOperadRow {
+    ProcessControlOperadRow {
+        title: title.into(),
+        detail: detail.into(),
+        tone,
+        action_name,
+        selected,
+    }
+}
+
+fn truncate_middle(text: impl AsRef<str>, max_chars: usize) -> String {
+    let text = text.as_ref();
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_string();
+    }
+    let keep = max_chars.saturating_sub(3);
+    let head = keep / 2;
+    let tail = keep - head;
+    let start = text.chars().take(head).collect::<String>();
+    let end = text
+        .chars()
+        .rev()
+        .take(tail)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!("{start}...{end}")
 }
 
 fn control_overview_metrics_ui(
@@ -1797,5 +3324,60 @@ fn format_signed(value: f64) -> String {
         format!("{value:+.1}")
     } else {
         format!("{value:+.2}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_control_operad_view_audits_common_widths() {
+        let analysis = YieldAnalysis::synthetic();
+        let mut panel = ProcessControlPanel::from_model(ProcessControlModel::synthetic());
+        panel.ensure_selection();
+        for width in [360.0, 760.0, 1200.0] {
+            let mut view = panel.build_operad_view(width, &analysis);
+            view.document
+                .compute_layout(view.size, &mut ApproxTextMeasurer)
+                .unwrap();
+            let warnings = view.document.audit_layout();
+            assert!(warnings.is_empty(), "{warnings:#?}");
+            assert!(view.document.node_count() > 20);
+            assert!(!view.document.paint_list().items.is_empty());
+        }
+    }
+
+    #[test]
+    fn process_control_operad_actions_update_panel_state() {
+        let mut panel = ProcessControlPanel::from_model(ProcessControlModel::synthetic());
+        let target_loop = panel.model.loops.last().unwrap().id.clone();
+        assert_eq!(
+            panel.handle_operad_action(&format!(
+                "{OPERAD_ACTION_SELECT_LOOP}{}|test",
+                target_loop.as_str()
+            )),
+            Some("process control loop selected".to_string())
+        );
+        assert_eq!(panel.selected_loop.as_ref(), Some(&target_loop));
+
+        let target_action = panel
+            .model
+            .actions_for_loop(&target_loop)
+            .first()
+            .map(|action| action.id.clone())
+            .or_else(|| panel.model.actions.first().map(|action| action.id.clone()));
+        if let Some(action_id) = target_action {
+            assert_eq!(
+                panel.handle_operad_action(&format!(
+                    "{OPERAD_ACTION_SELECT_RECOMMENDATION}{}|test",
+                    action_id.as_str()
+                )),
+                Some(format!(
+                    "process control recommendation selected: {action_id}"
+                ))
+            );
+            assert_eq!(panel.selected_action.as_ref(), Some(&action_id));
+        }
     }
 }

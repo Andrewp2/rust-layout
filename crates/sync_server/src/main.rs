@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
     fs,
+    io::Write,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
@@ -9,7 +10,7 @@ use std::{
     },
 };
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use axum::{
     Json, Router,
     extract::{
@@ -412,6 +413,13 @@ fn load_or_create_state(
                     serde_json::from_slice(&bytes).with_context(|| {
                         format!("failed to parse persisted sync state {}", path.display())
                     })?;
+                if persisted.schema_version != PERSISTED_STATE_VERSION {
+                    bail!(
+                        "unsupported persisted sync schema {}; expected {}",
+                        persisted.schema_version,
+                        PERSISTED_STATE_VERSION
+                    );
+                }
                 let mut document = persisted.document;
                 let loro_log = LoroCrdtLog::from_snapshot(server_actor, &persisted.loro_snapshot)
                     .context("failed to import persisted Loro snapshot")?;
@@ -474,8 +482,44 @@ fn write_persisted_state(path: &Path, state: &PersistedSyncState) -> anyhow::Res
             .with_context(|| format!("failed to create state directory {}", parent.display()))?;
     }
     let bytes = serde_json::to_vec_pretty(state)?;
-    fs::write(path, bytes).with_context(|| format!("failed to write {}", path.display()))?;
+    atomic_write_bytes(path, &bytes)
+        .with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
+}
+
+fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    atomic_write_bytes_with_before_rename(path, bytes, |_| Ok(()))
+}
+
+fn atomic_write_bytes_with_before_rename(
+    path: &Path,
+    bytes: &[u8],
+    before_rename: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "write".into());
+    let temp_path = path.with_file_name(format!(".{file_name}.{}.tmp", Uuid::new_v4().simple()));
+    let result = (|| {
+        let mut file = fs::File::create(&temp_path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        before_rename(&temp_path)?;
+        fs::rename(&temp_path, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -489,6 +533,19 @@ mod tests {
     };
 
     type TestSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+    fn temp_state_path() -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("fabricad-sync-test-{}", Uuid::new_v4().simple()));
+        fs::create_dir_all(&dir).unwrap();
+        dir.join("state.json")
+    }
+
+    fn remove_temp_parent(path: &Path) {
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
 
     async fn send_client_message(socket: &mut TestSocket, message: &ClientMessage) {
         socket
@@ -578,6 +635,82 @@ mod tests {
             shape.kind.bounds()
         );
         assert_eq!(loaded.layers.get(&LayerId(layer.0)).unwrap().id, layer);
+    }
+
+    #[test]
+    fn write_persisted_state_replaces_file_atomically() {
+        let path = temp_state_path();
+        let document = Document::new("sync persistence");
+        let first = PersistedSyncState {
+            schema_version: PERSISTED_STATE_VERSION,
+            document: document.clone(),
+            sequence: 1,
+            loro_snapshot: Vec::new(),
+        };
+        let second = PersistedSyncState {
+            schema_version: PERSISTED_STATE_VERSION,
+            document,
+            sequence: 2,
+            loro_snapshot: Vec::new(),
+        };
+
+        write_persisted_state(&path, &first).unwrap();
+        write_persisted_state(&path, &second).unwrap();
+
+        let restored: PersistedSyncState =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(restored.sequence, 2);
+        let entries = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec!["state.json"]);
+        remove_temp_parent(&path);
+    }
+
+    #[test]
+    fn sync_atomic_write_preserves_previous_state_after_interrupted_temp_write() {
+        let path = temp_state_path();
+        atomic_write_bytes(&path, b"old sync state").unwrap();
+        let mut temp_path = PathBuf::new();
+
+        let err = atomic_write_bytes_with_before_rename(&path, b"new sync state", |path| {
+            temp_path = path.to_path_buf();
+            assert_eq!(fs::read_to_string(path).unwrap(), "new sync state");
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "injected interrupted sync state save",
+            ))
+        })
+        .unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "old sync state");
+        assert!(!temp_path.exists());
+        let entries = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec!["state.json"]);
+        remove_temp_parent(&path);
+    }
+
+    #[test]
+    fn persisted_startup_rejects_unsupported_schema_version() {
+        let path = temp_state_path();
+        let persisted = PersistedSyncState {
+            schema_version: PERSISTED_STATE_VERSION + 1,
+            document: Document::new("future sync state"),
+            sequence: 1,
+            loro_snapshot: Vec::new(),
+        };
+        atomic_write_bytes(&path, &serde_json::to_vec_pretty(&persisted).unwrap()).unwrap();
+
+        let err = load_or_create_state(Uuid::from_u128(501), Some(path.as_path())).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("unsupported persisted sync schema"));
+        assert!(message.contains(&PERSISTED_STATE_VERSION.to_string()));
+        remove_temp_parent(&path);
     }
 
     #[tokio::test]

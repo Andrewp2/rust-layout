@@ -1,0 +1,166 @@
+{
+  "schema_version": 0,
+  "document": {
+    "schema_version": 5,
+    "id": "00000000-0000-0000-0000-000000000001",
+    "name": "Legacy schema 0 blank layout",
+    "grid": 10,
+    "next_shape_id": 1,
+    "next_layer_id": 1,
+    "next_cell_id": 2,
+    "next_instance_id": 1,
+    "top_cell": 1,
+    "layers": {},
+    "shapes": {},
+    "cells": {
+      "1": {
+        "id": 1,
+        "name": "top",
+        "shapes": {},
+        "instances": {}
+      }
+    },
+    "marker_states": {
+      "legacy_rule|1|0,0,10,10|200|80.000": {
+        "hidden": true,
+        "waived": false,
+        "note": "legacy hidden marker"
+      }
+    },
+    "connectivity_issue_states": {
+      "short|VDD,VSS|0,0,100,50": {
+        "hidden": false,
+        "waived": true,
+        "note": "legacy connectivity waiver"
+      }
+    },
+    "crdt_seen": [],
+    "crdt_actor_clocks": {},
+    "crdt_operation_log": [],
+    "operation_log": []
+  },
+  "mes": {
+    "routes": {},
+    "lots": {},
+    "travelers": {}
+  },
+  "yield_analysis": {
+    "lots": [],
+    "recipes": [],
+    "test_results": [],
+    "process_measurements": [],
+    "lot_summaries": [],
+    "wafer_summaries": [],
+    "lot_comparisons": [],
+    "correlations": []
+  },
+  "wafer_map": {
+    "id": "",
+    "name": "No wafer map loaded",
+    "geometry": {
+      "diameter_mm": 200.0,
+      "edge_exclusion_mm": 3.0,
+      "die_pitch_mm": [8.4, 7.6],
+      "die_size_mm": [7.6, 6.8]
+    },
+    "links": {
+      "lot_id": "",
+      "wafer_id": "",
+      "process_step_id": "",
+      "recipe_id": "",
+      "tool_run_id": ""
+    },
+    "dies": [],
+    "measurements": [],
+    "defects": [],
+    "annotations": []
+  },
+  "recipe_catalog": {
+    "recipes": {},
+    "process_routes": [],
+    "tool_runs": []
+  },
+  "genealogy": {
+    "lots": {},
+    "material_lots": {},
+    "process_history": [],
+    "material_uses": [],
+    "events": [],
+    "next_sequence": 1
+  },
+  "inventory": {
+    "lots": {}
+  },
+  "maintenance": {
+    "today": null,
+    "tools": [],
+    "calibration_records": [],
+    "qualification_results": [],
+    "downtime": [],
+    "spare_parts": []
+  },
+  "environment": {
+    "sensors": [],
+    "readings": [],
+    "alarms": [],
+    "correlations": [],
+    "events": []
+  },
+  "scheduler": {
+    "now_minute": 0,
+    "tools": [],
+    "lots": [],
+    "assignments": []
+  },
+  "safety": {
+    "sensors": [],
+    "alarm_routes": [],
+    "tool_interlocks": [],
+    "incidents": [],
+    "audit_events": []
+  },
+  "experiment_plan": {
+    "id": "",
+    "title": "No experiment plan loaded",
+    "objective": "",
+    "owner": "",
+    "status": "draft",
+    "route_id": "",
+    "step_id": "",
+    "baseline_recipe": {
+      "recipe_id": "",
+      "version": 0
+    },
+    "factors": [],
+    "responses": [],
+    "runs": [],
+    "notes": []
+  },
+  "process_control": {
+    "loops": [],
+    "trends": {},
+    "actions": [],
+    "audit_events": []
+  },
+  "process_flow": {
+    "route": {
+      "id": "FLOW-UNTITLED",
+      "version": 1,
+      "name": "Untitled process flow",
+      "owner": "",
+      "mes_route_id": "",
+      "mask_design_id": "",
+      "layout_revision": "",
+      "nodes": [],
+      "edges": []
+    },
+    "versions": []
+  },
+  "lab_notebook": {
+    "entries": []
+  },
+  "equipment": {
+    "tools": {},
+    "now_s": 0
+  }
+}

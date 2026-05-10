@@ -10,3 +10,5 @@ geometry_core = { path = "../geometry_core" }
 layout_model = { path = "../layout_model" }
 serde.workspace = true
 
+[dev-dependencies]
+serde_json.workspace = true

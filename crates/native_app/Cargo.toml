@@ -26,6 +26,7 @@ egui.workspace = true
 egui-wgpu.workspace = true
 geometry_core = { path = "../geometry_core" }
 layout_model = { path = "../layout_model" }
+operad.workspace = true
 pollster.workspace = true
 renderer = { path = "../renderer" }
 router = { path = "../router" }

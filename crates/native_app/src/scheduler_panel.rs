@@ -6,8 +6,31 @@ use layout_model::scheduler::{
     DispatchAssignment, DispatchLot, DispatchPolicy, DispatchResult, DispatchSchedule,
     DispatchTool, QueueSummary, ToolDispatchState, ToolRecommendation, format_shift_time,
 };
+use operad::{
+    ApproxTextMeasurer, ClipBehavior, ColorRgba, FontWeight, InputBehavior, StrokeStyle, TextStyle,
+    TextWrap, UiDocument, UiNode, UiNodeId, UiNodeStyle, UiSize, UiVisual, layout, root_style,
+    widgets,
+};
 
-use crate::ui_chrome::{self, Tone};
+use crate::{
+    operad_egui,
+    operad_sidecar::{SidecarRow, SidecarSection, render_sidecar_interactive},
+    ui_chrome::{self, Tone},
+};
+
+const OPERAD_HEADER_HEIGHT: f32 = 104.0;
+const OPERAD_METRIC_HEIGHT: f32 = 88.0;
+const OPERAD_SECTION_TITLE_HEIGHT: f32 = 26.0;
+const OPERAD_ROW_HEIGHT: f32 = 58.0;
+const OPERAD_EMPTY_ROW_HEIGHT: f32 = 44.0;
+const OPERAD_GAP: f32 = 10.0;
+const OPERAD_PAD: f32 = 12.0;
+const OPERAD_ACTION_SET_POLICY: &str = "scheduler.action.set_policy.";
+const OPERAD_ACTION_SELECT_TOOL: &str = "scheduler.action.select_tool.";
+const OPERAD_ACTION_SET_MIN_PRIORITY: &str = "scheduler.action.set_min_priority.";
+const OPERAD_ACTION_TOGGLE_CONFLICTS: &str = "scheduler.action.toggle_conflicts";
+const OPERAD_ACTION_TOGGLE_FOCUS_TOOL: &str = "scheduler.action.toggle_focus_tool";
+const OPERAD_ACTION_RESET_FILTERS: &str = "scheduler.action.reset_filters";
 
 pub(crate) struct SchedulerPanel {
     schedule: DispatchSchedule,
@@ -19,11 +42,30 @@ pub(crate) struct SchedulerPanel {
     focus_selected_tool: bool,
 }
 
-impl SchedulerPanel {
-    pub(crate) fn empty() -> Self {
-        Self::from_schedule(DispatchSchedule::default())
-    }
+#[derive(Debug)]
+struct SchedulerOperadView {
+    document: UiDocument,
+    size: UiSize,
+}
 
+#[derive(Clone, Debug)]
+struct SchedulerMetricTile {
+    label: String,
+    value: String,
+    detail: String,
+    tone: Tone,
+}
+
+#[derive(Clone, Debug)]
+struct SchedulerOperadRow {
+    title: String,
+    detail: String,
+    tone: Tone,
+    action_name: Option<String>,
+    selected: bool,
+}
+
+impl SchedulerPanel {
     pub(crate) fn from_schedule(schedule: DispatchSchedule) -> Self {
         let selected_tool = schedule.tools.first().map(|tool| tool.id.clone());
         Self {
@@ -46,6 +88,78 @@ impl SchedulerPanel {
         let result = self.schedule.dispatch(self.policy);
         self.schedule.assignments = result.assignments.clone();
 
+        if let Err(error) = self.operad_ui(ui, &result, status) {
+            ui.colored_label(Color32::from_rgb(226, 96, 96), error);
+            self.egui_dashboard_ui(ui, &result, status);
+        }
+    }
+
+    fn operad_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        result: &DispatchResult,
+        status: &mut String,
+    ) -> Result<(), String> {
+        let mut action_status = None;
+        let mut result_state = Ok(());
+        egui::ScrollArea::vertical()
+            .id_salt("scheduler_dispatch_dashboard_operad_scroll")
+            .show(ui, |ui| {
+                let width = ui.available_width().max(320.0);
+                let mut view = self.build_operad_view(width, result);
+                if let Err(error) = view
+                    .document
+                    .compute_layout(view.size, &mut ApproxTextMeasurer)
+                    .map_err(|error| error.to_string())
+                {
+                    result_state = Err(error);
+                    return;
+                }
+
+                let (rect, response) =
+                    ui.allocate_exact_size(vec2(width, view.size.height), Sense::click());
+                if response.clicked()
+                    && let Some(pointer) = response.interact_pointer_pos()
+                    && let Some(node_name) =
+                        operad_egui::hit_test_name(&view.document, rect, pointer)
+                    && let Some(message) = self.handle_operad_action(&node_name)
+                {
+                    if !message.is_empty() {
+                        action_status = Some(message);
+                    }
+                    let updated_result = self.schedule.dispatch(self.policy);
+                    self.schedule.assignments = updated_result.assignments.clone();
+                    view = self.build_operad_view(width, &updated_result);
+                    if let Err(error) = view
+                        .document
+                        .compute_layout(view.size, &mut ApproxTextMeasurer)
+                        .map_err(|error| error.to_string())
+                    {
+                        result_state = Err(error);
+                        return;
+                    }
+                }
+
+                if response.hovered()
+                    && let Some(pointer) = ui.ctx().pointer_hover_pos()
+                    && operad_egui::hit_test_name(&view.document, rect, pointer).is_some()
+                {
+                    ui.output_mut(|output| output.cursor_icon = egui::CursorIcon::PointingHand);
+                }
+                operad_egui::paint_document_at(ui, &view.document, rect);
+            });
+        if let Some(message) = action_status {
+            *status = message;
+        }
+        result_state
+    }
+
+    fn egui_dashboard_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        result: &DispatchResult,
+        status: &mut String,
+    ) {
         egui::ScrollArea::vertical()
             .id_salt("scheduler_dispatch_dashboard")
             .show(ui, |ui| {
@@ -75,27 +189,774 @@ impl SchedulerPanel {
                     return;
                 }
 
-                self.summary_ui(ui, &result);
+                self.summary_ui(ui, result);
                 ui.separator();
                 self.filters_ui(ui);
                 ui.separator();
                 self.timeline_ui(ui, &result.assignments);
                 ui.separator();
-                self.next_actions_ui(ui, &result, status);
+                self.next_actions_ui(ui, result, status);
                 ui.separator();
-                self.queue_ui(ui, &result);
+                self.queue_ui(ui, result);
                 ui.separator();
-                self.tool_match_ui(ui, &result, status);
+                self.tool_match_ui(ui, result, status);
                 ui.separator();
-                self.queue_priority_ui(ui, &result, status);
+                self.queue_priority_ui(ui, result, status);
                 ui.separator();
-                self.conflicts_ui(ui, &result);
+                self.conflicts_ui(ui, result);
                 ui.separator();
                 self.assignment_table_ui(ui, &result.assignments, status);
             });
     }
 
+    fn build_operad_view(&self, width: f32, result: &DispatchResult) -> SchedulerOperadView {
+        let metrics = self.operad_metrics(result);
+        let control_rows = self.operad_control_rows();
+        let next_action_rows = self.operad_next_action_rows(result);
+        let queue_rows = self.operad_queue_rows(result);
+        let tool_rows = self.operad_tool_rows(result);
+        let priority_rows = self.operad_priority_rows(result);
+        let conflict_rows = self.operad_conflict_rows(result);
+        let assignment_rows = self.operad_assignment_rows(result);
+        let height = scheduler_operad_view_height(
+            width,
+            metrics.len(),
+            &[
+                control_rows.len(),
+                next_action_rows.len(),
+                queue_rows.len(),
+                tool_rows.len(),
+                priority_rows.len(),
+                conflict_rows.len(),
+                assignment_rows.len(),
+            ],
+        );
+        let size = UiSize::new(width, height);
+        let mut document = UiDocument::new(root_style(width, height));
+        let root = document.root;
+        document.set_node_visual(
+            root,
+            UiVisual::panel(
+                ColorRgba::new(15, 18, 21, 255),
+                Some(StrokeStyle::new(ColorRgba::new(39, 46, 52, 255), 1.0)),
+                0.0,
+            ),
+        );
+
+        add_scheduler_operad_header(
+            &mut document,
+            root,
+            "FAB OPERATIONS",
+            "Scheduler / Dispatch",
+            "Dispatch policy, bottlenecks, tool matching, queue risk, and estimated completion",
+            &format!(
+                "{} · shift {} · {} waiting lot(s), {} tool(s)",
+                self.policy.label(),
+                format_shift_time(self.schedule.now_minute),
+                self.schedule.lots.len(),
+                self.schedule.tools.len()
+            ),
+        );
+        add_scheduler_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_scheduler_operad_metric_grid(&mut document, root, width, &metrics);
+        add_scheduler_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_scheduler_operad_section(
+            &mut document,
+            root,
+            width,
+            "scheduler.controls",
+            "Dispatch Controls",
+            "No scheduler controls available",
+            &control_rows,
+        );
+        add_scheduler_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_scheduler_operad_section(
+            &mut document,
+            root,
+            width,
+            "scheduler.actions",
+            "Next Actions",
+            "Dispatch plan is clear",
+            &next_action_rows,
+        );
+        add_scheduler_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_scheduler_operad_section(
+            &mut document,
+            root,
+            width,
+            "scheduler.queue",
+            "Bottlenecks",
+            "No queued lots",
+            &queue_rows,
+        );
+        add_scheduler_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_scheduler_operad_section(
+            &mut document,
+            root,
+            width,
+            "scheduler.tools",
+            "Lot / Tool Matching",
+            "No dispatch tools loaded",
+            &tool_rows,
+        );
+        add_scheduler_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_scheduler_operad_section(
+            &mut document,
+            root,
+            width,
+            "scheduler.priority",
+            "Queue Priority",
+            "No lots match the dispatch filters",
+            &priority_rows,
+        );
+        add_scheduler_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_scheduler_operad_section(
+            &mut document,
+            root,
+            width,
+            "scheduler.conflicts",
+            "Schedule Conflicts",
+            "No schedule conflicts",
+            &conflict_rows,
+        );
+        add_scheduler_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_scheduler_operad_section(
+            &mut document,
+            root,
+            width,
+            "scheduler.assignments",
+            "Estimated Completion",
+            "No scheduled assignments match the filters",
+            &assignment_rows,
+        );
+
+        SchedulerOperadView { document, size }
+    }
+
+    fn operad_metrics(&self, result: &DispatchResult) -> Vec<SchedulerMetricTile> {
+        let scheduled = result.assignments.len();
+        let tardy = result
+            .assignments
+            .iter()
+            .filter(|assignment| assignment.tardy_minutes > 0)
+            .count();
+        let on_time = scheduled.saturating_sub(tardy);
+        let unscheduled = result.unscheduled_lots.len();
+        let available_tools = self
+            .schedule
+            .tools
+            .iter()
+            .filter(|tool| tool.state == ToolDispatchState::Available)
+            .count();
+        let ready_lots = self
+            .schedule
+            .lots
+            .iter()
+            .filter(|lot| lot.ready_at_minute <= self.schedule.now_minute)
+            .count();
+        let bottleneck = result
+            .queue_summaries
+            .iter()
+            .max_by_key(|summary| summary.total_process_minutes);
+        vec![
+            SchedulerMetricTile {
+                label: "Scheduled".to_string(),
+                value: scheduled.to_string(),
+                detail: format!("{on_time} on time"),
+                tone: if tardy > 0 {
+                    Tone::Warning
+                } else {
+                    Tone::Success
+                },
+            },
+            SchedulerMetricTile {
+                label: "Dispatch risk".to_string(),
+                value: (tardy + unscheduled).to_string(),
+                detail: format!("{tardy} tardy, {unscheduled} unscheduled"),
+                tone: if unscheduled > 0 || tardy > 0 {
+                    Tone::Danger
+                } else {
+                    Tone::Success
+                },
+            },
+            SchedulerMetricTile {
+                label: "Bottleneck".to_string(),
+                value: bottleneck
+                    .map(|summary| summary.tool_class.label().to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                detail: bottleneck
+                    .map(|summary| format!("{} lots", summary.waiting_lots))
+                    .unwrap_or_default(),
+                tone: Tone::Warning,
+            },
+            SchedulerMetricTile {
+                label: "Queue load".to_string(),
+                value: format!("{} min", total_queue_minutes(&result.queue_summaries)),
+                detail: format!("{ready_lots} ready now"),
+                tone: Tone::Neutral,
+            },
+            SchedulerMetricTile {
+                label: "Tool capacity".to_string(),
+                value: self.schedule.tools.len().to_string(),
+                detail: format!("{available_tools}/{} available", self.schedule.tools.len()),
+                tone: if available_tools == self.schedule.tools.len() {
+                    Tone::Success
+                } else {
+                    Tone::Warning
+                },
+            },
+        ]
+    }
+
+    fn operad_control_rows(&self) -> Vec<SchedulerOperadRow> {
+        let mut rows = Vec::new();
+        if self.schedule.is_empty() {
+            rows.push(scheduler_operad_row(
+                "No scheduler data loaded".to_string(),
+                "Load a workspace with dispatch data to populate queue and tool matching"
+                    .to_string(),
+                Tone::Neutral,
+                None,
+                false,
+            ));
+            return rows;
+        }
+        rows.extend(DISPATCH_POLICIES.into_iter().map(|policy| {
+            scheduler_operad_row(
+                format!("Policy: {}", policy.label()),
+                "Select dispatch sorting policy".to_string(),
+                if self.policy == policy {
+                    Tone::Info
+                } else {
+                    Tone::Neutral
+                },
+                Some(format!(
+                    "{OPERAD_ACTION_SET_POLICY}{}|controls",
+                    dispatch_policy_slug(policy)
+                )),
+                self.policy == policy,
+            )
+        }));
+        rows.push(scheduler_operad_row(
+            self.selected_tool
+                .as_ref()
+                .map(|tool| format!("Selected tool: {tool}"))
+                .unwrap_or_else(|| "Selected tool: none".to_string()),
+            "Rows that reference a tool can update this focus".to_string(),
+            Tone::Info,
+            None,
+            false,
+        ));
+        for tool in self.schedule.tools.iter().take(12) {
+            rows.push(scheduler_operad_row(
+                format!("Tool focus: {}", tool.id),
+                format!(
+                    "{} · {} · {}",
+                    tool.name,
+                    tool.class.label(),
+                    tool.state.label()
+                ),
+                tool_state_tone(tool.state),
+                Some(format!(
+                    "{OPERAD_ACTION_SELECT_TOOL}{}|controls",
+                    tool.id.as_str()
+                )),
+                self.selected_tool.as_ref() == Some(&tool.id),
+            ));
+        }
+        rows.push(scheduler_operad_row(
+            if self.filter_text.trim().is_empty() {
+                "Search inactive".to_string()
+            } else {
+                format!("Search: {}", self.filter_text.trim())
+            },
+            "Text filtering stays on the fallback egui path until Operad has full edit routing"
+                .to_string(),
+            Tone::Neutral,
+            None,
+            false,
+        ));
+        rows.extend((0..=5).map(|priority| {
+            scheduler_operad_row(
+                format!("Minimum priority: P{priority}"),
+                "Filter queue and assignment rows".to_string(),
+                if self.min_priority == priority {
+                    Tone::Info
+                } else {
+                    Tone::Neutral
+                },
+                Some(format!(
+                    "{OPERAD_ACTION_SET_MIN_PRIORITY}{priority}|controls"
+                )),
+                self.min_priority == priority,
+            )
+        }));
+        rows.extend([
+            scheduler_operad_row(
+                if self.show_conflicts_only {
+                    "Conflicts only: on"
+                } else {
+                    "Conflicts only: off"
+                },
+                "Limit queue views to risk items".to_string(),
+                if self.show_conflicts_only {
+                    Tone::Warning
+                } else {
+                    Tone::Neutral
+                },
+                Some(OPERAD_ACTION_TOGGLE_CONFLICTS.to_string()),
+                self.show_conflicts_only,
+            ),
+            scheduler_operad_row(
+                if self.focus_selected_tool {
+                    "Focus selected tool: on"
+                } else {
+                    "Focus selected tool: off"
+                },
+                "Limit queue views to the selected tool".to_string(),
+                if self.focus_selected_tool {
+                    Tone::Info
+                } else {
+                    Tone::Neutral
+                },
+                Some(OPERAD_ACTION_TOGGLE_FOCUS_TOOL.to_string()),
+                self.focus_selected_tool,
+            ),
+            scheduler_operad_row(
+                "Reset filters".to_string(),
+                "Clear text search, priority, conflict-only, and tool-focus filters".to_string(),
+                Tone::Neutral,
+                Some(OPERAD_ACTION_RESET_FILTERS.to_string()),
+                false,
+            ),
+        ]);
+        rows
+    }
+
+    fn operad_next_action_rows(&self, result: &DispatchResult) -> Vec<SchedulerOperadRow> {
+        self.next_action_rows(result)
+            .into_iter()
+            .take(12)
+            .map(|action| {
+                scheduler_operad_row(
+                    action.title,
+                    format!("{} · {}", action.timing, action.detail),
+                    action.tone,
+                    action.tool_id.map(|tool_id| {
+                        format!("{OPERAD_ACTION_SELECT_TOOL}{}|next", tool_id.as_str())
+                    }),
+                    false,
+                )
+            })
+            .collect()
+    }
+
+    fn operad_queue_rows(&self, result: &DispatchResult) -> Vec<SchedulerOperadRow> {
+        self.queue_load_rows(result)
+            .into_iter()
+            .map(|row| {
+                scheduler_operad_row(
+                    format!("{} · {}", row.class_label, row.status_label),
+                    format!(
+                        "{} lots / {} min / {} per tool · {} · {}",
+                        row.waiting_lots,
+                        row.total_process_minutes,
+                        row.load_per_tool,
+                        row.driver,
+                        row.action
+                    ),
+                    row.tone,
+                    None,
+                    false,
+                )
+            })
+            .collect()
+    }
+
+    fn operad_tool_rows(&self, result: &DispatchResult) -> Vec<SchedulerOperadRow> {
+        self.schedule
+            .tools
+            .iter()
+            .map(|tool| {
+                let match_count = self.matching_lots_for_tool(tool).count();
+                let visible_count = self
+                    .matching_lots_for_tool(tool)
+                    .filter(|lot| {
+                        let assignment = self.assignment_for_lot(&result.assignments, &lot.id);
+                        self.lot_passes_filters(lot, assignment)
+                    })
+                    .count();
+                let next_lot = self.top_lot_for_tool(tool, result);
+                let recommendation = self.recommendation_for_tool(result, &tool.id);
+                scheduler_operad_row(
+                    format!("{} · {}", tool.id, tool.state.label()),
+                    format!(
+                        "{} · {} · {} · {}{}",
+                        tool.name,
+                        tool.class.label(),
+                        match_count_label(visible_count, match_count, self.filters_active()),
+                        next_lot
+                            .map(|lot| format!(
+                                "next P{} {} due {}",
+                                lot.priority,
+                                lot.id,
+                                format_shift_time(lot.due_at_minute)
+                            ))
+                            .unwrap_or_else(|| "no matching waiting lots".to_string()),
+                        recommendation
+                            .map(|recommendation| format!(" · {}", recommendation.reason))
+                            .unwrap_or_default()
+                    ),
+                    tool_state_tone(tool.state),
+                    Some(format!(
+                        "{OPERAD_ACTION_SELECT_TOOL}{}|tool",
+                        tool.id.as_str()
+                    )),
+                    self.selected_tool.as_ref() == Some(&tool.id),
+                )
+            })
+            .collect()
+    }
+
+    fn operad_priority_rows(&self, result: &DispatchResult) -> Vec<SchedulerOperadRow> {
+        self.priority_lots(result)
+            .into_iter()
+            .take(28)
+            .enumerate()
+            .map(|(index, lot)| {
+                let assignment = self.assignment_for_lot(&result.assignments, &lot.id);
+                let (eligible_tools, available_tools) = self.compatible_tool_counts(lot);
+                let (risk, tone) = self.lot_risk(lot, assignment, available_tools);
+                let candidate_tool = assignment
+                    .map(|assignment| assignment.tool_id.clone())
+                    .or_else(|| self.first_matching_tool(lot).map(|tool| tool.id.clone()));
+                scheduler_operad_row(
+                    format!("P{} {} · {risk}", lot.priority, lot.id),
+                    format!(
+                        "{} · {} · {} min · due {} · {available_tools}/{eligible_tools} tools · {}",
+                        lot.product,
+                        lot.required_tool_class.label(),
+                        lot.process_minutes,
+                        format_shift_time(lot.due_at_minute),
+                        schedule_label(assignment)
+                    ),
+                    tone,
+                    candidate_tool.map(|tool_id| {
+                        format!(
+                            "{OPERAD_ACTION_SELECT_TOOL}{}|priority.{index}",
+                            tool_id.as_str()
+                        )
+                    }),
+                    false,
+                )
+            })
+            .collect()
+    }
+
+    fn operad_conflict_rows(&self, result: &DispatchResult) -> Vec<SchedulerOperadRow> {
+        self.conflict_items(result)
+            .into_iter()
+            .take(16)
+            .map(|conflict| {
+                scheduler_operad_row(
+                    format!("{} · {}", conflict.target, conflict.issue),
+                    format!("{} · {}", conflict.impact, conflict.action),
+                    conflict.tone,
+                    None,
+                    false,
+                )
+            })
+            .collect()
+    }
+
+    fn operad_assignment_rows(&self, result: &DispatchResult) -> Vec<SchedulerOperadRow> {
+        result
+            .assignments
+            .iter()
+            .filter(|assignment| self.assignment_passes_filters(assignment))
+            .take(36)
+            .enumerate()
+            .map(|(index, assignment)| {
+                let (state, tone) = assignment_state(assignment);
+                scheduler_operad_row(
+                    format!("P{} {} · {state}", assignment.priority, assignment.lot_id),
+                    format!(
+                        "{} · {}-{} · wait {} min · due {}",
+                        assignment.tool_id,
+                        format_shift_time(assignment.start_minute),
+                        format_shift_time(assignment.finish_minute),
+                        assignment.wait_minutes,
+                        format_shift_time(assignment.due_at_minute)
+                    ),
+                    tone,
+                    Some(format!(
+                        "{OPERAD_ACTION_SELECT_TOOL}{}|assignment.{index}",
+                        assignment.tool_id.as_str()
+                    )),
+                    self.selected_tool.as_ref() == Some(&assignment.tool_id),
+                )
+            })
+            .collect()
+    }
+
+    fn handle_operad_action(&mut self, node_name: &str) -> Option<String> {
+        if node_name == OPERAD_ACTION_TOGGLE_CONFLICTS {
+            self.show_conflicts_only = !self.show_conflicts_only;
+            return Some("dispatch conflict filter toggled".to_string());
+        }
+        if node_name == OPERAD_ACTION_TOGGLE_FOCUS_TOOL {
+            self.focus_selected_tool = !self.focus_selected_tool;
+            return Some("dispatch selected-tool filter toggled".to_string());
+        }
+        if node_name == OPERAD_ACTION_RESET_FILTERS {
+            self.filter_text.clear();
+            self.min_priority = 0;
+            self.show_conflicts_only = false;
+            self.focus_selected_tool = false;
+            return Some("dispatch filters reset".to_string());
+        }
+        if let Some(value) = node_name.strip_prefix(OPERAD_ACTION_SET_POLICY) {
+            let slug = value.split_once('|').map(|(slug, _)| slug).unwrap_or(value);
+            if let Some(policy) = dispatch_policy_from_slug(slug) {
+                self.policy = policy;
+                return Some(format!("dispatch policy set to {}", policy.label()));
+            }
+        }
+        if let Some(value) = node_name.strip_prefix(OPERAD_ACTION_SET_MIN_PRIORITY) {
+            let value = value
+                .split_once('|')
+                .map(|(value, _)| value)
+                .unwrap_or(value);
+            if let Ok(priority) = value.parse::<u8>()
+                && priority <= 5
+            {
+                self.min_priority = priority;
+                return Some(format!("minimum dispatch priority set to P{priority}"));
+            }
+        }
+        if let Some(value) = node_name.strip_prefix(OPERAD_ACTION_SELECT_TOOL) {
+            let tool_id = value.split_once('|').map(|(tool, _)| tool).unwrap_or(value);
+            if self
+                .schedule
+                .tools
+                .iter()
+                .any(|tool| tool.id.as_str() == tool_id)
+            {
+                self.selected_tool = Some(ToolId::new(tool_id));
+                return Some(format!("selected dispatch tool {tool_id}"));
+            }
+        }
+        None
+    }
+
     pub(crate) fn context_ui(&mut self, ui: &mut egui::Ui) {
+        self.ensure_selection();
+        if self.operad_context_ui(ui).is_err() {
+            self.egui_context_ui(ui);
+        }
+    }
+
+    fn operad_context_ui(&mut self, ui: &mut egui::Ui) -> Result<(), String> {
+        self.ensure_selection();
+        if self.schedule.is_empty() {
+            return render_sidecar_interactive(
+                ui,
+                "scheduler.context",
+                &[SidecarSection::new("Dispatch Control").empty("No scheduler data loaded")],
+            )
+            .map(|_| ());
+        }
+        let result = self.schedule.dispatch(self.policy);
+        let conflicts = self.conflict_items(&result);
+        let ready_lots = self
+            .schedule
+            .lots
+            .iter()
+            .filter(|lot| lot.ready_at_minute <= self.schedule.now_minute)
+            .count();
+        let available_tools = self
+            .schedule
+            .tools
+            .iter()
+            .filter(|tool| tool.state == ToolDispatchState::Available)
+            .count();
+
+        let mut sections = Vec::new();
+        sections.push(
+            SidecarSection::new("Dispatch Control")
+                .row(SidecarRow::new(
+                    "Shift clock",
+                    format_shift_time(self.schedule.now_minute),
+                    Tone::Info,
+                ))
+                .row(SidecarRow::new(
+                    "Queue",
+                    format!(
+                        "{} waiting lots / {} ready now",
+                        self.schedule.lots.len(),
+                        ready_lots
+                    ),
+                    Tone::Neutral,
+                ))
+                .row(SidecarRow::new(
+                    "Tool capacity",
+                    format!(
+                        "{} tools / {} available",
+                        self.schedule.tools.len(),
+                        available_tools
+                    ),
+                    if available_tools == self.schedule.tools.len() {
+                        Tone::Success
+                    } else {
+                        Tone::Warning
+                    },
+                ))
+                .row(SidecarRow::new(
+                    if conflicts.is_empty() {
+                        "No schedule conflicts"
+                    } else {
+                        "Schedule conflicts"
+                    },
+                    format!("{} conflict(s)", conflicts.len()),
+                    if conflicts.is_empty() {
+                        Tone::Success
+                    } else {
+                        Tone::Danger
+                    },
+                )),
+        );
+
+        if let Some(bottleneck) = result
+            .queue_summaries
+            .iter()
+            .max_by_key(|summary| summary.total_process_minutes)
+        {
+            sections.push(
+                SidecarSection::new("Bottleneck")
+                    .row(SidecarRow::new(
+                        bottleneck.tool_class.label(),
+                        format!(
+                            "{} waiting lots / {} process min",
+                            bottleneck.waiting_lots, bottleneck.total_process_minutes
+                        ),
+                        Tone::Warning,
+                    ))
+                    .row(SidecarRow::new(
+                        "Earliest due",
+                        bottleneck
+                            .earliest_due_minute
+                            .map(format_shift_time)
+                            .unwrap_or_else(|| "none".to_string()),
+                        Tone::Neutral,
+                    )),
+            );
+        }
+
+        let mut tool_focus = SidecarSection::new("Tool Focus").empty("No tools available");
+        if let Some(tool) = self.selected_tool_detail() {
+            let matching_lots = self.matching_lots_for_tool(tool).count();
+            tool_focus = tool_focus.row(SidecarRow::new(
+                tool.name.clone(),
+                format!(
+                    "{} / {} / {}% utilized / {} matching lots",
+                    tool.id,
+                    tool.state.label(),
+                    utilization_for_tool(&result.assignments, &tool.id),
+                    matching_lots
+                ),
+                tool_state_tone(tool.state),
+            ));
+            if let Some(recommendation) = self.recommendation_for_tool(&result, &tool.id) {
+                tool_focus = tool_focus.row(SidecarRow::new(
+                    "Next recommendation",
+                    format!(
+                        "{} {}-{}",
+                        recommendation
+                            .lot_id
+                            .as_ref()
+                            .map(ToString::to_string)
+                            .unwrap_or_else(|| "--".to_string()),
+                        format_optional_time(recommendation.start_minute),
+                        format_optional_time(recommendation.finish_minute)
+                    ),
+                    Tone::Info,
+                ));
+            }
+        }
+        for tool in self.schedule.tools.iter().take(6) {
+            tool_focus = tool_focus.row(
+                SidecarRow::new(
+                    tool.id.to_string(),
+                    format!("{} / {}", tool.class.label(), tool.state.label()),
+                    tool_state_tone(tool.state),
+                )
+                .selected(self.selected_tool.as_ref() == Some(&tool.id))
+                .action(format!("{OPERAD_ACTION_SELECT_TOOL}{}|context", tool.id)),
+            );
+        }
+        sections.push(tool_focus);
+
+        let mut controls = SidecarSection::new("Controls");
+        for policy in DISPATCH_POLICIES {
+            controls = controls.row(
+                SidecarRow::new(
+                    policy.label(),
+                    "dispatch policy",
+                    if self.policy == policy {
+                        Tone::Info
+                    } else {
+                        Tone::Neutral
+                    },
+                )
+                .selected(self.policy == policy)
+                .action(format!(
+                    "{OPERAD_ACTION_SET_POLICY}{}|context",
+                    dispatch_policy_slug(policy)
+                )),
+            );
+        }
+        controls = controls
+            .row(
+                SidecarRow::new(
+                    if self.show_conflicts_only {
+                        "Showing conflicts only"
+                    } else {
+                        "Showing all work"
+                    },
+                    "toggle conflict filter",
+                    Tone::Neutral,
+                )
+                .action(OPERAD_ACTION_TOGGLE_CONFLICTS),
+            )
+            .row(
+                SidecarRow::new(
+                    if self.focus_selected_tool {
+                        "Focused on selected tool"
+                    } else {
+                        "All tools in scope"
+                    },
+                    "toggle selected-tool filter",
+                    Tone::Neutral,
+                )
+                .action(OPERAD_ACTION_TOGGLE_FOCUS_TOOL),
+            )
+            .row(
+                SidecarRow::new(
+                    "Reset filters",
+                    "clear scheduler context filters",
+                    Tone::Info,
+                )
+                .action(OPERAD_ACTION_RESET_FILTERS),
+            );
+        sections.push(controls);
+
+        if let Some(action) = render_sidecar_interactive(ui, "scheduler.context", &sections)? {
+            let _ = self.handle_operad_action(&action);
+        }
+        Ok(())
+    }
+
+    fn egui_context_ui(&mut self, ui: &mut egui::Ui) {
         self.ensure_selection();
         ui_chrome::section_label(ui, "Dispatch Control");
         if self.schedule.is_empty() {
@@ -1582,6 +2443,515 @@ struct ConflictItem {
     tone: Tone,
 }
 
+const DISPATCH_POLICIES: [DispatchPolicy; 3] = [
+    DispatchPolicy::PriorityThenFifo,
+    DispatchPolicy::DueDateThenPriority,
+    DispatchPolicy::Fifo,
+];
+
+fn dispatch_policy_slug(policy: DispatchPolicy) -> &'static str {
+    match policy {
+        DispatchPolicy::Fifo => "fifo",
+        DispatchPolicy::PriorityThenFifo => "priority-fifo",
+        DispatchPolicy::DueDateThenPriority => "due-date-priority",
+    }
+}
+
+fn dispatch_policy_from_slug(slug: &str) -> Option<DispatchPolicy> {
+    match slug {
+        "fifo" => Some(DispatchPolicy::Fifo),
+        "priority-fifo" => Some(DispatchPolicy::PriorityThenFifo),
+        "due-date-priority" => Some(DispatchPolicy::DueDateThenPriority),
+        _ => None,
+    }
+}
+
+fn scheduler_operad_view_height(width: f32, metric_count: usize, row_counts: &[usize]) -> f32 {
+    let mut height = OPERAD_HEADER_HEIGHT + OPERAD_GAP;
+    height += scheduler_operad_metric_grid_height(width, metric_count) + OPERAD_GAP;
+    for row_count in row_counts {
+        height += scheduler_operad_section_height(*row_count) + OPERAD_GAP;
+    }
+    height + OPERAD_PAD
+}
+
+fn scheduler_operad_metric_columns(width: f32) -> usize {
+    if width >= 1020.0 {
+        4
+    } else if width >= 680.0 {
+        3
+    } else if width >= 440.0 {
+        2
+    } else {
+        1
+    }
+}
+
+fn scheduler_operad_metric_grid_height(width: f32, metric_count: usize) -> f32 {
+    let columns = scheduler_operad_metric_columns(width).max(1);
+    let rows = metric_count.div_ceil(columns).max(1);
+    rows as f32 * OPERAD_METRIC_HEIGHT
+}
+
+fn scheduler_operad_section_height(row_count: usize) -> f32 {
+    OPERAD_PAD * 2.0
+        + OPERAD_SECTION_TITLE_HEIGHT
+        + if row_count == 0 {
+            OPERAD_EMPTY_ROW_HEIGHT
+        } else {
+            row_count as f32 * OPERAD_ROW_HEIGHT
+        }
+}
+
+fn add_scheduler_operad_header(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    eyebrow: &str,
+    title: &str,
+    detail: &str,
+    meta: &str,
+) {
+    let header = document.add_child(
+        parent,
+        UiNode::container(
+            "scheduler.header",
+            UiNodeStyle {
+                layout: layout::with_padding_all(
+                    layout::with_size(
+                        layout::column(),
+                        layout::percent(1.0),
+                        layout::px(OPERAD_HEADER_HEIGHT),
+                    ),
+                    OPERAD_PAD,
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            ColorRgba::new(22, 27, 32, 255),
+            Some(StrokeStyle::new(ColorRgba::new(46, 55, 64, 255), 1.0)),
+            6.0,
+        )),
+    );
+    add_scheduler_operad_text(
+        document,
+        header,
+        "scheduler.header.eyebrow",
+        eyebrow,
+        scheduler_operad_text_style(12.0, FontWeight::BOLD, ColorRgba::new(146, 154, 162, 255)),
+        16.0,
+    );
+    add_scheduler_operad_text(
+        document,
+        header,
+        "scheduler.header.title",
+        title,
+        scheduler_operad_text_style(24.0, FontWeight::BOLD, ColorRgba::new(242, 246, 250, 255)),
+        30.0,
+    );
+    add_scheduler_operad_text(
+        document,
+        header,
+        "scheduler.header.detail",
+        detail,
+        scheduler_operad_text_style(14.0, FontWeight::NORMAL, ColorRgba::new(178, 185, 194, 255)),
+        20.0,
+    );
+    add_scheduler_operad_text(
+        document,
+        header,
+        "scheduler.header.meta",
+        meta,
+        scheduler_operad_text_style(13.0, FontWeight::NORMAL, ColorRgba::new(112, 183, 239, 255)),
+        18.0,
+    );
+}
+
+fn add_scheduler_operad_metric_grid(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    width: f32,
+    metrics: &[SchedulerMetricTile],
+) {
+    let columns = scheduler_operad_metric_columns(width);
+    let grid_height = scheduler_operad_metric_grid_height(width, metrics.len());
+    let grid = document.add_child(
+        parent,
+        UiNode::container(
+            "scheduler.metrics",
+            UiNodeStyle {
+                layout: layout::with_size(
+                    layout::column(),
+                    layout::percent(1.0),
+                    layout::px(grid_height),
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        ),
+    );
+    let tile_width =
+        ((width - OPERAD_GAP * (columns.saturating_sub(1) as f32)) / columns as f32).max(120.0);
+    for (row_index, chunk) in metrics.chunks(columns).enumerate() {
+        let row = document.add_child(
+            grid,
+            UiNode::container(
+                format!("scheduler.metrics.row.{row_index}"),
+                UiNodeStyle {
+                    layout: layout::with_size(
+                        layout::row(),
+                        layout::percent(1.0),
+                        layout::px(OPERAD_METRIC_HEIGHT),
+                    ),
+                    clip: ClipBehavior::Clip,
+                    ..Default::default()
+                },
+            ),
+        );
+        for (column, metric) in chunk.iter().enumerate() {
+            add_scheduler_operad_metric_tile(
+                document,
+                row,
+                &format!("scheduler.metrics.{row_index}.{column}"),
+                tile_width - 6.0,
+                metric,
+            );
+        }
+    }
+}
+
+fn add_scheduler_operad_metric_tile(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    name: &str,
+    width: f32,
+    metric: &SchedulerMetricTile,
+) {
+    let tile = document.add_child(
+        parent,
+        UiNode::container(
+            name,
+            UiNodeStyle {
+                layout: layout::with_padding_all(
+                    layout::with_margin_all(
+                        layout::with_size(
+                            layout::column(),
+                            layout::px(width.max(116.0)),
+                            layout::px(OPERAD_METRIC_HEIGHT - 8.0),
+                        ),
+                        3.0,
+                    ),
+                    9.0,
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            ColorRgba::new(29, 35, 40, 255),
+            Some(StrokeStyle::new(
+                scheduler_operad_tone_color(metric.tone),
+                1.0,
+            )),
+            6.0,
+        )),
+    );
+    add_scheduler_operad_text(
+        document,
+        tile,
+        &format!("{name}.label"),
+        &metric.label,
+        scheduler_operad_text_style(12.0, FontWeight::BOLD, ColorRgba::new(158, 166, 174, 255)),
+        18.0,
+    );
+    add_scheduler_operad_text(
+        document,
+        tile,
+        &format!("{name}.value"),
+        &metric.value,
+        scheduler_operad_text_style(20.0, FontWeight::BOLD, ColorRgba::new(239, 243, 247, 255)),
+        26.0,
+    );
+    add_scheduler_operad_text(
+        document,
+        tile,
+        &format!("{name}.detail"),
+        truncate_middle(&metric.detail, 52),
+        scheduler_operad_text_style(
+            12.0,
+            FontWeight::NORMAL,
+            scheduler_operad_tone_color(metric.tone),
+        ),
+        18.0,
+    );
+}
+
+fn add_scheduler_operad_section(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    width: f32,
+    name: &str,
+    title: &str,
+    empty: &str,
+    rows: &[SchedulerOperadRow],
+) {
+    let height = scheduler_operad_section_height(rows.len());
+    let section = document.add_child(
+        parent,
+        UiNode::container(
+            name,
+            UiNodeStyle {
+                layout: layout::with_padding_all(
+                    layout::with_size(layout::column(), layout::percent(1.0), layout::px(height)),
+                    OPERAD_PAD,
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            ColorRgba::new(21, 26, 31, 255),
+            Some(StrokeStyle::new(ColorRgba::new(45, 53, 61, 255), 1.0)),
+            6.0,
+        )),
+    );
+    add_scheduler_operad_text(
+        document,
+        section,
+        &format!("{name}.title"),
+        title,
+        scheduler_operad_text_style(15.0, FontWeight::BOLD, ColorRgba::new(242, 246, 250, 255)),
+        OPERAD_SECTION_TITLE_HEIGHT,
+    );
+    if rows.is_empty() {
+        add_scheduler_operad_empty_row(document, section, name, empty);
+    } else {
+        let row_width = (width - OPERAD_PAD * 2.0).max(240.0);
+        for (index, row) in rows.iter().enumerate() {
+            add_scheduler_operad_data_row(document, section, name, index, row_width, row);
+        }
+    }
+}
+
+fn add_scheduler_operad_empty_row(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    name: &str,
+    label: &str,
+) {
+    let row = document.add_child(
+        parent,
+        UiNode::container(
+            format!("{name}.empty"),
+            UiNodeStyle {
+                layout: layout::with_padding_all(
+                    layout::with_size(
+                        layout::row(),
+                        layout::percent(1.0),
+                        layout::px(OPERAD_EMPTY_ROW_HEIGHT),
+                    ),
+                    8.0,
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            ColorRgba::new(27, 32, 37, 255),
+            Some(StrokeStyle::new(ColorRgba::new(43, 50, 58, 255), 1.0)),
+            5.0,
+        )),
+    );
+    add_scheduler_operad_text(
+        document,
+        row,
+        &format!("{name}.empty.label"),
+        label,
+        scheduler_operad_text_style(13.0, FontWeight::NORMAL, ColorRgba::new(154, 163, 172, 255)),
+        24.0,
+    );
+}
+
+fn add_scheduler_operad_data_row(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    section_name: &str,
+    index: usize,
+    row_width: f32,
+    row: &SchedulerOperadRow,
+) {
+    let row_name = row
+        .action_name
+        .clone()
+        .unwrap_or_else(|| format!("{section_name}.row.{index}"));
+    let stroke_color = if row.selected {
+        scheduler_operad_tone_color(Tone::Info)
+    } else {
+        ColorRgba::new(42, 50, 58, 255)
+    };
+    let fill = if row.selected {
+        ColorRgba::new(26, 42, 56, 255)
+    } else {
+        ColorRgba::new(26, 31, 36, 255)
+    };
+    let mut node = UiNode::container(
+        row_name,
+        UiNodeStyle {
+            layout: layout::with_padding_all(
+                layout::with_size(
+                    layout::row(),
+                    layout::percent(1.0),
+                    layout::px(OPERAD_ROW_HEIGHT),
+                ),
+                6.0,
+            ),
+            clip: ClipBehavior::Clip,
+            ..Default::default()
+        },
+    )
+    .with_visual(UiVisual::panel(
+        fill,
+        Some(StrokeStyle::new(stroke_color, 1.0)),
+        4.0,
+    ));
+    if row.action_name.is_some() {
+        node = node.with_input(InputBehavior::BUTTON);
+    }
+    let row_node = document.add_child(parent, node);
+    document.add_child(
+        row_node,
+        UiNode::container(
+            format!("{section_name}.row.{index}.tone"),
+            UiNodeStyle {
+                layout: layout::fixed(5.0, OPERAD_ROW_HEIGHT - 12.0),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            scheduler_operad_tone_color(row.tone),
+            None,
+            2.0,
+        )),
+    );
+    let text_column = document.add_child(
+        row_node,
+        UiNode::container(
+            format!("{section_name}.row.{index}.text"),
+            UiNodeStyle {
+                layout: layout::with_size(
+                    layout::column(),
+                    layout::px((row_width - 28.0).max(120.0)),
+                    layout::px(OPERAD_ROW_HEIGHT - 12.0),
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        ),
+    );
+    add_scheduler_operad_text(
+        document,
+        text_column,
+        &format!("{section_name}.row.{index}.title"),
+        truncate_middle(&row.title, 72),
+        scheduler_operad_text_style(14.0, FontWeight::BOLD, ColorRgba::new(232, 237, 242, 255)),
+        21.0,
+    );
+    add_scheduler_operad_text(
+        document,
+        text_column,
+        &format!("{section_name}.row.{index}.detail"),
+        truncate_middle(&row.detail, 108),
+        scheduler_operad_text_style(12.0, FontWeight::NORMAL, ColorRgba::new(162, 171, 180, 255)),
+        19.0,
+    );
+}
+
+fn add_scheduler_operad_spacer(document: &mut UiDocument, parent: UiNodeId, height: f32) {
+    document.add_child(
+        parent,
+        UiNode::container(
+            format!("scheduler.spacer.{}", document.node_count()),
+            UiNodeStyle {
+                layout: layout::with_size(layout::row(), layout::percent(1.0), layout::px(height)),
+                ..Default::default()
+            },
+        ),
+    );
+}
+
+fn add_scheduler_operad_text(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    name: &str,
+    text: impl Into<String>,
+    style: TextStyle,
+    height: f32,
+) {
+    widgets::label(
+        document,
+        parent,
+        name,
+        text,
+        style,
+        layout::with_size(layout::row(), layout::percent(1.0), layout::px(height)),
+    );
+}
+
+fn scheduler_operad_text_style(font_size: f32, weight: FontWeight, color: ColorRgba) -> TextStyle {
+    TextStyle {
+        font_size,
+        line_height: font_size + 4.0,
+        weight,
+        color,
+        wrap: TextWrap::None,
+        ..Default::default()
+    }
+}
+
+fn scheduler_operad_tone_color(tone: Tone) -> ColorRgba {
+    let color = tone.color();
+    ColorRgba::new(color.r(), color.g(), color.b(), color.a())
+}
+
+fn scheduler_operad_row(
+    title: impl Into<String>,
+    detail: impl Into<String>,
+    tone: Tone,
+    action_name: Option<String>,
+    selected: bool,
+) -> SchedulerOperadRow {
+    SchedulerOperadRow {
+        title: title.into(),
+        detail: detail.into(),
+        tone,
+        action_name,
+        selected,
+    }
+}
+
+fn truncate_middle(text: impl AsRef<str>, max_chars: usize) -> String {
+    let text = text.as_ref();
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_string();
+    }
+    let keep = max_chars.saturating_sub(3);
+    let head = keep / 2;
+    let tail = keep - head;
+    let start = text.chars().take(head).collect::<String>();
+    let end = text
+        .chars()
+        .rev()
+        .take(tail)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!("{start}...{end}")
+}
+
 fn queue_summary_ui(ui: &mut egui::Ui, summary: &QueueSummary) {
     ui.label(summary.tool_class.label());
     ui.label(format!("{} waiting lots", summary.waiting_lots));
@@ -1789,5 +3159,72 @@ fn assignment_color(priority: u8) -> Color32 {
         4 => Color32::from_rgb(218, 150, 66),
         3 => Color32::from_rgb(82, 145, 214),
         _ => Color32::from_rgb(92, 168, 132),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scheduler_operad_view_audits_common_widths() {
+        let mut panel = SchedulerPanel::from_schedule(DispatchSchedule::sample());
+        panel.ensure_selection();
+        let result = panel.schedule.dispatch(panel.policy);
+        for width in [360.0, 760.0, 1200.0] {
+            let mut view = panel.build_operad_view(width, &result);
+            view.document
+                .compute_layout(view.size, &mut ApproxTextMeasurer)
+                .unwrap();
+            let warnings = view.document.audit_layout();
+            assert!(warnings.is_empty(), "{warnings:#?}");
+            assert!(view.document.node_count() > 20);
+            assert!(!view.document.paint_list().items.is_empty());
+        }
+    }
+
+    #[test]
+    fn scheduler_operad_actions_update_panel_state() {
+        let mut panel = SchedulerPanel::from_schedule(DispatchSchedule::sample());
+        let target_tool = panel.schedule.tools.last().unwrap().id.clone();
+
+        assert_eq!(
+            panel.handle_operad_action(&format!(
+                "{OPERAD_ACTION_SET_POLICY}{}|test",
+                dispatch_policy_slug(DispatchPolicy::DueDateThenPriority)
+            )),
+            Some("dispatch policy set to due date + priority".to_string())
+        );
+        assert_eq!(panel.policy, DispatchPolicy::DueDateThenPriority);
+
+        assert_eq!(
+            panel.handle_operad_action(&format!(
+                "{OPERAD_ACTION_SELECT_TOOL}{}|test",
+                target_tool.as_str()
+            )),
+            Some(format!("selected dispatch tool {target_tool}"))
+        );
+        assert_eq!(panel.selected_tool.as_ref(), Some(&target_tool));
+
+        assert_eq!(
+            panel.handle_operad_action(&format!("{OPERAD_ACTION_SET_MIN_PRIORITY}4|test")),
+            Some("minimum dispatch priority set to P4".to_string())
+        );
+        assert_eq!(panel.min_priority, 4);
+
+        assert!(!panel.show_conflicts_only);
+        assert_eq!(
+            panel.handle_operad_action(OPERAD_ACTION_TOGGLE_CONFLICTS),
+            Some("dispatch conflict filter toggled".to_string())
+        );
+        assert!(panel.show_conflicts_only);
+
+        assert_eq!(
+            panel.handle_operad_action(OPERAD_ACTION_RESET_FILTERS),
+            Some("dispatch filters reset".to_string())
+        );
+        assert_eq!(panel.min_priority, 0);
+        assert!(!panel.show_conflicts_only);
+        assert!(!panel.focus_selected_tool);
     }
 }

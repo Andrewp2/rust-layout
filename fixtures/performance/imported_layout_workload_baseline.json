@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "name": "imported_layout_workload_baseline",
+  "workloads": [
+    {
+      "name": "gds_export",
+      "metric": "elements",
+      "min_input_size": 1,
+      "max_actual": 8
+    },
+    {
+      "name": "gds_import",
+      "metric": "document_objects",
+      "min_input_size": 1,
+      "max_actual": 16
+    },
+    {
+      "name": "generated_layers",
+      "metric": "layers",
+      "min_input_size": 1,
+      "max_actual": 0
+    },
+    {
+      "name": "skipped_import_elements",
+      "metric": "elements",
+      "min_input_size": 1,
+      "max_actual": 0
+    },
+    {
+      "name": "layout_diff",
+      "metric": "changes",
+      "min_input_size": 1,
+      "max_actual": 4
+    },
+    {
+      "name": "3d_mesh_build",
+      "metric": "faces",
+      "min_input_size": 1,
+      "max_actual": 64
+    },
+    {
+      "name": "3d_stack_ranges",
+      "metric": "validated_ranges",
+      "min_input_size": 1,
+      "max_actual": 8
+    },
+    {
+      "name": "3d_mesh_validation",
+      "metric": "validated_primitives",
+      "min_input_size": 1,
+      "max_actual": 128
+    }
+  ]
+}

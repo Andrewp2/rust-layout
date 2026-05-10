@@ -7,8 +7,30 @@ use layout_model::{
     },
     yield_analysis::YieldAnalysis,
 };
+use operad::{
+    ApproxTextMeasurer, ClipBehavior, ColorRgba, FontWeight, InputBehavior, StrokeStyle, TextStyle,
+    TextWrap, UiDocument, UiNode, UiNodeId, UiNodeStyle, UiSize, UiVisual, layout, root_style,
+    widgets,
+};
 
-use crate::ui_chrome::{self, Tone};
+use crate::{
+    operad_egui,
+    operad_sidecar::{SidecarRow, SidecarSection, render_sidecar},
+    ui_chrome::{self, Tone},
+};
+
+const OPERAD_HEADER_HEIGHT: f32 = 104.0;
+const OPERAD_METRIC_HEIGHT: f32 = 88.0;
+const OPERAD_SECTION_TITLE_HEIGHT: f32 = 26.0;
+const OPERAD_ROW_HEIGHT: f32 = 58.0;
+const OPERAD_EMPTY_ROW_HEIGHT: f32 = 44.0;
+const OPERAD_GAP: f32 = 10.0;
+const OPERAD_PAD: f32 = 12.0;
+const OPERAD_ACTION_SELECT_CHART: &str = "spc_fdc.action.select_chart.";
+const OPERAD_ACTION_SELECT_TRACE: &str = "spc_fdc.action.select_trace.";
+const OPERAD_ACTION_SET_SEVERITY: &str = "spc_fdc.action.set_severity.";
+const OPERAD_ACTION_SET_SOURCE: &str = "spc_fdc.action.set_source.";
+const OPERAD_ACTION_CLEAR_CONTEXT: &str = "spc_fdc.action.clear_context";
 
 pub(crate) struct SpcFdcPanel {
     selected_chart: String,
@@ -16,6 +38,29 @@ pub(crate) struct SpcFdcPanel {
     severity_filter: SeverityFilter,
     source_filter: SourceFilter,
     context_filter: String,
+}
+
+#[derive(Debug)]
+struct SpcFdcOperadView {
+    document: UiDocument,
+    size: UiSize,
+}
+
+#[derive(Clone, Debug)]
+struct SpcFdcMetricTile {
+    label: String,
+    value: String,
+    detail: String,
+    tone: Tone,
+}
+
+#[derive(Clone, Debug)]
+struct SpcFdcOperadRow {
+    title: String,
+    detail: String,
+    tone: Tone,
+    action_name: Option<String>,
+    selected: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,6 +89,25 @@ impl SeverityFilter {
             Self::Critical => severity == MonitorSeverity::Critical,
             Self::Warning => severity == MonitorSeverity::Warning,
             Self::Advisory => severity == MonitorSeverity::Advisory,
+        }
+    }
+
+    fn slug(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Critical => "critical",
+            Self::Warning => "warning",
+            Self::Advisory => "advisory",
+        }
+    }
+
+    fn from_slug(slug: &str) -> Option<Self> {
+        match slug {
+            "all" => Some(Self::All),
+            "critical" => Some(Self::Critical),
+            "warning" => Some(Self::Warning),
+            "advisory" => Some(Self::Advisory),
+            _ => None,
         }
     }
 }
@@ -76,6 +140,25 @@ impl SourceFilter {
             Self::Alarm => source == FindingSource::EquipmentAlarm,
         }
     }
+
+    fn slug(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Spc => "spc",
+            Self::Fdc => "fdc",
+            Self::Alarm => "alarm",
+        }
+    }
+
+    fn from_slug(slug: &str) -> Option<Self> {
+        match slug {
+            "all" => Some(Self::All),
+            "spc" => Some(Self::Spc),
+            "fdc" => Some(Self::Fdc),
+            "alarm" => Some(Self::Alarm),
+            _ => None,
+        }
+    }
 }
 
 impl SpcFdcPanel {
@@ -97,7 +180,59 @@ impl SpcFdcPanel {
     ) {
         let monitor = monitor_from_fab_context(analysis, equipment);
         self.ensure_selection(&monitor);
+        if let Err(error) = self.operad_ui(ui, &monitor) {
+            ui.colored_label(Color32::from_rgb(226, 96, 96), error);
+            self.egui_dashboard_ui(ui, &monitor);
+        }
+    }
 
+    fn operad_ui(&mut self, ui: &mut egui::Ui, monitor: &SpcFdcMonitor) -> Result<(), String> {
+        let mut result = Ok(());
+        egui::ScrollArea::vertical()
+            .id_salt("spc_fdc_dashboard_operad_scroll")
+            .show(ui, |ui| {
+                let width = ui.available_width().max(320.0);
+                let mut view = self.build_operad_view(width, monitor);
+                if let Err(error) = view
+                    .document
+                    .compute_layout(view.size, &mut ApproxTextMeasurer)
+                    .map_err(|error| error.to_string())
+                {
+                    result = Err(error);
+                    return;
+                }
+
+                let (rect, response) =
+                    ui.allocate_exact_size(vec2(width, view.size.height), Sense::click());
+                if response.clicked()
+                    && let Some(pointer) = response.interact_pointer_pos()
+                    && let Some(node_name) =
+                        operad_egui::hit_test_name(&view.document, rect, pointer)
+                    && self.handle_operad_action(&node_name, monitor)
+                {
+                    view = self.build_operad_view(width, monitor);
+                    if let Err(error) = view
+                        .document
+                        .compute_layout(view.size, &mut ApproxTextMeasurer)
+                        .map_err(|error| error.to_string())
+                    {
+                        result = Err(error);
+                        return;
+                    }
+                }
+
+                if response.hovered()
+                    && let Some(pointer) = ui.ctx().pointer_hover_pos()
+                    && operad_egui::hit_test_name(&view.document, rect, pointer).is_some()
+                {
+                    ui.output_mut(|output| output.cursor_icon = egui::CursorIcon::PointingHand);
+                }
+                operad_egui::paint_document_at(ui, &view.document, rect);
+            });
+        result
+    }
+
+    fn egui_dashboard_ui(&mut self, ui: &mut egui::Ui, monitor: &SpcFdcMonitor) {
         egui::ScrollArea::vertical()
             .id_salt("spc_fdc_dashboard")
             .show(ui, |ui| {
@@ -109,37 +244,673 @@ impl SpcFdcPanel {
                 );
                 ui_chrome::module_header(ui, "Process monitor", "SPC / FDC", &detail, |_| {});
 
-                monitor_metrics_ui(ui, &monitor);
+                monitor_metrics_ui(ui, monitor);
 
                 ui.separator();
-                triage_summary_ui(ui, &monitor);
+                triage_summary_ui(ui, monitor);
 
                 ui.separator();
                 let available_width = ui.available_width();
                 if available_width < 780.0 {
-                    self.spc_section(ui, &monitor);
+                    self.spc_section(ui, monitor);
                     ui.separator();
-                    self.fdc_section(ui, &monitor);
+                    self.fdc_section(ui, monitor);
                     ui.separator();
-                    self.context_section(ui, &monitor);
+                    self.context_section(ui, monitor);
                 } else if available_width < 1120.0 {
                     ui.columns(2, |columns| {
-                        self.spc_section(&mut columns[0], &monitor);
-                        self.fdc_section(&mut columns[1], &monitor);
+                        self.spc_section(&mut columns[0], monitor);
+                        self.fdc_section(&mut columns[1], monitor);
                     });
                     ui.separator();
-                    self.context_section(ui, &monitor);
+                    self.context_section(ui, monitor);
                 } else {
                     ui.columns(3, |columns| {
-                        self.spc_section(&mut columns[0], &monitor);
-                        self.fdc_section(&mut columns[1], &monitor);
-                        self.context_section(&mut columns[2], &monitor);
+                        self.spc_section(&mut columns[0], monitor);
+                        self.fdc_section(&mut columns[1], monitor);
+                        self.context_section(&mut columns[2], monitor);
                     });
                 }
 
                 ui.separator();
                 self.findings_ui(ui, &monitor.findings);
             });
+    }
+
+    fn build_operad_view(&self, width: f32, monitor: &SpcFdcMonitor) -> SpcFdcOperadView {
+        let metrics = self.operad_metrics(monitor);
+        let triage_rows = self.operad_triage_rows(monitor);
+        let chart_rows = self.operad_chart_rows(monitor);
+        let selected_chart_rows = self.operad_selected_chart_rows(monitor);
+        let trace_rows = self.operad_trace_rows(monitor);
+        let selected_trace_rows = self.operad_selected_trace_rows(monitor);
+        let context_rows = self.operad_context_rows(monitor);
+        let finding_rows = self.operad_finding_rows(monitor);
+        let height = spc_fdc_operad_view_height(
+            width,
+            metrics.len(),
+            &[
+                triage_rows.len(),
+                chart_rows.len(),
+                selected_chart_rows.len(),
+                trace_rows.len(),
+                selected_trace_rows.len(),
+                context_rows.len(),
+                finding_rows.len(),
+            ],
+        );
+        let size = UiSize::new(width, height);
+        let mut document = UiDocument::new(root_style(width, height));
+        let root = document.root;
+        document.set_node_visual(
+            root,
+            UiVisual::panel(
+                ColorRgba::new(15, 18, 21, 255),
+                Some(StrokeStyle::new(ColorRgba::new(39, 46, 52, 255), 1.0)),
+                0.0,
+            ),
+        );
+
+        add_spc_fdc_operad_header(
+            &mut document,
+            root,
+            "PROCESS MONITOR",
+            "SPC / FDC",
+            "Control charts, equipment traces, active alarms, and release triage",
+            &format!(
+                "{} active finding(s) across {} chart(s), {} trace(s)",
+                monitor.findings.len(),
+                monitor.charts.len(),
+                monitor.traces.len()
+            ),
+        );
+        add_spc_fdc_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_spc_fdc_operad_metric_grid(&mut document, root, width, &metrics);
+        add_spc_fdc_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_spc_fdc_operad_section(
+            &mut document,
+            root,
+            width,
+            "spc_fdc.triage",
+            "Actionable Triage",
+            "No active SPC/FDC actions",
+            &triage_rows,
+        );
+        add_spc_fdc_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_spc_fdc_operad_section(
+            &mut document,
+            root,
+            width,
+            "spc_fdc.charts",
+            "SPC Control Charts",
+            "No process measurements are available",
+            &chart_rows,
+        );
+        add_spc_fdc_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_spc_fdc_operad_section(
+            &mut document,
+            root,
+            width,
+            "spc_fdc.selected_chart",
+            "Selected Chart",
+            "No SPC chart selected",
+            &selected_chart_rows,
+        );
+        add_spc_fdc_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_spc_fdc_operad_section(
+            &mut document,
+            root,
+            width,
+            "spc_fdc.traces",
+            "FDC Sensor Traces",
+            "No equipment sensor samples are available",
+            &trace_rows,
+        );
+        add_spc_fdc_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_spc_fdc_operad_section(
+            &mut document,
+            root,
+            width,
+            "spc_fdc.selected_trace",
+            "Selected Trace",
+            "No FDC trace selected",
+            &selected_trace_rows,
+        );
+        add_spc_fdc_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_spc_fdc_operad_section(
+            &mut document,
+            root,
+            width,
+            "spc_fdc.context",
+            "Sensor / Fault Context",
+            "Select a sensor trace for tool context",
+            &context_rows,
+        );
+        add_spc_fdc_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_spc_fdc_operad_section(
+            &mut document,
+            root,
+            width,
+            "spc_fdc.findings",
+            "Monitor Findings",
+            "No findings match the current filters",
+            &finding_rows,
+        );
+
+        SpcFdcOperadView { document, size }
+    }
+
+    fn operad_metrics(&self, monitor: &SpcFdcMonitor) -> Vec<SpcFdcMetricTile> {
+        let chart_violation_count = monitor
+            .charts
+            .iter()
+            .map(|chart| chart.violations.len())
+            .sum::<usize>();
+        let excursion_count = monitor
+            .traces
+            .iter()
+            .map(|trace| trace.violations.len())
+            .sum::<usize>();
+        vec![
+            SpcFdcMetricTile {
+                label: "Critical".to_string(),
+                value: monitor
+                    .finding_count_by_severity(MonitorSeverity::Critical)
+                    .to_string(),
+                detail: "release blockers".to_string(),
+                tone: if monitor.finding_count_by_severity(MonitorSeverity::Critical) > 0 {
+                    Tone::Danger
+                } else {
+                    Tone::Neutral
+                },
+            },
+            SpcFdcMetricTile {
+                label: "Warning".to_string(),
+                value: monitor
+                    .finding_count_by_severity(MonitorSeverity::Warning)
+                    .to_string(),
+                detail: "investigate".to_string(),
+                tone: if monitor.finding_count_by_severity(MonitorSeverity::Warning) > 0 {
+                    Tone::Warning
+                } else {
+                    Tone::Neutral
+                },
+            },
+            SpcFdcMetricTile {
+                label: "SPC violations".to_string(),
+                value: chart_violation_count.to_string(),
+                detail: "rule hits".to_string(),
+                tone: if chart_violation_count > 0 {
+                    Tone::Warning
+                } else {
+                    Tone::Neutral
+                },
+            },
+            SpcFdcMetricTile {
+                label: "FDC excursions".to_string(),
+                value: excursion_count.to_string(),
+                detail: "sensor samples".to_string(),
+                tone: if excursion_count > 0 {
+                    Tone::Warning
+                } else {
+                    Tone::Neutral
+                },
+            },
+            SpcFdcMetricTile {
+                label: "Active alarms".to_string(),
+                value: monitor.alarm_summary.active_count.to_string(),
+                detail: "equipment tools".to_string(),
+                tone: if monitor.alarm_summary.active_count > 0 {
+                    Tone::Warning
+                } else {
+                    Tone::Neutral
+                },
+            },
+        ]
+    }
+
+    fn operad_triage_rows(&self, monitor: &SpcFdcMonitor) -> Vec<SpcFdcOperadRow> {
+        let mut rows = vec![spc_fdc_operad_row(
+            monitor_risk_label(monitor).to_string(),
+            monitor
+                .findings
+                .first()
+                .map(|finding| format!("{} · {}", finding.title, next_action_for_finding(finding)))
+                .unwrap_or_else(|| {
+                    "No active SPC rules, FDC excursions, or equipment alarms".to_string()
+                }),
+            monitor_tone(monitor),
+            None,
+            false,
+        )];
+        rows.extend(SeverityFilter::ALL.into_iter().map(|filter| {
+            spc_fdc_operad_row(
+                format!("Severity filter: {}", filter.label()),
+                "Filter monitor findings".to_string(),
+                if self.severity_filter == filter {
+                    Tone::Info
+                } else {
+                    Tone::Neutral
+                },
+                Some(format!(
+                    "{OPERAD_ACTION_SET_SEVERITY}{}|triage",
+                    filter.slug()
+                )),
+                self.severity_filter == filter,
+            )
+        }));
+        rows.extend(SourceFilter::ALL.into_iter().map(|filter| {
+            spc_fdc_operad_row(
+                format!("Source filter: {}", filter.label()),
+                "Filter by SPC, FDC, or equipment alarms".to_string(),
+                if self.source_filter == filter {
+                    Tone::Info
+                } else {
+                    Tone::Neutral
+                },
+                Some(format!(
+                    "{OPERAD_ACTION_SET_SOURCE}{}|triage",
+                    filter.slug()
+                )),
+                self.source_filter == filter,
+            )
+        }));
+        rows.push(spc_fdc_operad_row(
+            if self.context_filter.trim().is_empty() {
+                "Context search inactive".to_string()
+            } else {
+                format!("Context search: {}", self.context_filter.trim())
+            },
+            "Text filtering stays on the fallback egui path until Operad has full edit routing"
+                .to_string(),
+            Tone::Neutral,
+            (!self.context_filter.trim().is_empty())
+                .then(|| OPERAD_ACTION_CLEAR_CONTEXT.to_string()),
+            false,
+        ));
+        rows
+    }
+
+    fn operad_chart_rows(&self, monitor: &SpcFdcMonitor) -> Vec<SpcFdcOperadRow> {
+        monitor
+            .charts
+            .iter()
+            .enumerate()
+            .map(|(index, chart)| {
+                let latest = chart.latest_point();
+                spc_fdc_operad_row(
+                    format!(
+                        "{} · {} violation(s)",
+                        chart.metric.replace('_', " "),
+                        chart.violations.len()
+                    ),
+                    format!(
+                        "{} point(s) · latest {} · {}",
+                        chart.points.len(),
+                        latest
+                            .map(|point| format!(
+                                "{} {} on {}",
+                                compact_number(point.value),
+                                chart.unit,
+                                point.wafer_id
+                            ))
+                            .unwrap_or_else(|| "n/a".to_string()),
+                        chart_trend_label(chart)
+                    ),
+                    chart
+                        .highest_severity()
+                        .map_or(Tone::Success, severity_tone),
+                    Some(format!(
+                        "{OPERAD_ACTION_SELECT_CHART}{}|chart.{index}",
+                        chart.id.as_str()
+                    )),
+                    chart.id.as_str() == self.selected_chart,
+                )
+            })
+            .collect()
+    }
+
+    fn operad_selected_chart_rows(&self, monitor: &SpcFdcMonitor) -> Vec<SpcFdcOperadRow> {
+        let Some(chart) = monitor
+            .charts
+            .iter()
+            .find(|chart| chart.id.as_str() == self.selected_chart)
+        else {
+            return Vec::new();
+        };
+        let latest = chart.latest_point();
+        let status = latest
+            .map(|point| {
+                if chart.limits.contains(point.value) {
+                    "inside control limits"
+                } else {
+                    "outside control limits"
+                }
+            })
+            .unwrap_or("no samples");
+        let mut rows = vec![
+            spc_fdc_operad_row(
+                chart.name.clone(),
+                format!(
+                    "{} · {} point(s), {} rule violation(s)",
+                    status,
+                    chart.points.len(),
+                    chart.violations.len()
+                ),
+                chart
+                    .highest_severity()
+                    .map_or(Tone::Success, severity_tone),
+                Some(format!(
+                    "{OPERAD_ACTION_SELECT_CHART}{}|selected",
+                    chart.id.as_str()
+                )),
+                true,
+            ),
+            spc_fdc_operad_row(
+                "Center / sigma".to_string(),
+                format!(
+                    "{} / {} {}",
+                    compact_number(chart.limits.center),
+                    compact_number(chart.limits.one_sigma),
+                    chart.unit
+                ),
+                Tone::Neutral,
+                None,
+                false,
+            ),
+            spc_fdc_operad_row(
+                "Limits / capability".to_string(),
+                format!(
+                    "{}..{} {}, {}",
+                    compact_number(chart.limits.lower_control),
+                    compact_number(chart.limits.upper_control),
+                    chart.unit,
+                    chart_cpk(chart)
+                        .map(|cpk| format!("Cpk {}", compact_number(cpk)))
+                        .unwrap_or_else(|| "Cpk n/a".to_string())
+                ),
+                Tone::Neutral,
+                None,
+                false,
+            ),
+        ];
+        for violation in chart.violations.iter().take(8) {
+            rows.push(spc_fdc_operad_row(
+                format!(
+                    "{} · {}",
+                    violation.rule.label(),
+                    violation.severity.label()
+                ),
+                format!(
+                    "{} · {} · {}",
+                    violation_points_label(chart, violation),
+                    violation_context(violation),
+                    spc_action_for_violation(violation)
+                ),
+                severity_tone(violation.severity),
+                None,
+                false,
+            ));
+        }
+        rows
+    }
+
+    fn operad_trace_rows(&self, monitor: &SpcFdcMonitor) -> Vec<SpcFdcOperadRow> {
+        monitor
+            .traces
+            .iter()
+            .enumerate()
+            .map(|(index, trace)| {
+                let latest = trace.latest_point();
+                spc_fdc_operad_row(
+                    format!(
+                        "{} · {} excursion(s)",
+                        trace.display_name(),
+                        trace.violations.len()
+                    ),
+                    format!(
+                        "{} sample(s) · latest {} · {} alarm(s)",
+                        trace.samples.len(),
+                        latest
+                            .map(|point| format!(
+                                "{} {} at t+{}s",
+                                compact_number(point.value),
+                                trace.unit,
+                                point.at_s
+                            ))
+                            .unwrap_or_else(|| "n/a".to_string()),
+                        same_tool_alarm_count(monitor, &trace.tool_id)
+                    ),
+                    trace_highest_severity(monitor, trace).map_or(Tone::Success, severity_tone),
+                    Some(format!(
+                        "{OPERAD_ACTION_SELECT_TRACE}{}|trace.{index}",
+                        trace.id
+                    )),
+                    trace.id == self.selected_trace,
+                )
+            })
+            .collect()
+    }
+
+    fn operad_selected_trace_rows(&self, monitor: &SpcFdcMonitor) -> Vec<SpcFdcOperadRow> {
+        let Some(trace) = monitor
+            .traces
+            .iter()
+            .find(|trace| trace.id == self.selected_trace)
+        else {
+            return Vec::new();
+        };
+        let latest = trace.latest_point();
+        let latest_status = latest
+            .map(|point| {
+                if trace.limit.contains(point.value) {
+                    "inside configured limits"
+                } else {
+                    "outside configured limits"
+                }
+            })
+            .unwrap_or("no samples");
+        let mut rows = vec![
+            spc_fdc_operad_row(
+                trace.display_name(),
+                format!(
+                    "{} · {} sample(s), {} excursion(s)",
+                    latest_status,
+                    trace.samples.len(),
+                    trace.violations.len()
+                ),
+                trace_highest_severity(monitor, trace).map_or(Tone::Success, severity_tone),
+                Some(format!("{OPERAD_ACTION_SELECT_TRACE}{}|selected", trace.id)),
+                true,
+            ),
+            spc_fdc_operad_row(
+                "Limits".to_string(),
+                limit_label(trace),
+                Tone::Neutral,
+                None,
+                false,
+            ),
+            spc_fdc_operad_row(
+                "Observed range".to_string(),
+                trace_range_label(trace),
+                Tone::Neutral,
+                None,
+                false,
+            ),
+        ];
+        for violation in trace.violations.iter().take(8) {
+            rows.push(spc_fdc_operad_row(
+                format!("t+{}s · {}", violation.at_s, violation.severity.label()),
+                format!(
+                    "{} {} · {} · {}",
+                    compact_number(violation.value),
+                    violation.unit,
+                    sensor_delta_label(violation.value, &violation.limit, &violation.unit),
+                    fdc_action_for_violation(violation)
+                ),
+                severity_tone(violation.severity),
+                None,
+                false,
+            ));
+        }
+        rows
+    }
+
+    fn operad_context_rows(&self, monitor: &SpcFdcMonitor) -> Vec<SpcFdcOperadRow> {
+        let mut rows = Vec::new();
+        if let Some(trace) = monitor
+            .traces
+            .iter()
+            .find(|trace| trace.id == self.selected_trace)
+        {
+            rows.push(spc_fdc_operad_row(
+                format!("Tool context: {}", trace.tool_id),
+                format!(
+                    "{} · {} sample(s), {} active alarm finding(s)",
+                    trace.sensor_name.replace('_', " "),
+                    trace.samples.len(),
+                    same_tool_alarm_count(monitor, &trace.tool_id)
+                ),
+                trace_highest_severity(monitor, trace).map_or(Tone::Neutral, severity_tone),
+                Some(format!("{OPERAD_ACTION_SELECT_TRACE}{}|context", trace.id)),
+                true,
+            ));
+            for finding in monitor
+                .findings
+                .iter()
+                .filter(|finding| {
+                    finding.source == FindingSource::EquipmentAlarm
+                        && finding.tool_id.as_deref() == Some(trace.tool_id.as_str())
+                })
+                .take(4)
+            {
+                rows.push(spc_fdc_operad_row(
+                    format!("Alarm · {}", finding.title),
+                    format!("{} · {}", finding.detail, next_action_for_finding(finding)),
+                    severity_tone(finding.severity),
+                    None,
+                    false,
+                ));
+            }
+        }
+        if monitor.alarm_summary.active_count == 0 {
+            rows.push(spc_fdc_operad_row(
+                "No active equipment alarms".to_string(),
+                "Equipment alarm summary is clear".to_string(),
+                Tone::Success,
+                None,
+                false,
+            ));
+        } else {
+            rows.push(spc_fdc_operad_row(
+                "Alarm summary".to_string(),
+                format!(
+                    "{} active alarm(s), latest {}",
+                    monitor.alarm_summary.active_count,
+                    monitor
+                        .alarm_summary
+                        .latest_alarm
+                        .as_ref()
+                        .map(|alarm| {
+                            format!(
+                                "{} {} at t+{}s",
+                                alarm.tool_id, alarm.code, alarm.occurred_at_s
+                            )
+                        })
+                        .unwrap_or_else(|| "n/a".to_string())
+                ),
+                Tone::Warning,
+                None,
+                false,
+            ));
+            for (tool_id, count) in monitor.alarm_summary.by_tool.iter().take(8) {
+                rows.push(spc_fdc_operad_row(
+                    format!("{tool_id} alarms"),
+                    format!("{count} active alarm(s)"),
+                    Tone::Warning,
+                    None,
+                    false,
+                ));
+            }
+        }
+        rows
+    }
+
+    fn operad_finding_rows(&self, monitor: &SpcFdcMonitor) -> Vec<SpcFdcOperadRow> {
+        let filtered = monitor
+            .findings
+            .iter()
+            .filter(|finding| self.finding_matches_filter(finding))
+            .collect::<Vec<_>>();
+        let total = filtered.len();
+        let mut rows = filtered
+            .into_iter()
+            .take(28)
+            .map(|finding| {
+                spc_fdc_operad_row(
+                    format!("{} · {}", finding.severity.label(), finding.title),
+                    format!(
+                        "{} · {} · {}",
+                        finding.source.label(),
+                        finding_context(finding),
+                        next_action_for_finding(finding)
+                    ),
+                    severity_tone(finding.severity),
+                    None,
+                    false,
+                )
+            })
+            .collect::<Vec<_>>();
+        if total > rows.len() {
+            rows.push(spc_fdc_operad_row(
+                format!("Showing first {} of {total} findings", rows.len()),
+                "Narrow severity, source, or context filters to reduce this list".to_string(),
+                Tone::Neutral,
+                None,
+                false,
+            ));
+        }
+        rows
+    }
+
+    fn handle_operad_action(&mut self, node_name: &str, monitor: &SpcFdcMonitor) -> bool {
+        if node_name == OPERAD_ACTION_CLEAR_CONTEXT {
+            self.context_filter.clear();
+            return true;
+        }
+        if let Some(value) = node_name.strip_prefix(OPERAD_ACTION_SET_SEVERITY) {
+            let slug = value.split_once('|').map(|(slug, _)| slug).unwrap_or(value);
+            if let Some(filter) = SeverityFilter::from_slug(slug) {
+                self.severity_filter = filter;
+                return true;
+            }
+        }
+        if let Some(value) = node_name.strip_prefix(OPERAD_ACTION_SET_SOURCE) {
+            let slug = value.split_once('|').map(|(slug, _)| slug).unwrap_or(value);
+            if let Some(filter) = SourceFilter::from_slug(slug) {
+                self.source_filter = filter;
+                return true;
+            }
+        }
+        if let Some(value) = node_name.strip_prefix(OPERAD_ACTION_SELECT_CHART) {
+            let chart_id = value.split_once('|').map(|(id, _)| id).unwrap_or(value);
+            if monitor
+                .charts
+                .iter()
+                .any(|chart| chart.id.as_str() == chart_id)
+            {
+                self.selected_chart = chart_id.to_string();
+                return true;
+            }
+        }
+        if let Some(value) = node_name.strip_prefix(OPERAD_ACTION_SELECT_TRACE) {
+            let trace_id = value.split_once('|').map(|(id, _)| id).unwrap_or(value);
+            if monitor.traces.iter().any(|trace| trace.id == trace_id) {
+                self.selected_trace = trace_id.to_string();
+                return true;
+            }
+        }
+        false
     }
 
     pub(crate) fn context_ui(
@@ -151,9 +922,101 @@ impl SpcFdcPanel {
         let monitor = monitor_from_fab_context(analysis, equipment);
         self.ensure_selection(&monitor);
 
+        if self.operad_context_ui(ui, &monitor).is_err() {
+            self.egui_context_ui(ui, &monitor);
+        }
+    }
+
+    fn operad_context_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        monitor: &SpcFdcMonitor,
+    ) -> Result<(), String> {
+        let overview = SidecarSection::new("SPC / FDC")
+            .row(SidecarRow::new(
+                monitor_risk_label(monitor),
+                format!("{} finding(s)", monitor.findings.len()),
+                monitor_tone(monitor),
+            ))
+            .row(SidecarRow::new(
+                "Signals",
+                format!(
+                    "{} SPC charts / {} FDC traces / {} active alarms",
+                    monitor.charts.len(),
+                    monitor.traces.len(),
+                    monitor.alarm_summary.active_count
+                ),
+                Tone::Info,
+            ))
+            .row(SidecarRow::new(
+                "Critical",
+                format!(
+                    "{} critical findings",
+                    monitor.finding_count_by_severity(MonitorSeverity::Critical)
+                ),
+                if monitor.finding_count_by_severity(MonitorSeverity::Critical) > 0 {
+                    Tone::Danger
+                } else {
+                    Tone::Neutral
+                },
+            ))
+            .row(SidecarRow::new(
+                "Warning",
+                format!(
+                    "{} warning findings",
+                    monitor.finding_count_by_severity(MonitorSeverity::Warning)
+                ),
+                if monitor.finding_count_by_severity(MonitorSeverity::Warning) > 0 {
+                    Tone::Warning
+                } else {
+                    Tone::Neutral
+                },
+            ))
+            .row(SidecarRow::new(
+                "Advisory",
+                format!(
+                    "{} advisory findings",
+                    monitor.finding_count_by_severity(MonitorSeverity::Advisory)
+                ),
+                if monitor.finding_count_by_severity(MonitorSeverity::Advisory) > 0 {
+                    Tone::Info
+                } else {
+                    Tone::Neutral
+                },
+            ));
+
+        let top_action = if let Some(finding) = monitor.findings.first() {
+            SidecarSection::new("Top Action")
+                .row(SidecarRow::new(
+                    format!("{} · {}", finding.severity.label(), finding.title),
+                    next_action_for_finding(finding),
+                    severity_tone(finding.severity),
+                ))
+                .row(SidecarRow::new(
+                    "Context",
+                    finding_context(finding),
+                    Tone::Neutral,
+                ))
+        } else {
+            SidecarSection::new("Top Action").empty("No active SPC/FDC actions")
+        };
+
+        let mut latest = SidecarSection::new("Latest Findings").empty("No active SPC/FDC findings");
+        for finding in monitor.findings.iter().take(6) {
+            latest = latest.row(SidecarRow::new(
+                format!("{} · {}", finding.severity.label(), finding.title),
+                finding_context(finding),
+                severity_tone(finding.severity),
+            ));
+        }
+
+        render_sidecar(ui, "spc_fdc.context", &[overview, top_action, latest])
+    }
+
+    fn egui_context_ui(&mut self, ui: &mut egui::Ui, monitor: &SpcFdcMonitor) {
         ui_chrome::section_label(ui, "SPC / FDC");
         ui.horizontal_wrapped(|ui| {
-            ui_chrome::status_pill(ui, monitor_risk_label(&monitor), monitor_tone(&monitor));
+            ui_chrome::status_pill(ui, monitor_risk_label(monitor), monitor_tone(monitor));
             ui.label(format!("{} finding(s)", monitor.findings.len()));
         });
         ui.label(format!("SPC charts: {}", monitor.charts.len()));
@@ -1605,5 +2468,560 @@ fn compact_number(value: f64) -> String {
         format!("{value:.1}")
     } else {
         format!("{value:.2}")
+    }
+}
+
+fn spc_fdc_operad_view_height(width: f32, metric_count: usize, row_counts: &[usize]) -> f32 {
+    let mut height = OPERAD_HEADER_HEIGHT + OPERAD_GAP;
+    height += spc_fdc_operad_metric_grid_height(width, metric_count) + OPERAD_GAP;
+    for row_count in row_counts {
+        height += spc_fdc_operad_section_height(*row_count) + OPERAD_GAP;
+    }
+    height + OPERAD_PAD
+}
+
+fn spc_fdc_operad_metric_columns(width: f32) -> usize {
+    if width >= 1020.0 {
+        4
+    } else if width >= 680.0 {
+        3
+    } else if width >= 440.0 {
+        2
+    } else {
+        1
+    }
+}
+
+fn spc_fdc_operad_metric_grid_height(width: f32, metric_count: usize) -> f32 {
+    let columns = spc_fdc_operad_metric_columns(width).max(1);
+    let rows = metric_count.div_ceil(columns).max(1);
+    rows as f32 * OPERAD_METRIC_HEIGHT
+}
+
+fn spc_fdc_operad_section_height(row_count: usize) -> f32 {
+    OPERAD_PAD * 2.0
+        + OPERAD_SECTION_TITLE_HEIGHT
+        + if row_count == 0 {
+            OPERAD_EMPTY_ROW_HEIGHT
+        } else {
+            row_count as f32 * OPERAD_ROW_HEIGHT
+        }
+}
+
+fn add_spc_fdc_operad_header(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    eyebrow: &str,
+    title: &str,
+    detail: &str,
+    meta: &str,
+) {
+    let header = document.add_child(
+        parent,
+        UiNode::container(
+            "spc_fdc.header",
+            UiNodeStyle {
+                layout: layout::with_padding_all(
+                    layout::with_size(
+                        layout::column(),
+                        layout::percent(1.0),
+                        layout::px(OPERAD_HEADER_HEIGHT),
+                    ),
+                    OPERAD_PAD,
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            ColorRgba::new(22, 27, 32, 255),
+            Some(StrokeStyle::new(ColorRgba::new(46, 55, 64, 255), 1.0)),
+            6.0,
+        )),
+    );
+    add_spc_fdc_operad_text(
+        document,
+        header,
+        "spc_fdc.header.eyebrow",
+        eyebrow,
+        spc_fdc_operad_text_style(12.0, FontWeight::BOLD, ColorRgba::new(146, 154, 162, 255)),
+        16.0,
+    );
+    add_spc_fdc_operad_text(
+        document,
+        header,
+        "spc_fdc.header.title",
+        title,
+        spc_fdc_operad_text_style(24.0, FontWeight::BOLD, ColorRgba::new(242, 246, 250, 255)),
+        30.0,
+    );
+    add_spc_fdc_operad_text(
+        document,
+        header,
+        "spc_fdc.header.detail",
+        detail,
+        spc_fdc_operad_text_style(14.0, FontWeight::NORMAL, ColorRgba::new(178, 185, 194, 255)),
+        20.0,
+    );
+    add_spc_fdc_operad_text(
+        document,
+        header,
+        "spc_fdc.header.meta",
+        meta,
+        spc_fdc_operad_text_style(13.0, FontWeight::NORMAL, ColorRgba::new(112, 183, 239, 255)),
+        18.0,
+    );
+}
+
+fn add_spc_fdc_operad_metric_grid(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    width: f32,
+    metrics: &[SpcFdcMetricTile],
+) {
+    let columns = spc_fdc_operad_metric_columns(width);
+    let grid_height = spc_fdc_operad_metric_grid_height(width, metrics.len());
+    let grid = document.add_child(
+        parent,
+        UiNode::container(
+            "spc_fdc.metrics",
+            UiNodeStyle {
+                layout: layout::with_size(
+                    layout::column(),
+                    layout::percent(1.0),
+                    layout::px(grid_height),
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        ),
+    );
+    let tile_width =
+        ((width - OPERAD_GAP * (columns.saturating_sub(1) as f32)) / columns as f32).max(120.0);
+    for (row_index, chunk) in metrics.chunks(columns).enumerate() {
+        let row = document.add_child(
+            grid,
+            UiNode::container(
+                format!("spc_fdc.metrics.row.{row_index}"),
+                UiNodeStyle {
+                    layout: layout::with_size(
+                        layout::row(),
+                        layout::percent(1.0),
+                        layout::px(OPERAD_METRIC_HEIGHT),
+                    ),
+                    clip: ClipBehavior::Clip,
+                    ..Default::default()
+                },
+            ),
+        );
+        for (column, metric) in chunk.iter().enumerate() {
+            add_spc_fdc_operad_metric_tile(
+                document,
+                row,
+                &format!("spc_fdc.metrics.{row_index}.{column}"),
+                tile_width - 6.0,
+                metric,
+            );
+        }
+    }
+}
+
+fn add_spc_fdc_operad_metric_tile(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    name: &str,
+    width: f32,
+    metric: &SpcFdcMetricTile,
+) {
+    let tile = document.add_child(
+        parent,
+        UiNode::container(
+            name,
+            UiNodeStyle {
+                layout: layout::with_padding_all(
+                    layout::with_margin_all(
+                        layout::with_size(
+                            layout::column(),
+                            layout::px(width.max(116.0)),
+                            layout::px(OPERAD_METRIC_HEIGHT - 8.0),
+                        ),
+                        3.0,
+                    ),
+                    9.0,
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            ColorRgba::new(29, 35, 40, 255),
+            Some(StrokeStyle::new(
+                spc_fdc_operad_tone_color(metric.tone),
+                1.0,
+            )),
+            6.0,
+        )),
+    );
+    add_spc_fdc_operad_text(
+        document,
+        tile,
+        &format!("{name}.label"),
+        &metric.label,
+        spc_fdc_operad_text_style(12.0, FontWeight::BOLD, ColorRgba::new(158, 166, 174, 255)),
+        18.0,
+    );
+    add_spc_fdc_operad_text(
+        document,
+        tile,
+        &format!("{name}.value"),
+        &metric.value,
+        spc_fdc_operad_text_style(20.0, FontWeight::BOLD, ColorRgba::new(239, 243, 247, 255)),
+        26.0,
+    );
+    add_spc_fdc_operad_text(
+        document,
+        tile,
+        &format!("{name}.detail"),
+        truncate_middle(&metric.detail, 52),
+        spc_fdc_operad_text_style(
+            12.0,
+            FontWeight::NORMAL,
+            spc_fdc_operad_tone_color(metric.tone),
+        ),
+        18.0,
+    );
+}
+
+fn add_spc_fdc_operad_section(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    width: f32,
+    name: &str,
+    title: &str,
+    empty: &str,
+    rows: &[SpcFdcOperadRow],
+) {
+    let height = spc_fdc_operad_section_height(rows.len());
+    let section = document.add_child(
+        parent,
+        UiNode::container(
+            name,
+            UiNodeStyle {
+                layout: layout::with_padding_all(
+                    layout::with_size(layout::column(), layout::percent(1.0), layout::px(height)),
+                    OPERAD_PAD,
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            ColorRgba::new(21, 26, 31, 255),
+            Some(StrokeStyle::new(ColorRgba::new(45, 53, 61, 255), 1.0)),
+            6.0,
+        )),
+    );
+    add_spc_fdc_operad_text(
+        document,
+        section,
+        &format!("{name}.title"),
+        title,
+        spc_fdc_operad_text_style(15.0, FontWeight::BOLD, ColorRgba::new(242, 246, 250, 255)),
+        OPERAD_SECTION_TITLE_HEIGHT,
+    );
+    if rows.is_empty() {
+        add_spc_fdc_operad_empty_row(document, section, name, empty);
+    } else {
+        let row_width = (width - OPERAD_PAD * 2.0).max(240.0);
+        for (index, row) in rows.iter().enumerate() {
+            add_spc_fdc_operad_data_row(document, section, name, index, row_width, row);
+        }
+    }
+}
+
+fn add_spc_fdc_operad_empty_row(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    name: &str,
+    label: &str,
+) {
+    let row = document.add_child(
+        parent,
+        UiNode::container(
+            format!("{name}.empty"),
+            UiNodeStyle {
+                layout: layout::with_padding_all(
+                    layout::with_size(
+                        layout::row(),
+                        layout::percent(1.0),
+                        layout::px(OPERAD_EMPTY_ROW_HEIGHT),
+                    ),
+                    8.0,
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            ColorRgba::new(27, 32, 37, 255),
+            Some(StrokeStyle::new(ColorRgba::new(43, 50, 58, 255), 1.0)),
+            5.0,
+        )),
+    );
+    add_spc_fdc_operad_text(
+        document,
+        row,
+        &format!("{name}.empty.label"),
+        label,
+        spc_fdc_operad_text_style(13.0, FontWeight::NORMAL, ColorRgba::new(154, 163, 172, 255)),
+        24.0,
+    );
+}
+
+fn add_spc_fdc_operad_data_row(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    section_name: &str,
+    index: usize,
+    row_width: f32,
+    row: &SpcFdcOperadRow,
+) {
+    let row_name = row
+        .action_name
+        .clone()
+        .unwrap_or_else(|| format!("{section_name}.row.{index}"));
+    let stroke_color = if row.selected {
+        spc_fdc_operad_tone_color(Tone::Info)
+    } else {
+        ColorRgba::new(42, 50, 58, 255)
+    };
+    let fill = if row.selected {
+        ColorRgba::new(26, 42, 56, 255)
+    } else {
+        ColorRgba::new(26, 31, 36, 255)
+    };
+    let mut node = UiNode::container(
+        row_name,
+        UiNodeStyle {
+            layout: layout::with_padding_all(
+                layout::with_size(
+                    layout::row(),
+                    layout::percent(1.0),
+                    layout::px(OPERAD_ROW_HEIGHT),
+                ),
+                6.0,
+            ),
+            clip: ClipBehavior::Clip,
+            ..Default::default()
+        },
+    )
+    .with_visual(UiVisual::panel(
+        fill,
+        Some(StrokeStyle::new(stroke_color, 1.0)),
+        4.0,
+    ));
+    if row.action_name.is_some() {
+        node = node.with_input(InputBehavior::BUTTON);
+    }
+    let row_node = document.add_child(parent, node);
+    document.add_child(
+        row_node,
+        UiNode::container(
+            format!("{section_name}.row.{index}.tone"),
+            UiNodeStyle {
+                layout: layout::fixed(5.0, OPERAD_ROW_HEIGHT - 12.0),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            spc_fdc_operad_tone_color(row.tone),
+            None,
+            2.0,
+        )),
+    );
+    let text_column = document.add_child(
+        row_node,
+        UiNode::container(
+            format!("{section_name}.row.{index}.text"),
+            UiNodeStyle {
+                layout: layout::with_size(
+                    layout::column(),
+                    layout::px((row_width - 28.0).max(120.0)),
+                    layout::px(OPERAD_ROW_HEIGHT - 12.0),
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        ),
+    );
+    add_spc_fdc_operad_text(
+        document,
+        text_column,
+        &format!("{section_name}.row.{index}.title"),
+        truncate_middle(&row.title, 72),
+        spc_fdc_operad_text_style(14.0, FontWeight::BOLD, ColorRgba::new(232, 237, 242, 255)),
+        21.0,
+    );
+    add_spc_fdc_operad_text(
+        document,
+        text_column,
+        &format!("{section_name}.row.{index}.detail"),
+        truncate_middle(&row.detail, 108),
+        spc_fdc_operad_text_style(12.0, FontWeight::NORMAL, ColorRgba::new(162, 171, 180, 255)),
+        19.0,
+    );
+}
+
+fn add_spc_fdc_operad_spacer(document: &mut UiDocument, parent: UiNodeId, height: f32) {
+    document.add_child(
+        parent,
+        UiNode::container(
+            format!("spc_fdc.spacer.{}", document.node_count()),
+            UiNodeStyle {
+                layout: layout::with_size(layout::row(), layout::percent(1.0), layout::px(height)),
+                ..Default::default()
+            },
+        ),
+    );
+}
+
+fn add_spc_fdc_operad_text(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    name: &str,
+    text: impl Into<String>,
+    style: TextStyle,
+    height: f32,
+) {
+    widgets::label(
+        document,
+        parent,
+        name,
+        text,
+        style,
+        layout::with_size(layout::row(), layout::percent(1.0), layout::px(height)),
+    );
+}
+
+fn spc_fdc_operad_text_style(font_size: f32, weight: FontWeight, color: ColorRgba) -> TextStyle {
+    TextStyle {
+        font_size,
+        line_height: font_size + 4.0,
+        weight,
+        color,
+        wrap: TextWrap::None,
+        ..Default::default()
+    }
+}
+
+fn spc_fdc_operad_tone_color(tone: Tone) -> ColorRgba {
+    let color = tone.color();
+    ColorRgba::new(color.r(), color.g(), color.b(), color.a())
+}
+
+fn spc_fdc_operad_row(
+    title: impl Into<String>,
+    detail: impl Into<String>,
+    tone: Tone,
+    action_name: Option<String>,
+    selected: bool,
+) -> SpcFdcOperadRow {
+    SpcFdcOperadRow {
+        title: title.into(),
+        detail: detail.into(),
+        tone,
+        action_name,
+        selected,
+    }
+}
+
+fn truncate_middle(text: impl AsRef<str>, max_chars: usize) -> String {
+    let text = text.as_ref();
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_string();
+    }
+    let keep = max_chars.saturating_sub(3);
+    let head = keep / 2;
+    let tail = keep - head;
+    let start = text.chars().take(head).collect::<String>();
+    let end = text
+        .chars()
+        .rev()
+        .take(tail)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!("{start}...{end}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_monitor() -> SpcFdcMonitor {
+        monitor_from_fab_context(&YieldAnalysis::synthetic(), &EquipmentSimulator::demo_fab())
+    }
+
+    #[test]
+    fn spc_fdc_operad_view_audits_common_widths() {
+        let monitor = sample_monitor();
+        let mut panel = SpcFdcPanel::new();
+        panel.ensure_selection(&monitor);
+        for width in [360.0, 760.0, 1200.0] {
+            let mut view = panel.build_operad_view(width, &monitor);
+            view.document
+                .compute_layout(view.size, &mut ApproxTextMeasurer)
+                .unwrap();
+            let warnings = view.document.audit_layout();
+            assert!(warnings.is_empty(), "{warnings:#?}");
+            assert!(view.document.node_count() > 20);
+            assert!(!view.document.paint_list().items.is_empty());
+        }
+    }
+
+    #[test]
+    fn spc_fdc_operad_actions_update_panel_state() {
+        let monitor = sample_monitor();
+        let mut panel = SpcFdcPanel::new();
+        panel.ensure_selection(&monitor);
+
+        let target_chart = monitor.charts.last().unwrap().id.as_str().to_string();
+        assert!(panel.handle_operad_action(
+            &format!("{OPERAD_ACTION_SELECT_CHART}{target_chart}|test"),
+            &monitor,
+        ));
+        assert_eq!(panel.selected_chart, target_chart);
+
+        let target_trace = monitor.traces.last().unwrap().id.clone();
+        assert!(panel.handle_operad_action(
+            &format!("{OPERAD_ACTION_SELECT_TRACE}{target_trace}|test"),
+            &monitor,
+        ));
+        assert_eq!(panel.selected_trace, target_trace);
+
+        assert!(panel.handle_operad_action(
+            &format!(
+                "{OPERAD_ACTION_SET_SEVERITY}{}|test",
+                SeverityFilter::Critical.slug()
+            ),
+            &monitor,
+        ));
+        assert_eq!(panel.severity_filter, SeverityFilter::Critical);
+
+        assert!(panel.handle_operad_action(
+            &format!(
+                "{OPERAD_ACTION_SET_SOURCE}{}|test",
+                SourceFilter::Fdc.slug()
+            ),
+            &monitor,
+        ));
+        assert_eq!(panel.source_filter, SourceFilter::Fdc);
+
+        panel.context_filter = "COAT".to_string();
+        assert!(panel.handle_operad_action(OPERAD_ACTION_CLEAR_CONTEXT, &monitor));
+        assert!(panel.context_filter.is_empty());
     }
 }

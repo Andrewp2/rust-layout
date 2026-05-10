@@ -334,6 +334,29 @@ pub struct GenealogySummary {
     pub process_record_count: usize,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GenealogyValidationContext {
+    pub route_ids: BTreeSet<ProcessRouteId>,
+    pub step_ids: BTreeSet<ProcessStepId>,
+    pub recipe_ids: BTreeSet<RecipeId>,
+    pub tool_ids: BTreeSet<ToolId>,
+}
+
+impl GenealogyValidationContext {
+    pub fn from_mes(mes: &FabMesData) -> Self {
+        let mut context = Self::default();
+        for route in mes.routes.values() {
+            context.route_ids.insert(route.id.clone());
+            for step in &route.steps {
+                context.step_ids.insert(step.id.clone());
+                context.recipe_ids.insert(step.required_recipe.clone());
+                context.tool_ids.extend(step.eligible_tools.iter().cloned());
+            }
+        }
+        context
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct LotGenealogy {
     pub lots: BTreeMap<LotId, GenealogyLot>,
@@ -343,6 +366,34 @@ pub struct LotGenealogy {
     pub events: Vec<GenealogyEvent>,
     #[serde(default = "default_next_sequence")]
     next_sequence: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GenealogyValidationSeverity {
+    Error,
+    Warning,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenealogyValidationFinding {
+    pub severity: GenealogyValidationSeverity,
+    pub message: String,
+}
+
+impl GenealogyValidationFinding {
+    fn error(message: impl Into<String>) -> Self {
+        Self {
+            severity: GenealogyValidationSeverity::Error,
+            message: message.into(),
+        }
+    }
+
+    fn warning(message: impl Into<String>) -> Self {
+        Self {
+            severity: GenealogyValidationSeverity::Warning,
+            message: message.into(),
+        }
+    }
 }
 
 impl LotGenealogy {
@@ -914,6 +965,355 @@ impl LotGenealogy {
         self.next_sequence += 1;
         sequence
     }
+
+    pub fn validate(&self) -> Vec<GenealogyValidationFinding> {
+        let mut findings = Vec::new();
+        let lot_ids = self.lots.keys().cloned().collect::<BTreeSet<_>>();
+        let material_lot_ids = self.material_lots.keys().cloned().collect::<BTreeSet<_>>();
+
+        for (lot_id, lot) in &self.lots {
+            if lot_id != &lot.id {
+                findings.push(GenealogyValidationFinding::error(format!(
+                    "genealogy lot map key {lot_id} does not match lot id {}",
+                    lot.id
+                )));
+            }
+            if lot.id.as_str().trim().is_empty() {
+                findings.push(GenealogyValidationFinding::error(
+                    "genealogy lot id is empty",
+                ));
+            }
+            if lot.product.trim().is_empty() {
+                findings.push(GenealogyValidationFinding::warning(format!(
+                    "genealogy lot {} has an empty product",
+                    lot.id
+                )));
+            }
+            let mut source_lots = BTreeSet::new();
+            for source_lot_id in &lot.created_from {
+                if source_lot_id == &lot.id {
+                    findings.push(GenealogyValidationFinding::error(format!(
+                        "genealogy lot {} cannot be created from itself",
+                        lot.id
+                    )));
+                }
+                if !source_lots.insert(source_lot_id.clone()) {
+                    findings.push(GenealogyValidationFinding::error(format!(
+                        "genealogy lot {} repeats created-from source {}",
+                        lot.id, source_lot_id
+                    )));
+                }
+                if !lot_ids.contains(source_lot_id) {
+                    findings.push(GenealogyValidationFinding::error(format!(
+                        "genealogy lot {} was created from missing lot {}",
+                        lot.id, source_lot_id
+                    )));
+                }
+            }
+            validate_genealogy_wafers(lot, &self.lots, &mut findings);
+        }
+
+        for (material_id, material) in &self.material_lots {
+            if material_id != &material.id {
+                findings.push(GenealogyValidationFinding::error(format!(
+                    "genealogy material map key {material_id} does not match material id {}",
+                    material.id
+                )));
+            }
+            if material.id.as_str().trim().is_empty() {
+                findings.push(GenealogyValidationFinding::error(
+                    "genealogy material lot id is empty",
+                ));
+            }
+            if material.name.trim().is_empty() || material.supplier.trim().is_empty() {
+                findings.push(GenealogyValidationFinding::warning(format!(
+                    "genealogy material lot {} has incomplete material metadata",
+                    material.id
+                )));
+            }
+        }
+
+        let mut sequences = BTreeSet::new();
+        for record in &self.process_history {
+            validate_sequence(
+                "process record",
+                record.sequence,
+                self.next_sequence,
+                &mut sequences,
+                &mut findings,
+            );
+            if self.wafer(&record.wafer).is_none() {
+                findings.push(GenealogyValidationFinding::error(format!(
+                    "genealogy process record {} references missing wafer {}",
+                    record.sequence, record.wafer
+                )));
+            }
+            if record.step_id.as_str().trim().is_empty()
+                || record.recipe_id.as_str().trim().is_empty()
+                || record.tool_id.as_str().trim().is_empty()
+                || record.tool_run_id.as_str().trim().is_empty()
+            {
+                findings.push(GenealogyValidationFinding::warning(format!(
+                    "genealogy process record {} has incomplete process metadata",
+                    record.sequence
+                )));
+            }
+        }
+
+        for record in &self.material_uses {
+            validate_sequence(
+                "material use",
+                record.sequence,
+                self.next_sequence,
+                &mut sequences,
+                &mut findings,
+            );
+            if self.wafer(&record.wafer).is_none() {
+                findings.push(GenealogyValidationFinding::error(format!(
+                    "genealogy material use {} references missing wafer {}",
+                    record.sequence, record.wafer
+                )));
+            }
+            if !material_lot_ids.contains(&record.material_lot_id) {
+                findings.push(GenealogyValidationFinding::error(format!(
+                    "genealogy material use {} references missing material lot {}",
+                    record.sequence, record.material_lot_id
+                )));
+            }
+            if !record.quantity.is_finite() || record.quantity <= 0.0 {
+                findings.push(GenealogyValidationFinding::error(format!(
+                    "genealogy material use {} has invalid quantity",
+                    record.sequence
+                )));
+            }
+            if record.unit.trim().is_empty() {
+                findings.push(GenealogyValidationFinding::warning(format!(
+                    "genealogy material use {} has an empty unit",
+                    record.sequence
+                )));
+            }
+        }
+
+        for event in &self.events {
+            validate_sequence(
+                "event",
+                event.sequence,
+                self.next_sequence,
+                &mut sequences,
+                &mut findings,
+            );
+            validate_event(&event.kind, &lot_ids, event.sequence, &mut findings);
+        }
+
+        findings
+    }
+
+    pub fn validate_with_context(
+        &self,
+        context: &GenealogyValidationContext,
+    ) -> Vec<GenealogyValidationFinding> {
+        let mut findings = self.validate();
+        for lot in self.lots.values() {
+            if !context.route_ids.contains(&lot.route_id) {
+                findings.push(GenealogyValidationFinding::error(format!(
+                    "genealogy lot {} references missing MES route {}",
+                    lot.id, lot.route_id
+                )));
+            }
+        }
+        for record in &self.process_history {
+            if !context.step_ids.contains(&record.step_id) {
+                findings.push(GenealogyValidationFinding::error(format!(
+                    "genealogy process record {} references missing MES step {}",
+                    record.sequence, record.step_id
+                )));
+            }
+            if !context.recipe_ids.contains(&record.recipe_id) {
+                findings.push(GenealogyValidationFinding::error(format!(
+                    "genealogy process record {} references missing MES recipe {}",
+                    record.sequence, record.recipe_id
+                )));
+            }
+            if !context.tool_ids.contains(&record.tool_id) {
+                findings.push(GenealogyValidationFinding::error(format!(
+                    "genealogy process record {} references missing MES tool {}",
+                    record.sequence, record.tool_id
+                )));
+            }
+        }
+        for record in &self.material_uses {
+            if !context.step_ids.contains(&record.step_id) {
+                findings.push(GenealogyValidationFinding::error(format!(
+                    "genealogy material use {} references missing MES step {}",
+                    record.sequence, record.step_id
+                )));
+            }
+        }
+        findings
+    }
+}
+
+fn validate_genealogy_wafers(
+    lot: &GenealogyLot,
+    lots: &BTreeMap<LotId, GenealogyLot>,
+    findings: &mut Vec<GenealogyValidationFinding>,
+) {
+    let mut slots = BTreeSet::new();
+    for (wafer_id, wafer) in &lot.wafers {
+        if wafer_id != &wafer.id {
+            findings.push(GenealogyValidationFinding::error(format!(
+                "genealogy lot {} wafer map key {} does not match wafer id {}",
+                lot.id, wafer_id, wafer.id
+            )));
+        }
+        if wafer.id.as_str().trim().is_empty() {
+            findings.push(GenealogyValidationFinding::error(format!(
+                "genealogy lot {} has an empty wafer id",
+                lot.id
+            )));
+        }
+        if wafer.slot == 0 {
+            findings.push(GenealogyValidationFinding::warning(format!(
+                "genealogy wafer {}/{} has slot 0",
+                lot.id, wafer.id
+            )));
+        } else if !slots.insert(wafer.slot) {
+            findings.push(GenealogyValidationFinding::error(format!(
+                "genealogy lot {} has duplicate wafer slot {}",
+                lot.id, wafer.slot
+            )));
+        }
+        if let Some(parent) = wafer.parent.as_ref() {
+            if parent.lot_id == lot.id && parent.wafer_id == wafer.id {
+                findings.push(GenealogyValidationFinding::error(format!(
+                    "genealogy wafer {}/{} cannot be its own parent",
+                    lot.id, wafer.id
+                )));
+            }
+            match lots.get(&parent.lot_id) {
+                Some(parent_lot) => {
+                    if !parent_lot.wafers.contains_key(&parent.wafer_id) {
+                        findings.push(GenealogyValidationFinding::error(format!(
+                            "genealogy wafer {}/{} references missing parent wafer {}",
+                            lot.id, wafer.id, parent
+                        )));
+                    }
+                }
+                None => {
+                    findings.push(GenealogyValidationFinding::error(format!(
+                        "genealogy wafer {}/{} references missing parent lot {}",
+                        lot.id, wafer.id, parent.lot_id
+                    )));
+                }
+            }
+        }
+        match &wafer.state {
+            WaferGenealogyState::SplitTo { lot_id } | WaferGenealogyState::MergedTo { lot_id } => {
+                if !lots.contains_key(lot_id) {
+                    findings.push(GenealogyValidationFinding::error(format!(
+                        "genealogy wafer {}/{} points to missing target lot {}",
+                        lot.id, wafer.id, lot_id
+                    )));
+                }
+            }
+            WaferGenealogyState::Scrapped { reason } if reason.trim().is_empty() => {
+                findings.push(GenealogyValidationFinding::warning(format!(
+                    "genealogy wafer {}/{} is scrapped without a reason",
+                    lot.id, wafer.id
+                )));
+            }
+            WaferGenealogyState::Scrapped { .. } | WaferGenealogyState::Active => {}
+        }
+    }
+}
+
+fn validate_sequence(
+    kind: &str,
+    sequence: u64,
+    next_sequence: u64,
+    sequences: &mut BTreeSet<u64>,
+    findings: &mut Vec<GenealogyValidationFinding>,
+) {
+    if sequence == 0 {
+        findings.push(GenealogyValidationFinding::error(format!(
+            "genealogy {kind} has sequence 0"
+        )));
+    }
+    if !sequences.insert(sequence) {
+        findings.push(GenealogyValidationFinding::error(format!(
+            "genealogy {kind} sequence {sequence} is duplicated"
+        )));
+    }
+    if sequence >= next_sequence {
+        findings.push(GenealogyValidationFinding::error(format!(
+            "genealogy {kind} sequence {sequence} is not below next sequence {next_sequence}"
+        )));
+    }
+}
+
+fn validate_event(
+    event: &GenealogyEventKind,
+    lot_ids: &BTreeSet<LotId>,
+    sequence: u64,
+    findings: &mut Vec<GenealogyValidationFinding>,
+) {
+    match event {
+        GenealogyEventKind::LotStarted { lot_id } => {
+            if !lot_ids.contains(lot_id) {
+                findings.push(GenealogyValidationFinding::error(format!(
+                    "genealogy event {sequence} starts missing lot {lot_id}"
+                )));
+            }
+        }
+        GenealogyEventKind::LotSplit {
+            source_lot_id,
+            target_lot_id,
+            wafer_count,
+            reason,
+        } => {
+            for lot_id in [source_lot_id, target_lot_id] {
+                if !lot_ids.contains(lot_id) {
+                    findings.push(GenealogyValidationFinding::error(format!(
+                        "genealogy split event {sequence} references missing lot {lot_id}"
+                    )));
+                }
+            }
+            if *wafer_count == 0 {
+                findings.push(GenealogyValidationFinding::error(format!(
+                    "genealogy split event {sequence} has zero wafers"
+                )));
+            }
+            if reason.trim().is_empty() {
+                findings.push(GenealogyValidationFinding::warning(format!(
+                    "genealogy split event {sequence} has an empty reason"
+                )));
+            }
+        }
+        GenealogyEventKind::LotMerge {
+            source_lot_ids,
+            target_lot_id,
+            wafer_count,
+            reason,
+        } => {
+            for lot_id in source_lot_ids.iter().chain([target_lot_id]) {
+                if !lot_ids.contains(lot_id) {
+                    findings.push(GenealogyValidationFinding::error(format!(
+                        "genealogy merge event {sequence} references missing lot {lot_id}"
+                    )));
+                }
+            }
+            if source_lot_ids.is_empty() || *wafer_count == 0 {
+                findings.push(GenealogyValidationFinding::error(format!(
+                    "genealogy merge event {sequence} has empty sources or zero wafers"
+                )));
+            }
+            if reason.trim().is_empty() {
+                findings.push(GenealogyValidationFinding::warning(format!(
+                    "genealogy merge event {sequence} has an empty reason"
+                )));
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1345,6 +1745,142 @@ mod tests {
                 .impacted_wafers
                 .iter()
                 .any(|impact| impact.wafer == WaferRef::new("L-00042-ETCH", "L-00042-ETCH-W12"))
+        );
+    }
+
+    #[test]
+    fn sample_genealogy_validates() {
+        let findings = sample_lot_genealogy().validate();
+
+        assert_eq!(findings, Vec::new());
+    }
+
+    #[test]
+    fn sample_genealogy_validates_against_mes_context() {
+        let mes = sample_fab_data();
+        let context = GenealogyValidationContext::from_mes(&mes);
+
+        let findings = sample_lot_genealogy().validate_with_context(&context);
+
+        assert_eq!(findings, Vec::new());
+    }
+
+    #[test]
+    fn context_validation_rejects_missing_mes_references() {
+        let mes = sample_fab_data();
+        let context = GenealogyValidationContext::from_mes(&mes);
+        let mut genealogy = sample_lot_genealogy();
+        let lot = genealogy.lots.values_mut().next().unwrap();
+        lot.route_id = ProcessRouteId::new("MISSING_ROUTE");
+        let process_record = genealogy.process_history.first_mut().unwrap();
+        process_record.step_id = ProcessStepId::new("MISSING_STEP");
+        process_record.recipe_id = RecipeId::new("MISSING_RECIPE");
+        process_record.tool_id = ToolId::new("MISSING_TOOL");
+        let material_use = genealogy.material_uses.first_mut().unwrap();
+        material_use.step_id = ProcessStepId::new("MISSING_STEP");
+
+        let findings = genealogy.validate_with_context(&context);
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("missing MES route")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("missing MES step")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("missing MES recipe")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("missing MES tool")),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn validation_rejects_broken_wafer_material_and_event_links() {
+        let mut genealogy = sample_lot_genealogy();
+        let base_lot = LotId::new("L-00042");
+        let lot = genealogy.lots.get_mut(&base_lot).unwrap();
+        lot.created_from.push(base_lot.clone());
+        lot.created_from.push(base_lot.clone());
+        let wafer = lot.wafers.values_mut().next().unwrap();
+        wafer.parent = Some(WaferRef::new(base_lot.clone(), "MISSING_PARENT_WAFER"));
+        wafer.state = WaferGenealogyState::SplitTo {
+            lot_id: LotId::new("MISSING_LOT"),
+        };
+        genealogy.material_uses.push(MaterialUse {
+            sequence: genealogy.next_sequence,
+            wafer: WaferRef::new("MISSING_LOT", "MISSING_WAFER"),
+            material_lot_id: MaterialLotId::new("MISSING_MATERIAL"),
+            step_id: ProcessStepId::new("S010-COAT"),
+            tool_run_id: ToolRunId::new("RUN"),
+            quantity: f64::NAN,
+            unit: String::new(),
+        });
+        genealogy.events.push(GenealogyEvent {
+            sequence: genealogy.next_sequence,
+            kind: GenealogyEventKind::LotSplit {
+                source_lot_id: LotId::new("MISSING_LOT"),
+                target_lot_id: LotId::new("L-00042"),
+                wafer_count: 0,
+                reason: String::new(),
+            },
+        });
+
+        let findings = genealogy.validate();
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("missing target lot")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("created from itself")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("repeats created-from source")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("missing parent wafer")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("missing material lot")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("invalid quantity")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("zero wafers")),
+            "{findings:?}"
         );
     }
 }

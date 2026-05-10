@@ -34,6 +34,7 @@ pub mod recipe;
 pub mod safety;
 pub mod scheduler;
 pub mod spc_fdc;
+pub mod workspace;
 pub mod yield_analysis;
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 5;
@@ -453,6 +454,8 @@ impl LoroCrdtLog {
             Operation::AddLayer { .. }
             | Operation::DeleteLayer { .. }
             | Operation::SetLayerVisibility { .. }
+            | Operation::SetMarkerState { .. }
+            | Operation::SetConnectivityIssueState { .. }
             | Operation::Cursor { .. } => {}
         }
         Ok(())
@@ -1289,6 +1292,10 @@ pub struct TechnologyLayer {
     #[serde(default)]
     pub display_order: i32,
     #[serde(default)]
+    pub z_base: Option<f32>,
+    #[serde(default)]
+    pub z_thickness: Option<f32>,
+    #[serde(default)]
     pub gds_layer: Option<u16>,
     #[serde(default)]
     pub gds_datatype: u16,
@@ -1372,12 +1379,14 @@ impl TechnologyFile {
         let mut ids = BTreeSet::new();
         let mut gds_geometry_pairs = BTreeSet::new();
         let mut gds_text_pairs = BTreeSet::new();
+        let mut stack_ranges = Vec::new();
         for layer in &self.layers {
             if layer.name.trim().is_empty() {
                 return Err(TechnologyError::Invalid(
                     "layer names must not be empty".to_string(),
                 ));
             }
+            validate_color_components(&layer.name, layer.color)?;
             let key = normalize_layer_ref(&layer.name);
             if !names.insert(key) {
                 return Err(TechnologyError::Invalid(format!(
@@ -1399,6 +1408,30 @@ impl TechnologyFile {
                     layer.name, layer.process
                 )));
             }
+            match (layer.z_base, layer.z_thickness) {
+                (Some(base), Some(thickness)) => {
+                    if !base.is_finite() || !thickness.is_finite() {
+                        return Err(TechnologyError::Invalid(format!(
+                            "layer {:?} has non-finite 3D stack metadata",
+                            layer.name
+                        )));
+                    }
+                    if thickness <= 0.0 {
+                        return Err(TechnologyError::Invalid(format!(
+                            "layer {:?} z_thickness must be positive",
+                            layer.name
+                        )));
+                    }
+                    stack_ranges.push((layer.name.as_str(), base, base + thickness));
+                }
+                (Some(_), None) | (None, Some(_)) => {
+                    return Err(TechnologyError::Invalid(format!(
+                        "layer {:?} must define both z_base and z_thickness",
+                        layer.name
+                    )));
+                }
+                (None, None) => {}
+            }
             let Some(gds_layer) = layer.effective_gds_layer() else {
                 return Err(TechnologyError::Invalid(format!(
                     "layer {:?} needs an id or gds_layer for GDSII mapping",
@@ -1418,18 +1451,50 @@ impl TechnologyFile {
                 )));
             }
         }
+        validate_stack_ranges(&mut stack_ranges)?;
 
+        let mut connectivity_keys = BTreeSet::new();
         for connection in &self.connectivity {
             self.layer_id(&connection.from)?;
             self.layer_id(&connection.through)?;
             self.layer_id(&connection.to)?;
+            let from = normalize_layer_ref(&connection.from);
+            let through = normalize_layer_ref(&connection.through);
+            let to = normalize_layer_ref(&connection.to);
+            let key = if from <= to {
+                (from, through, to)
+            } else {
+                (to, through, from)
+            };
+            if !connectivity_keys.insert(key) {
+                return Err(TechnologyError::Invalid(format!(
+                    "duplicate connectivity rule {:?} through {:?} to {:?}",
+                    connection.from, connection.through, connection.to
+                )));
+            }
         }
+        let mut min_width_layers = BTreeSet::new();
         for rule in &self.drc.min_width {
             self.layer_id(&rule.layer)?;
+            let layer_key = normalize_layer_ref(&rule.layer);
+            if !min_width_layers.insert(layer_key) {
+                return Err(TechnologyError::Invalid(format!(
+                    "duplicate min_width rule for layer {:?}",
+                    rule.layer
+                )));
+            }
             validate_non_negative(rule.value, "min_width", &rule.layer)?;
         }
+        let mut min_spacing_layers = BTreeSet::new();
         for rule in &self.drc.min_spacing {
             self.layer_id(&rule.layer)?;
+            let layer_key = normalize_layer_ref(&rule.layer);
+            if !min_spacing_layers.insert(layer_key) {
+                return Err(TechnologyError::Invalid(format!(
+                    "duplicate min_spacing rule for layer {:?}",
+                    rule.layer
+                )));
+            }
             validate_non_negative(rule.value, "min_spacing", &rule.layer)?;
         }
         for rule in &self.drc.via_enclosure {
@@ -1488,12 +1553,26 @@ impl TechnologyFile {
                 ))
             })
     }
+
+    pub fn layer_stack_range_for_process(&self, process: ProcessLayer) -> Option<(f32, f32)> {
+        self.layers.iter().find_map(|layer| {
+            (ProcessLayer::from_technology_name(&layer.process) == Some(process))
+                .then(|| layer.stack_range())
+                .flatten()
+        })
+    }
 }
 
 impl TechnologyLayer {
     pub fn effective_gds_layer(&self) -> Option<u16> {
         self.gds_layer
             .or_else(|| self.id.and_then(|id| u16::try_from(id.0).ok()))
+    }
+
+    pub fn stack_range(&self) -> Option<(f32, f32)> {
+        let base = self.z_base?;
+        let thickness = self.z_thickness?;
+        Some((base, base + thickness))
     }
 }
 
@@ -3128,6 +3207,14 @@ pub enum Operation {
         layer: LayerId,
         visible: bool,
     },
+    SetMarkerState {
+        key: String,
+        state: Option<MarkerState>,
+    },
+    SetConnectivityIssueState {
+        key: String,
+        state: Option<MarkerState>,
+    },
     Cursor {
         user: Uuid,
         position: Point,
@@ -3149,6 +3236,25 @@ pub struct MarkerState {
     pub waived: bool,
     #[serde(default)]
     pub note: Option<String>,
+}
+
+fn apply_marker_state_operation(
+    states: &mut BTreeMap<String, MarkerState>,
+    key: &str,
+    state: Option<&MarkerState>,
+) {
+    if key.trim().is_empty() {
+        warn!("marker state operation skipped empty key");
+        return;
+    }
+    match state {
+        Some(state) if *state != MarkerState::default() => {
+            states.insert(key.to_string(), state.clone());
+        }
+        _ => {
+            states.remove(key);
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -3238,6 +3344,8 @@ pub struct Document {
     #[serde(default)]
     pub marker_states: BTreeMap<String, MarkerState>,
     #[serde(default)]
+    pub connectivity_issue_states: BTreeMap<String, MarkerState>,
+    #[serde(default)]
     pub crdt_seen: BTreeSet<CrdtOpId>,
     #[serde(default)]
     pub crdt_actor_clocks: BTreeMap<Uuid, u64>,
@@ -3271,6 +3379,7 @@ impl Document {
             shapes: ShapeStore::new(),
             cells: CellStore::new(),
             marker_states: BTreeMap::new(),
+            connectivity_issue_states: BTreeMap::new(),
             crdt_seen: BTreeSet::new(),
             crdt_actor_clocks: BTreeMap::new(),
             crdt_operation_log: Vec::new(),
@@ -3286,6 +3395,11 @@ impl Document {
         self.grid = technology.grid;
         self.layers.clear();
         self.next_layer_id = 1;
+        let explicit_layer_ids = technology
+            .layers
+            .iter()
+            .filter_map(|layer| layer.id)
+            .collect::<BTreeSet<_>>();
         for technology_layer in &technology.layers {
             let process = ProcessLayer::from_technology_name(&technology_layer.process)
                 .ok_or_else(|| {
@@ -3294,16 +3408,23 @@ impl Document {
                         technology_layer.name, technology_layer.process
                     ))
                 })?;
-            let id = technology_layer.id.unwrap_or_else(|| {
-                let fallback = LayerId(self.next_layer_id);
+            let id = if let Some(id) = technology_layer.id {
+                id
+            } else {
+                let fallback = self.next_available_implicit_layer_id(&explicit_layer_ids)?;
                 warn!(
                     layer_name = %technology_layer.name,
                     fallback_layer_id = fallback.0,
                     "technology layer missing id; assigning next layer id"
                 );
                 fallback
-            });
-            self.next_layer_id = self.next_layer_id.max(id.0 + 1);
+            };
+            let next_after_id = id.0.checked_add(1).ok_or_else(|| {
+                TechnologyError::Invalid(
+                    "unable to assign next layer id; layer id space is exhausted".to_string(),
+                )
+            })?;
+            self.next_layer_id = self.next_layer_id.max(next_after_id);
             self.layers.insert(
                 id,
                 Layer {
@@ -3322,6 +3443,23 @@ impl Document {
             );
         }
         Ok(())
+    }
+
+    fn next_available_implicit_layer_id(
+        &mut self,
+        explicit_layer_ids: &BTreeSet<LayerId>,
+    ) -> Result<LayerId, TechnologyError> {
+        loop {
+            let candidate = LayerId(self.next_layer_id);
+            if !explicit_layer_ids.contains(&candidate) && !self.layers.contains_key(&candidate) {
+                return Ok(candidate);
+            }
+            self.next_layer_id = self.next_layer_id.checked_add(1).ok_or_else(|| {
+                TechnologyError::Invalid(
+                    "unable to assign implicit layer id; layer id space is exhausted".to_string(),
+                )
+            })?;
+        }
     }
 
     pub fn demo() -> Self {
@@ -3993,6 +4131,16 @@ impl Document {
                     );
                 }
             }
+            Operation::SetMarkerState { key, state } => {
+                apply_marker_state_operation(&mut self.marker_states, key, state.as_ref());
+            }
+            Operation::SetConnectivityIssueState { key, state } => {
+                apply_marker_state_operation(
+                    &mut self.connectivity_issue_states,
+                    key,
+                    state.as_ref(),
+                );
+            }
             Operation::Cursor { .. } => {}
         }
     }
@@ -4287,6 +4435,34 @@ fn validate_non_negative(
         return Err(TechnologyError::Invalid(format!(
             "{rule} for layer {layer:?} must be non-negative"
         )));
+    }
+    Ok(())
+}
+
+fn validate_color_components(layer: &str, color: [f32; 4]) -> Result<(), TechnologyError> {
+    if color
+        .iter()
+        .any(|component| !component.is_finite() || !(0.0..=1.0).contains(component))
+    {
+        return Err(TechnologyError::Invalid(format!(
+            "layer {layer:?} color components must be finite values from 0.0 to 1.0"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_stack_ranges(ranges: &mut Vec<(&str, f32, f32)>) -> Result<(), TechnologyError> {
+    ranges.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.2.total_cmp(&b.2)));
+    let mut previous: Option<(&str, f32)> = None;
+    for &(name, base, top) in ranges.iter() {
+        if let Some((previous_name, previous_top)) = previous
+            && base < previous_top
+        {
+            return Err(TechnologyError::Invalid(format!(
+                "3D stack range for layer {name:?} overlaps layer {previous_name:?}"
+            )));
+        }
+        previous = Some((name, top));
     }
     Ok(())
 }
@@ -4722,6 +4898,10 @@ mod tests {
             technology.layer_for_gds_geometry(4, 0).unwrap().name,
             "metal1"
         );
+        assert_eq!(
+            technology.layer_stack_range_for_process(ProcessLayer::Metal1),
+            Some((340.0, 430.0))
+        );
     }
 
     #[test]
@@ -4764,6 +4944,120 @@ mod tests {
         let err = technology.validate().unwrap_err();
 
         assert!(err.to_string().contains("duplicate GDSII geometry mapping"));
+    }
+
+    #[test]
+    fn invalid_technology_reports_incomplete_stack_metadata() {
+        let mut technology = default_technology();
+        technology.layers[0].z_thickness = None;
+
+        let err = technology.validate().unwrap_err();
+
+        assert!(err.to_string().contains("z_base and z_thickness"));
+    }
+
+    #[test]
+    fn invalid_technology_reports_out_of_range_color_components() {
+        let mut technology = default_technology();
+        technology.layers[0].color[3] = 1.25;
+
+        let err = technology.validate().unwrap_err();
+
+        assert!(err.to_string().contains("color components"));
+    }
+
+    #[test]
+    fn invalid_technology_reports_overlapping_stack_ranges() {
+        let mut technology = default_technology();
+        let poly = technology
+            .layers
+            .iter_mut()
+            .find(|layer| layer.process == "poly")
+            .unwrap();
+        poly.z_base = Some(120.0);
+
+        let err = technology.validate().unwrap_err();
+
+        assert!(err.to_string().contains("3D stack range"));
+        assert!(err.to_string().contains("overlaps"));
+    }
+
+    #[test]
+    fn invalid_technology_reports_duplicate_drc_width_and_spacing_rules() {
+        let mut technology = default_technology();
+        technology.drc.min_width.push(TechnologyLayerRule {
+            layer: "diffusion".to_string(),
+            value: 250,
+        });
+
+        let err = technology.validate().unwrap_err();
+
+        assert!(err.to_string().contains("duplicate min_width"));
+
+        let mut technology = default_technology();
+        technology.drc.min_spacing.push(TechnologyLayerRule {
+            layer: "metal-1".to_string(),
+            value: 300,
+        });
+
+        let err = technology.validate().unwrap_err();
+
+        assert!(err.to_string().contains("duplicate min_spacing"));
+    }
+
+    #[test]
+    fn custom_technology_stack_fixture_validates_and_builds_layers() {
+        let technology = TechnologyFile::from_json_str(include_str!(
+            "../../../fixtures/technology/custom_stack.json"
+        ))
+        .unwrap();
+        let document = Document::from_technology("custom stack", &technology).unwrap();
+
+        assert_eq!(technology.dbu_per_micron, 2_000);
+        assert_eq!(document.grid, 5);
+        assert_eq!(
+            technology.layer_stack_range_for_process(ProcessLayer::Diffusion),
+            Some((0.0, 50.0))
+        );
+        assert_eq!(
+            technology.layer_stack_range_for_process(ProcessLayer::Contact),
+            Some((50.0, 150.0))
+        );
+        assert_eq!(
+            technology.layer_stack_range_for_process(ProcessLayer::Metal1),
+            Some((150.0, 220.0))
+        );
+        assert_eq!(
+            document.layer_by_process(ProcessLayer::Metal1),
+            Some(LayerId(23))
+        );
+        assert_eq!(
+            technology.gds_mapping_for_layer(LayerId(23)),
+            Some((23, 0, 0))
+        );
+    }
+
+    #[test]
+    fn technology_application_assigns_missing_ids_without_colliding_with_explicit_ids() {
+        let mut technology = default_technology();
+        technology.layers[0].id = None;
+        technology.layers[1].id = Some(LayerId(1));
+        technology.connectivity.clear();
+        technology.drc = TechnologyDrc::default();
+        technology.validate().unwrap();
+
+        let document = Document::from_technology("implicit ids", &technology).unwrap();
+        let diffusion = document.layer_by_process(ProcessLayer::Diffusion).unwrap();
+        let poly = document.layer_by_process(ProcessLayer::Poly).unwrap();
+
+        assert_ne!(diffusion, poly);
+        assert_eq!(poly, LayerId(1));
+        assert_eq!(document.layers.len(), technology.layers.len());
+        assert_eq!(
+            document.layer(diffusion).unwrap().name.as_str(),
+            "diffusion"
+        );
+        assert_eq!(document.layer(poly).unwrap().name.as_str(), "poly");
     }
 
     #[test]
@@ -5044,6 +5338,86 @@ mod tests {
     }
 
     #[test]
+    fn connectivity_issue_states_round_trip_with_document() {
+        let mut doc = Document::new("connectivity issue states");
+        doc.connectivity_issue_states.insert(
+            "short|VDD,VSS|0,0,100,50".to_string(),
+            MarkerState {
+                hidden: true,
+                waived: false,
+                note: Some("bench-waived after ECO-17".to_string()),
+            },
+        );
+
+        let restored: Document =
+            serde_json::from_str(&serde_json::to_string(&doc).unwrap()).unwrap();
+        let state = restored
+            .connectivity_issue_states
+            .get("short|VDD,VSS|0,0,100,50")
+            .unwrap();
+
+        assert!(state.hidden);
+        assert!(!state.waived);
+        assert_eq!(state.note.as_deref(), Some("bench-waived after ECO-17"));
+    }
+
+    #[test]
+    fn marker_state_operations_set_and_remove_review_state() {
+        let mut doc = Document::new("review state operations");
+        let marker_key = "min_width|1|0,0,10,10|200|80.000".to_string();
+        let issue_key = "short|VDD,VSS|0,0,100,50".to_string();
+        let marker_state = MarkerState {
+            hidden: true,
+            waived: true,
+            note: Some("known test fixture marker".to_string()),
+        };
+        let issue_state = MarkerState {
+            hidden: false,
+            waived: true,
+            note: Some("accepted process exception".to_string()),
+        };
+
+        doc.apply_operation_without_log(&Operation::SetMarkerState {
+            key: marker_key.clone(),
+            state: Some(marker_state.clone()),
+        });
+        doc.apply_operation_without_log(&Operation::SetConnectivityIssueState {
+            key: issue_key.clone(),
+            state: Some(issue_state.clone()),
+        });
+
+        assert_eq!(doc.marker_states.get(&marker_key), Some(&marker_state));
+        assert_eq!(
+            doc.connectivity_issue_states.get(&issue_key),
+            Some(&issue_state)
+        );
+
+        doc.apply_operation_without_log(&Operation::SetMarkerState {
+            key: marker_key.clone(),
+            state: Some(MarkerState::default()),
+        });
+        doc.apply_operation_without_log(&Operation::SetConnectivityIssueState {
+            key: issue_key.clone(),
+            state: None,
+        });
+
+        assert!(!doc.marker_states.contains_key(&marker_key));
+        assert!(!doc.connectivity_issue_states.contains_key(&issue_key));
+
+        let encoded = serde_json::to_string(&Operation::SetMarkerState {
+            key: marker_key.clone(),
+            state: Some(marker_state.clone()),
+        })
+        .unwrap();
+        let decoded: Operation = serde_json::from_str(&encoded).unwrap();
+        let Operation::SetMarkerState { key, state } = decoded else {
+            panic!("expected marker state operation");
+        };
+        assert_eq!(key, marker_key);
+        assert_eq!(state, Some(marker_state));
+    }
+
+    #[test]
     fn server_snapshot_json_round_trips_numeric_id_map_keys() {
         let doc = Document::new("snapshot json");
         let message = ServerMessage::Snapshot {
@@ -5174,6 +5548,98 @@ mod tests {
         assert_eq!(imported.len(), 1);
         assert_eq!(imported[0].id, operation.id);
         assert!(target.import_update(&update).unwrap().is_empty());
+    }
+
+    #[test]
+    fn loro_log_replication_carries_review_state_operations() {
+        let actor_a = Uuid::from_u128(121);
+        let actor_b = Uuid::from_u128(122);
+        let mut source = LoroCrdtLog::new(actor_a).unwrap();
+        let mut target = LoroCrdtLog::new(actor_b).unwrap();
+        let mut target_doc = Document::new("review state replica");
+        let marker_key = "min_width|1|0,0,10,10|200|80.000".to_string();
+        let issue_key = "short|VDD,VSS|0,0,100,50".to_string();
+        let marker_state = MarkerState {
+            hidden: true,
+            waived: false,
+            note: Some("reviewed remotely".to_string()),
+        };
+        let issue_state = MarkerState {
+            hidden: false,
+            waived: true,
+            note: Some("waived remotely".to_string()),
+        };
+
+        let update = source
+            .append_operation(
+                actor_a,
+                CrdtOperation {
+                    id: CrdtOpId {
+                        actor: actor_a,
+                        counter: 1,
+                    },
+                    deps: Vec::new(),
+                    operation: Operation::Batch {
+                        operations: vec![
+                            Operation::SetMarkerState {
+                                key: marker_key.clone(),
+                                state: Some(marker_state.clone()),
+                            },
+                            Operation::SetConnectivityIssueState {
+                                key: issue_key.clone(),
+                                state: Some(issue_state.clone()),
+                            },
+                        ],
+                    },
+                },
+            )
+            .unwrap();
+
+        for operation in target.import_update(&update).unwrap() {
+            assert_eq!(
+                target_doc.apply_crdt_operation(operation),
+                CrdtApplyResult::Applied
+            );
+        }
+        assert_eq!(
+            target_doc.marker_states.get(&marker_key),
+            Some(&marker_state)
+        );
+        assert_eq!(
+            target_doc.connectivity_issue_states.get(&issue_key),
+            Some(&issue_state)
+        );
+
+        let clear_update = source
+            .append_operation(
+                actor_a,
+                CrdtOperation {
+                    id: CrdtOpId {
+                        actor: actor_a,
+                        counter: 2,
+                    },
+                    deps: vec![CrdtOpId {
+                        actor: actor_a,
+                        counter: 1,
+                    }],
+                    operation: Operation::SetConnectivityIssueState {
+                        key: issue_key.clone(),
+                        state: None,
+                    },
+                },
+            )
+            .unwrap();
+        for operation in target.import_update(&clear_update).unwrap() {
+            assert_eq!(
+                target_doc.apply_crdt_operation(operation),
+                CrdtApplyResult::Applied
+            );
+        }
+        assert!(
+            !target_doc
+                .connectivity_issue_states
+                .contains_key(&issue_key)
+        );
     }
 
     #[test]

@@ -1,12 +1,33 @@
 use std::collections::BTreeSet;
 
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui::{self, Color32, RichText, Sense, vec2};
 use layout_model::safety::{
     AlarmRouteTarget, IncidentStatus, SafetyAuditEvent, SafetyAuditKind, SafetyIncident,
     SafetySensor, SafetySeverity, SafetySystem, ToolLockout,
 };
+use operad::{
+    ApproxTextMeasurer, ClipBehavior, ColorRgba, FontWeight, InputBehavior, StrokeStyle, TextStyle,
+    TextWrap, UiDocument, UiNode, UiNodeId, UiNodeStyle, UiSize, UiVisual, layout, root_style,
+    widgets,
+};
 
-use crate::ui_chrome::{self, Tone};
+use crate::{
+    operad_egui,
+    operad_sidecar::{SidecarRow, SidecarSection, render_sidecar},
+    ui_chrome::{self, Tone},
+};
+
+const OPERAD_HEADER_HEIGHT: f32 = 104.0;
+const OPERAD_METRIC_HEIGHT: f32 = 88.0;
+const OPERAD_SECTION_TITLE_HEIGHT: f32 = 26.0;
+const OPERAD_ROW_HEIGHT: f32 = 52.0;
+const OPERAD_EMPTY_ROW_HEIGHT: f32 = 44.0;
+const OPERAD_GAP: f32 = 10.0;
+const OPERAD_PAD: f32 = 12.0;
+const OPERAD_ACTION_SELECT_TOOL: &str = "safety.action.select_tool.";
+const OPERAD_ACTION_ACK_CONDITION: &str = "safety.action.ack_condition.";
+const OPERAD_ACTION_ACK_LOCKOUT: &str = "safety.action.ack_lockout.";
+const OPERAD_ACTION_ACK_INCIDENT: &str = "safety.action.ack_incident.";
 
 pub(crate) struct SafetyPanel {
     model: SafetySystem,
@@ -14,6 +35,30 @@ pub(crate) struct SafetyPanel {
     acknowledged_conditions: BTreeSet<String>,
     acknowledged_lockouts: BTreeSet<String>,
     acknowledged_incidents: BTreeSet<String>,
+}
+
+#[derive(Debug)]
+struct SafetyOperadView {
+    document: UiDocument,
+    size: UiSize,
+}
+
+#[derive(Clone, Debug)]
+struct SafetyMetricTile {
+    label: String,
+    value: String,
+    detail: String,
+    tone: Tone,
+}
+
+#[derive(Clone, Debug)]
+struct SafetyOperadRow {
+    title: String,
+    detail: String,
+    tone: Tone,
+    action_name: Option<String>,
+    button_name: Option<String>,
+    button_label: Option<&'static str>,
 }
 
 impl SafetyPanel {
@@ -36,6 +81,74 @@ impl SafetyPanel {
     }
 
     pub(crate) fn context_ui(&mut self, ui: &mut egui::Ui) {
+        if self.operad_context_ui(ui).is_err() {
+            self.egui_context_ui(ui);
+        }
+    }
+
+    fn operad_context_ui(&mut self, ui: &mut egui::Ui) -> Result<(), String> {
+        self.ensure_selection();
+        let summary = self.model.summary();
+        let mut conditions =
+            SidecarSection::new("Active Conditions").empty("No active safety interlocks");
+        for sensor in self.model.active_conditions().into_iter().take(4) {
+            conditions = conditions.row(
+                SidecarRow::new(
+                    &sensor.name,
+                    active_condition_summary(sensor, &self.model),
+                    severity_tone(sensor.severity),
+                )
+                .selected(
+                    self.acknowledged_conditions
+                        .contains(&sensor.id.to_string()),
+                ),
+            );
+        }
+        let sections = vec![
+            SidecarSection::new("Safety Interlocks")
+                .row(SidecarRow::new(
+                    summary
+                        .highest_severity
+                        .map(SafetySeverity::label)
+                        .unwrap_or("normal"),
+                    "Simulated monitoring only",
+                    severity_tone(summary.highest_severity.unwrap_or(SafetySeverity::Normal)),
+                ))
+                .row(SidecarRow::new(
+                    "Sensors / interlocks",
+                    format!(
+                        "{} sensors | {} active interlocks",
+                        summary.sensor_count, summary.active_condition_count
+                    ),
+                    if summary.active_condition_count > 0 {
+                        Tone::Warning
+                    } else {
+                        Tone::Success
+                    },
+                ))
+                .row(SidecarRow::new(
+                    "Lockouts / incidents",
+                    format!(
+                        "{} tool lockouts | {} open incidents",
+                        summary.locked_out_tool_count, summary.open_incident_count
+                    ),
+                    if summary.locked_out_tool_count > 0 || summary.open_incident_count > 0 {
+                        Tone::Danger
+                    } else {
+                        Tone::Neutral
+                    },
+                ))
+                .row(SidecarRow::new(
+                    "Acknowledged",
+                    format!("{} this session", self.acknowledged_count()),
+                    Tone::Info,
+                )),
+            conditions,
+        ];
+        render_sidecar(ui, "safety.context", &sections)
+    }
+
+    fn egui_context_ui(&mut self, ui: &mut egui::Ui) {
         self.ensure_selection();
         let summary = self.model.summary();
 
@@ -139,6 +252,61 @@ impl SafetyPanel {
     }
 
     pub(crate) fn ui(&mut self, ui: &mut egui::Ui, status: &mut String) {
+        self.ensure_selection();
+        if let Err(error) = self.operad_ui(ui, status) {
+            ui.colored_label(Color32::from_rgb(226, 96, 96), error);
+            self.egui_dashboard_ui(ui, status);
+        }
+    }
+
+    fn operad_ui(&mut self, ui: &mut egui::Ui, status: &mut String) -> Result<(), String> {
+        let mut result = Ok(());
+        egui::ScrollArea::vertical()
+            .id_salt("safety_interlock_dashboard_operad_scroll")
+            .show(ui, |ui| {
+                let width = ui.available_width().max(320.0);
+                let mut view = self.build_operad_view(width);
+                if let Err(error) = view
+                    .document
+                    .compute_layout(view.size, &mut ApproxTextMeasurer)
+                    .map_err(|error| error.to_string())
+                {
+                    result = Err(error);
+                    return;
+                }
+
+                let (rect, response) =
+                    ui.allocate_exact_size(vec2(width, view.size.height), Sense::click());
+                if response.clicked()
+                    && let Some(pointer) = response.interact_pointer_pos()
+                    && let Some(node_name) =
+                        operad_egui::hit_test_name(&view.document, rect, pointer)
+                {
+                    if self.handle_operad_action(&node_name, status) {
+                        view = self.build_operad_view(width);
+                        if let Err(error) = view
+                            .document
+                            .compute_layout(view.size, &mut ApproxTextMeasurer)
+                            .map_err(|error| error.to_string())
+                        {
+                            result = Err(error);
+                            return;
+                        }
+                    }
+                }
+
+                if response.hovered()
+                    && let Some(pointer) = ui.ctx().pointer_hover_pos()
+                    && operad_egui::hit_test_name(&view.document, rect, pointer).is_some()
+                {
+                    ui.output_mut(|output| output.cursor_icon = egui::CursorIcon::PointingHand);
+                }
+                operad_egui::paint_document_at(ui, &view.document, rect);
+            });
+        result
+    }
+
+    fn egui_dashboard_ui(&mut self, ui: &mut egui::Ui, status: &mut String) {
         self.ensure_selection();
         let summary = self.model.summary();
         let lockouts = self.model.evaluate_lockouts();
@@ -300,6 +468,483 @@ impl SafetyPanel {
                     });
                 }
             });
+    }
+
+    fn build_operad_view(&self, width: f32) -> SafetyOperadView {
+        let lockouts = self.model.evaluate_lockouts();
+        let selected_permissives = self
+            .selected_tool
+            .as_deref()
+            .map(|tool_id| self.permissive_rows_for_tool(tool_id))
+            .unwrap_or_default();
+        let metrics = self.operad_metrics(&selected_permissives);
+        let active_rows = self.operad_active_condition_rows();
+        let lockout_rows = self.operad_lockout_rows(&lockouts);
+        let selected_rows = self.operad_selected_tool_rows(&lockouts, &selected_permissives);
+        let sensor_rows = self.operad_sensor_rows();
+        let route_rows = self.operad_route_rows();
+        let incident_rows = self.operad_incident_rows();
+        let audit_rows = self.operad_audit_rows();
+
+        let height = self.operad_view_height(
+            width,
+            metrics.len(),
+            &[
+                active_rows.len(),
+                lockout_rows.len(),
+                selected_rows.len(),
+                sensor_rows.len(),
+                route_rows.len(),
+                incident_rows.len(),
+                audit_rows.len(),
+            ],
+        );
+        let size = UiSize::new(width, height);
+        let mut document = UiDocument::new(root_style(width, height));
+        let root = document.root;
+        document.set_node_visual(
+            root,
+            UiVisual::panel(
+                ColorRgba::new(15, 18, 21, 255),
+                Some(StrokeStyle::new(ColorRgba::new(39, 46, 52, 255), 1.0)),
+                0.0,
+            ),
+        );
+
+        add_operad_header(
+            &mut document,
+            root,
+            "SIMULATED OPERATIONS",
+            "Safety and Interlock Dashboard",
+            "Demo-only safety monitoring, alarm routing, tool lockout, and audit trail",
+            &format!(
+                "Selected tool: {}",
+                self.selected_tool.as_deref().unwrap_or("none")
+            ),
+        );
+        add_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_operad_metric_grid(&mut document, root, width, &metrics);
+        add_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_operad_section(
+            &mut document,
+            root,
+            width,
+            "safety.active_interlocks",
+            "Active Interlocks",
+            "All simulated interlocks are clear",
+            &active_rows,
+        );
+        add_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_operad_section(
+            &mut document,
+            root,
+            width,
+            "safety.tool_lockouts",
+            "Tool Lockouts",
+            "No tool interlocks loaded",
+            &lockout_rows,
+        );
+        add_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_operad_section(
+            &mut document,
+            root,
+            width,
+            "safety.selected_tool",
+            "Selected Tool Readiness",
+            "Select a tool to inspect permissives",
+            &selected_rows,
+        );
+        add_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_operad_section(
+            &mut document,
+            root,
+            width,
+            "safety.sensors",
+            "Simulated Sensors",
+            "No safety sensors loaded",
+            &sensor_rows,
+        );
+        add_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_operad_section(
+            &mut document,
+            root,
+            width,
+            "safety.routes",
+            "Alarm Routing",
+            "No alarm routes loaded",
+            &route_rows,
+        );
+        add_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_operad_section(
+            &mut document,
+            root,
+            width,
+            "safety.incidents",
+            "Incident Trail",
+            "No safety incidents loaded",
+            &incident_rows,
+        );
+        add_operad_spacer(&mut document, root, OPERAD_GAP);
+        add_operad_section(
+            &mut document,
+            root,
+            width,
+            "safety.audit",
+            "Audit Trail",
+            "No safety audit events loaded",
+            &audit_rows,
+        );
+
+        SafetyOperadView { document, size }
+    }
+
+    fn operad_view_height(&self, width: f32, metric_count: usize, row_counts: &[usize]) -> f32 {
+        let mut height = OPERAD_HEADER_HEIGHT + OPERAD_GAP;
+        height += operad_metric_grid_height(width, metric_count) + OPERAD_GAP;
+        for row_count in row_counts {
+            height += operad_section_height(*row_count) + OPERAD_GAP;
+        }
+        height + OPERAD_PAD
+    }
+
+    fn operad_metrics(&self, selected_permissives: &[PermissiveRow]) -> Vec<SafetyMetricTile> {
+        let summary = self.model.summary();
+        let ready_permissives = selected_permissives.iter().filter(|row| row.passes).count();
+        let acknowledged_count = self.acknowledged_count();
+        vec![
+            SafetyMetricTile {
+                label: "Overall state".to_string(),
+                value: summary
+                    .highest_severity
+                    .map(SafetySeverity::label)
+                    .unwrap_or("blank")
+                    .to_string(),
+                detail: severity_breakdown(&self.model.sensors),
+                tone: severity_tone(summary.highest_severity.unwrap_or(SafetySeverity::Normal)),
+            },
+            SafetyMetricTile {
+                label: "Active interlocks".to_string(),
+                value: summary.active_condition_count.to_string(),
+                detail: "conditions blocking permissives".to_string(),
+                tone: if summary.active_condition_count == 0 {
+                    Tone::Success
+                } else if summary.highest_severity == Some(SafetySeverity::Critical) {
+                    Tone::Danger
+                } else {
+                    Tone::Warning
+                },
+            },
+            SafetyMetricTile {
+                label: "Permissives".to_string(),
+                value: format!("{ready_permissives}/{}", selected_permissives.len()),
+                detail: "selected tool checks".to_string(),
+                tone: if selected_permissives.is_empty()
+                    || ready_permissives == selected_permissives.len()
+                {
+                    Tone::Success
+                } else {
+                    Tone::Danger
+                },
+            },
+            SafetyMetricTile {
+                label: "Tool lockouts".to_string(),
+                value: summary.locked_out_tool_count.to_string(),
+                detail: "computed from interlocks".to_string(),
+                tone: if summary.locked_out_tool_count == 0 {
+                    Tone::Success
+                } else {
+                    Tone::Danger
+                },
+            },
+            SafetyMetricTile {
+                label: "Open incidents".to_string(),
+                value: summary.open_incident_count.to_string(),
+                detail: "requiring operator review".to_string(),
+                tone: if summary.open_incident_count == 0 {
+                    Tone::Success
+                } else {
+                    Tone::Warning
+                },
+            },
+            SafetyMetricTile {
+                label: "Acknowledged".to_string(),
+                value: acknowledged_count.to_string(),
+                detail: "current UI session".to_string(),
+                tone: if acknowledged_count == 0 {
+                    Tone::Neutral
+                } else {
+                    Tone::Info
+                },
+            },
+        ]
+    }
+
+    fn operad_active_condition_rows(&self) -> Vec<SafetyOperadRow> {
+        self.model
+            .active_conditions()
+            .into_iter()
+            .map(|sensor| {
+                let sensor_id = sensor.id.to_string();
+                SafetyOperadRow {
+                    title: format!("{} - {}", sensor.severity.label(), sensor.name),
+                    detail: truncate_middle(
+                        format!(
+                            "{} {} / limit {} / routed {}",
+                            compact_number(sensor.value),
+                            sensor.unit,
+                            limit_label(&sensor.limit),
+                            route_summary(sensor, &self.model)
+                        ),
+                        96,
+                    ),
+                    tone: severity_tone(sensor.severity),
+                    action_name: None,
+                    button_name: (!self.acknowledged_conditions.contains(&sensor_id))
+                        .then(|| format!("{OPERAD_ACTION_ACK_CONDITION}{sensor_id}")),
+                    button_label: (!self.acknowledged_conditions.contains(&sensor_id))
+                        .then_some("Acknowledge"),
+                }
+            })
+            .collect()
+    }
+
+    fn operad_lockout_rows(&self, lockouts: &[ToolLockout]) -> Vec<SafetyOperadRow> {
+        lockouts
+            .iter()
+            .map(|lockout| {
+                let selected = self.selected_tool.as_deref() == Some(lockout.tool_id.as_str());
+                SafetyOperadRow {
+                    title: format!("{}{}", if selected { "* " } else { "" }, lockout.tool_name),
+                    detail: truncate_middle(
+                        if lockout.reasons.is_empty() {
+                            "No failed simulated safety condition".to_string()
+                        } else {
+                            lockout.reasons.join(" / ")
+                        },
+                        96,
+                    ),
+                    tone: if lockout.locked_out {
+                        Tone::Danger
+                    } else {
+                        Tone::Success
+                    },
+                    action_name: Some(format!("{OPERAD_ACTION_SELECT_TOOL}{}", lockout.tool_id)),
+                    button_name: None,
+                    button_label: None,
+                }
+            })
+            .collect()
+    }
+
+    fn operad_selected_tool_rows(
+        &self,
+        lockouts: &[ToolLockout],
+        permissives: &[PermissiveRow],
+    ) -> Vec<SafetyOperadRow> {
+        let Some(lockout) = self.selected_lockout(lockouts) else {
+            return Vec::new();
+        };
+        let mut rows = vec![SafetyOperadRow {
+            title: format!("{} ({})", lockout.tool_name, lockout.tool_id),
+            detail: if lockout.reasons.is_empty() {
+                "All simulated interlocks clear".to_string()
+            } else {
+                truncate_middle(lockout.reasons.join(" / "), 96)
+            },
+            tone: if lockout.locked_out {
+                Tone::Danger
+            } else {
+                Tone::Success
+            },
+            action_name: None,
+            button_name: (lockout.locked_out
+                && !self.acknowledged_lockouts.contains(&lockout.tool_id))
+            .then(|| format!("{OPERAD_ACTION_ACK_LOCKOUT}{}", lockout.tool_id)),
+            button_label: (lockout.locked_out
+                && !self.acknowledged_lockouts.contains(&lockout.tool_id))
+            .then_some("Acknowledge"),
+        }];
+        rows.extend(permissives.iter().map(|row| SafetyOperadRow {
+            title: format!(
+                "{} - {}",
+                if row.passes { "pass" } else { "blocked" },
+                row.name
+            ),
+            detail: truncate_middle(
+                format!(
+                    "{} / {} / {} / limit {} / {}s",
+                    row.domain, row.state, row.value, row.limit, row.last_seen_s
+                ),
+                96,
+            ),
+            tone: if row.passes {
+                Tone::Success
+            } else {
+                Tone::Danger
+            },
+            action_name: None,
+            button_name: None,
+            button_label: None,
+        }));
+        rows
+    }
+
+    fn operad_sensor_rows(&self) -> Vec<SafetyOperadRow> {
+        self.model
+            .sensors
+            .iter()
+            .map(|sensor| SafetyOperadRow {
+                title: sensor.name.clone(),
+                detail: truncate_middle(
+                    format!(
+                        "{} / {} / {} {} / last {}s",
+                        sensor.domain.label(),
+                        sensor.state.label(),
+                        compact_number(sensor.value),
+                        sensor.unit,
+                        sensor.last_seen_s
+                    ),
+                    96,
+                ),
+                tone: severity_tone(sensor.severity),
+                action_name: None,
+                button_name: None,
+                button_label: None,
+            })
+            .collect()
+    }
+
+    fn operad_route_rows(&self) -> Vec<SafetyOperadRow> {
+        let mut rows = self
+            .model
+            .alarm_routes
+            .iter()
+            .map(|route| SafetyOperadRow {
+                title: format!(
+                    "{} - {}",
+                    route.domain.label(),
+                    route.minimum_severity.label()
+                ),
+                detail: truncate_middle(
+                    format!("{} via {}", route.target.label(), route.channel),
+                    96,
+                ),
+                tone: severity_tone(route.minimum_severity),
+                action_name: None,
+                button_name: None,
+                button_label: None,
+            })
+            .collect::<Vec<_>>();
+        for sensor in self.model.active_conditions() {
+            rows.push(SafetyOperadRow {
+                title: format!("Active: {}", sensor.name),
+                detail: truncate_middle(route_summary(sensor, &self.model), 96),
+                tone: severity_tone(sensor.severity),
+                action_name: None,
+                button_name: None,
+                button_label: None,
+            });
+        }
+        rows
+    }
+
+    fn operad_incident_rows(&self) -> Vec<SafetyOperadRow> {
+        self.model
+            .incidents
+            .iter()
+            .map(|incident| {
+                let incident_id = incident.id.to_string();
+                SafetyOperadRow {
+                    title: format!("{} - {}", incident.id, incident.status.label()),
+                    detail: truncate_middle(
+                        format!(
+                            "{} / opened {} / routed {} / {}",
+                            incident.domain.label(),
+                            incident.opened_at,
+                            route_targets_label(&incident.routed_to),
+                            incident.summary
+                        ),
+                        108,
+                    ),
+                    tone: severity_tone(incident.severity),
+                    action_name: None,
+                    button_name: (incident.status != IncidentStatus::Closed
+                        && !self.acknowledged_incidents.contains(&incident_id))
+                    .then(|| format!("{OPERAD_ACTION_ACK_INCIDENT}{incident_id}")),
+                    button_label: (incident.status != IncidentStatus::Closed
+                        && !self.acknowledged_incidents.contains(&incident_id))
+                    .then_some("Acknowledge"),
+                }
+            })
+            .collect()
+    }
+
+    fn operad_audit_rows(&self) -> Vec<SafetyOperadRow> {
+        self.model
+            .audit_events
+            .iter()
+            .take(8)
+            .map(|event| SafetyOperadRow {
+                title: format!("#{} - {}", event.sequence, event.kind.label()),
+                detail: truncate_middle(
+                    format!("{} / {} / {}", event.timestamp, event.actor, event.message),
+                    108,
+                ),
+                tone: audit_tone(event.kind),
+                action_name: None,
+                button_name: None,
+                button_label: None,
+            })
+            .collect()
+    }
+
+    fn handle_operad_action(&mut self, node_name: &str, status: &mut String) -> bool {
+        if let Some(tool_id) = node_name.strip_prefix(OPERAD_ACTION_SELECT_TOOL) {
+            if self.selected_tool.as_deref() != Some(tool_id) {
+                self.selected_tool = Some(tool_id.to_string());
+                *status = "safety interlock context selected".to_string();
+            }
+            return true;
+        }
+
+        if let Some(sensor_id) = node_name.strip_prefix(OPERAD_ACTION_ACK_CONDITION) {
+            if let Some(sensor) = self
+                .model
+                .sensors
+                .iter()
+                .find(|sensor| sensor.id.to_string() == sensor_id)
+            {
+                self.acknowledge_condition(sensor_id.to_string(), sensor.name.clone(), status);
+                return true;
+            }
+        }
+
+        if let Some(tool_id) = node_name.strip_prefix(OPERAD_ACTION_ACK_LOCKOUT) {
+            let lockout = self
+                .model
+                .evaluate_lockouts()
+                .into_iter()
+                .find(|lockout| lockout.tool_id == tool_id);
+            if let Some(lockout) = lockout {
+                self.acknowledge_lockout(&lockout, status);
+                return true;
+            }
+        }
+
+        if let Some(incident_id) = node_name.strip_prefix(OPERAD_ACTION_ACK_INCIDENT) {
+            let incident = self
+                .model
+                .incidents
+                .iter()
+                .find(|incident| incident.id.to_string() == incident_id)
+                .cloned();
+            if let Some(incident) = incident {
+                self.acknowledge_incident(&incident, status);
+                return true;
+            }
+        }
+
+        false
     }
 
     fn active_interlocks_ui(&mut self, ui: &mut egui::Ui, status: &mut String) {
@@ -811,6 +1456,465 @@ impl SafetyPanel {
     }
 }
 
+fn operad_metric_columns(width: f32) -> usize {
+    if width >= 900.0 {
+        3
+    } else if width >= 560.0 {
+        2
+    } else {
+        1
+    }
+}
+
+fn operad_metric_grid_height(width: f32, metric_count: usize) -> f32 {
+    let columns = operad_metric_columns(width);
+    let rows = metric_count.div_ceil(columns).max(1);
+    rows as f32 * OPERAD_METRIC_HEIGHT
+}
+
+fn operad_section_height(row_count: usize) -> f32 {
+    OPERAD_PAD * 2.0
+        + OPERAD_SECTION_TITLE_HEIGHT
+        + if row_count == 0 {
+            OPERAD_EMPTY_ROW_HEIGHT
+        } else {
+            row_count as f32 * OPERAD_ROW_HEIGHT
+        }
+}
+
+fn add_operad_header(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    eyebrow: &str,
+    title: &str,
+    detail: &str,
+    meta: &str,
+) {
+    let header = document.add_child(
+        parent,
+        UiNode::container(
+            "safety.header",
+            UiNodeStyle {
+                layout: layout::with_padding_all(
+                    layout::with_size(
+                        layout::column(),
+                        layout::percent(1.0),
+                        layout::px(OPERAD_HEADER_HEIGHT),
+                    ),
+                    OPERAD_PAD,
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            ColorRgba::new(22, 27, 32, 255),
+            Some(StrokeStyle::new(ColorRgba::new(46, 55, 64, 255), 1.0)),
+            6.0,
+        )),
+    );
+    add_operad_text(
+        document,
+        header,
+        "safety.header.eyebrow",
+        eyebrow,
+        operad_text_style(12.0, FontWeight::BOLD, ColorRgba::new(146, 154, 162, 255)),
+        16.0,
+    );
+    add_operad_text(
+        document,
+        header,
+        "safety.header.title",
+        title,
+        operad_text_style(24.0, FontWeight::BOLD, ColorRgba::new(242, 246, 250, 255)),
+        30.0,
+    );
+    add_operad_text(
+        document,
+        header,
+        "safety.header.detail",
+        detail,
+        operad_text_style(14.0, FontWeight::NORMAL, ColorRgba::new(178, 185, 194, 255)),
+        20.0,
+    );
+    add_operad_text(
+        document,
+        header,
+        "safety.header.meta",
+        meta,
+        operad_text_style(13.0, FontWeight::NORMAL, ColorRgba::new(112, 183, 239, 255)),
+        18.0,
+    );
+}
+
+fn add_operad_metric_grid(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    width: f32,
+    metrics: &[SafetyMetricTile],
+) {
+    let columns = operad_metric_columns(width);
+    let grid_height = operad_metric_grid_height(width, metrics.len());
+    let grid = document.add_child(
+        parent,
+        UiNode::container(
+            "safety.metrics",
+            UiNodeStyle {
+                layout: layout::with_size(
+                    layout::column(),
+                    layout::percent(1.0),
+                    layout::px(grid_height),
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        ),
+    );
+    let tile_width =
+        ((width - OPERAD_GAP * (columns.saturating_sub(1) as f32)) / columns as f32).max(120.0);
+    for (row_index, chunk) in metrics.chunks(columns).enumerate() {
+        let row = document.add_child(
+            grid,
+            UiNode::container(
+                format!("safety.metrics.row.{row_index}"),
+                UiNodeStyle {
+                    layout: layout::with_size(
+                        layout::row(),
+                        layout::percent(1.0),
+                        layout::px(OPERAD_METRIC_HEIGHT),
+                    ),
+                    clip: ClipBehavior::Clip,
+                    ..Default::default()
+                },
+            ),
+        );
+        for (column, metric) in chunk.iter().enumerate() {
+            add_operad_metric_tile(
+                document,
+                row,
+                &format!("safety.metrics.{row_index}.{column}"),
+                tile_width - 6.0,
+                metric,
+            );
+        }
+    }
+}
+
+fn add_operad_metric_tile(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    name: &str,
+    width: f32,
+    metric: &SafetyMetricTile,
+) {
+    let tile = document.add_child(
+        parent,
+        UiNode::container(
+            name,
+            UiNodeStyle {
+                layout: layout::with_padding_all(
+                    layout::with_margin_all(
+                        layout::with_size(
+                            layout::column(),
+                            layout::px(width.max(116.0)),
+                            layout::px(OPERAD_METRIC_HEIGHT - 8.0),
+                        ),
+                        3.0,
+                    ),
+                    9.0,
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            ColorRgba::new(29, 35, 40, 255),
+            Some(StrokeStyle::new(operad_tone_color(metric.tone), 1.0)),
+            6.0,
+        )),
+    );
+    add_operad_text(
+        document,
+        tile,
+        &format!("{name}.label"),
+        &metric.label,
+        operad_text_style(12.0, FontWeight::BOLD, ColorRgba::new(158, 166, 174, 255)),
+        18.0,
+    );
+    add_operad_text(
+        document,
+        tile,
+        &format!("{name}.value"),
+        &metric.value,
+        operad_text_style(20.0, FontWeight::BOLD, ColorRgba::new(239, 243, 247, 255)),
+        26.0,
+    );
+    add_operad_text(
+        document,
+        tile,
+        &format!("{name}.detail"),
+        truncate_middle(&metric.detail, 52),
+        operad_text_style(12.0, FontWeight::NORMAL, operad_tone_color(metric.tone)),
+        18.0,
+    );
+}
+
+fn add_operad_section(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    width: f32,
+    name: &str,
+    title: &str,
+    empty: &str,
+    rows: &[SafetyOperadRow],
+) {
+    let height = operad_section_height(rows.len());
+    let section = document.add_child(
+        parent,
+        UiNode::container(
+            name,
+            UiNodeStyle {
+                layout: layout::with_padding_all(
+                    layout::with_size(layout::column(), layout::percent(1.0), layout::px(height)),
+                    OPERAD_PAD,
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            ColorRgba::new(21, 26, 31, 255),
+            Some(StrokeStyle::new(ColorRgba::new(45, 53, 61, 255), 1.0)),
+            6.0,
+        )),
+    );
+    add_operad_text(
+        document,
+        section,
+        &format!("{name}.title"),
+        title,
+        operad_text_style(15.0, FontWeight::BOLD, ColorRgba::new(242, 246, 250, 255)),
+        OPERAD_SECTION_TITLE_HEIGHT,
+    );
+    if rows.is_empty() {
+        add_operad_empty_row(document, section, name, empty);
+    } else {
+        let row_width = (width - OPERAD_PAD * 2.0).max(240.0);
+        for (index, row) in rows.iter().enumerate() {
+            add_operad_data_row(document, section, name, index, row_width, row);
+        }
+    }
+}
+
+fn add_operad_empty_row(document: &mut UiDocument, parent: UiNodeId, name: &str, label: &str) {
+    let row = document.add_child(
+        parent,
+        UiNode::container(
+            format!("{name}.empty"),
+            UiNodeStyle {
+                layout: layout::with_padding_all(
+                    layout::with_size(
+                        layout::row(),
+                        layout::percent(1.0),
+                        layout::px(OPERAD_EMPTY_ROW_HEIGHT),
+                    ),
+                    8.0,
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            ColorRgba::new(27, 32, 37, 255),
+            Some(StrokeStyle::new(ColorRgba::new(43, 50, 58, 255), 1.0)),
+            5.0,
+        )),
+    );
+    add_operad_text(
+        document,
+        row,
+        &format!("{name}.empty.label"),
+        label,
+        operad_text_style(13.0, FontWeight::NORMAL, ColorRgba::new(154, 163, 172, 255)),
+        24.0,
+    );
+}
+
+fn add_operad_data_row(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    section_name: &str,
+    index: usize,
+    row_width: f32,
+    row: &SafetyOperadRow,
+) {
+    let row_name = row
+        .action_name
+        .clone()
+        .unwrap_or_else(|| format!("{section_name}.row.{index}"));
+    let mut node = UiNode::container(
+        row_name,
+        UiNodeStyle {
+            layout: layout::with_padding_all(
+                layout::with_size(
+                    layout::row(),
+                    layout::percent(1.0),
+                    layout::px(OPERAD_ROW_HEIGHT),
+                ),
+                6.0,
+            ),
+            clip: ClipBehavior::Clip,
+            ..Default::default()
+        },
+    )
+    .with_visual(UiVisual::panel(
+        ColorRgba::new(26, 31, 36, 255),
+        Some(StrokeStyle::new(ColorRgba::new(42, 50, 58, 255), 1.0)),
+        4.0,
+    ));
+    if row.action_name.is_some() {
+        node = node.with_input(InputBehavior::BUTTON);
+    }
+    let row_node = document.add_child(parent, node);
+    document.add_child(
+        row_node,
+        UiNode::container(
+            format!("{section_name}.row.{index}.tone"),
+            UiNodeStyle {
+                layout: layout::fixed(5.0, OPERAD_ROW_HEIGHT - 12.0),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(operad_tone_color(row.tone), None, 2.0)),
+    );
+    let button_width = if row.button_name.is_some() {
+        112.0
+    } else {
+        0.0
+    };
+    let text_width = (row_width - button_width - 28.0).max(120.0);
+    let text_column = document.add_child(
+        row_node,
+        UiNode::container(
+            format!("{section_name}.row.{index}.text"),
+            UiNodeStyle {
+                layout: layout::with_size(
+                    layout::column(),
+                    layout::px(text_width),
+                    layout::px(OPERAD_ROW_HEIGHT - 12.0),
+                ),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        ),
+    );
+    add_operad_text(
+        document,
+        text_column,
+        &format!("{section_name}.row.{index}.title"),
+        truncate_middle(&row.title, 64),
+        operad_text_style(14.0, FontWeight::BOLD, ColorRgba::new(232, 237, 242, 255)),
+        20.0,
+    );
+    add_operad_text(
+        document,
+        text_column,
+        &format!("{section_name}.row.{index}.detail"),
+        truncate_middle(&row.detail, 96),
+        operad_text_style(12.0, FontWeight::NORMAL, ColorRgba::new(162, 171, 180, 255)),
+        18.0,
+    );
+    if let (Some(button_name), Some(button_label)) = (&row.button_name, row.button_label) {
+        let mut options = widgets::ButtonOptions::new(layout::fixed(104.0, 28.0));
+        options.text_style =
+            operad_text_style(12.0, FontWeight::BOLD, ColorRgba::new(12, 16, 20, 255));
+        options.visual = UiVisual::panel(
+            ColorRgba::new(220, 176, 72, 255),
+            Some(StrokeStyle::new(ColorRgba::new(238, 202, 119, 255), 1.0)),
+            5.0,
+        );
+        widgets::button(document, row_node, button_name, button_label, options);
+    }
+}
+
+fn add_operad_spacer(document: &mut UiDocument, parent: UiNodeId, height: f32) {
+    document.add_child(
+        parent,
+        UiNode::container(
+            format!("safety.spacer.{}", document.node_count()),
+            UiNodeStyle {
+                layout: layout::with_size(layout::row(), layout::percent(1.0), layout::px(height)),
+                ..Default::default()
+            },
+        ),
+    );
+}
+
+fn add_operad_text(
+    document: &mut UiDocument,
+    parent: UiNodeId,
+    name: &str,
+    text: impl Into<String>,
+    style: TextStyle,
+    height: f32,
+) {
+    widgets::label(
+        document,
+        parent,
+        name,
+        text,
+        style,
+        layout::with_size(layout::row(), layout::percent(1.0), layout::px(height)),
+    );
+}
+
+fn operad_text_style(font_size: f32, weight: FontWeight, color: ColorRgba) -> TextStyle {
+    TextStyle {
+        font_size,
+        line_height: font_size + 4.0,
+        weight,
+        color,
+        wrap: TextWrap::None,
+        ..Default::default()
+    }
+}
+
+fn operad_tone_color(tone: Tone) -> ColorRgba {
+    let color = tone.color();
+    ColorRgba::new(color.r(), color.g(), color.b(), color.a())
+}
+
+fn audit_tone(kind: SafetyAuditKind) -> Tone {
+    match kind {
+        SafetyAuditKind::SensorSample => Tone::Info,
+        SafetyAuditKind::AlarmRouted => Tone::Warning,
+        SafetyAuditKind::ToolLockedOut | SafetyAuditKind::IncidentOpened => Tone::Danger,
+        SafetyAuditKind::IncidentUpdated => Tone::Neutral,
+    }
+}
+
+fn truncate_middle(text: impl AsRef<str>, max_chars: usize) -> String {
+    let text = text.as_ref();
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_string();
+    }
+    let keep = max_chars.saturating_sub(3);
+    let head = keep / 2;
+    let tail = keep - head;
+    let start = text.chars().take(head).collect::<String>();
+    let end = text
+        .chars()
+        .rev()
+        .take(tail)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!("{start}...{end}")
+}
+
 fn audit_ui(ui: &mut egui::Ui, model: &SafetySystem) {
     ui_chrome::section_label(ui, "Audit Trail");
     if model.audit_events.is_empty() {
@@ -1076,5 +2180,57 @@ fn compact_number(value: f64) -> String {
         format!("{value:.1}")
     } else {
         format!("{value:.2}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safety_operad_view_audits_common_widths() {
+        let panel = SafetyPanel::from_model(SafetySystem::simulated_demo());
+        for width in [360.0, 760.0, 1200.0] {
+            let mut view = panel.build_operad_view(width);
+            view.document
+                .compute_layout(view.size, &mut ApproxTextMeasurer)
+                .expect("safety operad view should lay out");
+            let warnings = view.document.audit_layout();
+            assert!(warnings.is_empty(), "{warnings:?}");
+            assert!(view.document.node_count() > 40);
+            assert!(!view.document.paint_list().is_empty());
+        }
+    }
+
+    #[test]
+    fn safety_operad_actions_update_panel_state() {
+        let mut panel = SafetyPanel::from_model(SafetySystem::simulated_demo());
+        let mut status = String::new();
+        let target_tool = panel
+            .model
+            .evaluate_lockouts()
+            .last()
+            .expect("demo safety model has lockouts")
+            .tool_id
+            .clone();
+
+        assert!(panel.handle_operad_action(
+            &format!("{OPERAD_ACTION_SELECT_TOOL}{target_tool}"),
+            &mut status
+        ));
+        assert_eq!(panel.selected_tool.as_deref(), Some(target_tool.as_str()));
+
+        let sensor_id = panel
+            .model
+            .active_conditions()
+            .first()
+            .expect("demo safety model has active conditions")
+            .id
+            .to_string();
+        assert!(panel.handle_operad_action(
+            &format!("{OPERAD_ACTION_ACK_CONDITION}{sensor_id}"),
+            &mut status
+        ));
+        assert!(panel.acknowledged_conditions.contains(&sensor_id));
     }
 }

@@ -1,0 +1,55 @@
+{
+  "name": "UNSUPPORTED_ELEMENTS",
+  "elements": [
+    {
+      "kind": "box",
+      "gds_layer": 31,
+      "gds_type": 2,
+      "points": [[0, 0], [10, 0], [10, 10], [0, 10], [0, 0]]
+    },
+    {
+      "kind": "node",
+      "gds_layer": 32,
+      "gds_type": 3,
+      "points": [[20, 0], [30, 0]]
+    },
+    {
+      "kind": "textnode",
+      "gds_layer": 33,
+      "gds_type": 4,
+      "points": [[40, 0]]
+    },
+    {
+      "kind": "boundary",
+      "gds_layer": 1,
+      "datatype": 0,
+      "points": [[50, 0], [70, 0], [70, 20], [50, 20], [50, 0]]
+    }
+  ],
+  "expect": {
+    "element_count": 4,
+    "generated_layer_count": 0,
+    "visible_shape_count": 1,
+    "skipped_count": 3,
+    "skipped": [
+      {
+        "element_kind": "BOX",
+        "gds_layer": 31,
+        "gds_type": 2,
+        "reason_contains": "unsupported GDSII BOX"
+      },
+      {
+        "element_kind": "NODE",
+        "gds_layer": 32,
+        "gds_type": 3,
+        "reason_contains": "unsupported GDSII NODE"
+      },
+      {
+        "element_kind": "TEXTNODE",
+        "gds_layer": 33,
+        "gds_type": 4,
+        "reason_contains": "unsupported GDSII TEXTNODE"
+      }
+    ]
+  }
+}

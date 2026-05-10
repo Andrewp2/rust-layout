@@ -1,0 +1,79 @@
+{
+  "name": "Fixture custom stack process",
+  "dbu_per_micron": 2000,
+  "grid": 5,
+  "layers": [
+    {
+      "id": 21,
+      "name": "active_custom",
+      "process": "diffusion",
+      "purpose": "fixture active",
+      "color": [0.2, 0.7, 0.35, 0.4],
+      "display_order": 10,
+      "z_base": 0.0,
+      "z_thickness": 50.0,
+      "gds_layer": 21,
+      "gds_datatype": 0,
+      "gds_texttype": 0
+    },
+    {
+      "id": 22,
+      "name": "contact_custom",
+      "process": "contact",
+      "purpose": "fixture active to metal contact",
+      "color": [0.92, 0.9, 0.75, 0.8],
+      "display_order": 20,
+      "z_base": 50.0,
+      "z_thickness": 100.0,
+      "gds_layer": 22,
+      "gds_datatype": 0,
+      "gds_texttype": 0
+    },
+    {
+      "id": 23,
+      "name": "metal_custom",
+      "process": "metal1",
+      "purpose": "fixture routing metal",
+      "color": [0.2, 0.55, 0.95, 0.45],
+      "display_order": 30,
+      "z_base": 150.0,
+      "z_thickness": 70.0,
+      "gds_layer": 23,
+      "gds_datatype": 0,
+      "gds_texttype": 0
+    },
+    {
+      "id": 24,
+      "name": "labels_custom",
+      "process": "annotation",
+      "purpose": "fixture labels",
+      "color": [0.95, 0.95, 0.95, 0.9],
+      "display_order": 100,
+      "gds_layer": 24,
+      "gds_datatype": 0,
+      "gds_texttype": 0
+    }
+  ],
+  "connectivity": [
+    {
+      "from": "active_custom",
+      "through": "contact_custom",
+      "to": "metal_custom"
+    }
+  ],
+  "drc": {
+    "min_width": [
+      { "layer": "active_custom", "value": 80 },
+      { "layer": "metal_custom", "value": 120 }
+    ],
+    "min_spacing": [
+      { "layer": "active_custom", "value": 80 },
+      { "layer": "metal_custom", "value": 120 }
+    ],
+    "via_enclosure": [
+      { "via": "contact_custom", "enclosure": "active_custom", "required": 20 },
+      { "via": "contact_custom", "enclosure": "metal_custom", "required": 20 }
+    ],
+    "forbidden_overlaps": []
+  }
+}

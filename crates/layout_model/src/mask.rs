@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 
 use geometry_core::{Coord, Point, Rect, Vector};
 use serde::{Deserialize, Serialize};
@@ -350,8 +353,18 @@ impl ReticlePrep {
             ));
         }
 
+        let mut block_lookup = BTreeMap::new();
         for block in &self.exposure_blocks {
             validate_exposure_block(block, &field_lookup, &layer_lookup, document, &mut report);
+            if block_lookup.insert(block.id.clone(), block).is_some() {
+                report.push_issue(
+                    MaskPrepIssue::error(
+                        "duplicate_exposure_block",
+                        format!("exposure block {} appears more than once", block.id),
+                    )
+                    .with_block(block.id.clone()),
+                );
+            }
         }
         if self.exposure_blocks.is_empty() {
             report.push_issue(MaskPrepIssue::error(
@@ -552,6 +565,24 @@ fn validate_reticle(prep: &ReticlePrep, report: &mut MaskCheckReport) {
             "mask design id is empty",
         ));
     }
+    if prep.layout_revision.trim().is_empty() {
+        report.push_issue(MaskPrepIssue::error(
+            "empty_layout_revision",
+            "layout revision is empty",
+        ));
+    }
+    if prep.reticle.id.as_str().trim().is_empty() {
+        report.push_issue(MaskPrepIssue::error(
+            "empty_reticle_id",
+            "reticle id is empty",
+        ));
+    }
+    if prep.reticle.name.trim().is_empty() {
+        report.push_issue(MaskPrepIssue::error(
+            "empty_reticle_name",
+            "reticle name is empty",
+        ));
+    }
     if prep.reticle.size.width <= 0 || prep.reticle.size.height <= 0 {
         report.push_issue(MaskPrepIssue::error(
             "bad_reticle_size",
@@ -564,6 +595,20 @@ fn validate_reticle(prep: &ReticlePrep, report: &mut MaskCheckReport) {
             "reticle field limits must be positive",
         ));
     }
+    if prep.reticle.edge_clearance < 0 || prep.reticle.alignment_clearance < 0 {
+        report.push_issue(MaskPrepIssue::error(
+            "negative_reticle_clearance",
+            "reticle clearances must be non-negative",
+        ));
+    }
+    if prep.reticle.edge_clearance.saturating_mul(2) >= prep.reticle.size.width
+        || prep.reticle.edge_clearance.saturating_mul(2) >= prep.reticle.size.height
+    {
+        report.push_issue(MaskPrepIssue::error(
+            "no_printable_reticle_area",
+            "reticle edge clearance leaves no printable area",
+        ));
+    }
 }
 
 fn validate_field(
@@ -572,6 +617,12 @@ fn validate_field(
     field: &ReticleField,
     report: &mut MaskCheckReport,
 ) {
+    if field.id.as_str().trim().is_empty() {
+        report.push_issue(MaskPrepIssue::error(
+            "empty_field_id",
+            "reticle field id is empty",
+        ));
+    }
     if field.name.trim().is_empty() {
         report.push_issue(
             MaskPrepIssue::error("empty_field_name", "reticle field name is empty")
@@ -628,6 +679,21 @@ fn validate_exposure_block(
     document: &Document,
     report: &mut MaskCheckReport,
 ) {
+    if block.id.as_str().trim().is_empty() {
+        report.push_issue(MaskPrepIssue::error(
+            "empty_exposure_block_id",
+            "exposure block id is empty",
+        ));
+    }
+    if block.name.trim().is_empty() {
+        report.push_issue(
+            MaskPrepIssue::error(
+                "empty_exposure_block_name",
+                format!("block {} has an empty name", block.id),
+            )
+            .with_block(block.id.clone()),
+        );
+    }
     let Some(field) = fields.get(&block.field_id) else {
         report.push_issue(
             MaskPrepIssue::error(
@@ -646,6 +712,15 @@ fn validate_exposure_block(
             MaskPrepIssue::error(
                 "bad_exposure_dose",
                 format!("block {} has invalid exposure dose", block.id),
+            )
+            .with_block(block.id.clone()),
+        );
+    }
+    if !block.focus_offset_um.is_finite() {
+        report.push_issue(
+            MaskPrepIssue::error(
+                "bad_exposure_focus",
+                format!("block {} has a non-finite focus offset", block.id),
             )
             .with_block(block.id.clone()),
         );
@@ -685,7 +760,21 @@ fn validate_exposure_block(
             .with_block(block.id.clone()),
         );
     }
+    let mut seen_block_layers = BTreeSet::new();
     for layer_id in &block.layer_ids {
+        if !seen_block_layers.insert(*layer_id) {
+            report.push_issue(
+                MaskPrepIssue::error(
+                    "duplicate_block_layer",
+                    format!(
+                        "block {} exposes layer {} more than once",
+                        block.id, layer_id.0
+                    ),
+                )
+                .with_block(block.id.clone())
+                .with_layer(*layer_id),
+            );
+        }
         if !layers.contains_key(layer_id) {
             report.push_issue(
                 MaskPrepIssue::error(
@@ -1053,5 +1142,59 @@ mod tests {
                 .iter()
                 .any(|issue| issue.code == "block_unknown_layer")
         );
+    }
+
+    #[test]
+    fn validation_rejects_structurally_invalid_reticle_prep() {
+        let document = Document::demo();
+        let route = demo_process_route();
+        let mut prep = ReticlePrep::from_document_and_route(&document, &route);
+        prep.layout_revision = " ".to_string();
+        prep.reticle.id = ReticleId::new(" ");
+        prep.reticle.name = " ".to_string();
+        prep.reticle.edge_clearance = prep.reticle.size.width.max(prep.reticle.size.height);
+
+        let duplicated_layer = prep.layer_stack.first().expect("mask layer").layer;
+        let mut duplicate_block = prep
+            .exposure_blocks
+            .first()
+            .expect("exposure block")
+            .clone();
+        duplicate_block.name = " ".to_string();
+        duplicate_block.focus_offset_um = f64::NAN;
+        duplicate_block.layer_ids = vec![duplicated_layer, duplicated_layer];
+        prep.exposure_blocks.push(duplicate_block);
+
+        let report = prep.validate_document(&document);
+        let codes = report
+            .issues
+            .iter()
+            .map(|issue| issue.code.as_str())
+            .collect::<BTreeSet<_>>();
+
+        assert!(codes.contains("empty_layout_revision"));
+        assert!(codes.contains("empty_reticle_id"));
+        assert!(codes.contains("empty_reticle_name"));
+        assert!(codes.contains("no_printable_reticle_area"));
+        assert!(codes.contains("empty_exposure_block_name"));
+        assert!(codes.contains("bad_exposure_focus"));
+        assert!(codes.contains("duplicate_block_layer"));
+        assert!(codes.contains("duplicate_exposure_block"));
+    }
+
+    #[test]
+    fn check_report_counts_omitted_issues_in_totals() {
+        let mut report = MaskCheckReport::default();
+        for index in 0..MAX_RETAINED_MASK_ISSUES + 3 {
+            report.push_issue(MaskPrepIssue::warning(
+                "synthetic_warning",
+                format!("synthetic warning {index}"),
+            ));
+        }
+
+        assert_eq!(report.issues.len(), MAX_RETAINED_MASK_ISSUES);
+        assert_eq!(report.warning_count(), MAX_RETAINED_MASK_ISSUES + 3);
+        assert_eq!(report.total_issue_count(), MAX_RETAINED_MASK_ISSUES + 3);
+        assert_eq!(report.omitted_issue_count(), 3);
     }
 }

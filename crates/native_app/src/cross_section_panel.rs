@@ -6,7 +6,12 @@ use layout_model::cross_section::{
     ProcessStepKind,
 };
 
-use crate::ui_chrome::{self, Tone};
+use crate::{
+    operad_sidecar::{SidecarRow, SidecarSection, render_sidecar_interactive},
+    ui_chrome::{self, Tone},
+};
+
+const OPERAD_ACTION_SELECT_STEP: &str = "cross_section.action.select_step.";
 
 pub(crate) struct CrossSectionPanel {
     process: CrossSectionProcess,
@@ -20,7 +25,10 @@ pub(crate) struct CrossSectionPanel {
 
 impl CrossSectionPanel {
     pub(crate) fn sample() -> Self {
-        let process = CrossSectionProcess::sample_sequence();
+        Self::from_process(CrossSectionProcess::sample_sequence())
+    }
+
+    pub(crate) fn from_process(process: CrossSectionProcess) -> Self {
         let snapshots = process.simulate();
         let selected_material = Some(process.substrate_material.clone());
         Self {
@@ -34,7 +42,138 @@ impl CrossSectionPanel {
         }
     }
 
+    pub(crate) fn process(&self) -> &CrossSectionProcess {
+        &self.process
+    }
+
     pub(crate) fn context_ui(&mut self, ui: &mut egui::Ui) {
+        self.clamp_selection();
+        if self.operad_context_ui(ui).is_err() {
+            self.egui_context_ui(ui);
+        }
+    }
+
+    fn operad_context_ui(&mut self, ui: &mut egui::Ui) -> Result<(), String> {
+        self.clamp_selection();
+        let Some(snapshot) = self.selected_snapshot().cloned() else {
+            return render_sidecar_interactive(
+                ui,
+                "cross_section.context",
+                &[
+                    SidecarSection::new("Process Cross-Section")
+                        .empty("No process sequence loaded"),
+                ],
+            )
+            .map(|_| ());
+        };
+
+        let risks = self.risk_findings(&snapshot);
+        let surface = surface_summary(&self.process, &snapshot);
+        let selected_material = self
+            .selected_material_id(&snapshot)
+            .map(|material| self.material_name(&material))
+            .unwrap_or_else(|| "n/a".to_string());
+        let mut sections = Vec::new();
+        sections.push(
+            SidecarSection::new("Process Cross-Section")
+                .row(SidecarRow::new(
+                    format!("Step {}: {}", snapshot.step_index, snapshot.title),
+                    snapshot.detail.clone(),
+                    Tone::Info,
+                ))
+                .row(SidecarRow::new(
+                    self.step_kind_label(snapshot.step_index),
+                    risk_summary_label(&risks),
+                    risk_summary_tone(&risks),
+                ))
+                .row(SidecarRow::new(
+                    "Surface",
+                    format!(
+                        "{} avg / {} range",
+                        format_um(surface.average_um),
+                        format_um(surface.range_um)
+                    ),
+                    surface_range_tone(surface.range_um),
+                )),
+        );
+
+        let mut sequence = SidecarSection::new("Step Sequence").empty("No process steps");
+        for step_index in 0..self.snapshots.len() {
+            let title = if step_index == 0 {
+                "Starting substrate".to_string()
+            } else {
+                self.process
+                    .steps
+                    .get(step_index - 1)
+                    .map(|step| step.name.clone())
+                    .unwrap_or_else(|| format!("Step {step_index}"))
+            };
+            sequence = sequence.row(
+                SidecarRow::new(
+                    format!("{step_index}. {title}"),
+                    if step_index == self.selected_step {
+                        "selected step"
+                    } else {
+                        "inspect step"
+                    },
+                    if step_index == self.selected_step {
+                        Tone::Info
+                    } else {
+                        Tone::Neutral
+                    },
+                )
+                .selected(step_index == self.selected_step)
+                .action(format!("{OPERAD_ACTION_SELECT_STEP}{step_index}|context")),
+            );
+        }
+        sections.push(sequence);
+
+        sections.push(
+            SidecarSection::new("Selected Material")
+                .row(SidecarRow::new(
+                    "Material",
+                    selected_material,
+                    Tone::Neutral,
+                ))
+                .row(SidecarRow::new(
+                    "Mask openings",
+                    format!("{} active openings", snapshot.active_mask.len()),
+                    if snapshot.active_mask.is_empty() {
+                        Tone::Warning
+                    } else {
+                        Tone::Neutral
+                    },
+                ))
+                .row(SidecarRow::new(
+                    "Segments",
+                    format!("{} rendered bands", snapshot.segments.len()),
+                    Tone::Neutral,
+                )),
+        );
+
+        let mut risk_section =
+            SidecarSection::new("Defects / Risks").empty("No significant cross-section risk cues");
+        for risk in risks.iter().take(5) {
+            risk_section = risk_section.row(SidecarRow::new(
+                risk.title.clone(),
+                risk.detail.clone(),
+                risk.tone,
+            ));
+        }
+        sections.push(risk_section);
+
+        if let Some(action) = render_sidecar_interactive(ui, "cross_section.context", &sections)?
+            && let Some(step) = action
+                .strip_prefix(OPERAD_ACTION_SELECT_STEP)
+                .and_then(|value| value.split_once('|').map(|(step, _)| step).or(Some(value)))
+                .and_then(|value| value.parse::<usize>().ok())
+        {
+            self.select_step(step);
+        }
+        Ok(())
+    }
+
+    fn egui_context_ui(&mut self, ui: &mut egui::Ui) {
         self.clamp_selection();
         ui_chrome::section_label(ui, "Process Cross-Section");
         let Some(snapshot) = self.selected_snapshot().cloned() else {

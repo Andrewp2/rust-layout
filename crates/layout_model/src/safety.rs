@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -126,7 +129,7 @@ impl SafetySensorState {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AlarmRouteTarget {
     EquipmentHost,
@@ -301,6 +304,54 @@ pub struct SafetySystem {
     pub incidents: Vec<SafetyIncident>,
     #[serde(default)]
     pub audit_events: Vec<SafetyAuditEvent>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SafetyValidationSeverity {
+    Error,
+    Warning,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SafetyValidationFinding {
+    pub severity: SafetyValidationSeverity,
+    pub message: String,
+}
+
+impl SafetyValidationFinding {
+    fn error(message: impl Into<String>) -> Self {
+        Self {
+            severity: SafetyValidationSeverity::Error,
+            message: message.into(),
+        }
+    }
+
+    fn warning(message: impl Into<String>) -> Self {
+        Self {
+            severity: SafetyValidationSeverity::Warning,
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SafetyValidationContext {
+    pub tool_ids: BTreeSet<String>,
+}
+
+impl SafetyValidationContext {
+    pub fn from_equipment(equipment: &crate::equipment::EquipmentSimulator) -> Self {
+        Self {
+            tool_ids: equipment
+                .tools()
+                .map(|tool| tool.id.as_str().to_string())
+                .collect(),
+        }
+    }
+
+    fn contains_tool(&self, tool_id: &str) -> bool {
+        self.tool_ids.contains(tool_id)
+    }
 }
 
 impl SafetySystem {
@@ -547,6 +598,321 @@ impl SafetySystem {
             highest_severity: self.sensors.iter().map(|sensor| sensor.severity).max(),
         }
     }
+
+    pub fn validate(&self) -> Vec<SafetyValidationFinding> {
+        let mut findings = Vec::new();
+        let mut sensor_ids = BTreeSet::new();
+        let mut sensor_domains = BTreeMap::new();
+        let mut sensors_by_id = BTreeMap::new();
+        for sensor in &self.sensors {
+            if sensor.id.as_str().trim().is_empty() {
+                findings.push(SafetyValidationFinding::error("safety sensor id is empty"));
+                continue;
+            }
+            if !sensor_ids.insert(sensor.id.clone()) {
+                findings.push(SafetyValidationFinding::error(format!(
+                    "safety sensor {} is duplicated",
+                    sensor.id
+                )));
+            }
+            sensor_domains.insert(sensor.id.clone(), sensor.domain);
+            sensors_by_id.insert(sensor.id.clone(), sensor);
+            if sensor.name.trim().is_empty() {
+                findings.push(SafetyValidationFinding::warning(format!(
+                    "safety sensor {} has an empty name",
+                    sensor.id
+                )));
+            }
+            if sensor.unit.trim().is_empty() {
+                findings.push(SafetyValidationFinding::warning(format!(
+                    "safety sensor {} has an empty unit",
+                    sensor.id
+                )));
+            }
+            if !sensor.value.is_finite() {
+                findings.push(SafetyValidationFinding::error(format!(
+                    "safety sensor {} has non-finite value",
+                    sensor.id
+                )));
+            }
+            if sensor
+                .tool_id
+                .as_deref()
+                .is_some_and(|tool_id| tool_id.trim().is_empty())
+            {
+                findings.push(SafetyValidationFinding::error(format!(
+                    "safety sensor {} has an empty equipment tool id",
+                    sensor.id
+                )));
+            }
+            if sensor.state == SafetySensorState::Normal && !sensor.in_limit() {
+                findings.push(SafetyValidationFinding::warning(format!(
+                    "safety sensor {} is normal while outside configured limits",
+                    sensor.id
+                )));
+            }
+            if !sensor.in_limit() && sensor.severity == SafetySeverity::Normal {
+                findings.push(SafetyValidationFinding::error(format!(
+                    "safety sensor {} is outside configured limits but severity is normal",
+                    sensor.id
+                )));
+            }
+            if sensor.severity.fails_interlock()
+                && sensor.state == SafetySensorState::Normal
+                && sensor.in_limit()
+            {
+                findings.push(SafetyValidationFinding::warning(format!(
+                    "safety sensor {} has failed severity without failed state or limit excursion",
+                    sensor.id
+                )));
+            }
+            if sensor.fails_interlock() && sensor.message.trim().is_empty() {
+                findings.push(SafetyValidationFinding::warning(format!(
+                    "safety sensor {} fails interlock without a message",
+                    sensor.id
+                )));
+            }
+            validate_limit(sensor, &mut findings);
+        }
+
+        let mut route_keys = BTreeSet::new();
+        for route in &self.alarm_routes {
+            if !route_keys.insert((route.domain, route.minimum_severity, route.target)) {
+                findings.push(SafetyValidationFinding::warning(format!(
+                    "safety alarm route for {} to {} is duplicated",
+                    route.domain.label(),
+                    route.target.label()
+                )));
+            }
+            if route.channel.trim().is_empty() {
+                findings.push(SafetyValidationFinding::warning(format!(
+                    "safety alarm route for {} to {} has an empty channel",
+                    route.domain.label(),
+                    route.target.label()
+                )));
+            }
+        }
+
+        let mut interlock_tool_ids = BTreeSet::new();
+        for interlock in &self.tool_interlocks {
+            if interlock.tool_id.trim().is_empty() {
+                findings.push(SafetyValidationFinding::error(
+                    "safety tool interlock has an empty tool id",
+                ));
+            } else if !interlock_tool_ids.insert(interlock.tool_id.clone()) {
+                findings.push(SafetyValidationFinding::error(format!(
+                    "safety tool interlock {} is duplicated",
+                    interlock.tool_id
+                )));
+            }
+            if interlock.required_sensors.is_empty() {
+                findings.push(SafetyValidationFinding::warning(format!(
+                    "safety tool interlock {} has no required sensors",
+                    interlock.tool_id
+                )));
+            }
+            if interlock.tool_name.trim().is_empty() {
+                findings.push(SafetyValidationFinding::warning(format!(
+                    "safety tool interlock {} has an empty tool name",
+                    interlock.tool_id
+                )));
+            }
+            let mut required_sensor_ids = BTreeSet::new();
+            for sensor_id in &interlock.required_sensors {
+                if sensor_id.as_str().trim().is_empty() {
+                    findings.push(SafetyValidationFinding::error(format!(
+                        "safety tool interlock {} has an empty required sensor id",
+                        interlock.tool_id
+                    )));
+                    continue;
+                }
+                if !required_sensor_ids.insert(sensor_id.clone()) {
+                    findings.push(SafetyValidationFinding::error(format!(
+                        "safety tool interlock {} has duplicate required sensor {}",
+                        interlock.tool_id, sensor_id
+                    )));
+                }
+                if !sensor_ids.contains(sensor_id) {
+                    findings.push(SafetyValidationFinding::error(format!(
+                        "safety tool interlock {} references missing sensor {}",
+                        interlock.tool_id, sensor_id
+                    )));
+                }
+            }
+        }
+
+        let mut incident_ids = BTreeSet::new();
+        for incident in &self.incidents {
+            if incident.id.0.trim().is_empty() {
+                findings.push(SafetyValidationFinding::error(
+                    "safety incident id is empty",
+                ));
+            } else if !incident_ids.insert(incident.id.clone()) {
+                findings.push(SafetyValidationFinding::error(format!(
+                    "safety incident {} is duplicated",
+                    incident.id
+                )));
+            }
+            if !is_valid_safety_timestamp(&incident.opened_at) {
+                findings.push(SafetyValidationFinding::error(format!(
+                    "safety incident {} has invalid opened timestamp {}",
+                    incident.id, incident.opened_at
+                )));
+            }
+            if let Some(sensor_id) = incident.sensor_id.as_ref() {
+                if sensor_id.as_str().trim().is_empty() {
+                    findings.push(SafetyValidationFinding::error(format!(
+                        "safety incident {} has an empty sensor id",
+                        incident.id
+                    )));
+                }
+                match sensor_domains.get(sensor_id) {
+                    Some(domain) if *domain != incident.domain => {
+                        findings.push(SafetyValidationFinding::warning(format!(
+                            "safety incident {} domain {} does not match sensor {} domain {}",
+                            incident.id,
+                            incident.domain.label(),
+                            sensor_id,
+                            domain.label()
+                        )));
+                    }
+                    Some(_) => {}
+                    None => findings.push(SafetyValidationFinding::error(format!(
+                        "safety incident {} references missing sensor {}",
+                        incident.id, sensor_id
+                    ))),
+                }
+                if let Some(sensor) = sensors_by_id.get(sensor_id)
+                    && sensor.severity > incident.severity
+                {
+                    findings.push(SafetyValidationFinding::warning(format!(
+                        "safety incident {} severity {} is below linked sensor {} severity {}",
+                        incident.id,
+                        incident.severity.label(),
+                        sensor_id,
+                        sensor.severity.label()
+                    )));
+                }
+            }
+            if incident
+                .tool_id
+                .as_deref()
+                .is_some_and(|tool_id| tool_id.trim().is_empty())
+            {
+                findings.push(SafetyValidationFinding::error(format!(
+                    "safety incident {} has an empty equipment tool id",
+                    incident.id
+                )));
+            }
+            if incident.summary.trim().is_empty() {
+                findings.push(SafetyValidationFinding::warning(format!(
+                    "safety incident {} has an empty summary",
+                    incident.id
+                )));
+            }
+            if incident.status != IncidentStatus::Closed
+                && incident.severity == SafetySeverity::Normal
+            {
+                findings.push(SafetyValidationFinding::warning(format!(
+                    "safety incident {} is open or contained with normal severity",
+                    incident.id
+                )));
+            }
+            if incident.routed_to.is_empty() && incident.status != IncidentStatus::Closed {
+                findings.push(SafetyValidationFinding::warning(format!(
+                    "safety incident {} is not routed",
+                    incident.id
+                )));
+            }
+            let mut routed_to = BTreeSet::new();
+            for target in &incident.routed_to {
+                if !routed_to.insert(*target) {
+                    findings.push(SafetyValidationFinding::warning(format!(
+                        "safety incident {} repeats route target {}",
+                        incident.id,
+                        target.label()
+                    )));
+                }
+            }
+        }
+
+        let mut audit_sequences = BTreeSet::new();
+        for event in &self.audit_events {
+            if event.sequence == 0 {
+                findings.push(SafetyValidationFinding::error(
+                    "safety audit sequence cannot be zero",
+                ));
+            }
+            if !audit_sequences.insert(event.sequence) {
+                findings.push(SafetyValidationFinding::warning(format!(
+                    "safety audit sequence {} is duplicated",
+                    event.sequence
+                )));
+            }
+            if !is_valid_safety_timestamp(&event.timestamp) {
+                findings.push(SafetyValidationFinding::error(format!(
+                    "safety audit sequence {} has invalid timestamp {}",
+                    event.sequence, event.timestamp
+                )));
+            }
+            if event.actor.trim().is_empty() || event.message.trim().is_empty() {
+                findings.push(SafetyValidationFinding::warning(format!(
+                    "safety audit sequence {} has incomplete audit metadata",
+                    event.sequence
+                )));
+            }
+        }
+
+        findings
+    }
+
+    pub fn validate_with_context(
+        &self,
+        context: &SafetyValidationContext,
+    ) -> Vec<SafetyValidationFinding> {
+        let mut findings = self.validate();
+        self.validate_context_links(context, &mut findings);
+        findings
+    }
+
+    fn validate_context_links(
+        &self,
+        context: &SafetyValidationContext,
+        findings: &mut Vec<SafetyValidationFinding>,
+    ) {
+        for sensor in &self.sensors {
+            if let Some(tool_id) = sensor.tool_id.as_deref()
+                && !tool_id.trim().is_empty()
+                && !context.contains_tool(tool_id)
+            {
+                findings.push(SafetyValidationFinding::error(format!(
+                    "safety sensor {} references missing equipment tool {tool_id}",
+                    sensor.id
+                )));
+            }
+        }
+
+        for interlock in &self.tool_interlocks {
+            if !interlock.tool_id.trim().is_empty() && !context.contains_tool(&interlock.tool_id) {
+                findings.push(SafetyValidationFinding::error(format!(
+                    "safety tool interlock {} references missing equipment tool",
+                    interlock.tool_id
+                )));
+            }
+        }
+
+        for incident in &self.incidents {
+            if let Some(tool_id) = incident.tool_id.as_deref()
+                && !tool_id.trim().is_empty()
+                && !context.contains_tool(tool_id)
+            {
+                findings.push(SafetyValidationFinding::error(format!(
+                    "safety incident {} references missing equipment tool {tool_id}",
+                    incident.id
+                )));
+            }
+        }
+    }
 }
 
 fn sensor_reason(sensor: &SafetySensor) -> String {
@@ -556,6 +922,76 @@ fn sensor_reason(sensor: &SafetySensor) -> String {
         sensor.name,
         sensor.severity.label()
     )
+}
+
+fn validate_limit(sensor: &SafetySensor, findings: &mut Vec<SafetyValidationFinding>) {
+    if sensor.limit.lower.is_some_and(|value| !value.is_finite()) {
+        findings.push(SafetyValidationFinding::error(format!(
+            "safety sensor {} has non-finite lower limit",
+            sensor.id
+        )));
+    }
+    if sensor.limit.upper.is_some_and(|value| !value.is_finite()) {
+        findings.push(SafetyValidationFinding::error(format!(
+            "safety sensor {} has non-finite upper limit",
+            sensor.id
+        )));
+    }
+    if let (Some(lower), Some(upper)) = (sensor.limit.lower, sensor.limit.upper)
+        && lower > upper
+    {
+        findings.push(SafetyValidationFinding::error(format!(
+            "safety sensor {} lower limit is above upper limit",
+            sensor.id
+        )));
+    }
+}
+
+fn is_valid_safety_timestamp(timestamp: &str) -> bool {
+    if timestamp.len() != 20 || !timestamp.ends_with('Z') {
+        return false;
+    }
+    let bytes = timestamp.as_bytes();
+    if bytes.get(4) != Some(&b'-')
+        || bytes.get(7) != Some(&b'-')
+        || bytes.get(10) != Some(&b'T')
+        || bytes.get(13) != Some(&b':')
+        || bytes.get(16) != Some(&b':')
+    {
+        return false;
+    }
+    for index in [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18] {
+        if !bytes[index].is_ascii_digit() {
+            return false;
+        }
+    }
+    let year = parse_timestamp_field(timestamp, 0, 4);
+    let month = parse_timestamp_field(timestamp, 5, 7);
+    let day = parse_timestamp_field(timestamp, 8, 10);
+    let hour = parse_timestamp_field(timestamp, 11, 13);
+    let minute = parse_timestamp_field(timestamp, 14, 16);
+    let second = parse_timestamp_field(timestamp, 17, 19);
+    let max_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => return false,
+    };
+
+    (1900..=9999).contains(&year)
+        && (1..=max_day).contains(&day)
+        && hour <= 23
+        && minute <= 59
+        && second <= 59
+}
+
+fn parse_timestamp_field(timestamp: &str, start: usize, end: usize) -> u32 {
+    timestamp[start..end].parse().unwrap_or_default()
+}
+
+fn is_leap_year(year: u32) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
 }
 
 #[cfg(test)]
@@ -606,6 +1042,232 @@ mod tests {
             lockouts
                 .iter()
                 .any(|lockout| lockout.tool_id == "ALIGN-01" && !lockout.locked_out)
+        );
+    }
+
+    #[test]
+    fn simulated_safety_system_validates() {
+        let findings = SafetySystem::simulated_demo().validate();
+
+        assert_eq!(findings, Vec::new());
+    }
+
+    #[test]
+    fn validation_rejects_stale_sensor_incident_and_audit_metadata() {
+        assert!(is_valid_safety_timestamp("2026-05-08T09:18:00Z"));
+        assert!(!is_valid_safety_timestamp("2026-02-30T09:18:00Z"));
+        assert!(!is_valid_safety_timestamp("2026-05-08T25:18:00Z"));
+
+        let mut model = SafetySystem::simulated_demo();
+        model.sensors[0].state = SafetySensorState::Normal;
+        model.sensors[0].severity = SafetySeverity::Normal;
+        model.sensors[0].tool_id = Some(String::new());
+        model.sensors[0].message.clear();
+        model.sensors[1].state = SafetySensorState::Normal;
+        model.sensors[1].value = -90.0;
+        model.alarm_routes.push(model.alarm_routes[0].clone());
+        model.tool_interlocks[0].tool_name.clear();
+        model.tool_interlocks[0].required_sensors.push("".into());
+        model.incidents[0].opened_at = "2026-02-30T09:18:00Z".to_string();
+        model.incidents[0].severity = SafetySeverity::Warning;
+        model.incidents[0].tool_id = Some(String::new());
+        let repeated_route_target = model.incidents[0].routed_to[0];
+        model.incidents[0].routed_to.push(repeated_route_target);
+        model.incidents[1].severity = SafetySeverity::Normal;
+        model.audit_events[0].sequence = 0;
+        model.audit_events[0].timestamp = "bad-timestamp".to_string();
+
+        let findings = model.validate();
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("empty equipment tool id")),
+            "{findings:?}"
+        );
+        assert!(
+            findings.iter().any(|finding| finding
+                .message
+                .contains("normal while outside configured limits")),
+            "{findings:?}"
+        );
+        assert!(
+            findings.iter().any(|finding| finding
+                .message
+                .contains("outside configured limits but severity is normal")),
+            "{findings:?}"
+        );
+        assert!(
+            findings.iter().any(|finding| finding
+                .message
+                .contains("fails interlock without a message")),
+            "{findings:?}"
+        );
+        assert!(
+            findings.iter().any(|finding| finding
+                .message
+                .contains("failed severity without failed state or limit excursion")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("alarm route for Gas")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("empty tool name")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("empty required sensor id")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("invalid opened timestamp")),
+            "{findings:?}"
+        );
+        assert!(
+            findings.iter().any(|finding| finding
+                .message
+                .contains("severity warning is below linked sensor")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("repeats route target Facilities")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("normal severity")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("audit sequence cannot be zero")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("invalid timestamp bad-timestamp")),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn simulated_safety_system_validates_against_equipment_context() {
+        let context = SafetyValidationContext::from_equipment(
+            &crate::equipment::EquipmentSimulator::demo_fab(),
+        );
+        let findings = SafetySystem::simulated_demo().validate_with_context(&context);
+
+        assert_eq!(findings, Vec::new());
+    }
+
+    #[test]
+    fn validation_context_rejects_missing_equipment_tools() {
+        let context = SafetyValidationContext::from_equipment(
+            &crate::equipment::EquipmentSimulator::demo_fab(),
+        );
+        let mut model = SafetySystem::simulated_demo();
+        model.sensors[0].tool_id = Some("MISSING-SENSOR-TOOL".to_string());
+        model.tool_interlocks[0].tool_id = "MISSING-INTERLOCK-TOOL".to_string();
+        model.incidents[0].tool_id = Some("MISSING-INCIDENT-TOOL".to_string());
+
+        let findings = model.validate_with_context(&context);
+
+        assert!(
+            findings.iter().any(|finding| {
+                finding
+                    .message
+                    .contains("safety sensor gas-h2-ppm references missing equipment tool")
+            }),
+            "{findings:?}"
+        );
+        assert!(
+            findings.iter().any(|finding| {
+                finding
+                    .message
+                    .contains("safety tool interlock MISSING-INTERLOCK-TOOL")
+            }),
+            "{findings:?}"
+        );
+        assert!(
+            findings.iter().any(|finding| {
+                finding
+                    .message
+                    .contains("safety incident INC-SIM-0007 references missing equipment tool")
+            }),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn validation_rejects_broken_sensors_interlocks_and_incidents() {
+        let mut model = SafetySystem::simulated_demo();
+        model.sensors[0].value = f64::NAN;
+        model.sensors[1].limit = SafetyLimit::new(Some(10.0), Some(1.0));
+        model.tool_interlocks[0]
+            .required_sensors
+            .push("missing-sensor".into());
+        let duplicated_sensor = model.tool_interlocks[0].required_sensors[0].clone();
+        model.tool_interlocks[0]
+            .required_sensors
+            .push(duplicated_sensor);
+        model.incidents.push(SafetyIncident {
+            id: "INC-BAD".into(),
+            opened_at: "2026-05-08T10:00:00Z".to_string(),
+            status: IncidentStatus::Open,
+            severity: SafetySeverity::Warning,
+            domain: SafetyDomain::Gas,
+            sensor_id: Some("missing-sensor".into()),
+            tool_id: Some("ETCH-01".to_string()),
+            summary: String::new(),
+            routed_to: Vec::new(),
+        });
+
+        let findings = model.validate();
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("non-finite value")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("lower limit is above upper limit")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("missing sensor")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("duplicate required sensor")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("is not routed")),
+            "{findings:?}"
         );
     }
 }

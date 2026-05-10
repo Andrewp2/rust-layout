@@ -3,6 +3,7 @@ pub mod shader;
 
 use std::{
     collections::{BTreeMap, BTreeSet, btree_map::Entry},
+    fmt,
     hash::{Hash, Hasher},
 };
 
@@ -76,6 +77,114 @@ pub struct BatchFingerprint {
     pub index_count: usize,
     pub hash: u64,
 }
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RenderBatch3dValidation {
+    pub mesh_vertices: usize,
+    pub mesh_triangles: usize,
+    pub rect_slabs: usize,
+    pub guide_vertices: usize,
+    pub guide_segments: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum RenderBatch3dValidationError {
+    MeshIndexCountNotMultipleOfThree {
+        index_count: usize,
+    },
+    GuideIndexCountNotMultipleOfTwo {
+        index_count: usize,
+    },
+    MeshIndexOutOfBounds {
+        index: u32,
+        vertex_count: usize,
+    },
+    GuideIndexOutOfBounds {
+        index: u32,
+        vertex_count: usize,
+    },
+    NonFiniteVertex {
+        stream: &'static str,
+        vertex: usize,
+        component: &'static str,
+        value: f32,
+    },
+    NonFiniteColor {
+        stream: &'static str,
+        vertex: usize,
+        channel: usize,
+        value: f32,
+    },
+    InvalidNormal {
+        vertex: usize,
+    },
+    DegenerateTriangle {
+        triangle: usize,
+    },
+    InvalidRectSlab {
+        slab: usize,
+        reason: &'static str,
+    },
+}
+
+impl fmt::Display for RenderBatch3dValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MeshIndexCountNotMultipleOfThree { index_count } => {
+                write!(f, "3D mesh index count {index_count} is not divisible by 3")
+            }
+            Self::GuideIndexCountNotMultipleOfTwo { index_count } => {
+                write!(
+                    f,
+                    "3D guide index count {index_count} is not divisible by 2"
+                )
+            }
+            Self::MeshIndexOutOfBounds {
+                index,
+                vertex_count,
+            } => write!(
+                f,
+                "3D mesh index {index} is outside {vertex_count} mesh vertices"
+            ),
+            Self::GuideIndexOutOfBounds {
+                index,
+                vertex_count,
+            } => write!(
+                f,
+                "3D guide index {index} is outside {vertex_count} guide vertices"
+            ),
+            Self::NonFiniteVertex {
+                stream,
+                vertex,
+                component,
+                value,
+            } => write!(
+                f,
+                "3D {stream} vertex {vertex} has non-finite {component} component {value}"
+            ),
+            Self::NonFiniteColor {
+                stream,
+                vertex,
+                channel,
+                value,
+            } => write!(
+                f,
+                "3D {stream} vertex {vertex} has non-finite color channel {channel}: {value}"
+            ),
+            Self::InvalidNormal { vertex } => {
+                write!(f, "3D mesh vertex {vertex} has an invalid normal")
+            }
+            Self::DegenerateTriangle { triangle } => {
+                write!(f, "3D mesh triangle {triangle} is degenerate")
+            }
+            Self::InvalidRectSlab { slab, reason } => {
+                write!(f, "3D rect slab {slab} is invalid: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RenderBatch3dValidationError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TileKey {
@@ -271,6 +380,164 @@ impl RenderBatch3d {
             hash: hasher.finish(),
         }
     }
+
+    pub fn validate_geometry(
+        &self,
+    ) -> Result<RenderBatch3dValidation, RenderBatch3dValidationError> {
+        if self.indices.len() % 3 != 0 {
+            return Err(
+                RenderBatch3dValidationError::MeshIndexCountNotMultipleOfThree {
+                    index_count: self.indices.len(),
+                },
+            );
+        }
+        if self.guide_indices.len() % 2 != 0 {
+            return Err(
+                RenderBatch3dValidationError::GuideIndexCountNotMultipleOfTwo {
+                    index_count: self.guide_indices.len(),
+                },
+            );
+        }
+
+        validate_3d_vertices("mesh", &self.vertices, true)?;
+        validate_3d_vertices("guide", &self.guide_vertices, false)?;
+
+        for &index in &self.indices {
+            if index as usize >= self.vertices.len() {
+                return Err(RenderBatch3dValidationError::MeshIndexOutOfBounds {
+                    index,
+                    vertex_count: self.vertices.len(),
+                });
+            }
+        }
+        for &index in &self.guide_indices {
+            if index as usize >= self.guide_vertices.len() {
+                return Err(RenderBatch3dValidationError::GuideIndexOutOfBounds {
+                    index,
+                    vertex_count: self.guide_vertices.len(),
+                });
+            }
+        }
+        for (triangle, indices) in self.indices.chunks_exact(3).enumerate() {
+            let a = self.vertices[indices[0] as usize].position;
+            let b = self.vertices[indices[1] as usize].position;
+            let c = self.vertices[indices[2] as usize].position;
+            if triangle_area2_3d(a, b, c) <= f32::EPSILON {
+                return Err(RenderBatch3dValidationError::DegenerateTriangle { triangle });
+            }
+        }
+        for (slab, instance) in self.rect_slabs.iter().enumerate() {
+            validate_rect_slab_instance(slab, instance)?;
+        }
+
+        Ok(RenderBatch3dValidation {
+            mesh_vertices: self.vertices.len(),
+            mesh_triangles: self.indices.len() / 3,
+            rect_slabs: self.rect_slabs.len(),
+            guide_vertices: self.guide_vertices.len(),
+            guide_segments: self.guide_indices.len() / 2,
+        })
+    }
+}
+
+fn validate_3d_vertices(
+    stream: &'static str,
+    vertices: &[GpuVertex3d],
+    require_normal: bool,
+) -> Result<(), RenderBatch3dValidationError> {
+    for (vertex_index, vertex) in vertices.iter().enumerate() {
+        for (component_index, value) in vertex.position.into_iter().enumerate() {
+            if !value.is_finite() {
+                return Err(RenderBatch3dValidationError::NonFiniteVertex {
+                    stream,
+                    vertex: vertex_index,
+                    component: match component_index {
+                        0 => "x",
+                        1 => "y",
+                        _ => "z",
+                    },
+                    value,
+                });
+            }
+        }
+        for (component_index, value) in vertex.normal.into_iter().enumerate() {
+            if !value.is_finite() {
+                return Err(RenderBatch3dValidationError::NonFiniteVertex {
+                    stream,
+                    vertex: vertex_index,
+                    component: match component_index {
+                        0 => "normal x",
+                        1 => "normal y",
+                        _ => "normal z",
+                    },
+                    value,
+                });
+            }
+        }
+        if require_normal && vector_length2_3d(vertex.normal) <= f32::EPSILON {
+            return Err(RenderBatch3dValidationError::InvalidNormal {
+                vertex: vertex_index,
+            });
+        }
+        for (channel, value) in vertex.color.into_iter().enumerate() {
+            if !value.is_finite() {
+                return Err(RenderBatch3dValidationError::NonFiniteColor {
+                    stream,
+                    vertex: vertex_index,
+                    channel,
+                    value,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_rect_slab_instance(
+    slab: usize,
+    instance: &GpuRectSlabInstance,
+) -> Result<(), RenderBatch3dValidationError> {
+    for value in instance
+        .rect
+        .into_iter()
+        .chain(instance.z_range)
+        .chain(instance.color)
+    {
+        if !value.is_finite() {
+            return Err(RenderBatch3dValidationError::InvalidRectSlab {
+                slab,
+                reason: "non-finite value",
+            });
+        }
+    }
+    if instance.rect[0] >= instance.rect[2] || instance.rect[1] >= instance.rect[3] {
+        return Err(RenderBatch3dValidationError::InvalidRectSlab {
+            slab,
+            reason: "empty rectangle",
+        });
+    }
+    if instance.z_range[0] >= instance.z_range[1] {
+        return Err(RenderBatch3dValidationError::InvalidRectSlab {
+            slab,
+            reason: "empty z range",
+        });
+    }
+    Ok(())
+}
+
+fn triangle_area2_3d(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> f32 {
+    let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+    let cross = [
+        ab[1] * ac[2] - ab[2] * ac[1],
+        ab[2] * ac[0] - ab[0] * ac[2],
+        ab[0] * ac[1] - ab[1] * ac[0],
+    ];
+    vector_length2_3d(cross)
+}
+
+fn vector_length2_3d(vector: [f32; 3]) -> f32 {
+    vector[0] * vector[0] + vector[1] * vector[1] + vector[2] * vector[2]
 }
 
 impl PickBatch {
@@ -1194,6 +1461,114 @@ mod tests {
                 + 5 * std::mem::size_of::<u32>()
                 + std::mem::size_of::<GpuRectSlabInstance>()
         );
+    }
+
+    #[test]
+    fn render_batch_3d_validation_accepts_valid_mesh_slabs_and_guides() {
+        let batch = RenderBatch3d {
+            vertices: vec![
+                GpuVertex3d {
+                    position: [0.0, 0.0, 10.0],
+                    normal: [0.0, 0.0, 1.0],
+                    color: [1.0, 0.0, 0.0, 1.0],
+                },
+                GpuVertex3d {
+                    position: [10.0, 0.0, 10.0],
+                    normal: [0.0, 0.0, 1.0],
+                    color: [1.0, 0.0, 0.0, 1.0],
+                },
+                GpuVertex3d {
+                    position: [0.0, 10.0, 10.0],
+                    normal: [0.0, 0.0, 1.0],
+                    color: [1.0, 0.0, 0.0, 1.0],
+                },
+            ],
+            indices: vec![0, 1, 2],
+            rect_slabs: vec![GpuRectSlabInstance {
+                rect: [0.0, 0.0, 10.0, 10.0],
+                z_range: [0.0, 20.0],
+                color: [0.0, 1.0, 0.0, 1.0],
+            }],
+            guide_vertices: vec![
+                GpuVertex3d {
+                    position: [0.0, 0.0, 0.0],
+                    normal: [0.0, 0.0, 0.0],
+                    color: [0.5, 0.5, 0.5, 0.5],
+                },
+                GpuVertex3d {
+                    position: [10.0, 0.0, 0.0],
+                    normal: [0.0, 0.0, 0.0],
+                    color: [0.5, 0.5, 0.5, 0.5],
+                },
+            ],
+            guide_indices: vec![0, 1],
+        };
+
+        let validation = batch.validate_geometry().unwrap();
+
+        assert_eq!(validation.mesh_vertices, 3);
+        assert_eq!(validation.mesh_triangles, 1);
+        assert_eq!(validation.rect_slabs, 1);
+        assert_eq!(validation.guide_vertices, 2);
+        assert_eq!(validation.guide_segments, 1);
+    }
+
+    #[test]
+    fn render_batch_3d_validation_rejects_invalid_geometry() {
+        let valid_vertex = GpuVertex3d {
+            position: [0.0, 0.0, 0.0],
+            normal: [0.0, 0.0, 1.0],
+            color: [1.0, 1.0, 1.0, 1.0],
+        };
+        let valid_batch = RenderBatch3d {
+            vertices: vec![
+                valid_vertex,
+                GpuVertex3d {
+                    position: [10.0, 0.0, 0.0],
+                    ..valid_vertex
+                },
+                GpuVertex3d {
+                    position: [0.0, 10.0, 0.0],
+                    ..valid_vertex
+                },
+            ],
+            indices: vec![0, 1, 2],
+            rect_slabs: vec![GpuRectSlabInstance {
+                rect: [0.0, 0.0, 10.0, 10.0],
+                z_range: [0.0, 10.0],
+                color: [1.0, 1.0, 1.0, 1.0],
+            }],
+            guide_vertices: Vec::new(),
+            guide_indices: Vec::new(),
+        };
+
+        let mut bad_index = valid_batch.clone();
+        bad_index.indices[2] = 42;
+        assert!(matches!(
+            bad_index.validate_geometry(),
+            Err(RenderBatch3dValidationError::MeshIndexOutOfBounds { .. })
+        ));
+
+        let mut bad_triangle = valid_batch.clone();
+        bad_triangle.vertices[2].position = [20.0, 0.0, 0.0];
+        assert!(matches!(
+            bad_triangle.validate_geometry(),
+            Err(RenderBatch3dValidationError::DegenerateTriangle { .. })
+        ));
+
+        let mut bad_normal = valid_batch.clone();
+        bad_normal.vertices[0].normal = [0.0, 0.0, 0.0];
+        assert!(matches!(
+            bad_normal.validate_geometry(),
+            Err(RenderBatch3dValidationError::InvalidNormal { .. })
+        ));
+
+        let mut bad_slab = valid_batch;
+        bad_slab.rect_slabs[0].rect = [10.0, 0.0, 0.0, 10.0];
+        assert!(matches!(
+            bad_slab.validate_geometry(),
+            Err(RenderBatch3dValidationError::InvalidRectSlab { .. })
+        ));
     }
 
     #[test]

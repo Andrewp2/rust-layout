@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -300,6 +303,34 @@ pub struct SpcFdcMonitor {
     pub findings: Vec<MonitorFinding>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpcFdcValidationSeverity {
+    Error,
+    Warning,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpcFdcValidationFinding {
+    pub severity: SpcFdcValidationSeverity,
+    pub message: String,
+}
+
+impl SpcFdcValidationFinding {
+    fn error(message: impl Into<String>) -> Self {
+        Self {
+            severity: SpcFdcValidationSeverity::Error,
+            message: message.into(),
+        }
+    }
+
+    fn warning(message: impl Into<String>) -> Self {
+        Self {
+            severity: SpcFdcValidationSeverity::Warning,
+            message: message.into(),
+        }
+    }
+}
+
 impl SpcFdcMonitor {
     pub fn from_fab_context(
         measurements: &[ProcessMeasurement],
@@ -380,6 +411,451 @@ impl SpcFdcMonitor {
             .filter(|finding| finding.severity == severity)
             .count()
     }
+
+    pub fn validate(&self) -> Vec<SpcFdcValidationFinding> {
+        let mut findings = Vec::new();
+        let mut chart_ids = BTreeSet::new();
+        let mut spc_violation_count = 0usize;
+        for chart in &self.charts {
+            validate_chart(chart, &mut chart_ids, &mut findings);
+            spc_violation_count += chart.violations.len();
+        }
+
+        let mut trace_ids = BTreeSet::new();
+        let mut fdc_violation_count = 0usize;
+        for trace in &self.traces {
+            validate_trace(trace, &mut trace_ids, &mut findings);
+            fdc_violation_count += trace.violations.len();
+        }
+
+        validate_alarm_summary(&self.alarm_summary, &mut findings);
+        validate_findings(
+            &self.findings,
+            spc_violation_count,
+            fdc_violation_count,
+            self.alarm_summary.active_count,
+            &mut findings,
+        );
+
+        findings
+    }
+}
+
+fn validate_chart(
+    chart: &ControlChart,
+    chart_ids: &mut BTreeSet<ChartId>,
+    findings: &mut Vec<SpcFdcValidationFinding>,
+) {
+    if chart.id.as_str().trim().is_empty() {
+        findings.push(SpcFdcValidationFinding::error("SPC chart id is empty"));
+    } else if !chart_ids.insert(chart.id.clone()) {
+        findings.push(SpcFdcValidationFinding::error(format!(
+            "SPC chart {} is duplicated",
+            chart.id
+        )));
+    }
+    for (field, value) in [
+        ("name", chart.name.as_str()),
+        ("metric", chart.metric.as_str()),
+        ("unit", chart.unit.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            findings.push(SpcFdcValidationFinding::warning(format!(
+                "SPC chart {} has empty {field}",
+                chart.id
+            )));
+        }
+    }
+    validate_control_limits(&chart.id, &chart.limits, findings);
+
+    let mut source_ids = BTreeSet::new();
+    for (index, point) in chart.points.iter().enumerate() {
+        let expected_sequence = index + 1;
+        if point.sequence != expected_sequence {
+            findings.push(SpcFdcValidationFinding::error(format!(
+                "SPC chart {} point {} has sequence {}, expected {}",
+                chart.id, point.source_id, point.sequence, expected_sequence
+            )));
+        }
+        validate_control_point(&chart.id, point, &mut source_ids, findings);
+    }
+
+    let mut violation_ids = BTreeSet::new();
+    for violation in &chart.violations {
+        validate_rule_violation(chart, violation, &mut violation_ids, findings);
+    }
+}
+
+fn validate_control_limits(
+    chart_id: &ChartId,
+    limits: &ControlLimits,
+    findings: &mut Vec<SpcFdcValidationFinding>,
+) {
+    for (label, value) in [
+        ("center", Some(limits.center)),
+        ("lower control", Some(limits.lower_control)),
+        ("upper control", Some(limits.upper_control)),
+        ("one sigma", Some(limits.one_sigma)),
+        ("lower spec", limits.lower_spec),
+        ("upper spec", limits.upper_spec),
+    ] {
+        if value.is_some_and(|value| !value.is_finite()) {
+            findings.push(SpcFdcValidationFinding::error(format!(
+                "SPC chart {chart_id} has non-finite {label}"
+            )));
+        }
+    }
+    if limits.lower_control > limits.upper_control {
+        findings.push(SpcFdcValidationFinding::error(format!(
+            "SPC chart {chart_id} lower control is above upper control"
+        )));
+    }
+    if limits.one_sigma <= 0.0 {
+        findings.push(SpcFdcValidationFinding::error(format!(
+            "SPC chart {chart_id} one sigma must be positive"
+        )));
+    }
+    if let (Some(lower), Some(upper)) = (limits.lower_spec, limits.upper_spec)
+        && lower > upper
+    {
+        findings.push(SpcFdcValidationFinding::error(format!(
+            "SPC chart {chart_id} lower spec is above upper spec"
+        )));
+    }
+}
+
+fn validate_control_point(
+    chart_id: &ChartId,
+    point: &ControlPoint,
+    source_ids: &mut BTreeSet<String>,
+    findings: &mut Vec<SpcFdcValidationFinding>,
+) {
+    if point.source_id.trim().is_empty() {
+        findings.push(SpcFdcValidationFinding::error(format!(
+            "SPC chart {chart_id} has a point with empty source id"
+        )));
+    } else if !source_ids.insert(point.source_id.clone()) {
+        findings.push(SpcFdcValidationFinding::error(format!(
+            "SPC chart {chart_id} repeats source point {}",
+            point.source_id
+        )));
+    }
+    for (field, value) in [
+        ("lot id", point.lot_id.as_str()),
+        ("wafer id", point.wafer_id.as_str()),
+        ("step id", point.step_id.as_str()),
+        ("tool run id", point.tool_run_id.as_str()),
+        ("recipe id", point.recipe_id.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            findings.push(SpcFdcValidationFinding::error(format!(
+                "SPC chart {chart_id} point {} has empty {field}",
+                point.source_id
+            )));
+        }
+    }
+    if !point.value.is_finite() {
+        findings.push(SpcFdcValidationFinding::error(format!(
+            "SPC chart {chart_id} point {} has non-finite value",
+            point.source_id
+        )));
+    }
+}
+
+fn validate_rule_violation(
+    chart: &ControlChart,
+    violation: &RuleViolation,
+    violation_ids: &mut BTreeSet<String>,
+    findings: &mut Vec<SpcFdcValidationFinding>,
+) {
+    if violation.id.trim().is_empty() {
+        findings.push(SpcFdcValidationFinding::error(format!(
+            "SPC chart {} has a violation with empty id",
+            chart.id
+        )));
+    } else if !violation_ids.insert(violation.id.clone()) {
+        findings.push(SpcFdcValidationFinding::error(format!(
+            "SPC chart {} repeats violation {}",
+            chart.id, violation.id
+        )));
+    }
+    if violation.chart_id != chart.id {
+        findings.push(SpcFdcValidationFinding::error(format!(
+            "SPC violation {} references chart {}, but is stored under {}",
+            violation.id, violation.chart_id, chart.id
+        )));
+    }
+    if violation.message.trim().is_empty() {
+        findings.push(SpcFdcValidationFinding::warning(format!(
+            "SPC violation {} has empty message",
+            violation.id
+        )));
+    }
+    if violation.point_indices.is_empty() {
+        findings.push(SpcFdcValidationFinding::error(format!(
+            "SPC violation {} has no point indices",
+            violation.id
+        )));
+    }
+    for point_index in &violation.point_indices {
+        if *point_index >= chart.points.len() {
+            findings.push(SpcFdcValidationFinding::error(format!(
+                "SPC violation {} references missing point index {}",
+                violation.id, point_index
+            )));
+        }
+    }
+    for (field, value) in [
+        ("lot id", violation.lot_id.as_deref()),
+        ("wafer id", violation.wafer_id.as_deref()),
+        ("tool id", violation.tool_id.as_deref()),
+        ("recipe id", violation.recipe_id.as_deref()),
+    ] {
+        if value.is_some_and(|value| value.trim().is_empty()) {
+            findings.push(SpcFdcValidationFinding::warning(format!(
+                "SPC violation {} has empty {field}",
+                violation.id
+            )));
+        }
+    }
+}
+
+fn validate_trace(
+    trace: &SensorTrace,
+    trace_ids: &mut BTreeSet<String>,
+    findings: &mut Vec<SpcFdcValidationFinding>,
+) {
+    if trace.id.trim().is_empty() {
+        findings.push(SpcFdcValidationFinding::error("FDC trace id is empty"));
+    } else if !trace_ids.insert(trace.id.clone()) {
+        findings.push(SpcFdcValidationFinding::error(format!(
+            "FDC trace {} is duplicated",
+            trace.id
+        )));
+    }
+    for (field, value) in [
+        ("tool id", trace.tool_id.as_str()),
+        ("sensor name", trace.sensor_name.as_str()),
+        ("unit", trace.unit.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            findings.push(SpcFdcValidationFinding::error(format!(
+                "FDC trace {} has empty {field}",
+                trace.id
+            )));
+        }
+    }
+    validate_sensor_limit(&trace.id, &trace.limit, findings);
+
+    let mut last_sample_at = None;
+    let mut sample_times = BTreeSet::new();
+    for sample in &trace.samples {
+        if let Some(last_sample_at) = last_sample_at
+            && sample.at_s < last_sample_at
+        {
+            findings.push(SpcFdcValidationFinding::error(format!(
+                "FDC trace {} samples are not sorted by timestamp",
+                trace.id
+            )));
+        }
+        last_sample_at = Some(sample.at_s);
+        if !sample_times.insert(sample.at_s) {
+            findings.push(SpcFdcValidationFinding::warning(format!(
+                "FDC trace {} repeats sample timestamp {}",
+                trace.id, sample.at_s
+            )));
+        }
+        if !sample.value.is_finite() {
+            findings.push(SpcFdcValidationFinding::error(format!(
+                "FDC trace {} sample {} has non-finite value",
+                trace.id, sample.at_s
+            )));
+        }
+    }
+
+    let mut violation_keys = BTreeSet::new();
+    for violation in &trace.violations {
+        validate_sensor_violation(trace, violation, &mut violation_keys, findings);
+    }
+}
+
+fn validate_sensor_limit(
+    trace_id: &str,
+    limit: &SensorLimit,
+    findings: &mut Vec<SpcFdcValidationFinding>,
+) {
+    for (label, value) in [("lower", limit.lower), ("upper", limit.upper)] {
+        if value.is_some_and(|value| !value.is_finite()) {
+            findings.push(SpcFdcValidationFinding::error(format!(
+                "FDC trace {trace_id} has non-finite {label} limit"
+            )));
+        }
+    }
+    if let (Some(lower), Some(upper)) = (limit.lower, limit.upper)
+        && lower > upper
+    {
+        findings.push(SpcFdcValidationFinding::error(format!(
+            "FDC trace {trace_id} lower limit is above upper limit"
+        )));
+    }
+}
+
+fn validate_sensor_violation(
+    trace: &SensorTrace,
+    violation: &SensorViolation,
+    violation_keys: &mut BTreeSet<(u64, String)>,
+    findings: &mut Vec<SpcFdcValidationFinding>,
+) {
+    if !violation_keys.insert((violation.at_s, violation.message.clone())) {
+        findings.push(SpcFdcValidationFinding::warning(format!(
+            "FDC trace {} repeats violation at {}",
+            trace.id, violation.at_s
+        )));
+    }
+    if violation.trace_id != trace.id {
+        findings.push(SpcFdcValidationFinding::error(format!(
+            "FDC violation for {} references trace {}",
+            trace.id, violation.trace_id
+        )));
+    }
+    if violation.tool_id != trace.tool_id {
+        findings.push(SpcFdcValidationFinding::error(format!(
+            "FDC violation for trace {} references tool {}",
+            trace.id, violation.tool_id
+        )));
+    }
+    if violation.sensor_name != trace.sensor_name {
+        findings.push(SpcFdcValidationFinding::error(format!(
+            "FDC violation for trace {} references sensor {}",
+            trace.id, violation.sensor_name
+        )));
+    }
+    if violation.unit != trace.unit {
+        findings.push(SpcFdcValidationFinding::warning(format!(
+            "FDC violation for trace {} uses unit {}, expected {}",
+            trace.id, violation.unit, trace.unit
+        )));
+    }
+    if violation.limit != trace.limit {
+        findings.push(SpcFdcValidationFinding::error(format!(
+            "FDC violation for trace {} uses stale limits",
+            trace.id
+        )));
+    }
+    match trace
+        .samples
+        .iter()
+        .find(|sample| sample.at_s == violation.at_s)
+    {
+        Some(sample) if (sample.value - violation.value).abs() > 0.001 => {
+            findings.push(SpcFdcValidationFinding::warning(format!(
+                "FDC violation for trace {} does not match sample value at {}",
+                trace.id, violation.at_s
+            )));
+        }
+        Some(_) => {}
+        None => findings.push(SpcFdcValidationFinding::error(format!(
+            "FDC violation for trace {} references missing sample {}",
+            trace.id, violation.at_s
+        ))),
+    }
+    if !violation.value.is_finite() {
+        findings.push(SpcFdcValidationFinding::error(format!(
+            "FDC violation for trace {} has non-finite value",
+            trace.id
+        )));
+    }
+    if violation.message.trim().is_empty() {
+        findings.push(SpcFdcValidationFinding::warning(format!(
+            "FDC violation for trace {} has empty message",
+            trace.id
+        )));
+    }
+}
+
+fn validate_alarm_summary(summary: &AlarmSummary, findings: &mut Vec<SpcFdcValidationFinding>) {
+    if summary.active_count > summary.total_count {
+        findings.push(SpcFdcValidationFinding::error(
+            "SPC/FDC alarm summary active count exceeds total count",
+        ));
+    }
+    let by_severity_total = summary.by_severity.values().sum::<usize>();
+    if by_severity_total != summary.active_count {
+        findings.push(SpcFdcValidationFinding::error(format!(
+            "SPC/FDC alarm summary severity count {} does not match active count {}",
+            by_severity_total, summary.active_count
+        )));
+    }
+    let by_tool_total = summary.by_tool.values().sum::<usize>();
+    if by_tool_total != summary.active_count {
+        findings.push(SpcFdcValidationFinding::error(format!(
+            "SPC/FDC alarm summary tool count {} does not match active count {}",
+            by_tool_total, summary.active_count
+        )));
+    }
+    if summary.total_count == 0 && summary.latest_alarm.is_some() {
+        findings.push(SpcFdcValidationFinding::warning(
+            "SPC/FDC alarm summary has latest alarm despite zero total count",
+        ));
+    }
+    if summary.total_count > 0 && summary.latest_alarm.is_none() {
+        findings.push(SpcFdcValidationFinding::warning(
+            "SPC/FDC alarm summary has no latest alarm despite nonzero total count",
+        ));
+    }
+}
+
+fn validate_findings(
+    monitor_findings: &[MonitorFinding],
+    spc_violation_count: usize,
+    fdc_violation_count: usize,
+    active_alarm_count: usize,
+    findings: &mut Vec<SpcFdcValidationFinding>,
+) {
+    let spc_findings = monitor_findings
+        .iter()
+        .filter(|finding| finding.source == FindingSource::SpcRule)
+        .count();
+    let fdc_findings = monitor_findings
+        .iter()
+        .filter(|finding| finding.source == FindingSource::FdcTrace)
+        .count();
+    let alarm_findings = monitor_findings
+        .iter()
+        .filter(|finding| finding.source == FindingSource::EquipmentAlarm)
+        .count();
+    for (label, expected, actual) in [
+        ("SPC", spc_violation_count, spc_findings),
+        ("FDC", fdc_violation_count, fdc_findings),
+        ("alarm", active_alarm_count, alarm_findings),
+    ] {
+        if expected != actual {
+            findings.push(SpcFdcValidationFinding::error(format!(
+                "SPC/FDC monitor has {actual} {label} findings but expected {expected}"
+            )));
+        }
+    }
+    for finding in monitor_findings {
+        if finding.title.trim().is_empty() || finding.detail.trim().is_empty() {
+            findings.push(SpcFdcValidationFinding::warning(format!(
+                "SPC/FDC {} finding has incomplete text",
+                finding.source.label()
+            )));
+        }
+        for (field, value) in [
+            ("tool id", finding.tool_id.as_deref()),
+            ("lot id", finding.lot_id.as_deref()),
+            ("wafer id", finding.wafer_id.as_deref()),
+            ("recipe id", finding.recipe_id.as_deref()),
+        ] {
+            if value.is_some_and(|value| value.trim().is_empty()) {
+                findings.push(SpcFdcValidationFinding::warning(format!(
+                    "SPC/FDC {} finding has empty {field}",
+                    finding.source.label()
+                )));
+            }
+        }
+    }
 }
 
 pub fn control_charts_for_measurements(measurements: &[ProcessMeasurement]) -> Vec<ControlChart> {
@@ -389,6 +865,13 @@ pub fn control_charts_for_measurements(measurements: &[ProcessMeasurement]) -> V
             .entry((measurement.name.clone(), measurement.unit.clone()))
             .or_default()
             .push(measurement);
+    }
+    let mut units_by_metric: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (metric, unit) in grouped.keys() {
+        units_by_metric
+            .entry(metric.clone())
+            .or_default()
+            .insert(unit.clone());
     }
 
     grouped
@@ -409,7 +892,13 @@ pub fn control_charts_for_measurements(measurements: &[ProcessMeasurement]) -> V
                     ))
             });
 
-            let id = ChartId::new(format!("spc:{}", metric));
+            let id = spc_chart_id(
+                &metric,
+                &unit,
+                units_by_metric
+                    .get(&metric)
+                    .is_some_and(|units| units.len() > 1),
+            );
             let limits = limits_for_measurements(&rows);
             let points = rows
                 .iter()
@@ -437,6 +926,22 @@ pub fn control_charts_for_measurements(measurements: &[ProcessMeasurement]) -> V
             }
         })
         .collect()
+}
+
+fn spc_chart_id(metric: &str, unit: &str, include_unit: bool) -> ChartId {
+    let metric = metric.trim();
+    let metric = if metric.is_empty() {
+        "unnamed_metric"
+    } else {
+        metric
+    };
+    if include_unit {
+        let unit = unit.trim();
+        let unit = if unit.is_empty() { "unitless" } else { unit };
+        ChartId::new(format!("spc:{metric}:{unit}"))
+    } else {
+        ChartId::new(format!("spc:{metric}"))
+    }
 }
 
 pub fn sensor_traces_for_samples(samples: &[SensorSample]) -> Vec<SensorTrace> {
@@ -882,6 +1387,28 @@ mod tests {
     }
 
     #[test]
+    fn same_metric_with_different_units_gets_distinct_chart_ids() {
+        let mut micron_measurement = measurement("W02", 10.0);
+        micron_measurement.unit = "um".to_string();
+        let monitor = SpcFdcMonitor::from_fab_context(
+            &[measurement("W01", 10.0), micron_measurement],
+            &[],
+            &[],
+        );
+        let chart_ids = monitor
+            .charts
+            .iter()
+            .map(|chart| chart.id.as_str())
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(monitor.charts.len(), 2);
+        assert_eq!(chart_ids.len(), 2);
+        assert!(chart_ids.contains("spc:critical_dimension:nm"));
+        assert!(chart_ids.contains("spc:critical_dimension:um"));
+        assert_eq!(monitor.validate(), Vec::new());
+    }
+
+    #[test]
     fn eight_points_on_one_side_are_reported() {
         let measurements = (1..=8)
             .map(|slot| measurement(&format!("W{slot:02}"), 10.1 + slot as f64 * 0.03))
@@ -947,6 +1474,7 @@ mod tests {
 
         let monitor = SpcFdcMonitor::from_fab_context(&measurements, &samples, &alarms);
 
+        assert_eq!(monitor.validate(), Vec::new());
         assert_eq!(monitor.alarm_summary.active_count, 1);
         assert!(
             monitor
@@ -965,6 +1493,92 @@ mod tests {
                 .findings
                 .iter()
                 .any(|finding| finding.source == FindingSource::EquipmentAlarm)
+        );
+    }
+
+    #[test]
+    fn monitor_validation_rejects_stale_summaries_and_links() {
+        let measurements = vec![measurement("W01", 14.0)];
+        let samples = vec![SensorSample {
+            tool_id: ToolId::new("PROBE-T"),
+            at_s: 1,
+            name: "contact_resistance".to_string(),
+            value: 1.8,
+            unit: "ohm".to_string(),
+        }];
+        let alarms = vec![Alarm {
+            id: "A1".to_string(),
+            tool_id: ToolId::new("ETCH-T"),
+            code: "VAC".to_string(),
+            message: "vacuum warning".to_string(),
+            severity: AlarmSeverity::Warning,
+            active: true,
+            occurred_at_s: 5,
+            cleared_at_s: None,
+        }];
+        let mut monitor = SpcFdcMonitor::from_fab_context(&measurements, &samples, &alarms);
+
+        monitor.charts[0].limits.lower_control = 20.0;
+        monitor.charts[0].limits.upper_control = 10.0;
+        monitor.charts[0].points[0].sequence = 99;
+        monitor.charts[0].violations[0].point_indices.push(99);
+        monitor.traces[0].samples.push(SensorTracePoint {
+            at_s: 0,
+            value: f64::NAN,
+        });
+        monitor.traces[0].violations[0].limit = SensorLimit::new(None, None);
+        monitor.alarm_summary.active_count = 2;
+        monitor.findings.pop();
+
+        let findings = monitor.validate();
+
+        assert!(
+            findings.iter().any(|finding| finding
+                .message
+                .contains("lower control is above upper control")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("has sequence 99")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("missing point index 99")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("samples are not sorted")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("non-finite value")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("uses stale limits")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("severity count")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("alarm findings")),
+            "{findings:?}"
         );
     }
 }

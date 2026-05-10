@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use geometry_core::Rect;
 
-use crate::{Document, LayerId, LayoutIndex, Shape, ShapeId};
+use crate::{Document, FlattenedShape, LayerId, LayoutIndex, Shape, ShapeId, ShapeOccurrenceId};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LayoutDiffReport {
@@ -40,6 +40,7 @@ pub struct LayerDiffSummary {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShapeChange {
     pub kind: ShapeChangeKind,
+    pub occurrence: ShapeOccurrenceId,
     pub id: ShapeId,
     pub layer: LayerId,
     pub layer_name: String,
@@ -80,9 +81,9 @@ pub fn diff_documents(
         .copied()
         .collect::<BTreeSet<_>>();
 
-    for (id, shape) in &candidate_shapes {
-        if !baseline_shapes.contains_key(id) {
-            layer_ids.insert(shape.layer);
+    for (occurrence, shape) in &candidate_shapes {
+        if !baseline_shapes.contains_key(occurrence) {
+            layer_ids.insert(shape.shape.layer);
             changes.push(shape_change(
                 ShapeChangeKind::Added,
                 candidate,
@@ -92,9 +93,9 @@ pub fn diff_documents(
         }
     }
 
-    for (id, shape) in &baseline_shapes {
-        if !candidate_shapes.contains_key(id) {
-            layer_ids.insert(shape.layer);
+    for (occurrence, shape) in &baseline_shapes {
+        if !candidate_shapes.contains_key(occurrence) {
+            layer_ids.insert(shape.shape.layer);
             changes.push(shape_change(
                 ShapeChangeKind::Removed,
                 baseline,
@@ -104,22 +105,24 @@ pub fn diff_documents(
         }
     }
 
-    for (id, baseline_shape) in &baseline_shapes {
-        let Some(candidate_shape) = candidate_shapes.get(id) else {
+    for (occurrence, baseline_shape) in &baseline_shapes {
+        let Some(candidate_shape) = candidate_shapes.get(occurrence) else {
             continue;
         };
-        if baseline_shape != candidate_shape {
-            layer_ids.insert(candidate_shape.layer);
+        let baseline_shape_for_diff = flattened_shape_for_diff(baseline_shape);
+        let candidate_shape_for_diff = flattened_shape_for_diff(candidate_shape);
+        if baseline_shape_for_diff != candidate_shape_for_diff {
+            layer_ids.insert(candidate_shape_for_diff.layer);
             changes.push(shape_change(
                 ShapeChangeKind::Modified,
                 candidate,
                 candidate_shape,
-                modified_detail(baseline_shape, candidate_shape),
+                modified_detail(&baseline_shape_for_diff, &candidate_shape_for_diff),
             ));
         }
     }
 
-    changes.sort_by_key(|change| (change.layer, change.id, change.kind.label()));
+    changes.sort_by_key(|change| (change.layer, change.occurrence.clone(), change.kind.label()));
     let layers = layer_ids
         .into_iter()
         .map(|layer| layer_summary(layer, baseline, candidate, &changes))
@@ -146,33 +149,39 @@ pub fn diff_documents(
             baseline_layers: baseline.layers.len(),
             candidate_layers: candidate.layers.len(),
         },
-        baseline_bounds: LayoutIndex::rebuild(baseline).bounds(),
-        candidate_bounds: LayoutIndex::rebuild(candidate).bounds(),
+        baseline_bounds: LayoutIndex::rebuild_hierarchical(baseline).bounds(),
+        candidate_bounds: LayoutIndex::rebuild_hierarchical(candidate).bounds(),
         layers,
         changes,
     }
 }
 
-fn shape_map(document: &Document) -> BTreeMap<ShapeId, Shape> {
+fn shape_map(document: &Document) -> BTreeMap<ShapeOccurrenceId, FlattenedShape> {
     document
-        .shapes
-        .values()
-        .map(|shape| (shape.id, shape))
+        .visible_flattened_shapes()
+        .into_iter()
+        .map(|shape| (shape.id.clone(), shape))
         .collect()
+}
+
+fn flattened_shape_for_diff(flattened: &FlattenedShape) -> Shape {
+    flattened.transformed_shape()
 }
 
 fn shape_change(
     kind: ShapeChangeKind,
     document: &Document,
-    shape: &Shape,
+    shape: &FlattenedShape,
     detail: impl Into<String>,
 ) -> ShapeChange {
+    let transformed = flattened_shape_for_diff(shape);
     ShapeChange {
         kind,
-        id: shape.id,
-        layer: shape.layer,
-        layer_name: layer_name(document, shape.layer),
-        bounds: shape.kind.bounds(),
+        occurrence: shape.id.clone(),
+        id: shape.source_shape_id(),
+        layer: transformed.layer,
+        layer_name: layer_name(document, transformed.layer),
+        bounds: shape.bounds,
         detail: detail.into(),
     }
 }
@@ -211,14 +220,14 @@ fn layer_summary(
         layer,
         name: layer_name(candidate, layer).or_else_unknown(layer_name(baseline, layer)),
         baseline_shapes: baseline
-            .shapes
-            .values()
-            .filter(|shape| shape.layer == layer)
+            .visible_flattened_shapes()
+            .iter()
+            .filter(|shape| shape.shape.layer == layer)
             .count(),
         candidate_shapes: candidate
-            .shapes
-            .values()
-            .filter(|shape| shape.layer == layer)
+            .visible_flattened_shapes()
+            .iter()
+            .filter(|shape| shape.shape.layer == layer)
             .count(),
         added_shapes: changes
             .iter()
@@ -261,7 +270,7 @@ fn layer_name(document: &Document, layer: LayerId) -> String {
 mod tests {
     use geometry_core::{Point, Rect, Vector};
 
-    use crate::{Document, Operation, ProcessLayer, ShapeKind};
+    use crate::{Document, Operation, ProcessLayer, ShapeKind, Transform};
 
     use super::*;
 
@@ -300,5 +309,54 @@ mod tests {
                 .iter()
                 .any(|change| change.kind == ShapeChangeKind::Modified && change.id == kept)
         );
+    }
+
+    #[test]
+    fn diff_reports_changes_in_hierarchical_visible_geometry() {
+        let mut baseline = Document::new("hierarchical baseline");
+        let metal1 = baseline.layer_by_process(ProcessLayer::Metal1).unwrap();
+        let child = baseline.create_cell("unit");
+        let child_shape = baseline
+            .insert_shape_in_cell(
+                child,
+                metal1,
+                ShapeKind::Rectangle(Rect::from_min_size(Point::new(0, 0), 100, 100)),
+            )
+            .unwrap();
+        let instance = baseline
+            .insert_instance_in_top(child, Transform::translate(0, 0))
+            .unwrap();
+        let mut candidate = baseline.clone();
+        candidate.apply_operation_without_log(&Operation::MoveInstance {
+            parent: candidate.top_cell,
+            id: instance,
+            delta: Vector::new(500, 0),
+        });
+
+        let report = diff_documents("baseline", &baseline, "candidate", &candidate);
+
+        assert_eq!(report.summary.baseline_shapes, 1);
+        assert_eq!(report.summary.candidate_shapes, 1);
+        assert_eq!(report.summary.added_shapes, 0);
+        assert_eq!(report.summary.removed_shapes, 0);
+        assert_eq!(report.summary.modified_shapes, 1);
+        assert_eq!(
+            report.baseline_bounds,
+            Some(Rect::from_min_size(Point::new(0, 0), 100, 100))
+        );
+        assert_eq!(
+            report.candidate_bounds,
+            Some(Rect::from_min_size(Point::new(500, 0), 100, 100))
+        );
+
+        let change = &report.changes[0];
+        assert_eq!(change.kind, ShapeChangeKind::Modified);
+        assert_eq!(change.id, child_shape);
+        assert!(!change.occurrence.is_top_level());
+        assert_eq!(
+            change.bounds,
+            Rect::from_min_size(Point::new(500, 0), 100, 100)
+        );
+        assert_eq!(change.detail, "geometry changed");
     }
 }

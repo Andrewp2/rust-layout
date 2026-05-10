@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "metadata": {
+    "producer": "future-fabricad",
+    "producer_version": "999.0.0",
+    "workspace_schema_version": 1,
+    "document_schema_version": 999,
+    "feature_flags": ["future-document"],
+    "migration_history": ["document_schema:5->999"]
+  },
+  "document": {
+    "schema_version": 999,
+    "future_document_payload": {
+      "cells": "renamed in future schema"
+    }
+  }
+}

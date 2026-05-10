@@ -1,0 +1,23 @@
+{
+  "name": "SPLIT_LAYER",
+  "elements": [
+    {
+      "kind": "boundary",
+      "gds_layer": 88,
+      "datatype": 1,
+      "points": [[0, 0], [10, 0], [10, 10], [0, 10], [0, 0]]
+    },
+    {
+      "kind": "boundary",
+      "gds_layer": 88,
+      "datatype": 2,
+      "points": [[30, 0], [40, 0], [40, 10], [30, 10], [30, 0]]
+    }
+  ],
+  "expect": {
+    "generated_layer_count": 2,
+    "warning_count": 1,
+    "split_warning_gds_layer": 88,
+    "message_contains": ["multiple Fabricad layers", "DATATYPE 1", "DATATYPE 2"]
+  }
+}

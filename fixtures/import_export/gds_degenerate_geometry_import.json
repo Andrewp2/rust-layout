@@ -1,0 +1,38 @@
+{
+  "name": "DEGENERATE_GEOMETRY",
+  "elements": [
+    {
+      "kind": "boundary",
+      "gds_layer": 4,
+      "datatype": 0,
+      "points": [[0, 0], [100, 0], [0, 0]]
+    },
+    {
+      "kind": "path",
+      "gds_layer": 5,
+      "datatype": 0,
+      "width": 20,
+      "points": [[0, 0]]
+    }
+  ],
+  "expect": {
+    "element_count": 2,
+    "generated_layer_count": 0,
+    "visible_shape_count": 0,
+    "skipped_count": 2,
+    "skipped": [
+      {
+        "element_kind": "BOUNDARY",
+        "gds_layer": 4,
+        "gds_type": 0,
+        "reason_contains": "at least 3 distinct points"
+      },
+      {
+        "element_kind": "PATH",
+        "gds_layer": 5,
+        "gds_type": 0,
+        "reason_contains": "at least 2"
+      }
+    ]
+  }
+}

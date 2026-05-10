@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -97,7 +99,100 @@ pub struct CrossSectionProcess {
     pub steps: Vec<ProcessStep>,
 }
 
+impl Default for CrossSectionProcess {
+    fn default() -> Self {
+        Self::blank()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CrossSectionValidationSeverity {
+    Error,
+    Warning,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CrossSectionValidationFinding {
+    pub severity: CrossSectionValidationSeverity,
+    pub message: String,
+}
+
+impl CrossSectionValidationFinding {
+    fn error(message: impl Into<String>) -> Self {
+        Self {
+            severity: CrossSectionValidationSeverity::Error,
+            message: message.into(),
+        }
+    }
+
+    fn warning(message: impl Into<String>) -> Self {
+        Self {
+            severity: CrossSectionValidationSeverity::Warning,
+            message: message.into(),
+        }
+    }
+}
+
 impl CrossSectionProcess {
+    pub fn blank() -> Self {
+        let substrate = MaterialId::from("substrate");
+        Self {
+            width_um: 10.0,
+            columns: 80,
+            substrate_material: substrate.clone(),
+            substrate_thickness_um: 1.0,
+            materials: vec![ProcessMaterial {
+                id: substrate,
+                name: "Substrate".to_string(),
+                color_rgb: [96, 112, 128],
+            }],
+            steps: Vec::new(),
+        }
+    }
+
+    pub fn validate(&self) -> Vec<CrossSectionValidationFinding> {
+        let mut findings = Vec::new();
+        if !self.width_um.is_finite() || self.width_um <= 0.0 {
+            findings.push(CrossSectionValidationFinding::error(format!(
+                "cross-section width must be positive and finite, got {}",
+                self.width_um
+            )));
+        }
+        if self.columns == 0 {
+            findings.push(CrossSectionValidationFinding::error(
+                "cross-section column count must be greater than 0",
+            ));
+        }
+        if !self.substrate_thickness_um.is_finite() || self.substrate_thickness_um < 0.0 {
+            findings.push(CrossSectionValidationFinding::error(format!(
+                "substrate thickness must be non-negative and finite, got {}",
+                self.substrate_thickness_um
+            )));
+        } else if self.substrate_thickness_um == 0.0 {
+            findings.push(CrossSectionValidationFinding::warning(
+                "substrate thickness is zero",
+            ));
+        }
+
+        let material_ids = validate_materials(self, &mut findings);
+        if !material_ids.contains(&self.substrate_material) {
+            findings.push(CrossSectionValidationFinding::error(format!(
+                "substrate material {:?} is not in the material catalog",
+                self.substrate_material
+            )));
+        }
+        if self.steps.is_empty() {
+            findings.push(CrossSectionValidationFinding::warning(
+                "cross-section process has no process steps",
+            ));
+        }
+        for (index, step) in self.steps.iter().enumerate() {
+            validate_step(step, index, self.width_um, &material_ids, &mut findings);
+        }
+
+        findings
+    }
+
     pub fn simulate(&self) -> Vec<CrossSectionSnapshot> {
         let columns = self.columns.max(1);
         let width_um = self.width_um.max(0.1);
@@ -252,6 +347,139 @@ impl CrossSectionProcess {
     }
 }
 
+fn validate_materials(
+    process: &CrossSectionProcess,
+    findings: &mut Vec<CrossSectionValidationFinding>,
+) -> BTreeSet<MaterialId> {
+    let mut material_ids = BTreeSet::new();
+    for material in &process.materials {
+        if material.id.as_str().trim().is_empty() {
+            findings.push(CrossSectionValidationFinding::error(
+                "material id must not be empty",
+            ));
+        } else if !material_ids.insert(material.id.clone()) {
+            findings.push(CrossSectionValidationFinding::error(format!(
+                "material id {:?} is duplicated",
+                material.id
+            )));
+        }
+        if material.name.trim().is_empty() {
+            findings.push(CrossSectionValidationFinding::warning(format!(
+                "material {:?} has an empty display name",
+                material.id
+            )));
+        }
+    }
+    material_ids
+}
+
+fn validate_step(
+    step: &ProcessStep,
+    index: usize,
+    process_width_um: f32,
+    material_ids: &BTreeSet<MaterialId>,
+    findings: &mut Vec<CrossSectionValidationFinding>,
+) {
+    if step.name.trim().is_empty() {
+        findings.push(CrossSectionValidationFinding::warning(format!(
+            "process step {index} has an empty name"
+        )));
+    }
+    match &step.kind {
+        ProcessStepKind::Deposit {
+            material,
+            thickness_um,
+        } => {
+            validate_step_material("deposit", index, material, material_ids, findings);
+            validate_positive_step_value("deposit thickness", index, *thickness_um, findings);
+        }
+        ProcessStepKind::Etch { material, depth_um } => {
+            validate_step_material("etch", index, material, material_ids, findings);
+            validate_positive_step_value("etch depth", index, *depth_um, findings);
+        }
+        ProcessStepKind::Pattern { openings } => {
+            if openings.is_empty() {
+                findings.push(CrossSectionValidationFinding::warning(format!(
+                    "pattern step {index} has no mask openings"
+                )));
+            }
+            validate_mask_openings(index, process_width_um, openings, findings);
+        }
+    }
+}
+
+fn validate_step_material(
+    kind: &str,
+    index: usize,
+    material: &MaterialId,
+    material_ids: &BTreeSet<MaterialId>,
+    findings: &mut Vec<CrossSectionValidationFinding>,
+) {
+    if !material_ids.contains(material) {
+        findings.push(CrossSectionValidationFinding::error(format!(
+            "{kind} step {index} references unknown material {:?}",
+            material
+        )));
+    }
+}
+
+fn validate_positive_step_value(
+    label: &str,
+    index: usize,
+    value: f32,
+    findings: &mut Vec<CrossSectionValidationFinding>,
+) {
+    if !value.is_finite() || value < 0.0 {
+        findings.push(CrossSectionValidationFinding::error(format!(
+            "{label} for step {index} must be non-negative and finite, got {value}"
+        )));
+    } else if value == 0.0 {
+        findings.push(CrossSectionValidationFinding::warning(format!(
+            "{label} for step {index} is zero"
+        )));
+    }
+}
+
+fn validate_mask_openings(
+    step_index: usize,
+    process_width_um: f32,
+    openings: &[MaskOpening],
+    findings: &mut Vec<CrossSectionValidationFinding>,
+) {
+    let mut sorted = openings.to_vec();
+    sorted.sort_by(|a, b| a.start_um.total_cmp(&b.start_um));
+    for (index, opening) in sorted.iter().enumerate() {
+        if !opening.start_um.is_finite() || !opening.end_um.is_finite() {
+            findings.push(CrossSectionValidationFinding::error(format!(
+                "pattern step {step_index} opening {index} has non-finite bounds"
+            )));
+            continue;
+        }
+        if opening.start_um >= opening.end_um {
+            findings.push(CrossSectionValidationFinding::error(format!(
+                "pattern step {step_index} opening {index} has empty or inverted bounds {}..{}",
+                opening.start_um, opening.end_um
+            )));
+        }
+        if process_width_um.is_finite()
+            && process_width_um > 0.0
+            && (opening.start_um < 0.0 || opening.end_um > process_width_um)
+        {
+            findings.push(CrossSectionValidationFinding::error(format!(
+                "pattern step {step_index} opening {index} bounds {}..{} exceed process width {}",
+                opening.start_um, opening.end_um, process_width_um
+            )));
+        }
+        if let Some(previous) = index.checked_sub(1).and_then(|prev| sorted.get(prev))
+            && previous.end_um > opening.start_um
+        {
+            findings.push(CrossSectionValidationFinding::warning(format!(
+                "pattern step {step_index} opening {index} overlaps a previous opening"
+            )));
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ColumnLayer {
     material: MaterialId,
@@ -347,6 +575,156 @@ fn nearly_equal(a: f32, b: f32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sample_cross_section_process_validates() {
+        let process = CrossSectionProcess::sample_sequence();
+
+        assert_eq!(process.validate(), Vec::new());
+    }
+
+    #[test]
+    fn validation_rejects_invalid_dimensions_materials_and_masks() {
+        let process = CrossSectionProcess {
+            width_um: f32::NAN,
+            columns: 0,
+            substrate_material: MaterialId::from("missing"),
+            substrate_thickness_um: -1.0,
+            materials: vec![
+                ProcessMaterial {
+                    id: MaterialId::from(""),
+                    name: "blank".to_string(),
+                    color_rgb: [0, 0, 0],
+                },
+                ProcessMaterial {
+                    id: MaterialId::from("oxide"),
+                    name: String::new(),
+                    color_rgb: [1, 2, 3],
+                },
+                ProcessMaterial {
+                    id: MaterialId::from("oxide"),
+                    name: "duplicate".to_string(),
+                    color_rgb: [4, 5, 6],
+                },
+            ],
+            steps: vec![
+                ProcessStep {
+                    name: String::new(),
+                    detail: String::new(),
+                    kind: ProcessStepKind::Deposit {
+                        material: MaterialId::from("oxide"),
+                        thickness_um: 0.0,
+                    },
+                },
+                ProcessStep {
+                    name: "Etch".to_string(),
+                    detail: String::new(),
+                    kind: ProcessStepKind::Etch {
+                        material: MaterialId::from("poly"),
+                        depth_um: f32::INFINITY,
+                    },
+                },
+                ProcessStep {
+                    name: "Pattern".to_string(),
+                    detail: String::new(),
+                    kind: ProcessStepKind::Pattern {
+                        openings: vec![
+                            MaskOpening {
+                                start_um: 2.0,
+                                end_um: 1.0,
+                            },
+                            MaskOpening {
+                                start_um: 0.5,
+                                end_um: 1.5,
+                            },
+                            MaskOpening {
+                                start_um: 1.0,
+                                end_um: 1.25,
+                            },
+                        ],
+                    },
+                },
+            ],
+        };
+
+        let findings = process.validate();
+        let messages = findings
+            .iter()
+            .map(|finding| finding.message.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.severity == CrossSectionValidationSeverity::Error)
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.severity == CrossSectionValidationSeverity::Warning)
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("width must be positive"))
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("column count"))
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("substrate thickness"))
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("material id must not be empty"))
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("duplicated"))
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("substrate material"))
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("empty display name"))
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("empty name"))
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("deposit thickness") && message.contains("zero"))
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("unknown material"))
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("etch depth"))
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("empty or inverted"))
+        );
+        assert!(messages.iter().any(|message| message.contains("overlaps")));
+    }
 
     #[test]
     fn blanket_deposition_adds_material_across_full_width() {

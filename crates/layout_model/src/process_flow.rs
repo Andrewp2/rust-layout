@@ -73,6 +73,10 @@ impl ProcessFlowEdgeId {
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
     }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 impl From<&str> for ProcessFlowEdgeId {
@@ -321,6 +325,36 @@ pub struct ProcessFlowFinding {
     pub edge_id: Option<ProcessFlowEdgeId>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProcessFlowValidationContext {
+    pub mes_route_ids: BTreeSet<String>,
+    pub recipe_ids: BTreeSet<String>,
+}
+
+impl ProcessFlowValidationContext {
+    pub fn from_recipe_ids_and_mes<I>(recipe_ids: I, mes: &mes::FabMesData) -> Self
+    where
+        I: IntoIterator<Item = String>,
+    {
+        Self {
+            mes_route_ids: mes
+                .routes
+                .keys()
+                .map(|route_id| route_id.as_str().to_string())
+                .collect(),
+            recipe_ids: recipe_ids.into_iter().collect(),
+        }
+    }
+
+    fn contains_mes_route(&self, route_id: &str) -> bool {
+        self.mes_route_ids.contains(route_id)
+    }
+
+    fn contains_recipe(&self, recipe_id: &RecipeBinding) -> bool {
+        self.recipe_ids.contains(recipe_id.recipe_id.as_str())
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcessFlowModel {
     pub route: ProcessFlowRoute,
@@ -334,7 +368,16 @@ impl ProcessFlowModel {
     }
 
     pub fn findings(&self) -> Vec<ProcessFlowFinding> {
-        self.route.validation_findings()
+        validate_process_flow_model(self)
+    }
+
+    pub fn validate_with_context(
+        &self,
+        context: &ProcessFlowValidationContext,
+    ) -> Vec<ProcessFlowFinding> {
+        let mut findings = validate_process_flow_model(self);
+        validate_process_flow_context_links(&self.route, context, &mut findings);
+        findings
     }
 
     pub fn export_to_mes_route(&self) -> mes::ProcessRoute {
@@ -344,9 +387,38 @@ impl ProcessFlowModel {
 
 pub fn validate_process_flow(route: &ProcessFlowRoute) -> Vec<ProcessFlowFinding> {
     let mut findings = Vec::new();
+    if route.id.as_str().trim().is_empty() {
+        findings.push(ProcessFlowFinding {
+            severity: ProcessFlowFindingSeverity::Error,
+            code: "empty_route_id".to_string(),
+            message: "process flow route id cannot be empty".to_string(),
+            node_id: None,
+            edge_id: None,
+        });
+    }
+    if route.version == 0 {
+        findings.push(ProcessFlowFinding {
+            severity: ProcessFlowFindingSeverity::Error,
+            code: "invalid_route_version".to_string(),
+            message: format!("process flow route {} has version 0", route.id),
+            node_id: None,
+            edge_id: None,
+        });
+    }
+
     let mut node_ids = BTreeSet::new();
     let mut duplicate_node_ids = BTreeSet::new();
     for node in &route.nodes {
+        if node.id.as_str().trim().is_empty() {
+            findings.push(ProcessFlowFinding {
+                severity: ProcessFlowFindingSeverity::Error,
+                code: "empty_node_id".to_string(),
+                message: "process flow node id cannot be empty".to_string(),
+                node_id: Some(node.id.clone()),
+                edge_id: None,
+            });
+            continue;
+        }
         if !node_ids.insert(node.id.clone()) {
             duplicate_node_ids.insert(node.id.clone());
         }
@@ -359,6 +431,34 @@ pub fn validate_process_flow(route: &ProcessFlowRoute) -> Vec<ProcessFlowFinding
             message: format!("node id {node_id} is used more than once"),
             node_id: Some(node_id),
             edge_id: None,
+        });
+    }
+
+    let mut edge_ids = BTreeSet::new();
+    let mut duplicate_edge_ids = BTreeSet::new();
+    for edge in &route.edges {
+        if edge.id.as_str().trim().is_empty() {
+            findings.push(ProcessFlowFinding {
+                severity: ProcessFlowFindingSeverity::Error,
+                code: "empty_edge_id".to_string(),
+                message: "process flow edge id cannot be empty".to_string(),
+                node_id: None,
+                edge_id: Some(edge.id.clone()),
+            });
+            continue;
+        }
+        if !edge_ids.insert(edge.id.clone()) {
+            duplicate_edge_ids.insert(edge.id.clone());
+        }
+    }
+
+    for edge_id in duplicate_edge_ids {
+        findings.push(ProcessFlowFinding {
+            severity: ProcessFlowFindingSeverity::Error,
+            code: "duplicate_edge".to_string(),
+            message: format!("edge id {edge_id} is used more than once"),
+            node_id: None,
+            edge_id: Some(edge_id),
         });
     }
 
@@ -461,6 +561,154 @@ pub fn validate_process_flow(route: &ProcessFlowRoute) -> Vec<ProcessFlowFinding
     }
 
     findings
+}
+
+pub fn validate_process_flow_model(model: &ProcessFlowModel) -> Vec<ProcessFlowFinding> {
+    let mut findings = validate_process_flow(&model.route);
+    validate_process_flow_versions(model, &mut findings);
+    findings
+}
+
+pub fn validate_process_flow_with_context(
+    route: &ProcessFlowRoute,
+    context: &ProcessFlowValidationContext,
+) -> Vec<ProcessFlowFinding> {
+    let mut findings = validate_process_flow(route);
+    validate_process_flow_context_links(route, context, &mut findings);
+    findings
+}
+
+fn validate_process_flow_context_links(
+    route: &ProcessFlowRoute,
+    context: &ProcessFlowValidationContext,
+    findings: &mut Vec<ProcessFlowFinding>,
+) {
+    let mes_route_id = route.mes_route_id.trim();
+    if !mes_route_id.is_empty() && !context.contains_mes_route(mes_route_id) {
+        findings.push(ProcessFlowFinding {
+            severity: ProcessFlowFindingSeverity::Error,
+            code: "missing_mes_route".to_string(),
+            message: format!(
+                "process flow route {} references missing MES route {mes_route_id}",
+                route.id
+            ),
+            node_id: None,
+            edge_id: None,
+        });
+    }
+
+    for node in &route.nodes {
+        if let Some(binding) = &node.recipe
+            && !context.contains_recipe(binding)
+        {
+            findings.push(ProcessFlowFinding {
+                severity: ProcessFlowFindingSeverity::Error,
+                code: "missing_recipe_reference".to_string(),
+                message: format!(
+                    "process flow node {} references missing recipe {}",
+                    node.id, binding.recipe_id
+                ),
+                node_id: Some(node.id.clone()),
+                edge_id: None,
+            });
+        }
+    }
+}
+
+fn validate_process_flow_versions(
+    model: &ProcessFlowModel,
+    findings: &mut Vec<ProcessFlowFinding>,
+) {
+    let mut versions = BTreeSet::new();
+    let mut has_current_version = false;
+    for version in &model.versions {
+        if version.version == 0 {
+            findings.push(ProcessFlowFinding {
+                severity: ProcessFlowFindingSeverity::Error,
+                code: "invalid_version_record".to_string(),
+                message: "process flow version history contains version 0".to_string(),
+                node_id: None,
+                edge_id: None,
+            });
+            continue;
+        }
+        if !versions.insert(version.version) {
+            findings.push(ProcessFlowFinding {
+                severity: ProcessFlowFindingSeverity::Error,
+                code: "duplicate_version_record".to_string(),
+                message: format!(
+                    "process flow version history repeats version {}",
+                    version.version
+                ),
+                node_id: None,
+                edge_id: None,
+            });
+        }
+        if version.author.trim().is_empty() {
+            findings.push(ProcessFlowFinding {
+                severity: ProcessFlowFindingSeverity::Warning,
+                code: "empty_version_author".to_string(),
+                message: format!("process flow version {} has no author", version.version),
+                node_id: None,
+                edge_id: None,
+            });
+        }
+        if version.timestamp.trim().is_empty() {
+            findings.push(ProcessFlowFinding {
+                severity: ProcessFlowFindingSeverity::Warning,
+                code: "empty_version_timestamp".to_string(),
+                message: format!("process flow version {} has no timestamp", version.version),
+                node_id: None,
+                edge_id: None,
+            });
+        }
+        if version.change_note.trim().is_empty() {
+            findings.push(ProcessFlowFinding {
+                severity: ProcessFlowFindingSeverity::Warning,
+                code: "empty_version_change_note".to_string(),
+                message: format!(
+                    "process flow version {} has no change note",
+                    version.version
+                ),
+                node_id: None,
+                edge_id: None,
+            });
+        }
+        if version.version == model.route.version {
+            has_current_version = true;
+            if version.node_count != model.route.nodes.len()
+                || version.edge_count != model.route.edges.len()
+            {
+                findings.push(ProcessFlowFinding {
+                    severity: ProcessFlowFindingSeverity::Error,
+                    code: "stale_current_version_counts".to_string(),
+                    message: format!(
+                        "process flow current version {} records {} nodes / {} edges but route has {} nodes / {} edges",
+                        version.version,
+                        version.node_count,
+                        version.edge_count,
+                        model.route.nodes.len(),
+                        model.route.edges.len()
+                    ),
+                    node_id: None,
+                    edge_id: None,
+                });
+            }
+        }
+    }
+
+    if !model.versions.is_empty() && !has_current_version && model.route.version != 0 {
+        findings.push(ProcessFlowFinding {
+            severity: ProcessFlowFindingSeverity::Error,
+            code: "missing_current_version_record".to_string(),
+            message: format!(
+                "process flow version history is missing current route version {}",
+                model.route.version
+            ),
+            node_id: None,
+            edge_id: None,
+        });
+    }
 }
 
 fn map_tool_class_to_mes(tool_class: ToolClass) -> mes::ToolClass {
@@ -677,6 +925,16 @@ pub fn sample_process_flow_model() -> ProcessFlowModel {
 mod tests {
     use super::*;
 
+    fn validation_context() -> ProcessFlowValidationContext {
+        ProcessFlowValidationContext::from_recipe_ids_and_mes(
+            crate::recipe::RecipeCatalog::sample()
+                .recipes
+                .keys()
+                .map(|recipe_id| recipe_id.as_str().to_string()),
+            &crate::mes::FabMesData::sample(),
+        )
+    }
+
     #[test]
     fn sample_process_flow_is_valid_for_mvp_export() {
         let model = ProcessFlowModel::sample();
@@ -696,6 +954,43 @@ mod tests {
                 .iter()
                 .any(|step| step.signoff_required && step.name == "Poly plasma etch")
         );
+    }
+
+    #[test]
+    fn context_validation_accepts_sample_references() {
+        let model = ProcessFlowModel::sample();
+        let findings = model.validate_with_context(&validation_context());
+
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.severity != ProcessFlowFindingSeverity::Error),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn context_validation_reports_missing_mes_route_and_recipe() {
+        let mut model = ProcessFlowModel::sample();
+        model.route.mes_route_id = "ROUTE-MISSING".to_string();
+        let etch = model
+            .route
+            .nodes
+            .iter_mut()
+            .find(|node| node.id.as_str() == "ETCH")
+            .unwrap();
+        etch.recipe = Some(RecipeBinding::new("RECIPE-MISSING", 1));
+
+        let findings = model.validate_with_context(&validation_context());
+
+        assert!(findings.iter().any(|finding| {
+            finding.code == "missing_mes_route"
+                && finding.severity == ProcessFlowFindingSeverity::Error
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding.code == "missing_recipe_reference"
+                && finding.node_id == Some(ProcessFlowNodeId::new("ETCH"))
+        }));
     }
 
     #[test]
@@ -739,5 +1034,79 @@ mod tests {
             finding.code == "edge_to_missing"
                 && finding.edge_id == Some(ProcessFlowEdgeId::new("BROKEN"))
         }));
+    }
+
+    #[test]
+    fn validation_rejects_empty_and_duplicate_stable_ids() {
+        let mut model = ProcessFlowModel::sample();
+        model.route.id = ProcessFlowRouteId::new("");
+        model.route.version = 0;
+        model.route.nodes[0].id = ProcessFlowNodeId::new("");
+        let duplicate_edge = model.route.edges[0].clone();
+        model.route.edges.push(duplicate_edge);
+        model.route.edges.push(ProcessFlowEdge {
+            id: ProcessFlowEdgeId::new(""),
+            from: ProcessFlowNodeId::new("ETCH"),
+            to: ProcessFlowNodeId::new("END"),
+            kind: ProcessFlowEdgeKind::Sequence,
+            condition: String::new(),
+        });
+
+        let findings = model.findings();
+
+        for code in [
+            "empty_route_id",
+            "invalid_route_version",
+            "empty_node_id",
+            "duplicate_edge",
+            "empty_edge_id",
+        ] {
+            assert!(
+                findings.iter().any(|finding| finding.code == code),
+                "missing {code}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validation_rejects_stale_version_history() {
+        let mut model = ProcessFlowModel::sample();
+        model.versions[2].node_count += 1;
+        model.versions[2].author.clear();
+        let mut duplicate = model.versions[2].clone();
+        duplicate.node_count = model.route.nodes.len();
+        duplicate.author = "process.engineer".to_string();
+        model.versions.push(duplicate);
+        model.versions.push(ProcessFlowVersion {
+            version: 0,
+            author: "integration.owner".to_string(),
+            timestamp: "2026-05-07T09:00:00Z".to_string(),
+            change_note: "invalid migration artifact".to_string(),
+            node_count: model.route.nodes.len(),
+            edge_count: model.route.edges.len(),
+        });
+
+        let findings = model.findings();
+
+        for code in [
+            "stale_current_version_counts",
+            "empty_version_author",
+            "duplicate_version_record",
+            "invalid_version_record",
+        ] {
+            assert!(
+                findings.iter().any(|finding| finding.code == code),
+                "missing {code}: {findings:?}"
+            );
+        }
+
+        let mut missing_current = ProcessFlowModel::sample();
+        missing_current.route.version = 4;
+        let findings = missing_current.findings();
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.code == "missing_current_version_record")
+        );
     }
 }

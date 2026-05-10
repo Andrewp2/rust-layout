@@ -1,0 +1,40 @@
+{
+  "name": "MISSING_REFS",
+  "elements": [
+    {
+      "kind": "boundary",
+      "gds_layer": 4,
+      "datatype": 0,
+      "points": [[0, 0], [100, 0], [100, 100], [0, 100], [0, 0]]
+    },
+    {
+      "kind": "sref",
+      "name": "MISSING_UNIT",
+      "origin": [200, 0]
+    },
+    {
+      "kind": "aref",
+      "name": "MISSING_ARRAY_UNIT",
+      "columns": 2,
+      "rows": 2,
+      "points": [[300, 0], [500, 0], [300, 200]]
+    }
+  ],
+  "expect": {
+    "element_count": 3,
+    "generated_layer_count": 0,
+    "visible_shape_count": 1,
+    "top_instance_count": 0,
+    "skipped_count": 2,
+    "skipped": [
+      {
+        "element_kind": "SREF",
+        "reason_contains": "MISSING_UNIT"
+      },
+      {
+        "element_kind": "AREF",
+        "reason_contains": "MISSING_ARRAY_UNIT"
+      }
+    ]
+  }
+}

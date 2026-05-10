@@ -368,6 +368,11 @@ impl RecipeValidationIssue {
             message: message.into(),
         }
     }
+
+    fn with_context(mut self, context: impl AsRef<str>) -> Self {
+        self.message = format!("{}{}", context.as_ref(), self.message);
+        self
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1015,6 +1020,579 @@ impl RecipeCatalog {
 
     pub fn recipe_mut(&mut self, id: &RecipeId) -> Option<&mut Recipe> {
         self.recipes.get_mut(id)
+    }
+
+    pub fn validate(&self) -> Vec<RecipeValidationIssue> {
+        let mut issues = Vec::new();
+        for (recipe_id, recipe) in &self.recipes {
+            validate_catalog_recipe(recipe_id, recipe, &mut issues);
+        }
+
+        let mut route_keys = BTreeSet::new();
+        let mut process_steps = BTreeMap::new();
+        for route in &self.process_routes {
+            validate_catalog_route(
+                route,
+                &self.recipes,
+                &mut route_keys,
+                &mut process_steps,
+                &mut issues,
+            );
+        }
+
+        let mut tool_run_ids = BTreeSet::new();
+        let mut tool_runs = BTreeMap::new();
+        for run in &self.tool_runs {
+            validate_catalog_tool_run(
+                run,
+                &self.recipes,
+                &process_steps,
+                &mut tool_run_ids,
+                &mut tool_runs,
+                &mut issues,
+            );
+        }
+
+        for recipe in self.recipes.values() {
+            validate_usage_references(
+                recipe,
+                &self.recipes,
+                &process_steps,
+                &tool_runs,
+                &mut issues,
+            );
+        }
+
+        issues
+    }
+}
+
+type ProcessStepKey = (ProcessRouteId, u32, ProcessStepId);
+type ProcessStepCatalogEntry = (Option<RecipeBinding>, ToolClass);
+
+fn validate_catalog_recipe(
+    recipe_id: &RecipeId,
+    recipe: &Recipe,
+    issues: &mut Vec<RecipeValidationIssue>,
+) {
+    if recipe_id != &recipe.id {
+        issues.push(RecipeValidationIssue::error(
+            None,
+            format!(
+                "recipe map key {recipe_id} does not match recipe id {}",
+                recipe.id
+            ),
+        ));
+    }
+    if recipe.id.as_str().trim().is_empty() {
+        issues.push(RecipeValidationIssue::error(None, "recipe id is empty"));
+    }
+    if recipe.name.trim().is_empty() {
+        issues.push(RecipeValidationIssue::warning(
+            None,
+            format!("recipe {} has an empty name", recipe.id),
+        ));
+    }
+    if recipe.versions.is_empty() {
+        issues.push(RecipeValidationIssue::error(
+            None,
+            format!("recipe {} has no versions", recipe.id),
+        ));
+    }
+
+    let mut versions = BTreeSet::new();
+    for version in &recipe.versions {
+        if !versions.insert(version.version) {
+            issues.push(RecipeValidationIssue::error(
+                None,
+                format!(
+                    "recipe {} has duplicate version {}",
+                    recipe.id, version.version
+                ),
+            ));
+        }
+        for issue in recipe.validate_version(version) {
+            issues.push(issue.with_context(format!("recipe {} {}: ", recipe.id, version.version)));
+        }
+        validate_recipe_approval_state(recipe, version, issues);
+    }
+
+    for (key, spec) in &recipe.parameter_specs {
+        if key != &spec.key {
+            issues.push(RecipeValidationIssue::error(
+                Some(key.clone()),
+                format!(
+                    "recipe {} parameter map key {key} does not match spec key {}",
+                    recipe.id, spec.key
+                ),
+            ));
+        }
+        if spec.key.trim().is_empty() {
+            issues.push(RecipeValidationIssue::error(
+                Some(key.clone()),
+                format!("recipe {} has an empty parameter key", recipe.id),
+            ));
+        }
+        validate_parameter_spec_options(&recipe.id, spec, issues);
+    }
+}
+
+fn validate_recipe_approval_state(
+    recipe: &Recipe,
+    version: &RecipeVersion,
+    issues: &mut Vec<RecipeValidationIssue>,
+) {
+    if version.approval_state == ApprovalState::Approved {
+        if version
+            .approved_by
+            .as_ref()
+            .is_none_or(|actor| actor.trim().is_empty())
+        {
+            issues.push(RecipeValidationIssue::warning(
+                None,
+                format!(
+                    "recipe {} {} is approved without an approver",
+                    recipe.id, version.version
+                ),
+            ));
+        }
+        if version
+            .approved_at
+            .as_ref()
+            .is_none_or(|time| time.trim().is_empty())
+        {
+            issues.push(RecipeValidationIssue::warning(
+                None,
+                format!(
+                    "recipe {} {} is approved without an approval timestamp",
+                    recipe.id, version.version
+                ),
+            ));
+        }
+    } else if version.approved_by.is_some() || version.approved_at.is_some() {
+        issues.push(RecipeValidationIssue::warning(
+            None,
+            format!(
+                "recipe {} {} keeps approval metadata while state is {}",
+                recipe.id,
+                version.version,
+                version.approval_state.label()
+            ),
+        ));
+    }
+}
+
+fn validate_parameter_spec_options(
+    recipe_id: &RecipeId,
+    spec: &RecipeParameterSpec,
+    issues: &mut Vec<RecipeValidationIssue>,
+) {
+    if let RecipeParameterType::Choice { options } = &spec.value_type {
+        let mut seen = BTreeSet::new();
+        if options.is_empty() {
+            issues.push(RecipeValidationIssue::error(
+                Some(spec.key.clone()),
+                format!("recipe {recipe_id} parameter {} has no choices", spec.key),
+            ));
+        }
+        for option in options {
+            if option.trim().is_empty() {
+                issues.push(RecipeValidationIssue::error(
+                    Some(spec.key.clone()),
+                    format!(
+                        "recipe {recipe_id} parameter {} has an empty choice",
+                        spec.key
+                    ),
+                ));
+            }
+            if !seen.insert(option) {
+                issues.push(RecipeValidationIssue::error(
+                    Some(spec.key.clone()),
+                    format!(
+                        "recipe {recipe_id} parameter {} has duplicate choice {option}",
+                        spec.key
+                    ),
+                ));
+            }
+        }
+    }
+}
+
+fn validate_catalog_route(
+    route: &ProcessRoute,
+    recipes: &BTreeMap<RecipeId, Recipe>,
+    route_keys: &mut BTreeSet<(ProcessRouteId, u32)>,
+    process_steps: &mut BTreeMap<ProcessStepKey, ProcessStepCatalogEntry>,
+    issues: &mut Vec<RecipeValidationIssue>,
+) {
+    let route_key = (route.id.clone(), route.version);
+    if !route_keys.insert(route_key.clone()) {
+        issues.push(RecipeValidationIssue::error(
+            None,
+            format!(
+                "process route {} v{} is duplicated",
+                route.id, route.version
+            ),
+        ));
+    }
+    if route.id.0.trim().is_empty() {
+        issues.push(RecipeValidationIssue::error(
+            None,
+            "process route id is empty",
+        ));
+    }
+    if route.version == 0 {
+        issues.push(RecipeValidationIssue::error(
+            None,
+            format!("process route {} has invalid version 0", route.id),
+        ));
+    }
+    if route.steps.is_empty() {
+        issues.push(RecipeValidationIssue::warning(
+            None,
+            format!("process route {} v{} has no steps", route.id, route.version),
+        ));
+    }
+
+    let mut step_ids = BTreeSet::new();
+    let mut sequences = BTreeSet::new();
+    for step in &route.steps {
+        if step.id.0.trim().is_empty() {
+            issues.push(RecipeValidationIssue::error(
+                None,
+                format!(
+                    "process route {} v{} has an empty step id",
+                    route.id, route.version
+                ),
+            ));
+        }
+        if !step_ids.insert(step.id.clone()) {
+            issues.push(RecipeValidationIssue::error(
+                None,
+                format!(
+                    "process route {} v{} contains duplicate step {}",
+                    route.id, route.version, step.id
+                ),
+            ));
+        }
+        if !sequences.insert(step.sequence) {
+            issues.push(RecipeValidationIssue::warning(
+                None,
+                format!(
+                    "process route {} v{} contains duplicate step sequence {}",
+                    route.id, route.version, step.sequence
+                ),
+            ));
+        }
+        if step.sequence == 0 {
+            issues.push(RecipeValidationIssue::error(
+                None,
+                format!(
+                    "process route {} v{} step {} has sequence 0",
+                    route.id, route.version, step.id
+                ),
+            ));
+        }
+        if let Some(binding) = &step.recipe {
+            validate_recipe_binding(
+                binding,
+                recipes,
+                issues,
+                format!(
+                    "process route {} v{} step {}",
+                    route.id, route.version, step.id
+                ),
+            );
+        }
+        process_steps.insert(
+            (route.id.clone(), route.version, step.id.clone()),
+            (step.recipe.clone(), step.tool_class),
+        );
+    }
+}
+
+fn validate_catalog_tool_run(
+    run: &ToolRun,
+    recipes: &BTreeMap<RecipeId, Recipe>,
+    process_steps: &BTreeMap<ProcessStepKey, ProcessStepCatalogEntry>,
+    tool_run_ids: &mut BTreeSet<ToolRunId>,
+    tool_runs: &mut BTreeMap<ToolRunId, (String, RecipeBinding)>,
+    issues: &mut Vec<RecipeValidationIssue>,
+) {
+    if run.id.0.trim().is_empty() {
+        issues.push(RecipeValidationIssue::error(None, "tool run id is empty"));
+    }
+    if !tool_run_ids.insert(run.id.clone()) {
+        issues.push(RecipeValidationIssue::error(
+            None,
+            format!("tool run {} is duplicated", run.id),
+        ));
+    }
+    if run.tool_id.trim().is_empty() {
+        issues.push(RecipeValidationIssue::error(
+            None,
+            format!("tool run {} has an empty tool id", run.id),
+        ));
+    }
+    validate_recipe_binding(&run.recipe, recipes, issues, format!("tool run {}", run.id));
+    if let Some(step_ref) = &run.process_step {
+        if step_ref.route_id.0.trim().is_empty() {
+            issues.push(RecipeValidationIssue::error(
+                None,
+                format!("tool run {} has an empty process route id", run.id),
+            ));
+        }
+        if step_ref.route_version == 0 {
+            issues.push(RecipeValidationIssue::error(
+                None,
+                format!("tool run {} references process route version 0", run.id),
+            ));
+        }
+        if step_ref.step_id.0.trim().is_empty() {
+            issues.push(RecipeValidationIssue::error(
+                None,
+                format!("tool run {} has an empty process step id", run.id),
+            ));
+        }
+        let step_key = (
+            step_ref.route_id.clone(),
+            step_ref.route_version,
+            step_ref.step_id.clone(),
+        );
+        match process_steps.get(&step_key) {
+            Some((Some(step_recipe), step_tool_class)) if step_recipe != &run.recipe => {
+                issues.push(RecipeValidationIssue::error(
+                    None,
+                    format!(
+                        "tool run {} recipe {} does not match process step {} v{} {} recipe {}",
+                        run.id,
+                        run.recipe,
+                        step_ref.route_id,
+                        step_ref.route_version,
+                        step_ref.step_id,
+                        step_recipe
+                    ),
+                ));
+                if *step_tool_class != run.tool_class {
+                    issues.push(RecipeValidationIssue::error(
+                        None,
+                        format!(
+                            "tool run {} class {} does not match process step {} v{} {} class {}",
+                            run.id,
+                            run.tool_class,
+                            step_ref.route_id,
+                            step_ref.route_version,
+                            step_ref.step_id,
+                            step_tool_class
+                        ),
+                    ));
+                }
+            }
+            Some((_, step_tool_class)) => {
+                if *step_tool_class != run.tool_class {
+                    issues.push(RecipeValidationIssue::error(
+                        None,
+                        format!(
+                            "tool run {} class {} does not match process step {} v{} {} class {}",
+                            run.id,
+                            run.tool_class,
+                            step_ref.route_id,
+                            step_ref.route_version,
+                            step_ref.step_id,
+                            step_tool_class
+                        ),
+                    ));
+                }
+            }
+            None => issues.push(RecipeValidationIssue::error(
+                None,
+                format!(
+                    "tool run {} references missing process step {} v{} {}",
+                    run.id, step_ref.route_id, step_ref.route_version, step_ref.step_id
+                ),
+            )),
+        }
+    }
+    match run.state {
+        ToolRunState::Running | ToolRunState::Completed | ToolRunState::Alarmed
+            if run.started_at.trim().is_empty() =>
+        {
+            issues.push(RecipeValidationIssue::error(
+                None,
+                format!("tool run {} has no started_at timestamp", run.id),
+            ));
+        }
+        ToolRunState::Queued if !run.started_at.trim().is_empty() => {
+            issues.push(RecipeValidationIssue::warning(
+                None,
+                format!(
+                    "queued tool run {} already has started_at timestamp",
+                    run.id
+                ),
+            ));
+        }
+        _ => {}
+    }
+    if run.state == ToolRunState::Completed
+        && run
+            .completed_at
+            .as_deref()
+            .is_none_or(|timestamp| timestamp.trim().is_empty())
+    {
+        issues.push(RecipeValidationIssue::warning(
+            None,
+            format!(
+                "completed tool run {} has no completed_at timestamp",
+                run.id
+            ),
+        ));
+    }
+    if run.state != ToolRunState::Completed
+        && run
+            .completed_at
+            .as_deref()
+            .is_some_and(|timestamp| !timestamp.trim().is_empty())
+    {
+        issues.push(RecipeValidationIssue::warning(
+            None,
+            format!(
+                "non-completed tool run {} already has completed_at timestamp",
+                run.id
+            ),
+        ));
+    }
+    if let Some(completed_at) = run.completed_at.as_deref()
+        && !run.started_at.trim().is_empty()
+        && !completed_at.trim().is_empty()
+        && completed_at < run.started_at.as_str()
+    {
+        issues.push(RecipeValidationIssue::error(
+            None,
+            format!(
+                "tool run {} completed_at timestamp is before started_at timestamp",
+                run.id
+            ),
+        ));
+    }
+    tool_runs.insert(run.id.clone(), (run.tool_id.clone(), run.recipe.clone()));
+}
+
+fn validate_usage_references(
+    recipe: &Recipe,
+    recipes: &BTreeMap<RecipeId, Recipe>,
+    process_steps: &BTreeMap<ProcessStepKey, ProcessStepCatalogEntry>,
+    tool_runs: &BTreeMap<ToolRunId, (String, RecipeBinding)>,
+    issues: &mut Vec<RecipeValidationIssue>,
+) {
+    for reference in &recipe.usage_references {
+        validate_recipe_binding(
+            &reference.binding,
+            recipes,
+            issues,
+            format!("recipe {} usage reference", recipe.id),
+        );
+        match &reference.target {
+            RecipeUsageTarget::ProcessStep {
+                route_id,
+                route_version,
+                step_id,
+            } => {
+                let step_key = (route_id.clone(), *route_version, step_id.clone());
+                match process_steps.get(&step_key) {
+                    Some((Some(step_recipe), _)) if step_recipe != &reference.binding => {
+                        issues.push(RecipeValidationIssue::error(
+                            None,
+                            format!(
+                                "recipe {} usage reference {} does not match process step {} v{} {} recipe {}",
+                                recipe.id, reference.binding, route_id, route_version, step_id, step_recipe
+                            ),
+                        ));
+                    }
+                    Some(_) => {}
+                    None => issues.push(RecipeValidationIssue::warning(
+                        None,
+                        format!(
+                            "recipe {} usage reference targets missing process step {} v{} {}",
+                            recipe.id, route_id, route_version, step_id
+                        ),
+                    )),
+                }
+            }
+            RecipeUsageTarget::ToolRun {
+                tool_run_id,
+                tool_id,
+            } => match tool_runs.get(tool_run_id) {
+                Some((run_tool_id, run_recipe)) => {
+                    if run_tool_id != tool_id {
+                        issues.push(RecipeValidationIssue::error(
+                            None,
+                            format!(
+                                "recipe {} usage reference targets tool run {} on {}, but run belongs to {}",
+                                recipe.id, tool_run_id, tool_id, run_tool_id
+                            ),
+                        ));
+                    }
+                    if run_recipe != &reference.binding {
+                        issues.push(RecipeValidationIssue::error(
+                            None,
+                            format!(
+                                "recipe {} usage reference {} does not match tool run {} recipe {}",
+                                recipe.id, reference.binding, tool_run_id, run_recipe
+                            ),
+                        ));
+                    }
+                }
+                None => issues.push(RecipeValidationIssue::warning(
+                    None,
+                    format!(
+                        "recipe {} usage reference targets missing tool run {}",
+                        recipe.id, tool_run_id
+                    ),
+                )),
+            },
+            RecipeUsageTarget::Lot { lot_id } => {
+                if lot_id.trim().is_empty() {
+                    issues.push(RecipeValidationIssue::error(
+                        None,
+                        format!("recipe {} usage reference has an empty lot id", recipe.id),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+fn validate_recipe_binding(
+    binding: &RecipeBinding,
+    recipes: &BTreeMap<RecipeId, Recipe>,
+    issues: &mut Vec<RecipeValidationIssue>,
+    context: impl AsRef<str>,
+) {
+    let context = context.as_ref();
+    if binding.recipe_id.as_str().trim().is_empty() {
+        issues.push(RecipeValidationIssue::error(
+            None,
+            format!("{context} has an empty recipe id"),
+        ));
+        return;
+    }
+    if binding.version.0 == 0 {
+        issues.push(RecipeValidationIssue::error(
+            None,
+            format!("{context} references {} version 0", binding.recipe_id),
+        ));
+        return;
+    }
+    match recipes.get(&binding.recipe_id) {
+        Some(recipe) if recipe.version(binding.version).is_some() => {}
+        Some(_) => issues.push(RecipeValidationIssue::error(
+            None,
+            format!("{context} references missing recipe binding {binding}"),
+        )),
+        None => issues.push(RecipeValidationIssue::error(
+            None,
+            format!("{context} references missing recipe {}", binding.recipe_id),
+        )),
     }
 }
 
@@ -2010,6 +2588,109 @@ mod tests {
         assert!(issues.iter().any(|issue| {
             issue.severity == ValidationSeverity::Warning
                 && issue.parameter_key.as_deref() == Some("operator_note")
+        }));
+    }
+
+    #[test]
+    fn sample_recipe_catalog_validates() {
+        let catalog = sample_recipe_catalog();
+        let issues = catalog.validate();
+        assert!(
+            !issues
+                .iter()
+                .any(|issue| issue.severity == ValidationSeverity::Error),
+            "{issues:?}"
+        );
+    }
+
+    #[test]
+    fn recipe_catalog_validation_rejects_bad_catalog_references() {
+        let mut catalog = sample_recipe_catalog();
+        let spin_id = RecipeId::from("SPIN_PR_3000");
+        let first_spin_version = catalog.recipes[&spin_id].versions[0].clone();
+        catalog
+            .recipes
+            .get_mut(&spin_id)
+            .unwrap()
+            .versions
+            .push(first_spin_version);
+        catalog
+            .process_routes
+            .push(catalog.process_routes[0].clone());
+        catalog.process_routes[0].steps[0].recipe = Some(RecipeBinding::new("MISSING_RECIPE", 1));
+        catalog.process_routes[0].steps[1].sequence = 0;
+        let mut duplicate_run = catalog.tool_runs[0].clone();
+        duplicate_run.recipe = RecipeBinding::new("SPIN_PR_3000", 99);
+        duplicate_run.process_step.as_mut().unwrap().step_id = ProcessStepId::from("missing_step");
+        catalog.tool_runs.push(duplicate_run);
+        let mut stale_run = catalog.tool_runs[1].clone();
+        stale_run.id = ToolRunId::from("RUN-STALE-META");
+        stale_run.tool_class = ToolClass::SpinCoater;
+        stale_run.started_at = "2026-04-22T11:05:00Z".to_string();
+        stale_run.completed_at = Some("2026-04-22T11:00:00Z".to_string());
+        catalog.tool_runs.push(stale_run);
+        let mut queued_run = catalog.tool_runs[1].clone();
+        queued_run.id = ToolRunId::from("RUN-QUEUED-META");
+        queued_run.state = ToolRunState::Queued;
+        queued_run.completed_at = Some("2026-04-22T11:03:00Z".to_string());
+        catalog.tool_runs.push(queued_run);
+        let mut zero_version_run = catalog.tool_runs[1].clone();
+        zero_version_run.id = ToolRunId::from("RUN-ZERO-STEP-VERSION");
+        zero_version_run
+            .process_step
+            .as_mut()
+            .unwrap()
+            .route_version = 0;
+        catalog.tool_runs.push(zero_version_run);
+
+        let issues = catalog.validate();
+        let messages = issues
+            .iter()
+            .map(|issue| issue.message.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("recipe SPIN_PR_3000 has duplicate version v1"))
+        );
+        assert!(messages.iter().any(|message| {
+            message.contains("process route ROUTE_POLY_GATE_DEMO v1 is duplicated")
+        }));
+        assert!(messages.iter().any(|message| {
+            message.contains("process route ROUTE_POLY_GATE_DEMO v1 step soft_bake has sequence 0")
+        }));
+        assert!(
+            messages.iter().any(|message| message.contains(
+                "process route ROUTE_POLY_GATE_DEMO v1 step coat_photoresist references missing recipe MISSING_RECIPE"
+            ))
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("tool run RUN-SPIN-0007 is duplicated"))
+        );
+        assert!(messages.iter().any(|message| message.contains(
+            "tool run RUN-SPIN-0007 references missing recipe binding SPIN_PR_3000 v99"
+        )));
+        assert!(
+            messages.iter().any(|message| message.contains(
+                "tool run RUN-SPIN-0007 references missing process step ROUTE_POLY_GATE_DEMO v1 missing_step"
+            ))
+        );
+        assert!(messages.iter().any(|message| message.contains(
+            "tool run RUN-STALE-META class Spin coater does not match process step ROUTE_POLY_GATE_DEMO v1 etch_poly class Plasma etcher"
+        )));
+        assert!(messages.iter().any(|message| message.contains(
+            "tool run RUN-STALE-META completed_at timestamp is before started_at timestamp"
+        )));
+        assert!(messages.iter().any(|message| {
+            message.contains("queued tool run RUN-QUEUED-META already has started_at timestamp")
+        }));
+        assert!(messages.iter().any(|message| message.contains(
+            "non-completed tool run RUN-QUEUED-META already has completed_at timestamp"
+        )));
+        assert!(messages.iter().any(|message| {
+            message.contains("tool run RUN-ZERO-STEP-VERSION references process route version 0")
         }));
     }
 

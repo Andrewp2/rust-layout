@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "name": "demo_workload_baseline",
+  "workloads": [
+    {
+      "name": "demo_load",
+      "metric": "document_objects",
+      "min_input_size": 1,
+      "max_actual": 5000
+    },
+    {
+      "name": "workspace_validation",
+      "metric": "errors",
+      "min_input_size": 1,
+      "max_actual": 0
+    },
+    {
+      "name": "drc",
+      "metric": "violations",
+      "min_input_size": 1,
+      "max_actual": 32
+    },
+    {
+      "name": "connectivity",
+      "metric": "shorts_plus_opens",
+      "min_input_size": 1,
+      "max_actual": 16
+    },
+    {
+      "name": "layout_diff",
+      "metric": "changes",
+      "min_input_size": 1,
+      "max_actual": 8
+    },
+    {
+      "name": "reticle_checks",
+      "metric": "issues",
+      "min_input_size": 1,
+      "max_actual": 128
+    },
+    {
+      "name": "3d_mesh_build",
+      "metric": "faces",
+      "min_input_size": 1,
+      "max_actual": 128
+    },
+    {
+      "name": "3d_mesh_validation",
+      "metric": "validated_primitives",
+      "min_input_size": 1,
+      "max_actual": 2048
+    }
+  ]
+}

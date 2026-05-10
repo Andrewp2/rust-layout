@@ -1,13 +1,18 @@
-use std::{collections::BTreeMap, error::Error, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt,
+};
 
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::{
     ProcessLayer,
-    mes::{Lot, LotId, ProcessRouteId, ProcessStepId, ToolId, WaferId},
+    mes::{FabMesData, Lot, LotId, ProcessRouteId, ProcessStepId, ToolId, WaferId},
     metrology::MeasurementKind,
-    recipe::RecipeBinding,
+    recipe::{RecipeBinding, RecipeCatalog},
+    yield_analysis::YieldAnalysis,
 };
 
 macro_rules! string_id {
@@ -92,6 +97,162 @@ pub struct ExperimentPlan {
     pub runs: Vec<ExperimentRun>,
     #[serde(default)]
     pub notes: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExperimentValidationSeverity {
+    Error,
+    Warning,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExperimentValidationFinding {
+    pub severity: ExperimentValidationSeverity,
+    pub message: String,
+}
+
+impl ExperimentValidationFinding {
+    fn error(message: impl Into<String>) -> Self {
+        Self {
+            severity: ExperimentValidationSeverity::Error,
+            message: message.into(),
+        }
+    }
+
+    fn warning(message: impl Into<String>) -> Self {
+        Self {
+            severity: ExperimentValidationSeverity::Warning,
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExperimentValidationContext {
+    pub route_steps: BTreeMap<String, BTreeSet<String>>,
+    pub route_step_recipes: BTreeMap<(String, String), String>,
+    pub lot_wafers: BTreeMap<String, BTreeSet<String>>,
+    pub recipe_versions: BTreeMap<String, BTreeSet<u32>>,
+    pub recipe_parameters: BTreeMap<String, BTreeSet<String>>,
+    pub equipment_tool_ids: BTreeSet<String>,
+    pub process_measurement_names: BTreeSet<String>,
+}
+
+impl ExperimentValidationContext {
+    pub fn from_workspace_parts(
+        mes: &FabMesData,
+        recipes: &RecipeCatalog,
+        equipment: &crate::equipment::EquipmentSimulator,
+        yield_analysis: &YieldAnalysis,
+    ) -> Self {
+        let mut route_steps = BTreeMap::<String, BTreeSet<String>>::new();
+        let mut route_step_recipes = BTreeMap::new();
+        for route in mes.routes.values() {
+            let route_id = route.id.as_str().to_string();
+            let steps = route_steps.entry(route_id.clone()).or_default();
+            for step in &route.steps {
+                let step_id = step.id.as_str().to_string();
+                steps.insert(step_id.clone());
+                route_step_recipes.insert(
+                    (route_id.clone(), step_id),
+                    step.required_recipe.as_str().to_string(),
+                );
+            }
+        }
+
+        Self {
+            route_steps,
+            route_step_recipes,
+            lot_wafers: mes
+                .lots
+                .values()
+                .map(|lot| {
+                    (
+                        lot.id.as_str().to_string(),
+                        lot.wafers
+                            .iter()
+                            .map(|wafer| wafer.id.as_str().to_string())
+                            .collect(),
+                    )
+                })
+                .collect(),
+            recipe_versions: recipes
+                .recipes
+                .values()
+                .map(|recipe| {
+                    (
+                        recipe.id.as_str().to_string(),
+                        recipe
+                            .versions
+                            .iter()
+                            .map(|version| version.version.0)
+                            .collect(),
+                    )
+                })
+                .collect(),
+            recipe_parameters: recipes
+                .recipes
+                .values()
+                .map(|recipe| {
+                    (
+                        recipe.id.as_str().to_string(),
+                        recipe.parameter_specs.keys().cloned().collect(),
+                    )
+                })
+                .collect(),
+            equipment_tool_ids: equipment
+                .tools()
+                .map(|tool| tool.id.as_str().to_string())
+                .collect(),
+            process_measurement_names: yield_analysis
+                .process_measurements
+                .iter()
+                .map(|measurement| measurement.name.clone())
+                .collect(),
+        }
+    }
+
+    fn contains_route(&self, route_id: &ProcessRouteId) -> bool {
+        self.route_steps.contains_key(route_id.as_str())
+    }
+
+    fn contains_step(&self, route_id: &ProcessRouteId, step_id: &ProcessStepId) -> bool {
+        self.route_steps
+            .get(route_id.as_str())
+            .is_some_and(|steps| steps.contains(step_id.as_str()))
+    }
+
+    fn recipe_for_step(&self, route_id: &ProcessRouteId, step_id: &ProcessStepId) -> Option<&str> {
+        self.route_step_recipes
+            .get(&(route_id.as_str().to_string(), step_id.as_str().to_string()))
+            .map(String::as_str)
+    }
+
+    fn contains_lot_wafer(&self, lot_id: &LotId, wafer_id: &WaferId) -> bool {
+        self.lot_wafers
+            .get(lot_id.as_str())
+            .is_some_and(|wafers| wafers.contains(wafer_id.as_str()))
+    }
+
+    fn contains_recipe_binding(&self, binding: &RecipeBinding) -> bool {
+        self.recipe_versions
+            .get(binding.recipe_id.as_str())
+            .is_some_and(|versions| versions.contains(&binding.version.0))
+    }
+
+    fn contains_recipe_parameter(&self, recipe: &RecipeBinding, parameter: &str) -> bool {
+        self.recipe_parameters
+            .get(recipe.recipe_id.as_str())
+            .is_some_and(|parameters| parameters.contains(parameter))
+    }
+
+    fn contains_tool(&self, tool_id: &ToolId) -> bool {
+        self.equipment_tool_ids.contains(tool_id.as_str())
+    }
+
+    fn contains_process_measurement_name(&self, name: &str) -> bool {
+        self.process_measurement_names.contains(name)
+    }
 }
 
 impl ExperimentPlan {
@@ -436,6 +597,485 @@ impl ExperimentPlan {
         } else {
             self.status = ExperimentStatus::MatrixGenerated;
         }
+    }
+
+    pub fn validate(&self) -> Vec<ExperimentValidationFinding> {
+        let mut findings = Vec::new();
+        if self.id.as_str().trim().is_empty()
+            && self.factors.is_empty()
+            && self.responses.is_empty()
+            && self.runs.is_empty()
+        {
+            return findings;
+        }
+        if self.id.as_str().trim().is_empty() {
+            findings.push(ExperimentValidationFinding::error(
+                "experiment plan id is empty",
+            ));
+        }
+        if self.title.trim().is_empty() {
+            findings.push(ExperimentValidationFinding::warning(format!(
+                "experiment plan {} has an empty title",
+                self.id
+            )));
+        }
+
+        let mut factor_ids = BTreeSet::new();
+        let mut factor_levels = BTreeMap::new();
+        for factor in &self.factors {
+            if factor.id.as_str().trim().is_empty() {
+                findings.push(ExperimentValidationFinding::error(
+                    "experiment factor id is empty",
+                ));
+                continue;
+            }
+            if !factor_ids.insert(factor.id.clone()) {
+                findings.push(ExperimentValidationFinding::error(format!(
+                    "experiment factor {} is duplicated",
+                    factor.id
+                )));
+            }
+            if factor.name.trim().is_empty() {
+                findings.push(ExperimentValidationFinding::warning(format!(
+                    "experiment factor {} has an empty name",
+                    factor.id
+                )));
+            }
+            validate_factor_source(factor, &mut findings);
+
+            let mut level_ids = BTreeSet::new();
+            for level in &factor.levels {
+                if level.id.as_str().trim().is_empty() {
+                    findings.push(ExperimentValidationFinding::error(format!(
+                        "experiment factor {} has an empty level id",
+                        factor.id
+                    )));
+                    continue;
+                }
+                if !level_ids.insert(level.id.clone()) {
+                    findings.push(ExperimentValidationFinding::error(format!(
+                        "experiment factor {} level {} is duplicated",
+                        factor.id, level.id
+                    )));
+                }
+                if level.label.trim().is_empty() {
+                    findings.push(ExperimentValidationFinding::warning(format!(
+                        "experiment factor {} level {} has an empty label",
+                        factor.id, level.id
+                    )));
+                }
+                validate_factor_value(&factor.id, level, &mut findings);
+            }
+            if level_ids.is_empty() {
+                findings.push(ExperimentValidationFinding::error(format!(
+                    "experiment factor {} has no levels",
+                    factor.id
+                )));
+            }
+            factor_levels.insert(factor.id.clone(), level_ids);
+        }
+
+        let mut response_ids = BTreeSet::new();
+        for response in &self.responses {
+            if response.id.as_str().trim().is_empty() {
+                findings.push(ExperimentValidationFinding::error(
+                    "experiment response id is empty",
+                ));
+                continue;
+            }
+            if !response_ids.insert(response.id.clone()) {
+                findings.push(ExperimentValidationFinding::error(format!(
+                    "experiment response {} is duplicated",
+                    response.id
+                )));
+            }
+            validate_response(response, &mut findings);
+        }
+
+        let mut run_ids = BTreeSet::new();
+        for run in &self.runs {
+            validate_run(
+                run,
+                &factor_ids,
+                &factor_levels,
+                &response_ids,
+                &mut run_ids,
+                &mut findings,
+            );
+        }
+
+        if expected_status(self) != self.status {
+            findings.push(ExperimentValidationFinding::warning(format!(
+                "experiment plan {} status {} does not match run/response state {}",
+                self.id,
+                self.status.label(),
+                expected_status(self).label()
+            )));
+        }
+
+        findings
+    }
+
+    pub fn validate_with_context(
+        &self,
+        context: &ExperimentValidationContext,
+    ) -> Vec<ExperimentValidationFinding> {
+        let mut findings = self.validate();
+        if self.id.as_str().trim().is_empty()
+            && self.factors.is_empty()
+            && self.responses.is_empty()
+            && self.runs.is_empty()
+        {
+            return findings;
+        }
+        self.validate_context_links(context, &mut findings);
+        findings
+    }
+
+    fn validate_context_links(
+        &self,
+        context: &ExperimentValidationContext,
+        findings: &mut Vec<ExperimentValidationFinding>,
+    ) {
+        if !self.route_id.as_str().trim().is_empty() && !context.contains_route(&self.route_id) {
+            findings.push(ExperimentValidationFinding::error(format!(
+                "experiment plan {} references missing MES route {}",
+                self.id, self.route_id
+            )));
+        } else if !self.step_id.as_str().trim().is_empty()
+            && !context.contains_step(&self.route_id, &self.step_id)
+        {
+            findings.push(ExperimentValidationFinding::error(format!(
+                "experiment plan {} references missing MES step {} on route {}",
+                self.id, self.step_id, self.route_id
+            )));
+        }
+
+        if !self.baseline_recipe.recipe_id.as_str().trim().is_empty()
+            && !context.contains_recipe_binding(&self.baseline_recipe)
+        {
+            findings.push(ExperimentValidationFinding::error(format!(
+                "experiment plan {} references missing baseline recipe binding {}",
+                self.id, self.baseline_recipe
+            )));
+        }
+        if let Some(step_recipe) = context.recipe_for_step(&self.route_id, &self.step_id)
+            && step_recipe != self.baseline_recipe.recipe_id.as_str()
+        {
+            findings.push(ExperimentValidationFinding::error(format!(
+                "experiment plan {} baseline recipe {} does not match MES step {} recipe {}",
+                self.id, self.baseline_recipe.recipe_id, self.step_id, step_recipe
+            )));
+        }
+
+        for factor in &self.factors {
+            validate_factor_source_context(factor, context, findings);
+        }
+        for response in &self.responses {
+            validate_response_source_context(response, &self.route_id, context, findings);
+        }
+        for run in &self.runs {
+            validate_run_context(run, context, findings);
+        }
+    }
+}
+
+fn validate_factor_source(
+    factor: &ExperimentFactor,
+    findings: &mut Vec<ExperimentValidationFinding>,
+) {
+    match &factor.source {
+        FactorSource::RecipeParameter { recipe, parameter } => {
+            if recipe.recipe_id.as_str().trim().is_empty() || parameter.trim().is_empty() {
+                findings.push(ExperimentValidationFinding::warning(format!(
+                    "experiment factor {} has incomplete recipe-parameter source",
+                    factor.id
+                )));
+            }
+        }
+        FactorSource::ToolSetting { tool_id, setting } => {
+            if tool_id.as_str().trim().is_empty() || setting.trim().is_empty() {
+                findings.push(ExperimentValidationFinding::warning(format!(
+                    "experiment factor {} has incomplete tool-setting source",
+                    factor.id
+                )));
+            }
+        }
+        FactorSource::ProcessStep { step_id, field } => {
+            if step_id.as_str().trim().is_empty() || field.trim().is_empty() {
+                findings.push(ExperimentValidationFinding::warning(format!(
+                    "experiment factor {} has incomplete process-step source",
+                    factor.id
+                )));
+            }
+        }
+        FactorSource::Manual => {}
+    }
+}
+
+fn validate_factor_source_context(
+    factor: &ExperimentFactor,
+    context: &ExperimentValidationContext,
+    findings: &mut Vec<ExperimentValidationFinding>,
+) {
+    match &factor.source {
+        FactorSource::RecipeParameter { recipe, parameter } => {
+            if recipe.recipe_id.as_str().trim().is_empty() || parameter.trim().is_empty() {
+                return;
+            }
+            if !context.contains_recipe_binding(recipe) {
+                findings.push(ExperimentValidationFinding::error(format!(
+                    "experiment factor {} references missing recipe binding {}",
+                    factor.id, recipe
+                )));
+            } else if !context.contains_recipe_parameter(recipe, parameter) {
+                findings.push(ExperimentValidationFinding::error(format!(
+                    "experiment factor {} references missing recipe parameter {} on {}",
+                    factor.id, parameter, recipe
+                )));
+            }
+        }
+        FactorSource::ToolSetting { tool_id, .. } => {
+            if !tool_id.as_str().trim().is_empty() && !context.contains_tool(tool_id) {
+                findings.push(ExperimentValidationFinding::error(format!(
+                    "experiment factor {} references missing equipment tool {}",
+                    factor.id, tool_id
+                )));
+            }
+        }
+        FactorSource::ProcessStep { step_id, .. } => {
+            if !step_id.as_str().trim().is_empty()
+                && !context
+                    .route_steps
+                    .values()
+                    .any(|steps| steps.contains(step_id.as_str()))
+            {
+                findings.push(ExperimentValidationFinding::error(format!(
+                    "experiment factor {} references missing process step {}",
+                    factor.id, step_id
+                )));
+            }
+        }
+        FactorSource::Manual => {}
+    }
+}
+
+fn validate_factor_value(
+    factor_id: &FactorId,
+    level: &FactorLevel,
+    findings: &mut Vec<ExperimentValidationFinding>,
+) {
+    if let FactorValue::Numeric(value) = level.value
+        && !value.is_finite()
+    {
+        findings.push(ExperimentValidationFinding::error(format!(
+            "experiment factor {factor_id} level {} has non-finite value",
+            level.id
+        )));
+    }
+}
+
+fn validate_response(response: &ResponseSpec, findings: &mut Vec<ExperimentValidationFinding>) {
+    if response.name.trim().is_empty() {
+        findings.push(ExperimentValidationFinding::warning(format!(
+            "experiment response {} has an empty name",
+            response.id
+        )));
+    }
+    for (label, value) in [
+        ("target", response.target),
+        ("lower spec", response.lower_spec),
+        ("upper spec", response.upper_spec),
+    ] {
+        if value.is_some_and(|value| !value.is_finite()) {
+            findings.push(ExperimentValidationFinding::error(format!(
+                "experiment response {} has non-finite {label}",
+                response.id
+            )));
+        }
+    }
+    if let (Some(lower), Some(upper)) = (response.lower_spec, response.upper_spec)
+        && lower > upper
+    {
+        findings.push(ExperimentValidationFinding::error(format!(
+            "experiment response {} lower spec is above upper spec",
+            response.id
+        )));
+    }
+    if response.goal == ResponseGoal::Target && response.target.is_none() {
+        findings.push(ExperimentValidationFinding::warning(format!(
+            "experiment response {} has target goal but no target value",
+            response.id
+        )));
+    }
+}
+
+fn validate_response_source_context(
+    response: &ResponseSpec,
+    route_id: &ProcessRouteId,
+    context: &ExperimentValidationContext,
+    findings: &mut Vec<ExperimentValidationFinding>,
+) {
+    match &response.source {
+        ResponseSource::MetrologyMeasurement {
+            process_step_id, ..
+        } => {
+            if !process_step_id.as_str().trim().is_empty()
+                && !context.contains_step(route_id, process_step_id)
+            {
+                findings.push(ExperimentValidationFinding::error(format!(
+                    "experiment response {} references missing MES step {} on route {}",
+                    response.id, process_step_id, route_id
+                )));
+            }
+        }
+        ResponseSource::ProcessMeasurement { name, .. } => {
+            if !name.trim().is_empty() && !context.contains_process_measurement_name(name) {
+                findings.push(ExperimentValidationFinding::error(format!(
+                    "experiment response {} references missing process measurement name {}",
+                    response.id, name
+                )));
+            }
+        }
+        ResponseSource::YieldMetric { .. } | ResponseSource::Manual => {}
+    }
+}
+
+fn validate_run(
+    run: &ExperimentRun,
+    factor_ids: &BTreeSet<FactorId>,
+    factor_levels: &BTreeMap<FactorId, BTreeSet<FactorLevelId>>,
+    response_ids: &BTreeSet<ResponseSpecId>,
+    run_ids: &mut BTreeSet<ExperimentRunId>,
+    findings: &mut Vec<ExperimentValidationFinding>,
+) {
+    if run.id.as_str().trim().is_empty() {
+        findings.push(ExperimentValidationFinding::error(
+            "experiment run id is empty",
+        ));
+    } else if !run_ids.insert(run.id.clone()) {
+        findings.push(ExperimentValidationFinding::error(format!(
+            "experiment run {} is duplicated",
+            run.id
+        )));
+    }
+    if run.assignment.lot_id.as_str().trim().is_empty()
+        || run.assignment.wafer_id.as_str().trim().is_empty()
+    {
+        findings.push(ExperimentValidationFinding::error(format!(
+            "experiment run {} has incomplete lot or wafer assignment",
+            run.id
+        )));
+    }
+    if run.assignment.run_order == 0 {
+        findings.push(ExperimentValidationFinding::warning(format!(
+            "experiment run {} has run order 0",
+            run.id
+        )));
+    }
+
+    for factor_id in factor_ids {
+        if !run.factor_levels.contains_key(factor_id) {
+            findings.push(ExperimentValidationFinding::error(format!(
+                "experiment run {} is missing factor {}",
+                run.id, factor_id
+            )));
+        }
+    }
+    for (factor_id, level_id) in &run.factor_levels {
+        match factor_levels.get(factor_id) {
+            Some(levels) if levels.contains(level_id) => {}
+            Some(_) => findings.push(ExperimentValidationFinding::error(format!(
+                "experiment run {} references missing level {} for factor {}",
+                run.id, level_id, factor_id
+            ))),
+            None => findings.push(ExperimentValidationFinding::error(format!(
+                "experiment run {} references missing factor {}",
+                run.id, factor_id
+            ))),
+        }
+    }
+
+    for (response_id, value) in &run.responses {
+        if !response_ids.contains(response_id) {
+            findings.push(ExperimentValidationFinding::error(format!(
+                "experiment run {} has value for missing response {}",
+                run.id, response_id
+            )));
+        }
+        if !value.value.is_finite() {
+            findings.push(ExperimentValidationFinding::error(format!(
+                "experiment run {} response {} has non-finite value",
+                run.id, response_id
+            )));
+        }
+        if value.captured_at.trim().is_empty() {
+            findings.push(ExperimentValidationFinding::warning(format!(
+                "experiment run {} response {} has empty capture timestamp",
+                run.id, response_id
+            )));
+        }
+    }
+    let known_response_count = run
+        .responses
+        .keys()
+        .filter(|response_id| response_ids.contains(*response_id))
+        .count();
+    if run.status == ExperimentRunStatus::Complete && known_response_count < response_ids.len() {
+        findings.push(ExperimentValidationFinding::error(format!(
+            "experiment run {} is complete with missing response values",
+            run.id
+        )));
+    }
+}
+
+fn validate_run_context(
+    run: &ExperimentRun,
+    context: &ExperimentValidationContext,
+    findings: &mut Vec<ExperimentValidationFinding>,
+) {
+    if !run.assignment.lot_id.as_str().trim().is_empty()
+        && !run.assignment.wafer_id.as_str().trim().is_empty()
+        && !context.contains_lot_wafer(&run.assignment.lot_id, &run.assignment.wafer_id)
+    {
+        findings.push(ExperimentValidationFinding::error(format!(
+            "experiment run {} references missing MES lot/wafer {} / {}",
+            run.id, run.assignment.lot_id, run.assignment.wafer_id
+        )));
+    }
+    if let Some(recipe) = &run.recipe
+        && !recipe.recipe_id.as_str().trim().is_empty()
+        && !context.contains_recipe_binding(recipe)
+    {
+        findings.push(ExperimentValidationFinding::error(format!(
+            "experiment run {} references missing recipe binding {}",
+            run.id, recipe
+        )));
+    }
+    if let Some(tool_id) = &run.tool_id
+        && !tool_id.as_str().trim().is_empty()
+        && !context.contains_tool(tool_id)
+    {
+        findings.push(ExperimentValidationFinding::error(format!(
+            "experiment run {} references missing equipment tool {}",
+            run.id, tool_id
+        )));
+    }
+}
+
+fn expected_status(plan: &ExperimentPlan) -> ExperimentStatus {
+    if plan.runs.is_empty() {
+        ExperimentStatus::Draft
+    } else if plan
+        .runs
+        .iter()
+        .all(|run| run.status == ExperimentRunStatus::Complete)
+    {
+        ExperimentStatus::AnalysisReady
+    } else if plan.runs.iter().any(|run| !run.responses.is_empty()) {
+        ExperimentStatus::Running
+    } else {
+        ExperimentStatus::MatrixGenerated
     }
 }
 
@@ -1123,5 +1763,164 @@ mod tests {
         let summary = plan.analysis_summary(Some(&ResponseSpecId::new("poly_cd_nm")));
         assert_eq!(summary.completed_runs, 4);
         assert_eq!(summary.missing_response_count, 6);
+    }
+
+    #[test]
+    fn sample_experiment_plan_validates() {
+        let findings = sample_experiment_plan().validate();
+
+        assert_eq!(findings, Vec::new());
+    }
+
+    fn validation_context() -> ExperimentValidationContext {
+        ExperimentValidationContext::from_workspace_parts(
+            &crate::mes::FabMesData::sample(),
+            &crate::recipe::RecipeCatalog::sample(),
+            &crate::equipment::EquipmentSimulator::demo_fab(),
+            &crate::yield_analysis::YieldAnalysis::synthetic(),
+        )
+    }
+
+    #[test]
+    fn sample_experiment_plan_validates_against_workspace_context() {
+        let plan = sample_experiment_plan();
+        let findings = plan.validate_with_context(&validation_context());
+
+        assert_eq!(findings, Vec::new());
+    }
+
+    #[test]
+    fn validation_context_rejects_missing_workspace_references() {
+        let mut plan = sample_experiment_plan();
+        plan.baseline_recipe = RecipeBinding::new("MISSING_BASELINE", 1);
+        plan.factors[0].source = FactorSource::RecipeParameter {
+            recipe: RecipeBinding::new("LITHO_POLY_EXPOSE_001", 1),
+            parameter: "missing_parameter".to_string(),
+        };
+        plan.responses[0].source = ResponseSource::MetrologyMeasurement {
+            kind: MeasurementKind::CriticalDimensionNm,
+            process_step_id: ProcessStepId::new("MISSING_METRO_STEP"),
+        };
+        plan.runs[0].assignment.wafer_id = WaferId::new("MISSING-WAFER");
+        plan.runs[0].recipe = Some(RecipeBinding::new("MISSING_RUN_RECIPE", 1));
+        plan.runs[0].tool_id = Some(ToolId::new("MISSING-TOOL"));
+
+        let findings = plan.validate_with_context(&validation_context());
+
+        assert!(
+            findings.iter().any(|finding| {
+                finding
+                    .message
+                    .contains("missing baseline recipe binding MISSING_BASELINE")
+            }),
+            "{findings:?}"
+        );
+        assert!(
+            findings.iter().any(|finding| {
+                finding
+                    .message
+                    .contains("factor dose references missing recipe parameter missing_parameter")
+            }),
+            "{findings:?}"
+        );
+        assert!(
+            findings.iter().any(|finding| {
+                finding
+                    .message
+                    .contains("response poly_cd_nm references missing MES step MISSING_METRO_STEP")
+            }),
+            "{findings:?}"
+        );
+        assert!(
+            findings.iter().any(|finding| {
+                finding
+                    .message
+                    .contains("run DOE-POLY-CD-0042-R01 references missing MES lot/wafer")
+            }),
+            "{findings:?}"
+        );
+        assert!(
+            findings.iter().any(|finding| {
+                finding
+                    .message
+                    .contains("run DOE-POLY-CD-0042-R01 references missing recipe binding")
+            }),
+            "{findings:?}"
+        );
+        assert!(
+            findings.iter().any(|finding| {
+                finding
+                    .message
+                    .contains("run DOE-POLY-CD-0042-R01 references missing equipment tool")
+            }),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn validation_accepts_empty_draft_placeholder_plan() {
+        let plan = ExperimentPlan {
+            id: ExperimentId::default(),
+            title: "No experiment plan loaded".to_string(),
+            objective: String::new(),
+            owner: String::new(),
+            status: ExperimentStatus::Draft,
+            route_id: ProcessRouteId::default(),
+            step_id: ProcessStepId::default(),
+            baseline_recipe: RecipeBinding::new("", 0),
+            factors: Vec::new(),
+            responses: Vec::new(),
+            runs: Vec::new(),
+            notes: Vec::new(),
+        };
+
+        assert_eq!(plan.validate(), Vec::new());
+    }
+
+    #[test]
+    fn validation_rejects_broken_run_factors_responses_and_values() {
+        let mut plan = minimal_plan();
+        plan.generate_full_factorial(assignments(4)).unwrap();
+        plan.factors[0].levels[0].value = FactorValue::Numeric(f64::NAN);
+        plan.responses[0].lower_spec = Some(120.0);
+        plan.responses[0].upper_spec = Some(100.0);
+        let run = &mut plan.runs[0];
+        run.factor_levels.remove(&FactorId::new("temperature"));
+        run.responses.insert(
+            ResponseSpecId::new("missing-response"),
+            ResponseValue {
+                value: f64::NAN,
+                measurement_id: None,
+                captured_at: String::new(),
+            },
+        );
+        run.status = ExperimentRunStatus::Complete;
+
+        let findings = plan.validate();
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("non-finite value")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("lower spec is above upper spec")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("missing factor")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("missing response")),
+            "{findings:?}"
+        );
     }
 }

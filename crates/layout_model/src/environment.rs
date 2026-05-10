@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -207,6 +207,34 @@ pub struct CleanroomEnvironment {
     pub events: Vec<FacilityEvent>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnvironmentValidationSeverity {
+    Error,
+    Warning,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnvironmentValidationFinding {
+    pub severity: EnvironmentValidationSeverity,
+    pub message: String,
+}
+
+impl EnvironmentValidationFinding {
+    fn error(message: impl Into<String>) -> Self {
+        Self {
+            severity: EnvironmentValidationSeverity::Error,
+            message: message.into(),
+        }
+    }
+
+    fn warning(message: impl Into<String>) -> Self {
+        Self {
+            severity: EnvironmentValidationSeverity::Warning,
+            message: message.into(),
+        }
+    }
+}
+
 impl CleanroomEnvironment {
     pub fn new(
         sensors: Vec<EnvironmentSensor>,
@@ -337,6 +365,265 @@ impl CleanroomEnvironment {
             direction,
             excursion_count,
         })
+    }
+
+    pub fn validate(&self) -> Vec<EnvironmentValidationFinding> {
+        let mut findings = Vec::new();
+        let mut sensor_ids = BTreeSet::new();
+        for sensor in &self.sensors {
+            if sensor.id.trim().is_empty() {
+                findings.push(EnvironmentValidationFinding::error(
+                    "environment sensor id is empty",
+                ));
+                continue;
+            }
+            if !sensor_ids.insert(sensor.id.clone()) {
+                findings.push(EnvironmentValidationFinding::error(format!(
+                    "environment sensor {} is duplicated",
+                    sensor.id
+                )));
+            }
+            if sensor.name.trim().is_empty() {
+                findings.push(EnvironmentValidationFinding::warning(format!(
+                    "environment sensor {} has an empty name",
+                    sensor.id
+                )));
+            }
+            if sensor.zone.trim().is_empty() {
+                findings.push(EnvironmentValidationFinding::warning(format!(
+                    "environment sensor {} has an empty zone",
+                    sensor.id
+                )));
+            }
+            if sensor.unit.trim().is_empty() {
+                findings.push(EnvironmentValidationFinding::warning(format!(
+                    "environment sensor {} has an empty unit",
+                    sensor.id
+                )));
+            }
+            validate_thresholds(sensor, &mut findings);
+        }
+
+        let mut reading_keys = BTreeSet::new();
+        let mut readings_by_key = BTreeMap::new();
+        for reading in &self.readings {
+            let reading_key = (reading.sensor_id.clone(), reading.timestamp_min);
+            if !reading_keys.insert(reading_key.clone()) {
+                findings.push(EnvironmentValidationFinding::error(format!(
+                    "environment has duplicate reading for sensor {} at {}",
+                    reading.sensor_id, reading.timestamp_min
+                )));
+            } else {
+                readings_by_key.insert(reading_key, reading);
+            }
+            if !sensor_ids.contains(&reading.sensor_id) {
+                findings.push(EnvironmentValidationFinding::error(format!(
+                    "environment reading at {} references missing sensor {}",
+                    reading.timestamp_min, reading.sensor_id
+                )));
+            }
+            if !reading.value.is_finite() {
+                findings.push(EnvironmentValidationFinding::error(format!(
+                    "environment reading for sensor {} has non-finite value",
+                    reading.sensor_id
+                )));
+            }
+        }
+
+        let mut alarm_ids = BTreeSet::new();
+        let latest_readings = self
+            .readings
+            .iter()
+            .map(|reading| (reading.sensor_id.as_str(), reading))
+            .fold(BTreeMap::new(), |mut latest, (sensor_id, reading)| {
+                latest
+                    .entry(sensor_id)
+                    .and_modify(|current: &mut &EnvironmentReading| {
+                        if reading.timestamp_min > current.timestamp_min {
+                            *current = reading;
+                        }
+                    })
+                    .or_insert(reading);
+                latest
+            });
+        for alarm in &self.alarms {
+            if alarm.id.trim().is_empty() {
+                findings.push(EnvironmentValidationFinding::error(
+                    "environment alarm id is empty",
+                ));
+            } else if !alarm_ids.insert(alarm.id.clone()) {
+                findings.push(EnvironmentValidationFinding::error(format!(
+                    "environment alarm {} is duplicated",
+                    alarm.id
+                )));
+            }
+            if !sensor_ids.contains(&alarm.sensor_id) {
+                findings.push(EnvironmentValidationFinding::error(format!(
+                    "environment alarm {} references missing sensor {}",
+                    alarm.id, alarm.sensor_id
+                )));
+            }
+            if !alarm.value.is_finite() {
+                findings.push(EnvironmentValidationFinding::error(format!(
+                    "environment alarm {} has non-finite value",
+                    alarm.id
+                )));
+            }
+            if alarm.message.trim().is_empty() {
+                findings.push(EnvironmentValidationFinding::warning(format!(
+                    "environment alarm {} has an empty message",
+                    alarm.id
+                )));
+            }
+            let expected_active = latest_readings
+                .get(alarm.sensor_id.as_str())
+                .is_some_and(|reading| reading.timestamp_min == alarm.timestamp_min);
+            if alarm.active != expected_active {
+                findings.push(EnvironmentValidationFinding::warning(format!(
+                    "environment alarm {} active state does not match latest reading for sensor {}",
+                    alarm.id, alarm.sensor_id
+                )));
+            }
+            if let Some(reading) =
+                readings_by_key.get(&(alarm.sensor_id.clone(), alarm.timestamp_min))
+            {
+                if (alarm.value - reading.value).abs() > f64::EPSILON {
+                    findings.push(EnvironmentValidationFinding::error(format!(
+                        "environment alarm {} value does not match source reading",
+                        alarm.id
+                    )));
+                }
+                if let Some(sensor) = self
+                    .sensors
+                    .iter()
+                    .find(|sensor| sensor.id == alarm.sensor_id)
+                {
+                    match sensor.thresholds.evaluate(reading.value) {
+                        Some(expected) if expected != alarm.severity => {
+                            findings.push(EnvironmentValidationFinding::error(format!(
+                                "environment alarm {} severity {} does not match source reading severity {}",
+                                alarm.id,
+                                alarm.severity.label(),
+                                expected.label()
+                            )));
+                        }
+                        None => findings.push(EnvironmentValidationFinding::error(format!(
+                            "environment alarm {} does not correspond to a threshold excursion",
+                            alarm.id
+                        ))),
+                        Some(_) => {}
+                    }
+                }
+            } else if sensor_ids.contains(&alarm.sensor_id) {
+                findings.push(EnvironmentValidationFinding::error(format!(
+                    "environment alarm {} references missing source reading {} at {}",
+                    alarm.id, alarm.sensor_id, alarm.timestamp_min
+                )));
+            }
+        }
+
+        let mut correlation_ids = BTreeSet::new();
+        for correlation in &self.correlations {
+            if correlation.id.trim().is_empty() {
+                findings.push(EnvironmentValidationFinding::error(
+                    "environment correlation id is empty",
+                ));
+            } else if !correlation_ids.insert(correlation.id.clone()) {
+                findings.push(EnvironmentValidationFinding::error(format!(
+                    "environment correlation {} is duplicated",
+                    correlation.id
+                )));
+            }
+            if correlation.sensor_ids.is_empty() {
+                findings.push(EnvironmentValidationFinding::warning(format!(
+                    "environment correlation {} has no linked sensors",
+                    correlation.id
+                )));
+            }
+            if correlation.label.trim().is_empty() {
+                findings.push(EnvironmentValidationFinding::warning(format!(
+                    "environment correlation {} has an empty label",
+                    correlation.id
+                )));
+            }
+            if correlation.process_area.trim().is_empty() {
+                findings.push(EnvironmentValidationFinding::warning(format!(
+                    "environment correlation {} has an empty process area",
+                    correlation.id
+                )));
+            }
+            if correlation.description.trim().is_empty() {
+                findings.push(EnvironmentValidationFinding::warning(format!(
+                    "environment correlation {} has an empty description",
+                    correlation.id
+                )));
+            }
+            let mut correlation_sensor_ids = BTreeSet::new();
+            for sensor_id in &correlation.sensor_ids {
+                if sensor_id.trim().is_empty() {
+                    findings.push(EnvironmentValidationFinding::error(format!(
+                        "environment correlation {} has an empty linked sensor id",
+                        correlation.id
+                    )));
+                    continue;
+                }
+                if !correlation_sensor_ids.insert(sensor_id.clone()) {
+                    findings.push(EnvironmentValidationFinding::warning(format!(
+                        "environment correlation {} repeats linked sensor {}",
+                        correlation.id, sensor_id
+                    )));
+                }
+                if !sensor_ids.contains(sensor_id) {
+                    findings.push(EnvironmentValidationFinding::error(format!(
+                        "environment correlation {} references missing sensor {}",
+                        correlation.id, sensor_id
+                    )));
+                }
+            }
+        }
+
+        let mut event_keys = BTreeSet::new();
+        for event in &self.events {
+            let event_key = (
+                event.timestamp_min,
+                event.zone.trim().to_string(),
+                event.title.trim().to_string(),
+            );
+            if !event_keys.insert(event_key) {
+                findings.push(EnvironmentValidationFinding::error(format!(
+                    "environment event {} at {} in {} is duplicated",
+                    event.title, event.timestamp_min, event.zone
+                )));
+            }
+            if event.zone.trim().is_empty() {
+                findings.push(EnvironmentValidationFinding::warning(format!(
+                    "environment event at {} has an empty zone",
+                    event.timestamp_min
+                )));
+            }
+            if event.title.trim().is_empty() {
+                findings.push(EnvironmentValidationFinding::warning(format!(
+                    "environment event at {} has an empty title",
+                    event.timestamp_min
+                )));
+            }
+            if event.detail.trim().is_empty() {
+                findings.push(EnvironmentValidationFinding::warning(format!(
+                    "environment event {} has an empty detail",
+                    event.title
+                )));
+            }
+            if let Some(alarm_id) = event.linked_alarm_id.as_ref()
+                && !alarm_ids.contains(alarm_id)
+            {
+                findings.push(EnvironmentValidationFinding::error(format!(
+                    "environment event {} references missing alarm {}",
+                    event.title, alarm_id
+                )));
+            }
+        }
+
+        findings
     }
 
     pub fn sample() -> Self {
@@ -505,6 +792,65 @@ impl CleanroomEnvironment {
     }
 }
 
+fn validate_thresholds(
+    sensor: &EnvironmentSensor,
+    findings: &mut Vec<EnvironmentValidationFinding>,
+) {
+    for (label, value) in [
+        ("warning low", sensor.thresholds.warning_low),
+        ("warning high", sensor.thresholds.warning_high),
+        ("critical low", sensor.thresholds.critical_low),
+        ("critical high", sensor.thresholds.critical_high),
+    ] {
+        if value.is_some_and(|value| !value.is_finite()) {
+            findings.push(EnvironmentValidationFinding::error(format!(
+                "environment sensor {} has non-finite {label} threshold",
+                sensor.id
+            )));
+        }
+    }
+    if let (Some(low), Some(high)) = (
+        sensor.thresholds.warning_low,
+        sensor.thresholds.warning_high,
+    ) && low > high
+    {
+        findings.push(EnvironmentValidationFinding::error(format!(
+            "environment sensor {} warning low threshold is above warning high threshold",
+            sensor.id
+        )));
+    }
+    if let (Some(low), Some(high)) = (
+        sensor.thresholds.critical_low,
+        sensor.thresholds.critical_high,
+    ) && low > high
+    {
+        findings.push(EnvironmentValidationFinding::error(format!(
+            "environment sensor {} critical low threshold is above critical high threshold",
+            sensor.id
+        )));
+    }
+    if let (Some(critical_low), Some(warning_low)) = (
+        sensor.thresholds.critical_low,
+        sensor.thresholds.warning_low,
+    ) && critical_low > warning_low
+    {
+        findings.push(EnvironmentValidationFinding::error(format!(
+            "environment sensor {} critical low threshold is above warning low threshold",
+            sensor.id
+        )));
+    }
+    if let (Some(critical_high), Some(warning_high)) = (
+        sensor.thresholds.critical_high,
+        sensor.thresholds.warning_high,
+    ) && critical_high < warning_high
+    {
+        findings.push(EnvironmentValidationFinding::error(format!(
+            "environment sensor {} critical high threshold is below warning high threshold",
+            sensor.id
+        )));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -572,5 +918,215 @@ mod tests {
 
         assert_eq!(summary.direction, TrendDirection::Rising);
         assert_eq!(summary.excursion_count, 5);
+    }
+
+    #[test]
+    fn sample_environment_validates() {
+        let findings = CleanroomEnvironment::sample().validate();
+
+        assert_eq!(findings, Vec::new());
+    }
+
+    #[test]
+    fn validation_rejects_stale_alarm_and_correlation_metadata() {
+        let mut model = CleanroomEnvironment::sample();
+        let active_alarm = model
+            .alarms
+            .iter_mut()
+            .find(|alarm| alarm.active)
+            .expect("sample has active environment alarms");
+        active_alarm.active = false;
+        active_alarm.value += 1.0;
+        active_alarm.severity = EnvironmentAlarmSeverity::Advisory;
+        active_alarm.message.clear();
+
+        let in_control_reading = model
+            .readings
+            .iter()
+            .find(|reading| reading.sensor_id == "temp-litho" && reading.timestamp_min == 480)
+            .expect("sample has in-control litho reading")
+            .clone();
+        model.alarms.push(EnvironmentAlarm {
+            id: "manual-in-control".to_string(),
+            sensor_id: in_control_reading.sensor_id,
+            severity: EnvironmentAlarmSeverity::Warning,
+            timestamp_min: in_control_reading.timestamp_min,
+            value: in_control_reading.value,
+            message: "Manual alarm on in-control reading".to_string(),
+            active: false,
+            correlation_labels: Vec::new(),
+        });
+        model.alarms.push(EnvironmentAlarm {
+            id: "missing-reading".to_string(),
+            sensor_id: "temp-litho".to_string(),
+            severity: EnvironmentAlarmSeverity::Warning,
+            timestamp_min: 9999,
+            value: 23.0,
+            message: String::new(),
+            active: false,
+            correlation_labels: Vec::new(),
+        });
+        model.correlations.push(EnvironmentCorrelationLabel {
+            id: "bad-correlation".to_string(),
+            label: String::new(),
+            process_area: String::new(),
+            description: String::new(),
+            sensor_ids: vec![
+                String::new(),
+                "temp-litho".to_string(),
+                "temp-litho".to_string(),
+            ],
+        });
+
+        let findings = model.validate();
+
+        assert!(
+            findings.iter().any(|finding| finding
+                .message
+                .contains("active state does not match latest reading")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("empty message")),
+            "{findings:?}"
+        );
+        assert!(
+            findings.iter().any(|finding| finding
+                .message
+                .contains("value does not match source reading")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("severity Advisory does not match")),
+            "{findings:?}"
+        );
+        assert!(
+            findings.iter().any(|finding| finding
+                .message
+                .contains("does not correspond to a threshold excursion")),
+            "{findings:?}"
+        );
+        assert!(
+            findings.iter().any(|finding| finding
+                .message
+                .contains("references missing source reading")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("empty linked sensor id")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("repeats linked sensor temp-litho")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("empty label")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("empty process area")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("empty description")),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn validation_rejects_broken_sensor_references_and_thresholds() {
+        let mut model = CleanroomEnvironment::sample();
+        model.sensors[0].thresholds.critical_high = Some(21.0);
+        let duplicate_reading = model.readings[0].clone();
+        model.readings.push(duplicate_reading);
+        model.readings.push(EnvironmentReading {
+            sensor_id: "missing-sensor".to_string(),
+            timestamp_min: 42,
+            value: f64::NAN,
+        });
+        model.correlations.push(EnvironmentCorrelationLabel {
+            id: "bad-correlation".to_string(),
+            label: "Broken".to_string(),
+            process_area: "Lithography".to_string(),
+            description: String::new(),
+            sensor_ids: vec!["missing-sensor".to_string()],
+        });
+        model.events.push(FacilityEvent {
+            timestamp_min: 43,
+            zone: String::new(),
+            kind: FacilityEventKind::Excursion,
+            title: "Broken event".to_string(),
+            detail: String::new(),
+            linked_alarm_id: Some("missing-alarm".to_string()),
+        });
+        model.events.push(FacilityEvent {
+            timestamp_min: model.events[0].timestamp_min,
+            zone: model.events[0].zone.clone(),
+            kind: model.events[0].kind,
+            title: model.events[0].title.clone(),
+            detail: "duplicated event row".to_string(),
+            linked_alarm_id: None,
+        });
+
+        let findings = model.validate();
+
+        assert!(
+            findings.iter().any(|finding| finding
+                .message
+                .contains("critical high threshold is below warning high threshold")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("missing sensor")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("duplicate reading")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("missing alarm")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("empty zone")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("empty detail")),
+            "{findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("event")
+                    && finding.message.contains("duplicated")),
+            "{findings:?}"
+        );
     }
 }

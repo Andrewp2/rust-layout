@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "name": "hierarchy_workload_baseline",
+  "workloads": [
+    {
+      "name": "hierarchy_startup",
+      "metric": "document_objects",
+      "min_input_size": 32,
+      "max_actual": 128
+    },
+    {
+      "name": "drc",
+      "metric": "violations",
+      "min_input_size": 32,
+      "max_actual": 512
+    },
+    {
+      "name": "connectivity",
+      "metric": "shorts_plus_opens",
+      "min_input_size": 32,
+      "max_actual": 512
+    },
+    {
+      "name": "layout_diff",
+      "metric": "changes",
+      "min_input_size": 32,
+      "max_actual": 8
+    },
+    {
+      "name": "reticle_checks",
+      "metric": "issues",
+      "min_input_size": 32,
+      "max_actual": 2048
+    },
+    {
+      "name": "3d_mesh_build",
+      "metric": "faces",
+      "min_input_size": 32,
+      "max_actual": 2048
+    },
+    {
+      "name": "3d_mesh_validation",
+      "metric": "validated_primitives",
+      "min_input_size": 32,
+      "max_actual": 4096
+    }
+  ]
+}
