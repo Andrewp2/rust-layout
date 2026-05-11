@@ -862,9 +862,9 @@ impl LotGenealogy {
         let direct_wafers = direct.iter().cloned().collect::<Vec<_>>();
 
         let mut impacted = BTreeMap::new();
-        for wafer in direct_wafers.iter().cloned() {
+        for wafer in &direct_wafers {
             impacted.insert(wafer.clone(), ImpactRelationship::Direct);
-            self.add_descendant_impacts(&wafer, &mut impacted);
+            self.add_descendant_impacts(wafer, &mut impacted);
         }
         for wafer in std::mem::take(&mut direct) {
             impacted.insert(wafer, ImpactRelationship::Direct);

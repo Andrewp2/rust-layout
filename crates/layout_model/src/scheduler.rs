@@ -77,10 +77,7 @@ impl DispatchTool {
         self.state == ToolDispatchState::Available
             && self.class == lot.required_tool_class
             && (self.compatible_recipes.is_empty()
-                || self
-                    .compatible_recipes
-                    .iter()
-                    .any(|recipe| *recipe == lot.recipe_id))
+                || self.compatible_recipes.contains(&lot.recipe_id))
     }
 
     pub fn next_start_after(&self, requested_start: u32, duration_minutes: u32) -> u32 {
@@ -210,6 +207,7 @@ pub struct SchedulerValidationContext {
     pub mes_eligible_tool_ids: BTreeSet<String>,
     pub equipment_tool_states: BTreeMap<String, EquipmentToolState>,
     pub equipment_tool_recipe_ids: BTreeMap<String, BTreeSet<String>>,
+    pub equipment_active_lot_ids: BTreeMap<String, String>,
 }
 
 impl SchedulerValidationContext {
@@ -262,6 +260,7 @@ impl SchedulerValidationContext {
             mes_eligible_tool_ids,
             equipment_tool_states: BTreeMap::new(),
             equipment_tool_recipe_ids: BTreeMap::new(),
+            equipment_active_lot_ids: BTreeMap::new(),
         }
     }
 
@@ -270,6 +269,17 @@ impl SchedulerValidationContext {
             let tool_id = tool.id.as_str().to_string();
             self.equipment_tool_states
                 .insert(tool_id.clone(), tool.state);
+            if tool.state == EquipmentToolState::Running
+                && let Some(lot_id) = tool
+                    .active_run
+                    .as_ref()
+                    .and_then(|run| run.recipe.lot_id.as_deref())
+                    .map(str::trim)
+                    .filter(|lot_id| !lot_id.is_empty())
+            {
+                self.equipment_active_lot_ids
+                    .insert(tool_id.clone(), lot_id.to_string());
+            }
             self.equipment_tool_recipe_ids.insert(
                 tool_id,
                 tool.available_recipes
@@ -323,6 +333,12 @@ impl SchedulerValidationContext {
         self.equipment_tool_recipe_ids
             .get(tool_id.as_str())
             .map(|recipes| recipes.contains(recipe_id.as_str()))
+    }
+
+    fn equipment_active_lot(&self, tool_id: &ToolId) -> Option<&str> {
+        self.equipment_active_lot_ids
+            .get(tool_id.as_str())
+            .map(String::as_str)
     }
 }
 
@@ -520,6 +536,15 @@ impl DispatchSchedule {
                     state.label()
                 )));
             }
+            if let Some(active_lot_id) = context.equipment_active_lot(&assignment.tool_id)
+                && active_lot_id != assignment.lot_id.as_str()
+            {
+                findings.push(SchedulerValidationFinding::warning(format!(
+                    "scheduler assignment for lot {} uses equipment tool {} while runtime active lot is {active_lot_id}",
+                    assignment.lot_id,
+                    assignment.tool_id
+                )));
+            }
         }
     }
 
@@ -540,11 +565,11 @@ impl DispatchSchedule {
                 .tools
                 .iter()
                 .filter(|tool| tool.can_process(&lot))
-                .filter_map(|tool| {
+                .map(|tool| {
                     let ready = *tool_available.get(&tool.id).unwrap_or(&self.now_minute);
                     let start =
                         tool.next_start_after(ready.max(lot.ready_at_minute), lot.process_minutes);
-                    Some((tool, start, start.saturating_add(lot.process_minutes)))
+                    (tool, start, start.saturating_add(lot.process_minutes))
                 })
                 .min_by(|left, right| {
                     left.1
@@ -1039,6 +1064,7 @@ fn sample_lots() -> Vec<DispatchLot> {
     ]
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sample_lot(
     id: &str,
     product: &str,
@@ -1099,6 +1125,30 @@ mod tests {
 
     fn validation_context_with_equipment() -> SchedulerValidationContext {
         validation_context().with_equipment(&crate::equipment::EquipmentSimulator::demo_fab())
+    }
+
+    fn validation_context_with_running_equipment_lot(
+        tool_id: &str,
+        runtime_lot_id: &str,
+    ) -> SchedulerValidationContext {
+        let mut simulator = crate::equipment::EquipmentSimulator::demo_fab();
+        let equipment_tool_id = crate::equipment::ToolId::new(tool_id);
+        let mut selection = simulator.selection_for(&equipment_tool_id, "ETCH_OXIDE_DESCUM");
+        selection.lot_id = Some(runtime_lot_id.to_string());
+        let started_at_s = simulator.now_s.saturating_sub(60);
+        if let Some(tool) = simulator.tool_mut(&equipment_tool_id) {
+            tool.state = crate::equipment::ToolState::Running;
+            tool.active_run = Some(crate::equipment::ToolRun {
+                id: crate::equipment::RunId::new("RUN-SCHEDULER-CONTEXT"),
+                tool_id: equipment_tool_id,
+                recipe: selection,
+                started_at_s,
+                completed_at_s: None,
+                status: crate::equipment::RunStatus::Running,
+                sensor_count: 0,
+            });
+        }
+        validation_context().with_equipment(&simulator)
     }
 
     fn has_validation_error(findings: &[SchedulerValidationFinding], needle: &str) -> bool {
@@ -1357,6 +1407,20 @@ mod tests {
         assert!(has_validation_warning(
             &findings,
             "uses equipment tool ETCH-01 while runtime state is Alarm"
+        ));
+    }
+
+    #[test]
+    fn scheduler_validation_warns_when_runtime_active_lot_conflicts_with_assignment() {
+        let schedule = DispatchSchedule::sample();
+
+        let findings = schedule.validate_with_context(
+            &validation_context_with_running_equipment_lot("ETCH-01", "L-RUNTIME"),
+        );
+
+        assert!(has_validation_warning(
+            &findings,
+            "scheduler assignment for lot L-00042-ETCH uses equipment tool ETCH-01 while runtime active lot is L-RUNTIME"
         ));
     }
 

@@ -881,6 +881,7 @@ pub fn sample_inventory() -> Inventory {
     Inventory { lots }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn material_lot(
     id: &str,
     material_name: &str,

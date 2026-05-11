@@ -1578,6 +1578,7 @@ pub fn correlate_yield_to_measurements(
     records
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_synthetic_die_tests(
     test_results: &mut Vec<TestResult>,
     lot_index: usize,

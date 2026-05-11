@@ -7,6 +7,9 @@ use crate::{
     Document, LayerId, NetId, Shape, ShapeKind, ShapeOccurrenceId, TechnologyError, TechnologyFile,
 };
 
+type ConnectivityLayerSet = BTreeSet<LayerId>;
+type ConnectivityLayerPairs = BTreeSet<(LayerId, LayerId)>;
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ConnectivityReport {
     pub components: Vec<NetComponent>,
@@ -284,14 +287,12 @@ impl ConnectivityReport {
         for (occurrence, component_id) in &self.shape_to_component {
             if !component_ids.contains(component_id) {
                 findings.push(ConnectivityValidationFinding::error(format!(
-                    "connectivity shape {:?} maps to missing component {}",
-                    occurrence, component_id
+                    "connectivity shape {occurrence:?} maps to missing component {component_id}"
                 )));
             }
             if !component_shape_pairs.contains(&(occurrence.clone(), *component_id)) {
                 findings.push(ConnectivityValidationFinding::error(format!(
-                    "connectivity shape {:?} maps to component {}, but no matching component shape entry exists",
-                    occurrence, component_id
+                    "connectivity shape {occurrence:?} maps to component {component_id}, but no matching component shape entry exists"
                 )));
             }
         }
@@ -603,7 +604,7 @@ pub fn extract_connectivity(
 fn connectivity_layers(
     document: &Document,
     technology: &TechnologyFile,
-) -> Result<(BTreeSet<LayerId>, BTreeSet<(LayerId, LayerId)>), TechnologyError> {
+) -> Result<(ConnectivityLayerSet, ConnectivityLayerPairs), TechnologyError> {
     let mut conductive_layers = BTreeSet::new();
     let mut connected_pairs = BTreeSet::new();
     for connection in &technology.connectivity {
@@ -862,13 +863,13 @@ fn validate_component_names(
         }
     }
 
-    if let Some(net_id) = component.net_id {
-        if !explicit_nets.contains(&net_id) {
-            findings.push(ConnectivityValidationFinding::error(format!(
-                "connectivity component {} net_id {:?} is not present in explicit_nets",
-                component.id, net_id
-            )));
-        }
+    if let Some(net_id) = component.net_id
+        && !explicit_nets.contains(&net_id)
+    {
+        findings.push(ConnectivityValidationFinding::error(format!(
+            "connectivity component {} net_id {:?} is not present in explicit_nets",
+            component.id, net_id
+        )));
     }
 
     let mut derived_names = BTreeSet::new();
@@ -928,14 +929,12 @@ fn validate_short(
             ));
         } else if normalized != *name {
             findings.push(ConnectivityValidationFinding::warning(format!(
-                "connectivity short net name {:?} is not normalized",
-                name
+                "connectivity short net name {name:?} is not normalized"
             )));
         }
         if !normalized.is_empty() && !normalized_names.insert(normalized) {
             findings.push(ConnectivityValidationFinding::error(format!(
-                "connectivity short repeats net name {:?}",
-                name
+                "connectivity short repeats net name {name:?}"
             )));
         }
     }

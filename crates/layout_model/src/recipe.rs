@@ -721,23 +721,22 @@ impl Recipe {
             ));
             return;
         }
-        if let RecipeParameterValue::Decimal(value) = value {
-            if !value.is_finite() {
-                issues.push(RecipeValidationIssue::error(
-                    Some(spec.key.clone()),
-                    format!("{} must be finite", spec.label),
-                ));
-            }
+        if let RecipeParameterValue::Decimal(value) = value
+            && !value.is_finite()
+        {
+            issues.push(RecipeValidationIssue::error(
+                Some(spec.key.clone()),
+                format!("{} must be finite", spec.label),
+            ));
         }
         if let (RecipeParameterType::Choice { options }, RecipeParameterValue::Choice(selected)) =
             (&spec.value_type, value)
+            && !options.iter().any(|option| option == selected)
         {
-            if !options.iter().any(|option| option == selected) {
-                issues.push(RecipeValidationIssue::error(
-                    Some(spec.key.clone()),
-                    format!("{} must be one of {}", spec.label, options.join(", ")),
-                ));
-            }
+            issues.push(RecipeValidationIssue::error(
+                Some(spec.key.clone()),
+                format!("{} must be one of {}", spec.label, options.join(", ")),
+            ));
         }
     }
 
@@ -775,27 +774,27 @@ impl Recipe {
                     max,
                     inclusive,
                 } => {
-                    if let Some(number) = value.as_i64() {
-                        if range_i64_failed(number, *min, *max, *inclusive) {
-                            issues.push(RecipeValidationIssue::error(
-                                Some(spec.key.clone()),
-                                format!(
-                                    "{} must be {}",
-                                    spec.label,
-                                    format_integer_range(*min, *max, *inclusive)
-                                ),
-                            ));
-                        }
+                    if let Some(number) = value.as_i64()
+                        && range_i64_failed(number, *min, *max, *inclusive)
+                    {
+                        issues.push(RecipeValidationIssue::error(
+                            Some(spec.key.clone()),
+                            format!(
+                                "{} must be {}",
+                                spec.label,
+                                format_integer_range(*min, *max, *inclusive)
+                            ),
+                        ));
                     }
                 }
                 ValidationRule::OneOf { values } => {
-                    if let Some(text) = value.as_str_value() {
-                        if !values.iter().any(|value| value == text) {
-                            issues.push(RecipeValidationIssue::error(
-                                Some(spec.key.clone()),
-                                format!("{} must be one of {}", spec.label, values.join(", ")),
-                            ));
-                        }
+                    if let Some(text) = value.as_str_value()
+                        && !values.iter().any(|value| value == text)
+                    {
+                        issues.push(RecipeValidationIssue::error(
+                            Some(spec.key.clone()),
+                            format!("{} must be one of {}", spec.label, values.join(", ")),
+                        ));
                     }
                 }
                 ValidationRule::NonEmpty => {

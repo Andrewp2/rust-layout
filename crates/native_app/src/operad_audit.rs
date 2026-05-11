@@ -217,27 +217,32 @@ fn add_sidebar_modules_row(
     match row.kind {
         SidebarModuleRowKind::Group => add_group_row(document, parent, row_index, row.label),
         SidebarModuleRowKind::Module { shown } => {
-            let mut options = widgets::CheckboxOptions::default();
-            options.layout =
-                layout::with_size(layout::row(), layout::percent(1.0), layout::px(ROW_HEIGHT));
-            options.box_visual = if shown {
-                UiVisual::panel(
-                    ColorRgba::new(65, 116, 157, 255),
-                    Some(StrokeStyle::new(ColorRgba::new(111, 174, 224, 255), 1.0)),
-                    4.0,
-                )
-            } else {
-                UiVisual::panel(
-                    ColorRgba::new(55, 59, 64, 255),
-                    Some(StrokeStyle::new(ColorRgba::new(72, 78, 86, 255), 1.0)),
-                    4.0,
-                )
+            let options = widgets::CheckboxOptions {
+                layout: layout::with_size(
+                    layout::row(),
+                    layout::percent(1.0),
+                    layout::px(ROW_HEIGHT),
+                ),
+                box_visual: if shown {
+                    UiVisual::panel(
+                        ColorRgba::new(65, 116, 157, 255),
+                        Some(StrokeStyle::new(ColorRgba::new(111, 174, 224, 255), 1.0)),
+                        4.0,
+                    )
+                } else {
+                    UiVisual::panel(
+                        ColorRgba::new(55, 59, 64, 255),
+                        Some(StrokeStyle::new(ColorRgba::new(72, 78, 86, 255), 1.0)),
+                        4.0,
+                    )
+                },
+                text_style: body_text(if shown {
+                    ColorRgba::new(230, 235, 240, 255)
+                } else {
+                    ColorRgba::new(166, 172, 178, 255)
+                }),
+                ..Default::default()
             };
-            options.text_style = body_text(if shown {
-                ColorRgba::new(230, 235, 240, 255)
-            } else {
-                ColorRgba::new(166, 172, 178, 255)
-            });
             widgets::checkbox(
                 document,
                 parent,

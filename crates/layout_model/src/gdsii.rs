@@ -918,6 +918,7 @@ fn write_shape(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn import_element(
     document: &mut Document,
     technology: &TechnologyFile,
@@ -2299,7 +2300,7 @@ impl GdsWriter {
     ) -> Result<(), GdsError> {
         let length = data.len() + 4;
         let length = u16::try_from(length).map_err(|_| {
-            GdsError::Unsupported(format!("record {:02x} exceeds 65535 bytes", record_type))
+            GdsError::Unsupported(format!("record {record_type:02x} exceeds 65535 bytes"))
         })?;
         self.bytes.extend_from_slice(&length.to_be_bytes());
         self.bytes.push(record_type);

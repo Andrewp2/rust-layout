@@ -39,7 +39,7 @@ pub const WORKSPACE_FEATURE_FLAGS: &[&str] = &[
     "operad_panels",
 ];
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct WorkspaceSnapshotMetadata {
     #[serde(default)]
     pub producer: String,
@@ -53,19 +53,6 @@ pub struct WorkspaceSnapshotMetadata {
     pub feature_flags: Vec<String>,
     #[serde(default)]
     pub migration_history: Vec<String>,
-}
-
-impl Default for WorkspaceSnapshotMetadata {
-    fn default() -> Self {
-        Self {
-            producer: String::new(),
-            producer_version: String::new(),
-            workspace_schema_version: 0,
-            document_schema_version: 0,
-            feature_flags: Vec::new(),
-            migration_history: Vec::new(),
-        }
-    }
 }
 
 impl WorkspaceSnapshotMetadata {
@@ -272,13 +259,12 @@ impl WorkspaceDataset {
             0 => {
                 self.schema_version = WORKSPACE_DATASET_SCHEMA_VERSION;
                 self.metadata = WorkspaceSnapshotMetadata::current(self.document.schema_version);
-                let migration = format!("workspace_schema:0->{}", WORKSPACE_DATASET_SCHEMA_VERSION);
+                let migration = format!("workspace_schema:0->{WORKSPACE_DATASET_SCHEMA_VERSION}");
                 self.metadata.migration_history.insert(0, migration.clone());
                 Ok(vec![migration])
             }
             schema_version => Err(format!(
-                "workspace schema {schema_version} is unsupported; expected {}",
-                WORKSPACE_DATASET_SCHEMA_VERSION
+                "workspace schema {schema_version} is unsupported; expected {WORKSPACE_DATASET_SCHEMA_VERSION}"
             )),
         }
     }
@@ -287,8 +273,8 @@ impl WorkspaceDataset {
         let mut report = WorkspaceValidationReport::default();
         if self.schema_version != WORKSPACE_DATASET_SCHEMA_VERSION {
             report.push_error(format!(
-                "workspace schema {} is unsupported; expected {}",
-                self.schema_version, WORKSPACE_DATASET_SCHEMA_VERSION
+                "workspace schema {} is unsupported; expected {WORKSPACE_DATASET_SCHEMA_VERSION}",
+                self.schema_version
             ));
         }
         self.validate_metadata(&mut report);
@@ -396,8 +382,7 @@ fn preflight_workspace_schema(value: &serde_json::Value) -> Result<(), String> {
         && schema_version > u64::from(WORKSPACE_DATASET_SCHEMA_VERSION)
     {
         return Err(format!(
-            "workspace schema {schema_version} is unsupported; expected {}",
-            WORKSPACE_DATASET_SCHEMA_VERSION
+            "workspace schema {schema_version} is unsupported; expected {WORKSPACE_DATASET_SCHEMA_VERSION}"
         ));
     }
     if let Some(metadata_schema_version) = preflight_schema_version(
@@ -408,8 +393,7 @@ fn preflight_workspace_schema(value: &serde_json::Value) -> Result<(), String> {
     )? && metadata_schema_version > u64::from(WORKSPACE_DATASET_SCHEMA_VERSION)
     {
         return Err(format!(
-            "workspace metadata schema {metadata_schema_version} is unsupported; expected {}",
-            WORKSPACE_DATASET_SCHEMA_VERSION
+            "workspace metadata schema {metadata_schema_version} is unsupported; expected {WORKSPACE_DATASET_SCHEMA_VERSION}"
         ));
     }
     if let Some(document_schema_version) = preflight_schema_version(
@@ -420,8 +404,7 @@ fn preflight_workspace_schema(value: &serde_json::Value) -> Result<(), String> {
     )? && document_schema_version > u64::from(CURRENT_SCHEMA_VERSION)
     {
         return Err(format!(
-            "document schema {document_schema_version} is unsupported; expected {}",
-            CURRENT_SCHEMA_VERSION
+            "document schema {document_schema_version} is unsupported; expected {CURRENT_SCHEMA_VERSION}"
         ));
     }
     if let Some(metadata_document_schema_version) = preflight_schema_version(
@@ -432,8 +415,7 @@ fn preflight_workspace_schema(value: &serde_json::Value) -> Result<(), String> {
     )? && metadata_document_schema_version > u64::from(CURRENT_SCHEMA_VERSION)
     {
         return Err(format!(
-            "workspace metadata document schema {metadata_document_schema_version} is unsupported; expected {}",
-            CURRENT_SCHEMA_VERSION
+            "workspace metadata document schema {metadata_document_schema_version} is unsupported; expected {CURRENT_SCHEMA_VERSION}"
         ));
     }
     preflight_string_array(
@@ -489,8 +471,8 @@ fn preflight_string_array(value: Option<&serde_json::Value>, label: &str) -> Res
 fn validate_document_integrity(document: &Document, report: &mut WorkspaceValidationReport) {
     if document.schema_version > CURRENT_SCHEMA_VERSION {
         report.push_error(format!(
-            "document schema {} is newer than supported schema {}",
-            document.schema_version, CURRENT_SCHEMA_VERSION
+            "document schema {} is newer than supported schema {CURRENT_SCHEMA_VERSION}",
+            document.schema_version
         ));
     }
     if document.grid <= 0 {

@@ -1165,13 +1165,13 @@ impl ProcessControlPanel {
             }
         });
 
-        if let Some(loop_id) = next_loop {
-            if self.selected_loop.as_ref() != Some(&loop_id) {
-                self.selected_loop = Some(loop_id);
-                self.selected_action = None;
-                self.ensure_selection();
-                *status = "process control loop selected".to_string();
-            }
+        if let Some(loop_id) = next_loop
+            && self.selected_loop.as_ref() != Some(&loop_id)
+        {
+            self.selected_loop = Some(loop_id);
+            self.selected_action = None;
+            self.ensure_selection();
+            *status = "process control loop selected".to_string();
         }
     }
 
@@ -1303,9 +1303,7 @@ impl ProcessControlPanel {
             .as_ref()
             .and_then(|id| actions.iter().find(|action| &action.id == id))
             .or_else(|| actions.first());
-        let Some(action) = selected_action else {
-            return None;
-        };
+        let action = selected_action?;
 
         ui.separator();
         selected_action_detail_ui(ui, loop_definition, action, &mut requested_transition);
@@ -1927,7 +1925,9 @@ fn add_process_control_operad_data_row(
         4.0,
     ));
     if row.action_name.is_some() {
-        node = node.with_input(InputBehavior::BUTTON);
+        node = node.with_input(InputBehavior::BUTTON).with_accessibility(
+            crate::ui_chrome::operad_button_accessibility(&row.title, &row.detail),
+        );
     }
     let row_node = document.add_child(parent, node);
     document.add_child(

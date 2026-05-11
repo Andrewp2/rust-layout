@@ -398,51 +398,50 @@ fn load_or_create_state(
     server_actor: Uuid,
     path: Option<&Path>,
 ) -> anyhow::Result<(Document, LoroCrdtLog, u64)> {
-    if let Some(path) = path {
-        if path.exists() {
-            let bytes = fs::read(path).with_context(|| {
-                format!("failed to read persisted sync state {}", path.display())
-            })?;
-            if bytes.is_empty() {
-                warn!(
-                    "persisted sync state {} is empty; starting from demo document",
-                    path.display()
+    if let Some(path) = path
+        && path.exists()
+    {
+        let bytes = fs::read(path)
+            .with_context(|| format!("failed to read persisted sync state {}", path.display()))?;
+        if bytes.is_empty() {
+            warn!(
+                "persisted sync state {} is empty; starting from demo document",
+                path.display()
+            );
+        } else {
+            let persisted: PersistedSyncState =
+                serde_json::from_slice(&bytes).with_context(|| {
+                    format!("failed to parse persisted sync state {}", path.display())
+                })?;
+            if persisted.schema_version != PERSISTED_STATE_VERSION {
+                bail!(
+                    "unsupported persisted sync schema {}; expected {}",
+                    persisted.schema_version,
+                    PERSISTED_STATE_VERSION
                 );
-            } else {
-                let persisted: PersistedSyncState =
-                    serde_json::from_slice(&bytes).with_context(|| {
-                        format!("failed to parse persisted sync state {}", path.display())
-                    })?;
-                if persisted.schema_version != PERSISTED_STATE_VERSION {
-                    bail!(
-                        "unsupported persisted sync schema {}; expected {}",
-                        persisted.schema_version,
-                        PERSISTED_STATE_VERSION
-                    );
-                }
-                let mut document = persisted.document;
-                let loro_log = LoroCrdtLog::from_snapshot(server_actor, &persisted.loro_snapshot)
-                    .context("failed to import persisted Loro snapshot")?;
-                if !persisted.loro_snapshot.is_empty() {
-                    loro_log
-                        .materialize_objects_into_document(&mut document)
-                        .context("failed to materialize persisted Loro object store")?;
-                }
-                info!(
-                    "loaded sync state from {} at sequence {}",
-                    path.display(),
-                    persisted.sequence
-                );
-                let sequence = persisted.sequence.max(1);
-                if sequence != persisted.sequence {
-                    warn!(
-                        persisted_sequence = persisted.sequence,
-                        effective_sequence = sequence,
-                        "persisted sync sequence was below supported range"
-                    );
-                }
-                return Ok((document, loro_log, sequence));
             }
+            let mut document = persisted.document;
+            let loro_log = LoroCrdtLog::from_snapshot(server_actor, &persisted.loro_snapshot)
+                .context("failed to import persisted Loro snapshot")?;
+            if !persisted.loro_snapshot.is_empty() {
+                loro_log
+                    .materialize_objects_into_document(&mut document)
+                    .context("failed to materialize persisted Loro object store")?;
+            }
+            info!(
+                "loaded sync state from {} at sequence {}",
+                path.display(),
+                persisted.sequence
+            );
+            let sequence = persisted.sequence.max(1);
+            if sequence != persisted.sequence {
+                warn!(
+                    persisted_sequence = persisted.sequence,
+                    effective_sequence = sequence,
+                    "persisted sync sequence was below supported range"
+                );
+            }
+            return Ok((document, loro_log, sequence));
         }
     }
 

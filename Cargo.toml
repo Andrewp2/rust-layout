@@ -27,7 +27,7 @@ futures-util = "0.3"
 glam = { version = "0.30.4", features = ["serde"] }
 log = "0.4"
 loro = "1.12.0"
-operad = { git = "ssh://git@github.com/Andrewp2/Operad.git", rev = "07061e2", features = [
+operad = { git = "https://github.com/Andrewp2/Operad.git", rev = "8762dbf", features = [
 	"widgets",
 ] }
 pollster = "0.4"

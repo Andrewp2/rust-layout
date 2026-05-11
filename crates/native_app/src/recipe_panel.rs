@@ -148,11 +148,11 @@ impl RecipeManagerPanel {
                 }
             });
 
-        if selected != self.selected_recipe {
-            if let Some(recipe_id) = selected {
-                self.select_recipe(recipe_id);
-                return true;
-            }
+        if selected != self.selected_recipe
+            && let Some(recipe_id) = selected
+        {
+            self.select_recipe(recipe_id);
+            return true;
         }
         false
     }
@@ -481,15 +481,14 @@ impl RecipeManagerPanel {
             .selected_recipe
             .as_ref()
             .is_some_and(|id| self.catalog.recipe(id).is_some());
-        if !selected_exists {
-            if let Some(recipe_id) = self
+        if !selected_exists
+            && let Some(recipe_id) = self
                 .catalog
                 .sorted_recipes()
                 .first()
                 .map(|recipe| recipe.id.clone())
-            {
-                self.select_recipe(recipe_id);
-            }
+        {
+            self.select_recipe(recipe_id);
         }
 
         let Some(recipe_id) = self.selected_recipe.clone() else {
@@ -561,7 +560,7 @@ impl RecipeManagerPanel {
             return;
         }
         version.parameters = self.draft_parameters.clone();
-        *status = format!("applied draft to {} {}", recipe_id, version_number);
+        *status = format!("applied draft to {recipe_id} {version_number}");
     }
 
     fn apply_approval_action(

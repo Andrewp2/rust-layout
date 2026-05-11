@@ -3145,6 +3145,7 @@ impl FlattenedShape {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Operation {
     Batch {
@@ -3284,6 +3285,7 @@ pub enum ClientMessage {
     RequestSnapshot,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
@@ -4227,10 +4229,10 @@ impl Document {
     }
 
     pub fn visible_shapes(&self) -> impl Iterator<Item = Shape> + '_ {
-        self.shapes.live_rows().filter_map(|row| {
-            self.layer_is_visible(self.shapes.row_layer(row))
-                .then(|| self.shapes.materialize_row(row))
-        })
+        self.shapes
+            .live_rows()
+            .filter(|&row| self.layer_is_visible(self.shapes.row_layer(row)))
+            .map(|row| self.shapes.materialize_row(row))
     }
 
     pub fn has_hierarchy_instances(&self) -> bool {
@@ -4537,16 +4539,21 @@ pub struct LayoutIndex {
 impl LayoutIndex {
     pub fn rebuild(document: &Document) -> Self {
         let mut entries = Vec::with_capacity(document.shapes.len());
-        entries.extend(document.shapes.live_rows().filter_map(|row| {
+        entries.extend(
             document
-                .layers
-                .get(&document.shapes.row_layer(row))
-                .is_some_and(|layer| layer.visible)
-                .then(|| IndexedShape {
+                .shapes
+                .live_rows()
+                .filter(|&row| {
+                    document
+                        .layers
+                        .get(&document.shapes.row_layer(row))
+                        .is_some_and(|layer| layer.visible)
+                })
+                .map(|row| IndexedShape {
                     id: ShapeOccurrenceId::top_level(document.shapes.row_id(row)),
                     bounds: document.shapes.row_bounds(row),
-                })
-        }));
+                }),
+        );
         Self::bulk_load(entries)
     }
 

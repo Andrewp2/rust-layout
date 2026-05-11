@@ -660,7 +660,7 @@ impl SyntheticTool {
                 let Some(recipe) = self.tool.recipe(&selection.recipe_id) else {
                     return Err(self.invalid(
                         "load_recipe",
-                        &format!("unknown recipe {}", selection.recipe_id),
+                        format!("unknown recipe {}", selection.recipe_id),
                     ));
                 };
                 if recipe.tool_kind != self.tool.kind {

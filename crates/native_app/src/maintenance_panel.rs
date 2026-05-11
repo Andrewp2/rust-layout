@@ -1992,7 +1992,9 @@ fn add_maintenance_operad_data_row(
         4.0,
     ));
     if row.action_name.is_some() {
-        node = node.with_input(InputBehavior::BUTTON);
+        node = node.with_input(InputBehavior::BUTTON).with_accessibility(
+            crate::ui_chrome::operad_button_accessibility(&row.title, &row.detail),
+        );
     }
     let row_node = document.add_child(parent, node);
     document.add_child(

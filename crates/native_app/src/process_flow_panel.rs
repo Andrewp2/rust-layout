@@ -407,7 +407,7 @@ impl ProcessFlowPanel {
                                 })
                                 .count();
                             *status =
-                                format!("process flow validation found {} issue(s)", error_count);
+                                format!("process flow validation found {error_count} issue(s)");
                         }
                     },
                 );
@@ -1199,7 +1199,7 @@ impl ProcessFlowPanel {
                 .iter()
                 .filter(|finding| finding.severity == ProcessFlowFindingSeverity::Error)
                 .count();
-            *status = format!("process flow validation found {} issue(s)", error_count);
+            *status = format!("process flow validation found {error_count} issue(s)");
             return true;
         }
         false
@@ -1664,7 +1664,7 @@ impl ProcessFlowPanel {
                     self.selected_node = Some(target_id.clone());
                 }
                 ui.colored_label(edge_color(edge.kind), edge.kind.label());
-                ui.label(format!("{} {}", target_id, target_name));
+                ui.label(format!("{target_id} {target_name}"));
             });
             if edge.condition.is_empty() {
                 ui.small("Condition: always");
@@ -2328,7 +2328,9 @@ fn add_process_flow_operad_data_row(
         4.0,
     ));
     if row.action_name.is_some() {
-        node = node.with_input(InputBehavior::BUTTON);
+        node = node.with_input(InputBehavior::BUTTON).with_accessibility(
+            crate::ui_chrome::operad_button_accessibility(&row.title, &row.detail),
+        );
     }
     let row_node = document.add_child(parent, node);
     document.add_child(

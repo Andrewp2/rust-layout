@@ -306,17 +306,17 @@ impl MaskPrepPanel {
                     }
                 });
 
-                metric_row(ui, &report);
+                metric_row(ui, report);
 
                 ui.separator();
                 if ui.available_width() < 700.0 {
                     self.reticle_summary_ui(ui);
                     ui.separator();
-                    self.exposure_blocks_ui(ui, &report);
+                    self.exposure_blocks_ui(ui, report);
                 } else {
                     ui.columns(2, |columns| {
                         self.reticle_summary_ui(&mut columns[0]);
-                        self.exposure_blocks_ui(&mut columns[1], &report);
+                        self.exposure_blocks_ui(&mut columns[1], report);
                     });
                 }
 
@@ -325,7 +325,7 @@ impl MaskPrepPanel {
                 self.fields_ui(ui);
 
                 ui.separator();
-                self.issues_ui(ui, &report);
+                self.issues_ui(ui, report);
             });
     }
 
@@ -873,10 +873,7 @@ impl MaskPrepPanel {
             .collect::<Vec<_>>();
         if total_groups > MAX_ISSUE_GROUP_ROWS {
             operad_rows.push(mask_operad_row(
-                format!(
-                    "Showing first {} of {} issue groups",
-                    MAX_ISSUE_GROUP_ROWS, total_groups
-                ),
+                format!("Showing first {MAX_ISSUE_GROUP_ROWS} of {total_groups} issue groups"),
                 "Narrow issue filters or switch grouping to inspect additional groups",
                 Tone::Info,
                 None,
@@ -1259,15 +1256,13 @@ impl MaskPrepPanel {
             .iter()
             .take(MAX_MASK_LAYER_SIDECAR_ROWS)
         {
+            let process = format!("{:?}", layer.process);
+            let tone = layer.tone.label();
+            let min_feature = format_coord(layer.min_feature);
+            let min_spacing = format_coord(layer.min_spacing);
             section = section.row(SidecarRow::new(
                 format!("{} · {}", layer.layer.0, layer.name),
-                format!(
-                    "{} / {} / feature {} / spacing {}",
-                    format!("{:?}", layer.process),
-                    layer.tone.label(),
-                    format_coord(layer.min_feature),
-                    format_coord(layer.min_spacing)
-                ),
+                format!("{process} / {tone} / feature {min_feature} / spacing {min_spacing}"),
                 if layer.critical {
                     Tone::Warning
                 } else {
@@ -2158,7 +2153,9 @@ fn add_mask_operad_data_row(
         4.0,
     ));
     if row.action_name.is_some() {
-        node = node.with_input(InputBehavior::BUTTON);
+        node = node.with_input(InputBehavior::BUTTON).with_accessibility(
+            crate::ui_chrome::operad_button_accessibility(&row.title, &row.detail),
+        );
     }
     let row_node = document.add_child(parent, node);
     document.add_child(

@@ -1568,16 +1568,15 @@ impl SchedulerPanel {
                         ui.label(format!(
                             "{available_tools}/{eligible_tools} tools available"
                         ));
-                        if let Some(tool_id) = &candidate_tool {
-                            if ui
+                        if let Some(tool_id) = &candidate_tool
+                            && ui
                                 .selectable_label(
                                     self.selected_tool.as_ref() == Some(tool_id),
                                     tool_id.to_string(),
                                 )
                                 .clicked()
-                            {
-                                pending_selection = Some(tool_id.clone());
-                            }
+                        {
+                            pending_selection = Some(tool_id.clone());
                         }
                     });
                     ui.small(schedule_label(assignment));
@@ -1613,16 +1612,15 @@ impl SchedulerPanel {
                         });
                         ui.vertical(|ui| {
                             ui.label(format!("{available_tools}/{eligible_tools} available"));
-                            if let Some(tool_id) = &candidate_tool {
-                                if ui
+                            if let Some(tool_id) = &candidate_tool
+                                && ui
                                     .selectable_label(
                                         self.selected_tool.as_ref() == Some(tool_id),
                                         tool_id.to_string(),
                                     )
                                     .clicked()
-                                {
-                                    pending_selection = Some(tool_id.clone());
-                                }
+                            {
+                                pending_selection = Some(tool_id.clone());
                             }
                         });
                         ui.label(schedule_label(assignment));
@@ -2125,7 +2123,7 @@ impl SchedulerPanel {
         result: &DispatchResult,
     ) -> (u8, u8, i32, u32, u32, String) {
         let assignment = self.assignment_for_lot(&result.assignments, &lot.id);
-        let conflict_rank = if assignment.map_or(true, |assignment| assignment.tardy_minutes > 0) {
+        let conflict_rank = if assignment.is_none_or(|assignment| assignment.tardy_minutes > 0) {
             0
         } else if lot.slack_minutes_at(self.schedule.now_minute) <= 60 {
             1
@@ -2255,10 +2253,7 @@ impl SchedulerPanel {
                 } else if available_tools == 0 {
                     (
                         "tool unavailable".to_string(),
-                        format!(
-                            "{} matching tools exist but none are available",
-                            eligible_tools
-                        ),
+                        format!("{eligible_tools} matching tools exist but none are available"),
                         "Release maintenance/down tools or move the recipe to an alternate tool"
                             .to_string(),
                     )
@@ -2266,8 +2261,7 @@ impl SchedulerPanel {
                     (
                         "unscheduled".to_string(),
                         format!(
-                            "{} compatible tools available; policy did not place the lot",
-                            available_tools
+                            "{available_tools} compatible tools available; policy did not place the lot"
                         ),
                         "Review policy order and queue capacity for this class".to_string(),
                     )
@@ -2816,7 +2810,9 @@ fn add_scheduler_operad_data_row(
         4.0,
     ));
     if row.action_name.is_some() {
-        node = node.with_input(InputBehavior::BUTTON);
+        node = node.with_input(InputBehavior::BUTTON).with_accessibility(
+            crate::ui_chrome::operad_button_accessibility(&row.title, &row.detail),
+        );
     }
     let row_node = document.add_child(parent, node);
     document.add_child(
@@ -3024,11 +3020,7 @@ fn utilization_for_tool(assignments: &[DispatchAssignment], tool_id: &ToolId) ->
 
 fn tool_matches_lot(tool: &DispatchTool, lot: &DispatchLot) -> bool {
     tool.class == lot.required_tool_class
-        && (tool.compatible_recipes.is_empty()
-            || tool
-                .compatible_recipes
-                .iter()
-                .any(|recipe| *recipe == lot.recipe_id))
+        && (tool.compatible_recipes.is_empty() || tool.compatible_recipes.contains(&lot.recipe_id))
 }
 
 fn recipe_scope(tool: &DispatchTool) -> String {
@@ -3137,7 +3129,7 @@ fn format_optional_time(minute: Option<u32>) -> String {
 }
 
 fn hourly_ticks(start: u32, end: u32) -> Vec<u32> {
-    let first = ((start + 59) / 60) * 60;
+    let first = start.div_ceil(60) * 60;
     let mut ticks = Vec::new();
     let mut tick = first;
     while tick <= end {

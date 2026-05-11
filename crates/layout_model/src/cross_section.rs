@@ -417,8 +417,7 @@ fn validate_step_material(
 ) {
     if !material_ids.contains(material) {
         findings.push(CrossSectionValidationFinding::error(format!(
-            "{kind} step {index} references unknown material {:?}",
-            material
+            "{kind} step {index} references unknown material {material:?}"
         )));
     }
 }

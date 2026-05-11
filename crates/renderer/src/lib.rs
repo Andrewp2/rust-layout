@@ -1811,7 +1811,7 @@ mod tests {
         });
         let encode_started = std::time::Instant::now();
         renderer.render_to_texture(
-            &device,
+            device,
             &mut encoder,
             target_size,
             wgpu::Color {

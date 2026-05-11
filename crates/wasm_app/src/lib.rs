@@ -101,7 +101,7 @@ fn startup_options_from_url() -> fabricad_app::StartupOptions {
 
 pub fn startup_options_from_query(search: &str) -> fabricad_app::StartupOptions {
     let mut options = fabricad_app::StartupOptions::default();
-    for (key, value) in query_pairs(&search) {
+    for (key, value) in query_pairs(search) {
         match key.as_str() {
             "workspace" if value == "demo" => {
                 options.demo_workspace = true;

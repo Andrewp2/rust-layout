@@ -281,17 +281,16 @@ impl SafetyPanel {
                     && let Some(pointer) = response.interact_pointer_pos()
                     && let Some(node_name) =
                         operad_egui::hit_test_name(&view.document, rect, pointer)
+                    && self.handle_operad_action(&node_name, status)
                 {
-                    if self.handle_operad_action(&node_name, status) {
-                        view = self.build_operad_view(width);
-                        if let Err(error) = view
-                            .document
-                            .compute_layout(view.size, &mut ApproxTextMeasurer)
-                            .map_err(|error| error.to_string())
-                        {
-                            result = Err(error);
-                            return;
-                        }
+                    view = self.build_operad_view(width);
+                    if let Err(error) = view
+                        .document
+                        .compute_layout(view.size, &mut ApproxTextMeasurer)
+                        .map_err(|error| error.to_string())
+                    {
+                        result = Err(error);
+                        return;
                     }
                 }
 
@@ -907,16 +906,15 @@ impl SafetyPanel {
             return true;
         }
 
-        if let Some(sensor_id) = node_name.strip_prefix(OPERAD_ACTION_ACK_CONDITION) {
-            if let Some(sensor) = self
+        if let Some(sensor_id) = node_name.strip_prefix(OPERAD_ACTION_ACK_CONDITION)
+            && let Some(sensor) = self
                 .model
                 .sensors
                 .iter()
                 .find(|sensor| sensor.id.to_string() == sensor_id)
-            {
-                self.acknowledge_condition(sensor_id.to_string(), sensor.name.clone(), status);
-                return true;
-            }
+        {
+            self.acknowledge_condition(sensor_id.to_string(), sensor.name.clone(), status);
+            return true;
         }
 
         if let Some(tool_id) = node_name.strip_prefix(OPERAD_ACTION_ACK_LOCKOUT) {
@@ -1773,7 +1771,9 @@ fn add_operad_data_row(
         4.0,
     ));
     if row.action_name.is_some() {
-        node = node.with_input(InputBehavior::BUTTON);
+        node = node.with_input(InputBehavior::BUTTON).with_accessibility(
+            crate::ui_chrome::operad_button_accessibility(&row.title, &row.detail),
+        );
     }
     let row_node = document.add_child(parent, node);
     document.add_child(

@@ -2674,8 +2674,8 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "operad"
-version = "2.0.0"
-source = "git+ssh://git@github.com/Andrewp2/Operad.git?rev=07061e2#07061e22364c7d9b15b0aeebb152e113331addd7"
+version = "3.0.0"
+source = "git+https://github.com/Andrewp2/Operad.git?rev=8762dbf#8762dbff183919e235de970cec7e0a9263c01884"
 dependencies = [
  "taffy",
 ]

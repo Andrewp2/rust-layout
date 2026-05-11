@@ -312,7 +312,7 @@ impl ProcessControlValidationContext {
                 |mut versions, recipe| {
                     versions
                         .entry(recipe.id.clone())
-                        .or_insert_with(BTreeSet::new)
+                        .or_default()
                         .insert(recipe.version);
                     versions
                 },
@@ -1880,7 +1880,7 @@ mod tests {
                 .iter()
                 .any(|action| action.target_recipe.recipe_id.as_str() == "POLY_ETCH_004")
         );
-        assert!(model.audit_for_loop(&edge_loop).len() >= 1);
+        assert!(!model.audit_for_loop(&edge_loop).is_empty());
     }
 
     #[test]

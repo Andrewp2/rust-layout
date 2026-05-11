@@ -2738,11 +2738,11 @@ impl FabricadApp {
                 return;
             }
         };
-        if performance_budget_for_document(&self.document).loro_seed_within_budget {
-            if let Err(err) = log.seed_document_objects(&self.document) {
-                self.status = format!("failed to seed Loro object store: {err}");
-                return;
-            }
+        if performance_budget_for_document(&self.document).loro_seed_within_budget
+            && let Err(err) = log.seed_document_objects(&self.document)
+        {
+            self.status = format!("failed to seed Loro object store: {err}");
+            return;
         }
         self.loro_log = log;
     }
@@ -3304,10 +3304,10 @@ impl FabricadApp {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn send_collaboration_message(&self, message: ClientMessage) {
-        if let Some(collab) = &self.collab {
-            if let Err(err) = collab.outbound.send(message) {
-                warn!(error = %err, "failed to enqueue outbound collaboration message");
-            }
+        if let Some(collab) = &self.collab
+            && let Err(err) = collab.outbound.send(message)
+        {
+            warn!(error = %err, "failed to enqueue outbound collaboration message");
         }
     }
 
@@ -4188,15 +4188,13 @@ impl FabricadApp {
                 .app_context
                 .focus_tool()
                 .is_none_or(|tool_id| !tool_ids.iter().any(|candidate| candidate == tool_id))
-        {
-            if let Some(tool_id) = self
+            && let Some(tool_id) = self
                 .selected_equipment_tool
                 .as_ref()
                 .map(|tool_id| tool_id.as_str().to_string())
                 .or_else(|| tool_ids.first().cloned())
-            {
-                self.app_context.set_tool(tool_id);
-            }
+        {
+            self.app_context.set_tool(tool_id);
         }
 
         let recipe_ids = self.context_recipe_ids();
@@ -4205,10 +4203,9 @@ impl FabricadApp {
                 .app_context
                 .focus_recipe()
                 .is_none_or(|recipe_id| !recipe_ids.iter().any(|candidate| candidate == recipe_id))
+            && let Some(recipe_id) = recipe_ids.first().cloned()
         {
-            if let Some(recipe_id) = recipe_ids.first().cloned() {
-                self.app_context.set_recipe(recipe_id);
-            }
+            self.app_context.set_recipe(recipe_id);
         }
     }
 
@@ -4342,10 +4339,10 @@ impl FabricadApp {
     }
 
     fn sync_workflow_focus_from_context(&mut self) {
-        if let Some(lot_id) = self.app_context.focus_lot() {
-            if self.workflow_panel.focus_lot() != lot_id {
-                self.workflow_panel.set_focus_lot(lot_id.to_string());
-            }
+        if let Some(lot_id) = self.app_context.focus_lot()
+            && self.workflow_panel.focus_lot() != lot_id
+        {
+            self.workflow_panel.set_focus_lot(lot_id.to_string());
         }
     }
 
@@ -4475,11 +4472,11 @@ impl FabricadApp {
 
     fn save_document(&mut self) {
         let path = PathBuf::from(SAVE_PATH);
-        if let Some(parent) = path.parent() {
-            if let Err(err) = fs::create_dir_all(parent) {
-                self.set_error_status(format!("save failed: {err}"));
-                return;
-            }
+        if let Some(parent) = path.parent()
+            && let Err(err) = fs::create_dir_all(parent)
+        {
+            self.set_error_status(format!("save failed: {err}"));
+            return;
         }
         match serde_json::to_vec_pretty(&self.document)
             .map_err(|err| err.to_string())
@@ -4883,9 +4880,9 @@ impl FabricadApp {
             (Some(start), Some(goal)) => {
                 let start_meta = component_route_metadata(start);
                 let goal_meta = component_route_metadata(goal);
-                if start_meta.net.is_some() && start_meta.net == goal_meta.net {
-                    start_meta
-                } else if start_meta.name.is_some() && start_meta.name == goal_meta.name {
+                if (start_meta.net.is_some() && start_meta.net == goal_meta.net)
+                    || (start_meta.name.is_some() && start_meta.name == goal_meta.name)
+                {
                     start_meta
                 } else if start_meta.net.is_none() && start_meta.name.is_none() {
                     goal_meta
@@ -5893,7 +5890,7 @@ impl FabricadApp {
             .count();
         let alarm_count = tools
             .iter()
-            .map(|tool| equipment_active_alarm_count(tool))
+            .map(equipment_active_alarm_count)
             .sum::<usize>();
         let critical_count = tools
             .iter()
@@ -6944,21 +6941,19 @@ impl FabricadApp {
     }
 
     fn panel_drawer_buttons(&mut self, ui: &mut egui::Ui) {
-        if self.view_mode.has_inspector_panel() {
-            if ui
+        if self.view_mode.has_inspector_panel()
+            && ui
                 .selectable_label(self.show_inspector_drawer, "Inspector")
                 .clicked()
-            {
-                self.show_inspector_drawer = !self.show_inspector_drawer;
-            }
+        {
+            self.show_inspector_drawer = !self.show_inspector_drawer;
         }
-        if self.view_mode.has_secondary_panel() {
-            if ui
+        if self.view_mode.has_secondary_panel()
+            && ui
                 .selectable_label(self.show_layers_drawer, self.secondary_panel_label())
                 .clicked()
-            {
-                self.show_layers_drawer = !self.show_layers_drawer;
-            }
+        {
+            self.show_layers_drawer = !self.show_layers_drawer;
         }
     }
 
@@ -7233,15 +7228,15 @@ impl FabricadApp {
                 ui.close();
             }
         }
-        if let Some(lot_id) = self.app_context.focus_lot().map(str::to_string) {
-            if ui.button("Add Focus Note").clicked() {
-                let entry_id = self.notebook_panel.add_quick_lot_note(&lot_id);
-                self.app_context
-                    .active
-                    .replace(FabObjectRef::notebook_entry(entry_id.to_string()));
-                self.status = format!("added notebook entry {entry_id}");
-                ui.close();
-            }
+        if let Some(lot_id) = self.app_context.focus_lot().map(str::to_string)
+            && ui.button("Add Focus Note").clicked()
+        {
+            let entry_id = self.notebook_panel.add_quick_lot_note(&lot_id);
+            self.app_context
+                .active
+                .replace(FabObjectRef::notebook_entry(entry_id.to_string()));
+            self.status = format!("added notebook entry {entry_id}");
+            ui.close();
         }
     }
 
@@ -8170,26 +8165,25 @@ impl FabricadApp {
                     }
                 }
                 TravelerStatus::Running => {
-                    if let Some(run) = &traveler.active_run {
-                        if ui.button(format!("Complete {}", run.step_id)).clicked() {
-                            action = Some(OperatorAction::CompleteStep {
-                                step_id: run.step_id.clone(),
-                                operator: self.mes_action_operator(),
-                            });
-                        }
+                    if let Some(run) = &traveler.active_run
+                        && ui.button(format!("Complete {}", run.step_id)).clicked()
+                    {
+                        action = Some(OperatorAction::CompleteStep {
+                            step_id: run.step_id.clone(),
+                            operator: self.mes_action_operator(),
+                        });
                     }
                 }
                 TravelerStatus::WaitingForSignoff => {
-                    if let Some(pending) = &traveler.pending_signoff {
-                        if ui
+                    if let Some(pending) = &traveler.pending_signoff
+                        && ui
                             .button(format!("Sign off {}", pending.run.step_id))
                             .clicked()
-                        {
-                            action = Some(OperatorAction::SignOff {
-                                step_id: pending.run.step_id.clone(),
-                                operator: self.mes_action_operator(),
-                            });
-                        }
+                    {
+                        action = Some(OperatorAction::SignOff {
+                            step_id: pending.run.step_id.clone(),
+                            operator: self.mes_action_operator(),
+                        });
                     }
                 }
                 TravelerStatus::OnHold => {
@@ -8217,30 +8211,28 @@ impl FabricadApp {
                         operator: self.mes_action_operator(),
                     });
                 }
-                if let Some(wafer_id) = lot.last_processable_wafer_id() {
-                    if ui.button(format!("Scrap {}", wafer_id)).clicked() {
-                        action = Some(OperatorAction::ScrapWafer {
-                            wafer_id,
-                            reason: "MES demo edge defect".to_string(),
-                            operator: self.mes_action_operator(),
-                        });
-                    }
+                if let Some(wafer_id) = lot.last_processable_wafer_id()
+                    && ui.button(format!("Scrap {wafer_id}")).clicked()
+                {
+                    action = Some(OperatorAction::ScrapWafer {
+                        wafer_id,
+                        reason: "MES demo edge defect".to_string(),
+                        operator: self.mes_action_operator(),
+                    });
                 }
                 if let (Some(step_id), Some(wafer_id)) = (
                     traveler.current_step_id.clone(),
                     lot.first_processable_wafer_id(),
-                ) {
-                    if ui
-                        .button(format!("Rework {} to {}", wafer_id, step_id))
-                        .clicked()
-                    {
-                        action = Some(OperatorAction::SendToRework {
-                            wafer_ids: vec![wafer_id],
-                            target_step: step_id,
-                            reason: "MES demo rework verification".to_string(),
-                            operator: self.mes_action_operator(),
-                        });
-                    }
+                ) && ui
+                    .button(format!("Rework {wafer_id} to {step_id}"))
+                    .clicked()
+                {
+                    action = Some(OperatorAction::SendToRework {
+                        wafer_ids: vec![wafer_id],
+                        target_step: step_id,
+                        reason: "MES demo rework verification".to_string(),
+                        operator: self.mes_action_operator(),
+                    });
                 }
             }
         });
@@ -8839,13 +8831,12 @@ impl FabricadApp {
                             has_gds_layer.then_some(u16::try_from(layer.id.0).unwrap_or(u16::MAX));
                         visual_dirty = true;
                     }
-                    if let Some(gds_layer) = layer.gds_layer.as_mut() {
-                        if ui
+                    if let Some(gds_layer) = layer.gds_layer.as_mut()
+                        && ui
                             .add(egui::DragValue::new(gds_layer).range(0..=u16::MAX).speed(1))
                             .changed()
-                        {
-                            visual_dirty = true;
-                        }
+                    {
+                        visual_dirty = true;
                     }
                 });
                 ui.horizontal(|ui| {
@@ -9613,14 +9604,15 @@ impl FabricadApp {
         for point in points {
             painter.circle_filled(point, 2.5, Color32::from_rgb(215, 238, 242));
         }
-        if let Some(target) = self.metrology_kind.spec().target {
-            if target >= min && target <= max {
-                let y = rect.bottom() - rect.height() * (((target - min) / span) as f32);
-                painter.line_segment(
-                    [Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)],
-                    Stroke::new(1.0, Color32::from_rgba_unmultiplied(180, 230, 176, 135)),
-                );
-            }
+        if let Some(target) = self.metrology_kind.spec().target
+            && target >= min
+            && target <= max
+        {
+            let y = rect.bottom() - rect.height() * (((target - min) / span) as f32);
+            painter.line_segment(
+                [Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)],
+                Stroke::new(1.0, Color32::from_rgba_unmultiplied(180, 230, 176, 135)),
+            );
         }
         painter.text(
             rect.left_bottom() + vec2(4.0, -4.0),
@@ -10489,11 +10481,11 @@ impl FabricadApp {
                 ui.add(egui::DragValue::new(&mut array.row_pitch.dy).speed(self.edit_step()));
             });
             let array = array.normalized();
-            if array != info.array {
-                if let Some(mut instance) = self.document.instance(info.parent, info.id) {
-                    instance.array = array;
-                    self.replace_instance(info.parent, info.id, instance, "updated instance array");
-                }
+            if array != info.array
+                && let Some(mut instance) = self.document.instance(info.parent, info.id)
+            {
+                instance.array = array;
+                self.replace_instance(info.parent, info.id, instance, "updated instance array");
             }
         } else if let Some(id) = self.selected_top_level_shape() {
             ui.separator();
@@ -10815,10 +10807,10 @@ impl FabricadApp {
             ui_chrome::empty_state(ui, "No yield dataset loaded");
             return;
         }
-        if self.selected_yield_lot.is_empty() {
-            if let Some(lot_id) = lot_ids.first() {
-                self.selected_yield_lot = lot_id.clone();
-            }
+        if self.selected_yield_lot.is_empty()
+            && let Some(lot_id) = lot_ids.first()
+        {
+            self.selected_yield_lot = lot_id.clone();
         }
         if !lot_ids.contains(&self.selected_yield_lot) {
             self.selected_yield_lot = lot_ids.first().cloned().unwrap_or_default();
@@ -11724,45 +11716,45 @@ impl FabricadApp {
             painter.circle_stroke(pos, 7.0, Stroke::new(1.5, Color32::from_rgb(130, 210, 230)));
         }
 
-        if let Some(die) = self.selected_die {
-            if canvas.width() > 340.0 {
-                let badge_width = (canvas.width() - 32.0).min(230.0);
-                let badge_top = if canvas.width() < 560.0 { 72.0 } else { 14.0 };
-                let badge = EguiRect::from_min_size(
-                    Pos2::new(
-                        canvas.right() - badge_width - 16.0,
-                        canvas.top() + badge_top,
-                    ),
-                    vec2(badge_width, 58.0),
-                );
-                painter.rect_filled(badge, 4.0, Color32::from_rgba_unmultiplied(16, 19, 21, 220));
-                painter.rect_stroke(
-                    badge,
-                    4.0,
-                    Stroke::new(1.0, Color32::from_rgba_unmultiplied(210, 220, 216, 80)),
-                    StrokeKind::Inside,
-                );
-                let value = self
-                    .wafer_map
-                    .measurement_for(die, self.metrology_kind)
-                    .map(|measurement| format_metrology_value(measurement.kind, measurement.value))
-                    .unwrap_or_else(|| "no record".to_string());
-                let site = metrology_triage_for_die(&self.wafer_map, die);
-                painter.text(
-                    badge.left_top() + vec2(10.0, 9.0),
-                    Align2::LEFT_TOP,
-                    format!("Selected C{} R{}", die.column, die.row),
-                    FontId::proportional(13.0),
-                    Color32::from_rgb(238, 244, 240),
-                );
-                painter.text(
-                    badge.left_top() + vec2(10.0, 30.0),
-                    Align2::LEFT_TOP,
-                    format!("{}  {} defect(s)", value, site.defect_count),
-                    FontId::monospace(11.0),
-                    Color32::from_rgb(204, 215, 210),
-                );
-            }
+        if let Some(die) = self.selected_die
+            && canvas.width() > 340.0
+        {
+            let badge_width = (canvas.width() - 32.0).min(230.0);
+            let badge_top = if canvas.width() < 560.0 { 72.0 } else { 14.0 };
+            let badge = EguiRect::from_min_size(
+                Pos2::new(
+                    canvas.right() - badge_width - 16.0,
+                    canvas.top() + badge_top,
+                ),
+                vec2(badge_width, 58.0),
+            );
+            painter.rect_filled(badge, 4.0, Color32::from_rgba_unmultiplied(16, 19, 21, 220));
+            painter.rect_stroke(
+                badge,
+                4.0,
+                Stroke::new(1.0, Color32::from_rgba_unmultiplied(210, 220, 216, 80)),
+                StrokeKind::Inside,
+            );
+            let value = self
+                .wafer_map
+                .measurement_for(die, self.metrology_kind)
+                .map(|measurement| format_metrology_value(measurement.kind, measurement.value))
+                .unwrap_or_else(|| "no record".to_string());
+            let site = metrology_triage_for_die(&self.wafer_map, die);
+            painter.text(
+                badge.left_top() + vec2(10.0, 9.0),
+                Align2::LEFT_TOP,
+                format!("Selected C{} R{}", die.column, die.row),
+                FontId::proportional(13.0),
+                Color32::from_rgb(238, 244, 240),
+            );
+            painter.text(
+                badge.left_top() + vec2(10.0, 30.0),
+                Align2::LEFT_TOP,
+                format!("{}  {} defect(s)", value, site.defect_count),
+                FontId::monospace(11.0),
+                Color32::from_rgb(204, 215, 210),
+            );
         }
 
         if let Some(die) = hovered_die {
@@ -12377,6 +12369,7 @@ fn smoothed_frame_interval_ms(previous: Option<f64>, frame_ms: f64) -> Option<f6
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn print_3d_benchmark_report(
     intervals: &[f64],
     canvas_cpu_ms: &[f64],
@@ -13170,11 +13163,11 @@ impl FabricadApp {
         world: Point,
     ) {
         let tolerance = (10.0 / self.zoom).max(self.snap_grid() as f32) as Coord;
-        if response.double_clicked() {
-            if let Some(edge) = self.hit_selected_edge(world, tolerance) {
-                self.insert_vertex(edge.shape, edge.edge, world);
-                return;
-            }
+        if response.double_clicked()
+            && let Some(edge) = self.hit_selected_edge(world, tolerance)
+        {
+            self.insert_vertex(edge.shape, edge.edge, world);
+            return;
         }
         if response.hovered()
             && ui.input(|input| {
@@ -13297,22 +13290,22 @@ impl FabricadApp {
         if response.drag_started_by(PointerButton::Primary) {
             self.drawing_start = Some(world);
         }
-        if response.drag_stopped_by(PointerButton::Primary) {
-            if let Some(start) = self.drawing_start.take() {
-                let rect = Rect::new(start, world);
-                let minimum_size = self.minimum_draw_size();
-                if rect.width().abs() >= minimum_size && rect.height().abs() >= minimum_size {
-                    self.add_shape(self.active_layer, ShapeKind::Rectangle(rect));
-                }
+        if response.drag_stopped_by(PointerButton::Primary)
+            && let Some(start) = self.drawing_start.take()
+        {
+            let rect = Rect::new(start, world);
+            let minimum_size = self.minimum_draw_size();
+            if rect.width().abs() >= minimum_size && rect.height().abs() >= minimum_size {
+                self.add_shape(self.active_layer, ShapeKind::Rectangle(rect));
             }
         }
     }
 
     fn handle_polyline_input(&mut self, response: &egui::Response, world: Point) {
-        if response.clicked_by(PointerButton::Primary) {
-            if self.drawing_points.last().copied() != Some(world) {
-                self.drawing_points.push(world);
-            }
+        if response.clicked_by(PointerButton::Primary)
+            && self.drawing_points.last().copied() != Some(world)
+        {
+            self.drawing_points.push(world);
         }
         if response.double_clicked() || response.clicked_by(PointerButton::Secondary) {
             self.finish_polyline();
@@ -13712,10 +13705,10 @@ impl egui_wgpu::CallbackTrait for LayoutGpuCallback {
         _egui_encoder: &mut egui_wgpu::wgpu::CommandEncoder,
         callback_resources: &mut egui_wgpu::CallbackResources,
     ) -> Vec<egui_wgpu::wgpu::CommandBuffer> {
-        if callback_resources.get::<LayoutGpuRenderer>().is_none() {
-            if let Some(resources) = LayoutGpuRenderer::new(device, self.target_format) {
-                callback_resources.insert(resources);
-            }
+        if callback_resources.get::<LayoutGpuRenderer>().is_none()
+            && let Some(resources) = LayoutGpuRenderer::new(device, self.target_format)
+        {
+            callback_resources.insert(resources);
         }
         if let Some(resources) = callback_resources.get_mut::<LayoutGpuRenderer>() {
             let layout_upload = resources.upload(device, queue, &self.batch, self.uniforms);
@@ -14468,7 +14461,7 @@ fn failure_breakdown_ui(
             ui.add(
                 egui::ProgressBar::new(count as f32 / denominator)
                     .desired_width(bar_width)
-                    .text(format!("{} dies", count)),
+                    .text(format!("{count} dies")),
             );
         });
     }
@@ -15923,6 +15916,7 @@ fn polygon_signed_area_twice(points: &[Point]) -> i128 {
     area + previous.x as i128 * first.y as i128 - first.x as i128 * previous.y as i128
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_path_segment_to_3d_batch(
     batch: &mut renderer::RenderBatch3d,
     a: Point,
@@ -16611,6 +16605,10 @@ fn add_nav_rail_row(
             },
         )
         .with_input(InputBehavior::BUTTON)
+        .with_accessibility(ui_chrome::operad_button_accessibility(
+            row.label,
+            "Open view",
+        ))
         .with_visual(UiVisual::panel(fill, stroke, 4.0)),
     );
     widgets::label(
@@ -17007,7 +17005,9 @@ fn add_fab_control_operad_data_row(
         4.0,
     ));
     if row.action_name.is_some() {
-        node = node.with_input(InputBehavior::BUTTON);
+        node = node.with_input(InputBehavior::BUTTON).with_accessibility(
+            crate::ui_chrome::operad_button_accessibility(&row.title, &row.detail),
+        );
     }
     let row_node = document.add_child(parent, node);
     document.add_child(
@@ -17733,7 +17733,7 @@ fn metrology_swatch(ui: &mut egui::Ui, color: Color32) {
 
 fn format_metrology_value(kind: MeasurementKind, value: f64) -> String {
     match kind {
-        MeasurementKind::DefectCount => format!("{:.0}", value),
+        MeasurementKind::DefectCount => format!("{value:.0}"),
         MeasurementKind::PassFail => {
             if value >= 0.5 {
                 "pass".to_string()
@@ -17747,8 +17747,8 @@ fn format_metrology_value(kind: MeasurementKind, value: f64) -> String {
 
 fn format_metrology_delta(kind: MeasurementKind, value: f64) -> String {
     match kind {
-        MeasurementKind::DefectCount => format!("{:.2}", value),
-        MeasurementKind::PassFail => format!("{:.2}", value),
+        MeasurementKind::DefectCount => format!("{value:.2}"),
+        MeasurementKind::PassFail => format!("{value:.2}"),
         _ => format!("{:.2} {}", value, kind.unit()),
     }
 }
@@ -18598,8 +18598,7 @@ mod tests {
         assert_eq!(
             dataset.metadata.migration_history,
             vec![format!(
-                "workspace_schema:{}",
-                WORKSPACE_DATASET_SCHEMA_VERSION
+                "workspace_schema:{WORKSPACE_DATASET_SCHEMA_VERSION}"
             )]
         );
 
@@ -19099,7 +19098,7 @@ mod tests {
                 .expect("fab control operad layout should compute");
             let warnings = view.document.audit_layout();
             assert!(warnings.is_empty(), "{width}: {warnings:?}");
-            assert!(view.document.paint_list().items.len() > 0);
+            assert!(!view.document.paint_list().items.is_empty());
         }
     }
 
@@ -19121,7 +19120,7 @@ mod tests {
             .expect("demo fab has multiple tools");
 
         assert!(app.handle_fab_control_operad_action(
-            &format!("{FAB_OPERAD_ACTION_SELECT_TOOL}{}", selected_id),
+            &format!("{FAB_OPERAD_ACTION_SELECT_TOOL}{selected_id}"),
             &tools,
         ));
         assert_eq!(app.selected_equipment_tool.as_ref(), Some(&selected_id));
@@ -19134,7 +19133,7 @@ mod tests {
             .expect("demo fab has an offline tool");
         let tools = app.equipment_sim.tools().cloned().collect::<Vec<_>>();
         assert!(app.handle_fab_control_operad_action(
-            &format!("{FAB_OPERAD_ACTION_BRING_ONLINE}{}", offline_id),
+            &format!("{FAB_OPERAD_ACTION_BRING_ONLINE}{offline_id}"),
             &tools,
         ));
         assert_eq!(
@@ -20306,7 +20305,7 @@ mod tests {
 
     #[test]
     fn cpu_fallback_3d_sort_draws_side_walls_before_top_caps_at_same_depth() {
-        let mut faces = vec![
+        let mut faces = [
             ProjectedFace {
                 surface: FaceSurface3d::Top,
                 depth: 768.0,
@@ -20331,7 +20330,7 @@ mod tests {
 
     #[test]
     fn cpu_fallback_3d_sort_draws_far_primitive_before_near_primitive() {
-        let mut faces = vec![
+        let mut faces = [
             ProjectedFace {
                 surface: FaceSurface3d::Side,
                 depth: 1_000.0,
@@ -20359,7 +20358,7 @@ mod tests {
 
     #[test]
     fn cpu_fallback_3d_overlays_are_after_sorted_layout() {
-        let mut layout_faces = vec![
+        let mut layout_faces = [
             ProjectedFace {
                 surface: FaceSurface3d::Top,
                 depth: 1_200.0,
@@ -20579,6 +20578,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn default_3d_shape_budget_covers_million_shape_stress_scene() {
         assert!(MAX_3D_RENDERED_SHAPES >= 1_000_000);
     }

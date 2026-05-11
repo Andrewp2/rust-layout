@@ -242,7 +242,12 @@ fn add_row(
         4.0,
     ));
     if row.action_name.is_some() {
-        row_node = row_node.with_input(InputBehavior::BUTTON);
+        row_node = row_node
+            .with_input(InputBehavior::BUTTON)
+            .with_accessibility(crate::ui_chrome::operad_button_accessibility(
+                &row.title,
+                &row.detail,
+            ));
     }
     let row_node = document.add_child(parent, row_node);
     document.add_child(
@@ -403,7 +408,7 @@ mod tests {
                 .expect("sidecar layout should compute");
             let warnings = view.document.audit_layout();
             assert!(warnings.is_empty(), "{width}: {warnings:?}");
-            assert!(view.document.paint_list().items.len() > 0);
+            assert!(!view.document.paint_list().items.is_empty());
         }
     }
 }

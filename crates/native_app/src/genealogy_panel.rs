@@ -93,7 +93,7 @@ impl GenealogyPanel {
             selected_lot,
             selected_wafer,
             selected_detail,
-            impact_mode: ImpactMode::LatestToolRun,
+            impact_mode: ImpactMode::ToolRun,
             search_query: String::new(),
             related_only: false,
         }
@@ -1347,10 +1347,10 @@ impl GenealogyPanel {
                     ui.selectable_value(&mut selected, Some(lot_id.clone()), lot_id.to_string());
                 }
             });
-        if selected != self.selected_lot {
-            if let Some(lot_id) = selected {
-                self.select_lot(lot_id);
-            }
+        if selected != self.selected_lot
+            && let Some(lot_id) = selected
+        {
+            self.select_lot(lot_id);
         }
     }
 
@@ -1375,10 +1375,10 @@ impl GenealogyPanel {
                     );
                 }
             });
-        if selected != self.selected_wafer {
-            if let Some(wafer_id) = selected {
-                self.select_wafer(WaferRef { lot_id, wafer_id });
-            }
+        if selected != self.selected_wafer
+            && let Some(wafer_id) = selected
+        {
+            self.select_wafer(WaferRef { lot_id, wafer_id });
         }
     }
 
@@ -2154,21 +2154,21 @@ impl GenealogyPanel {
     fn impact_query(&self) -> Option<ExcursionQuery> {
         let wafer = self.selected_wafer_ref()?;
         match self.impact_mode {
-            ImpactMode::LatestToolRun => self
+            ImpactMode::ToolRun => self
                 .genealogy
                 .inherited_process_history_for_wafer(&wafer)
                 .last()
                 .map(|record| ExcursionQuery::ToolRun {
                     tool_run_id: record.tool_run_id.clone(),
                 }),
-            ImpactMode::LatestStep => self
+            ImpactMode::Step => self
                 .genealogy
                 .inherited_process_history_for_wafer(&wafer)
                 .last()
                 .map(|record| ExcursionQuery::ProcessStep {
                     step_id: record.step_id.clone(),
                 }),
-            ImpactMode::LatestMaterial => self
+            ImpactMode::Material => self
                 .genealogy
                 .material_ancestry_for_wafer(&wafer)
                 .last()
@@ -2328,35 +2328,35 @@ enum TraceSelection {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ImpactMode {
-    LatestToolRun,
-    LatestStep,
-    LatestMaterial,
+    ToolRun,
+    Step,
+    Material,
 }
 
 impl ImpactMode {
-    const ALL: [Self; 3] = [Self::LatestToolRun, Self::LatestStep, Self::LatestMaterial];
+    const ALL: [Self; 3] = [Self::ToolRun, Self::Step, Self::Material];
 
     fn label(self) -> &'static str {
         match self {
-            Self::LatestToolRun => "Latest tool run",
-            Self::LatestStep => "Latest step",
-            Self::LatestMaterial => "Latest material",
+            Self::ToolRun => "Latest tool run",
+            Self::Step => "Latest step",
+            Self::Material => "Latest material",
         }
     }
 
     fn slug(self) -> &'static str {
         match self {
-            Self::LatestToolRun => "latest-tool-run",
-            Self::LatestStep => "latest-step",
-            Self::LatestMaterial => "latest-material",
+            Self::ToolRun => "latest-tool-run",
+            Self::Step => "latest-step",
+            Self::Material => "latest-material",
         }
     }
 
     fn from_slug(slug: &str) -> Option<Self> {
         match slug {
-            "latest-tool-run" => Some(Self::LatestToolRun),
-            "latest-step" => Some(Self::LatestStep),
-            "latest-material" => Some(Self::LatestMaterial),
+            "latest-tool-run" => Some(Self::ToolRun),
+            "latest-step" => Some(Self::Step),
+            "latest-material" => Some(Self::Material),
             _ => None,
         }
     }
@@ -2712,7 +2712,9 @@ fn add_genealogy_operad_data_row(
         4.0,
     ));
     if row.action_name.is_some() {
-        node = node.with_input(InputBehavior::BUTTON);
+        node = node.with_input(InputBehavior::BUTTON).with_accessibility(
+            crate::ui_chrome::operad_button_accessibility(&row.title, &row.detail),
+        );
     }
     let row_node = document.add_child(parent, node);
     document.add_child(
@@ -3255,9 +3257,9 @@ mod tests {
 
         assert!(panel.handle_operad_action(&format!(
             "{OPERAD_ACTION_IMPACT_MODE}{}:test",
-            ImpactMode::LatestMaterial.slug()
+            ImpactMode::Material.slug()
         )));
-        assert_eq!(panel.impact_mode, ImpactMode::LatestMaterial);
+        assert_eq!(panel.impact_mode, ImpactMode::Material);
 
         assert!(!panel.related_only);
         assert!(panel.handle_operad_action(OPERAD_ACTION_TOGGLE_RELATED));

@@ -282,13 +282,13 @@ impl LabNotebookPanel {
                     return;
                 }
 
-                self.summary_metrics_ui(ui, &filtered_ids, &metrics);
+                self.summary_metrics_ui(ui, filtered_ids, metrics);
                 self.filter_bar_ui(ui);
                 ui.separator();
 
                 let available_width = ui.available_width();
                 if available_width < 760.0 {
-                    self.entry_list_ui(ui, &filtered_ids);
+                    self.entry_list_ui(ui, filtered_ids);
                     ui.separator();
                     self.selected_entry_ui(ui, status);
                     ui.separator();
@@ -298,14 +298,14 @@ impl LabNotebookPanel {
                         columns[0].set_min_width(270.0);
                         columns[1].set_min_width(460.0);
                         columns[2].set_min_width(260.0);
-                        self.entry_list_ui(&mut columns[0], &filtered_ids);
+                        self.entry_list_ui(&mut columns[0], filtered_ids);
                         self.selected_entry_ui(&mut columns[1], status);
                         self.related_context_ui(&mut columns[2]);
                     });
                 } else {
                     ui.columns(2, |columns| {
                         columns[0].set_min_width(270.0);
-                        self.entry_list_ui(&mut columns[0], &filtered_ids);
+                        self.entry_list_ui(&mut columns[0], filtered_ids);
                         self.selected_entry_ui(&mut columns[1], status);
                     });
                 }
@@ -1170,10 +1170,10 @@ impl LabNotebookPanel {
             }
         });
 
-        if let Some(action) = entry_action {
-            if let Some(message) = self.apply_entry_action(&entry_id, action) {
-                *status = message;
-            }
+        if let Some(action) = entry_action
+            && let Some(message) = self.apply_entry_action(&entry_id, action)
+        {
+            *status = message;
         }
 
         ui.separator();
@@ -1196,11 +1196,11 @@ impl LabNotebookPanel {
 
         ui.separator();
         ui.label(RichText::new("Linked Data").strong());
-        if let Some(entry) = self.notebook.entry(&entry_id).cloned() {
-            if let Some(focus) = linked_data_ui(ui, &entry.links) {
-                self.apply_link_focus(focus.clone());
-                *status = format!("filtered notebook to {}", focus.label);
-            }
+        if let Some(entry) = self.notebook.entry(&entry_id).cloned()
+            && let Some(focus) = linked_data_ui(ui, &entry.links)
+        {
+            self.apply_link_focus(focus.clone());
+            *status = format!("filtered notebook to {}", focus.label);
         }
     }
 
@@ -1909,7 +1909,9 @@ fn add_notebook_operad_data_row(
         4.0,
     ));
     if row.action_name.is_some() {
-        node = node.with_input(InputBehavior::BUTTON);
+        node = node.with_input(InputBehavior::BUTTON).with_accessibility(
+            crate::ui_chrome::operad_button_accessibility(&row.title, &row.detail),
+        );
     }
     let row_node = document.add_child(parent, node);
     document.add_child(

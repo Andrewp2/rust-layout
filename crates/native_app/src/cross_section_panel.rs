@@ -249,14 +249,13 @@ impl CrossSectionPanel {
                     },
                 );
 
-                if step_changed {
-                    if let Some(snapshot) = self.selected_snapshot() {
+                if step_changed
+                    && let Some(snapshot) = self.selected_snapshot() {
                         *status = format!(
                             "cross-section step {}: {}",
                             snapshot.step_index, snapshot.title
                         );
                     }
-                }
 
                 let Some(snapshot) = self.selected_snapshot().cloned() else {
                     ui_chrome::empty_state(ui, "No cross-section snapshots loaded");

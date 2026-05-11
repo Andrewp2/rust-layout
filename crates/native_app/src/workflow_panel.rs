@@ -252,7 +252,7 @@ impl WorkflowPanel {
         ui: &mut egui::Ui,
         data: &WorkflowData<'_>,
     ) -> Option<WorkflowAction> {
-        let has_workspace_data = workflow_has_data(&data);
+        let has_workspace_data = workflow_has_data(data);
         let mut destination = None;
         let mut load_demo = false;
 
@@ -274,7 +274,7 @@ impl WorkflowPanel {
                     },
                     |ui| {
                         if has_workspace_data {
-                            self.lot_picker(ui, &data);
+                            self.lot_picker(ui, data);
                         } else if ui.button("Load demo workspace").clicked() {
                             load_demo = true;
                         }
@@ -286,24 +286,24 @@ impl WorkflowPanel {
                     return;
                 }
 
-                self.metric_row(ui, &data);
+                self.metric_row(ui, data);
                 ui.separator();
-                self.production_focus_ui(ui, &data, &mut destination);
+                self.production_focus_ui(ui, data, &mut destination);
                 ui.separator();
 
                 if ui.available_width() >= 940.0 {
                     ui.columns(2, |columns| {
-                        self.spine_ui(&mut columns[0], &data, &mut destination);
-                        self.route_operations_ui(&mut columns[1], &data, &mut destination);
+                        self.spine_ui(&mut columns[0], data, &mut destination);
+                        self.route_operations_ui(&mut columns[1], data, &mut destination);
                     });
                     ui.separator();
-                    self.cross_link_ui(ui, &data, &mut destination);
+                    self.cross_link_ui(ui, data, &mut destination);
                 } else {
-                    self.spine_ui(ui, &data, &mut destination);
+                    self.spine_ui(ui, data, &mut destination);
                     ui.separator();
-                    self.route_operations_ui(ui, &data, &mut destination);
+                    self.route_operations_ui(ui, data, &mut destination);
                     ui.separator();
-                    self.cross_link_ui(ui, &data, &mut destination);
+                    self.cross_link_ui(ui, data, &mut destination);
                 }
             });
 
@@ -2102,7 +2102,9 @@ fn add_workflow_operad_data_row(
         4.0,
     ));
     if row.action_name.is_some() {
-        node = node.with_input(InputBehavior::BUTTON);
+        node = node.with_input(InputBehavior::BUTTON).with_accessibility(
+            crate::ui_chrome::operad_button_accessibility(&row.title, &row.detail),
+        );
     }
     let row_node = document.add_child(parent, node);
     document.add_child(
@@ -2646,8 +2648,7 @@ fn cross_link_summaries(data: &WorkflowData<'_>, lot_id: &str) -> Vec<CrossLinkS
                 "empty"
             },
             detail: format!(
-                "{} focus material links, {} notebook entries",
-                material_count, notebook_count
+                "{material_count} focus material links, {notebook_count} notebook entries"
             ),
             tone: if material_count > 0 {
                 Tone::Success

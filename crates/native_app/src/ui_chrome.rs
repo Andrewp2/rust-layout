@@ -1,4 +1,5 @@
 use eframe::egui::{self, Color32, Margin, RichText, Stroke, StrokeKind, Vec2, vec2};
+use operad::{AccessibilityAction, AccessibilityMeta, AccessibilityRole};
 
 pub(crate) const NAV_WIDTH: f32 = 108.0;
 pub(crate) const INSPECTOR_WIDTH: f32 = 268.0;
@@ -18,6 +19,19 @@ pub(crate) enum Tone {
     Success,
     Warning,
     Danger,
+}
+
+pub(crate) fn operad_button_accessibility(label: &str, hint: &str) -> AccessibilityMeta {
+    let label = label.trim();
+    let hint = hint.trim();
+    let mut accessibility = AccessibilityMeta::new(AccessibilityRole::Button)
+        .label(if label.is_empty() { "Action" } else { label })
+        .focusable()
+        .action(AccessibilityAction::new("activate", "Activate"));
+    if !hint.is_empty() {
+        accessibility = accessibility.hint(hint);
+    }
+    accessibility
 }
 
 impl Tone {

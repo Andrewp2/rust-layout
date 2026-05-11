@@ -1500,6 +1500,7 @@ fn build_layout_index(document: &Document) -> LayoutIndex {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_viewport_3d_pipeline(
     device: &wgpu::Device,
     label: &'static str,
@@ -1913,23 +1914,6 @@ fn offscreen_viewport(width: u32, height: u32, zoom: f32, pan: [f32; 2]) -> Rect
     )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn viewport_3d_target_size_rounds_fractional_high_dpi_extents_up() {
-        assert_eq!(viewport_3d_target_size([320.25, 200.5], 1.5), [481, 301]);
-        assert_eq!(viewport_3d_target_size([320.0, 200.0], 2.0), [640, 400]);
-    }
-
-    #[test]
-    fn viewport_3d_target_size_sanitizes_empty_or_invalid_inputs() {
-        assert_eq!(viewport_3d_target_size([0.0, -4.0], 2.0), [1, 1]);
-        assert_eq!(viewport_3d_target_size([f32::NAN, 10.0], f32::NAN), [1, 10]);
-    }
-}
-
 fn align_to(value: u32, alignment: u32) -> u32 {
     value.div_ceil(alignment) * alignment
 }
@@ -1957,4 +1941,21 @@ fn count_non_dark_rgba_pixels(
 
 fn gpu_error(message: impl Into<String>) -> Box<dyn Error> {
     Box::new(std::io::Error::other(message.into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn viewport_3d_target_size_rounds_fractional_high_dpi_extents_up() {
+        assert_eq!(viewport_3d_target_size([320.25, 200.5], 1.5), [481, 301]);
+        assert_eq!(viewport_3d_target_size([320.0, 200.0], 2.0), [640, 400]);
+    }
+
+    #[test]
+    fn viewport_3d_target_size_sanitizes_empty_or_invalid_inputs() {
+        assert_eq!(viewport_3d_target_size([0.0, -4.0], 2.0), [1, 1]);
+        assert_eq!(viewport_3d_target_size([f32::NAN, 10.0], f32::NAN), [1, 10]);
+    }
 }

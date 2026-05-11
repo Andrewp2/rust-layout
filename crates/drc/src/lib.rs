@@ -188,8 +188,8 @@ impl DrcIssueStore {
                         .is_none_or(|indexed_record| indexed_record.key != record.key)
                     {
                         findings.push(DrcValidationFinding::error(format!(
-                            "DRC issue key {:?} points at stale record index {}",
-                            record.key, indexed
+                            "DRC issue key {:?} points at stale record index {indexed}",
+                            record.key
                         )));
                     }
                 }
@@ -206,8 +206,7 @@ impl DrcIssueStore {
                 .is_none_or(|record| record.key != *key)
             {
                 findings.push(DrcValidationFinding::error(format!(
-                    "DRC lookup index contains stale key {:?} at index {}",
-                    key, index
+                    "DRC lookup index contains stale key {key:?} at index {index}"
                 )));
             }
         }
@@ -282,8 +281,7 @@ impl RuleDeck {
             validate_rule_layer(document, *layer_id, "min-width", &mut findings);
             if *required <= 0 {
                 findings.push(DrcValidationFinding::error(format!(
-                    "DRC min-width rule for layer {:?} must be positive, got {}",
-                    layer_id, required
+                    "DRC min-width rule for layer {layer_id:?} must be positive, got {required}"
                 )));
             }
         }
@@ -291,8 +289,7 @@ impl RuleDeck {
             validate_rule_layer(document, *layer_id, "min-spacing", &mut findings);
             if *required <= 0 {
                 findings.push(DrcValidationFinding::error(format!(
-                    "DRC min-spacing rule for layer {:?} must be positive, got {}",
-                    layer_id, required
+                    "DRC min-spacing rule for layer {layer_id:?} must be positive, got {required}"
                 )));
             }
         }
@@ -425,8 +422,7 @@ fn validate_rule_layer(
 ) {
     if !document.layers.contains_key(&layer_id) {
         findings.push(DrcValidationFinding::error(format!(
-            "DRC {context} rule references missing document layer {:?}",
-            layer_id
+            "DRC {context} rule references missing document layer {layer_id:?}"
         )));
     }
 }
@@ -468,7 +464,7 @@ fn check_min_width(document: &Document, rules: &RuleDeck, violations: &mut Vec<D
             violations.push(DrcViolation {
                 id: 0,
                 rule: "min_width".to_string(),
-                message: format!("minimum width is {} dbu, found {:.1} dbu", required, actual),
+                message: format!("minimum width is {required} dbu, found {actual:.1} dbu"),
                 shape_ids: vec![shape.id],
                 bounds: shape.kind.bounds().expanded(required),
                 required,
@@ -503,8 +499,7 @@ fn check_spacing(document: &Document, rules: &RuleDeck, violations: &mut Vec<Drc
                     id: 0,
                     rule: "min_spacing".to_string(),
                     message: format!(
-                        "same-layer spacing is {:.1} dbu, below required {} dbu",
-                        actual, required
+                        "same-layer spacing is {actual:.1} dbu, below required {required} dbu"
                     ),
                     shape_ids: vec![left.id, right.id],
                     bounds: left_bounds.union(right_bounds).expanded(required),

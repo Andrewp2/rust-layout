@@ -1997,7 +1997,9 @@ fn add_layout_diff_operad_data_row(
         4.0,
     ));
     if row.action_name.is_some() {
-        node = node.with_input(InputBehavior::BUTTON);
+        node = node.with_input(InputBehavior::BUTTON).with_accessibility(
+            crate::ui_chrome::operad_button_accessibility(&row.title, &row.detail),
+        );
     }
     let row_node = document.add_child(parent, node);
     document.add_child(
@@ -2144,8 +2146,10 @@ mod tests {
     #[test]
     fn layout_diff_operad_view_audits_common_widths() {
         let current = Document::hierarchy_demo();
-        let mut panel = LayoutDiffPanel::default();
-        panel.candidate = DiffSource::Current;
+        let panel = LayoutDiffPanel {
+            candidate: DiffSource::Current,
+            ..Default::default()
+        };
         let report = panel.report(&current);
         for width in [360.0, 760.0, 1200.0] {
             let mut view = panel.build_operad_view(width, &report);
