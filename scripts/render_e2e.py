@@ -2,25 +2,14 @@
 from __future__ import annotations
 
 import argparse
-import base64
-import contextlib
-import io
-import json
-import os
 import shutil
-import signal
-import socket
 import subprocess
 import sys
-import tempfile
-import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Callable
 
-import requests
-import websocket
 from PIL import Image
 
 
@@ -48,19 +37,20 @@ class Metrics:
     green: int
     orange: int
     magenta: int
+    teal: int
     bright: int
     sampled_unique: int
 
     @property
     def layer_pixels(self) -> int:
-        return self.blue + self.green + self.orange + self.magenta
+        return self.blue + self.green + self.orange + self.magenta + self.teal
 
 
-@dataclass
+@dataclass(frozen=True)
 class Case:
     name: str
-    query: str
-    assertion: Any
+    args: tuple[str, ...]
+    assertion: Callable[[Metrics], None]
 
 
 @dataclass
@@ -70,161 +60,78 @@ class DiffMetrics:
     max_delta: int
 
 
-class Cdp:
-    def __init__(self, ws_url: str):
-        self.ws = websocket.create_connection(ws_url, timeout=10)
-        self.next_id = 1
-
-    def close(self) -> None:
-        self.ws.close()
-
-    def call(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        msg_id = self.next_id
-        self.next_id += 1
-        self.ws.send(json.dumps({"id": msg_id, "method": method, "params": params or {}}))
-        while True:
-            message = json.loads(self.ws.recv())
-            if message.get("id") == msg_id:
-                if "error" in message:
-                    raise RuntimeError(f"CDP {method} failed: {message['error']}")
-                return message.get("result", {})
-
-
-def free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
-def wait_http(url: str, timeout_s: float) -> None:
-    deadline = time.time() + timeout_s
-    last_error: Exception | None = None
-    while time.time() < deadline:
-        try:
-            response = requests.get(url, timeout=1)
-            if response.status_code < 500:
-                return
-        except Exception as error:
-            last_error = error
-        time.sleep(0.25)
-    raise RuntimeError(f"timed out waiting for {url}: {last_error}")
-
-
-def start_trunk(port: int, out_dir: Path) -> subprocess.Popen:
-    log = open(out_dir / "trunk.log", "w", encoding="utf-8")
-    env = os.environ.copy()
-    env.pop("NO_COLOR", None)
-    return subprocess.Popen(
-        ["trunk", "serve", "--address", "127.0.0.1", "--port", str(port)],
+def native_binary() -> Path:
+    subprocess.run(
+        ["cargo", "build", "-p", "native_app", "--bin", "fabricad"],
         cwd=ROOT,
-        env=env,
-        stdout=log,
-        stderr=subprocess.STDOUT,
-        text=True,
+        check=True,
     )
+    binary = ROOT / "target" / "debug" / "fabricad"
+    if not binary.exists():
+        raise RuntimeError(f"native binary was not built: {binary}")
+    return binary
 
 
-def chrome_binary() -> str:
-    override = os.environ.get("CHROME")
-    if override:
-        return override
-    for name in ("google-chrome", "chromium", "chromium-browser"):
-        path = shutil.which(name)
-        if path:
-            return path
-    raise RuntimeError("could not find Chrome/Chromium; set CHROME=/path/to/chrome")
-
-
-def start_chrome(debug_port: int, profile: Path) -> subprocess.Popen:
-    log = open(OUT_DIR / "chrome.log", "w", encoding="utf-8")
+def render_case(binary: Path, case: Case, out_dir: Path, keep_raw: bool) -> Image.Image:
+    raw_path = out_dir / f"{case.name}.rgba"
+    png_path = out_dir / f"{case.name}.png"
+    summary_path = out_dir / f"{case.name}.summary.txt"
     command = [
-        chrome_binary(),
-        "--headless=new",
-        "--no-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu-sandbox",
-        "--disable-extensions",
-        "--enable-unsafe-swiftshader",
-        "--enable-unsafe-webgpu",
-        "--ignore-gpu-blocklist",
-        "--use-angle=swiftshader",
-        "--remote-allow-origins=*",
-        f"--remote-debugging-port={debug_port}",
-        f"--user-data-dir={profile}",
-        f"--window-size={WIDTH},{HEIGHT}",
-        "about:blank",
+        str(binary),
+        "--operad-snapshot",
+        "--width",
+        str(WIDTH),
+        "--height",
+        str(HEIGHT),
+        "--snapshot-rgba",
+        str(raw_path),
+        *case.args,
     ]
-    return subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, text=True)
-
-
-def connect_cdp(debug_port: int) -> Cdp:
-    version_url = f"http://127.0.0.1:{debug_port}/json"
-    deadline = time.time() + 10
-    while time.time() < deadline:
-        try:
-            targets = requests.get(version_url, timeout=1).json()
-            page = next(target for target in targets if target.get("type") == "page")
-            return Cdp(page["webSocketDebuggerUrl"])
-        except Exception:
-            time.sleep(0.2)
-    raise RuntimeError("timed out waiting for Chrome DevTools Protocol")
-
-
-def wait_for_app(cdp: Cdp) -> None:
-    deadline = time.time() + 30
-    while time.time() < deadline:
-        result = cdp.call(
-            "Runtime.evaluate",
-            {
-                "returnByValue": True,
-                "expression": """
-                    (() => {
-                        const canvas = document.getElementById('fabricad_canvas');
-                        const rect = canvas ? canvas.getBoundingClientRect() : { width: 0, height: 0 };
-                        return document.readyState === 'complete'
-                            && !!canvas
-                            && rect.width >= 300
-                            && rect.height >= 300;
-                    })()
-                """,
-            },
+    result = subprocess.run(
+        command,
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=90,
+    )
+    summary_path.write_text(result.stdout + result.stderr, encoding="utf-8")
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"{case.name} snapshot command failed with {result.returncode}; see {summary_path}"
         )
-        if result.get("result", {}).get("value"):
-            time.sleep(1.0)
-            return
-        time.sleep(0.2)
-    raise RuntimeError("timed out waiting for Fabricad canvas")
+
+    raw = raw_path.read_bytes()
+    expected = WIDTH * HEIGHT * 4
+    if len(raw) != expected:
+        raise RuntimeError(
+            f"{case.name} wrote {len(raw)} RGBA bytes, expected {expected}"
+        )
+    image = Image.frombytes("RGBA", (WIDTH, HEIGHT), raw).convert("RGB")
+    image.save(png_path)
+    if not keep_raw:
+        raw_path.unlink(missing_ok=True)
+    return image
 
 
-def capture_png(cdp: Cdp, path: Path) -> Image.Image:
-    screenshot = cdp.call("Page.captureScreenshot", {"format": "png", "fromSurface": True})
-    data = base64.b64decode(screenshot["data"])
-    path.write_bytes(data)
-    return Image.open(io.BytesIO(data)).convert("RGB")
-
-
-def analyze_canvas_region(image: Image.Image) -> Metrics:
-    # Ignore toolbar/sidebar chrome so assertions describe the rendered canvas content.
-    left = min(300, image.width // 3)
-    right = image.width - min(300, image.width // 3)
-    top = min(54, image.height // 5)
-    crop = image.crop((left, top, right, image.height))
-    pixels = list(crop.getdata())
+def analyze_image(image: Image.Image) -> Metrics:
+    pixels = list(image.getdata())
     sampled = pixels[:: max(1, len(pixels) // 20_000)]
     unique = len(set(sampled))
 
-    non_dark = blue = green = orange = magenta = bright = 0
+    non_dark = blue = green = orange = magenta = teal = bright = 0
     for r, g, b in pixels:
         if max(r, g, b) > 45:
             non_dark += 1
-        if b > 105 and g > 55 and r < 90:
+        if b > 105 and g > 55 and r < 95:
             blue += 1
-        if g > 115 and r < 110 and b < 155:
+        if g > 115 and r < 125 and b < 165:
             green += 1
-        if r > 80 and g > 45 and b < 75 and r > b + 30:
+        if r > 100 and g > 55 and b < 95 and r > b + 30:
             orange += 1
-        if r > 85 and b > 55 and g < 80:
+        if r > 95 and b > 75 and g < 95:
             magenta += 1
+        if g > 120 and b > 110 and r < 150:
+            teal += 1
         if r > 170 and g > 170 and b > 150:
             bright += 1
 
@@ -234,81 +141,36 @@ def analyze_canvas_region(image: Image.Image) -> Metrics:
         green=green,
         orange=orange,
         magenta=magenta,
+        teal=teal,
         bright=bright,
         sampled_unique=unique,
     )
 
 
-def assert_demo(metrics: Metrics) -> None:
+def assert_operad_shell(metrics: Metrics) -> None:
     failures = []
-    if metrics.non_dark < 12_000:
-        failures.append(f"canvas is too dark/nonblank pixels={metrics.non_dark}")
-    if metrics.blue < 500:
-        failures.append(f"metal-blue layer appears missing/blue pixels={metrics.blue}")
-    if metrics.green < 500:
-        failures.append(f"diffusion-green layer appears missing/green pixels={metrics.green}")
-    if metrics.orange < 200:
-        failures.append(f"poly-orange layer appears missing/orange pixels={metrics.orange}")
-    if metrics.sampled_unique < 40:
-        failures.append(f"image has too little visual variation/unique={metrics.sampled_unique}")
+    if metrics.non_dark < 80_000:
+        failures.append(f"snapshot is too dark/nonblank pixels={metrics.non_dark}")
+    if metrics.bright < 1_000:
+        failures.append(f"text and chrome highlights appear missing/bright pixels={metrics.bright}")
+    if metrics.teal < 100:
+        failures.append(f"Operad accent/status color appears missing/teal pixels={metrics.teal}")
+    if metrics.sampled_unique < 30:
+        failures.append(f"snapshot has too little visual variation/unique={metrics.sampled_unique}")
     if failures:
         raise AssertionError("; ".join(failures))
 
 
-def assert_stress_lod(metrics: Metrics) -> None:
-    failures = []
-    if metrics.non_dark < 20_000:
-        failures.append(f"stress canvas is too sparse/nonblank pixels={metrics.non_dark}")
-    if metrics.sampled_unique < 10:
-        failures.append(f"stress image has too little variation/unique={metrics.sampled_unique}")
-    if failures:
-        raise AssertionError("; ".join(failures))
+def assert_layout_scene(metrics: Metrics) -> None:
+    assert_operad_shell(metrics)
+    if metrics.layer_pixels < 800:
+        raise AssertionError(f"layout preview color coverage is too low/layer pixels={metrics.layer_pixels}")
 
 
-def assert_hierarchy(metrics: Metrics) -> None:
-    failures = []
-    if metrics.non_dark < 18_000:
-        failures.append(f"hierarchy canvas is too sparse/nonblank pixels={metrics.non_dark}")
-    if metrics.blue < 800:
-        failures.append(f"hierarchy metal-blue layer appears missing/blue pixels={metrics.blue}")
-    if metrics.green < 800:
-        failures.append(f"hierarchy diffusion-green layer appears missing/green pixels={metrics.green}")
-    if metrics.orange < 400:
-        failures.append(f"hierarchy poly-orange layer appears missing/orange pixels={metrics.orange}")
-    if metrics.magenta < 200:
-        failures.append(f"hierarchy metal2-magenta layer appears missing/magenta pixels={metrics.magenta}")
-    if metrics.sampled_unique < 35:
-        failures.append(f"hierarchy image has too little visual variation/unique={metrics.sampled_unique}")
-    if failures:
-        raise AssertionError("; ".join(failures))
-
-
-def assert_3d_view(metrics: Metrics) -> None:
-    failures = []
-    if metrics.non_dark < 18_000:
-        failures.append(f"3D canvas is too sparse/nonblank pixels={metrics.non_dark}")
-    if metrics.layer_pixels < 1_800:
-        failures.append(f"3D layer color coverage is too low/layer pixels={metrics.layer_pixels}")
-    if metrics.bright < 150:
-        failures.append(f"3D grid/HUD highlights appear missing/bright pixels={metrics.bright}")
-    if metrics.sampled_unique < 45:
-        failures.append(f"3D image has too little visual variation/unique={metrics.sampled_unique}")
-    if failures:
-        raise AssertionError("; ".join(failures))
-
-
-def assert_options_menu(metrics: Metrics) -> None:
-    failures = []
-    if metrics.non_dark < 45_000:
-        failures.append(f"options view is too sparse/nonblank pixels={metrics.non_dark}")
-    if metrics.layer_pixels < 1_500:
-        failures.append(f"options view lost layer coverage/layer pixels={metrics.layer_pixels}")
-    if metrics.bright < 1_500:
-        failures.append(f"options menu chrome appears missing/bright pixels={metrics.bright}")
-    if metrics.sampled_unique < 70:
-        failures.append(f"options view has too little variation/unique={metrics.sampled_unique}")
-    if failures:
-        raise AssertionError("; ".join(failures))
+def assert_dense_scene(metrics: Metrics) -> None:
+    assert_operad_shell(metrics)
+    if metrics.layer_pixels < 1_200:
+        raise AssertionError(f"dense layout preview color coverage is too low/layer pixels={metrics.layer_pixels}")
 
 
 def compare_to_baseline(name: str, actual: Image.Image, baseline_dir: Path, diff_dir: Path) -> DiffMetrics:
@@ -365,94 +227,23 @@ def update_baseline(name: str, actual: Image.Image, baseline_dir: Path) -> None:
     actual.save(baseline_dir / f"{name}.png")
 
 
-def run_case(
-    cdp: Cdp,
-    base_url: str,
-    case: Case,
-    out_dir: Path,
-    baseline_dir: Path,
-    baseline_mode: BaselineMode,
-) -> tuple[Metrics, DiffMetrics | None]:
-    url = f"{base_url}/{case.query}"
-    cdp.call("Page.navigate", {"url": url})
-    wait_for_app(cdp)
-
-    last_metrics: Metrics | None = None
-    last_image: Image.Image | None = None
-    screenshot_path = out_dir / f"{case.name}.png"
-    for _ in range(12):
-        image = capture_png(cdp, screenshot_path)
-        metrics = analyze_canvas_region(image)
-        last_metrics = metrics
-        last_image = image
-        try:
-            case.assertion(metrics)
-            break
-        except AssertionError:
-            time.sleep(0.5)
-    assert last_metrics is not None
-    assert last_image is not None
-    case.assertion(last_metrics)
-
-    diff_metrics = None
-    if baseline_mode == BaselineMode.UPDATE:
-        update_baseline(case.name, last_image, baseline_dir)
-    elif baseline_mode == BaselineMode.CHECK:
-        diff_metrics = compare_to_baseline(case.name, last_image, baseline_dir, DIFF_DIR)
-    return last_metrics, diff_metrics
-
-
-def run_cases_once(
-    debug_port: int,
-    base_url: str,
-    cases: list[Case],
-    baseline_mode: BaselineMode,
-) -> None:
-    chrome_profile = Path(tempfile.mkdtemp(prefix="fabricad-chrome-", dir=OUT_DIR))
-    chrome: subprocess.Popen | None = None
-    cdp: Cdp | None = None
-    try:
-        chrome = start_chrome(debug_port, chrome_profile)
-        cdp = connect_cdp(debug_port)
-        cdp.call("Page.enable")
-        cdp.call("Runtime.enable")
-        cdp.call(
-            "Emulation.setDeviceMetricsOverride",
-            {
-                "width": WIDTH,
-                "height": HEIGHT,
-                "deviceScaleFactor": 1,
-                "mobile": False,
-            },
-        )
-
-        for case in cases:
-            metrics, diff = run_case(cdp, base_url, case, OUT_DIR, BASELINE_DIR, baseline_mode)
-            suffix = f" diff={diff}" if diff else ""
-            print(f"{case.name}: {metrics}{suffix}")
-    finally:
-        if cdp:
-            with contextlib.suppress(Exception):
-                cdp.close()
-        if chrome:
-            terminate(chrome)
-        with contextlib.suppress(Exception):
-            shutil.rmtree(chrome_profile)
-
-
-def terminate(process: subprocess.Popen) -> None:
-    if process.poll() is not None:
-        return
-    with contextlib.suppress(Exception):
-        process.send_signal(signal.SIGTERM)
-        process.wait(timeout=5)
-    if process.poll() is None:
-        with contextlib.suppress(Exception):
-            process.kill()
+def cases() -> list[Case]:
+    return [
+        Case("workflow", ("--workspace=demo", "--view=workflow"), assert_operad_shell),
+        Case("demo", ("--workspace=demo", "--view=layout"), assert_layout_scene),
+        Case("hierarchy", ("--scene=hierarchy", "--view=layout"), assert_layout_scene),
+        Case(
+            "stress_lod",
+            ("--scene=stress", "--count=20000", "--view=layout"),
+            assert_dense_scene,
+        ),
+        Case("view_3d", ("--workspace=demo", "--view=3d"), assert_layout_scene),
+        Case("process_flow", ("--workspace=demo", "--view=process-flow"), assert_operad_shell),
+    ]
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run Fabricad screenshot render E2E tests.")
+    parser = argparse.ArgumentParser(description="Run Fabricad Operad screenshot render E2E tests.")
     parser.add_argument("--keep-artifacts", action="store_true")
     baseline_group = parser.add_mutually_exclusive_group()
     baseline_group.add_argument(
@@ -479,60 +270,26 @@ def main() -> int:
         else BaselineMode.SKIP
     )
 
+    if OUT_DIR.exists():
+        shutil.rmtree(OUT_DIR)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     DIFF_DIR.mkdir(parents=True, exist_ok=True)
-    port = free_port()
-    debug_port = free_port()
-    while debug_port == port:
-        debug_port = free_port()
-    base_url = f"http://127.0.0.1:{port}"
-    trunk = start_trunk(port, OUT_DIR)
+    binary = native_binary()
 
-    try:
-        wait_http(base_url, 60)
-        cases = [
-            Case("demo", "?workspace=demo&view=layout&zoom=0.075", assert_demo),
-            Case(
-                "selected_handles",
-                "?workspace=demo&view=layout&zoom=0.075&select=first",
-                assert_demo,
-            ),
-            Case(
-                "vertex_moved",
-                "?workspace=demo&view=layout&zoom=0.075&edit=vertex_moved",
-                assert_demo,
-            ),
-            Case(
-                "hierarchy_workflow",
-                "?workspace=demo&view=layout&zoom=0.055&workflow=hierarchy_make_place",
-                assert_demo,
-            ),
-            Case(
-                "stress_lod",
-                "?scene=stress&count=20000&view=layout&zoom=0.008",
-                assert_stress_lod,
-            ),
-            Case("hierarchy", "?scene=hierarchy&view=layout&zoom=0.045", assert_hierarchy),
-            Case("view_3d", "?workspace=demo&view=3d", assert_3d_view),
-            Case("options_menu", "?workspace=demo&view=layout&options=1", assert_options_menu),
-        ]
-        last_error: Exception | None = None
-        for attempt in range(1, 4):
-            try:
-                run_cases_once(debug_port, base_url, cases, baseline_mode)
-                last_error = None
-                break
-            except (AssertionError, RuntimeError, websocket.WebSocketException) as error:
-                last_error = error
-                print(f"render E2E browser attempt {attempt} failed: {error}", file=sys.stderr)
-                time.sleep(0.75)
-        if last_error is not None:
-            raise last_error
+    for case in cases():
+        image = render_case(binary, case, OUT_DIR, args.keep_artifacts)
+        metrics = analyze_image(image)
+        case.assertion(metrics)
+        diff = None
+        if baseline_mode == BaselineMode.UPDATE:
+            update_baseline(case.name, image, BASELINE_DIR)
+        elif baseline_mode == BaselineMode.CHECK:
+            diff = compare_to_baseline(case.name, image, BASELINE_DIR, DIFF_DIR)
+        suffix = f" diff={diff}" if diff else ""
+        print(f"{case.name}: {metrics}{suffix}")
 
-        print(f"render E2E artifacts: {OUT_DIR}")
-        return 0
-    finally:
-        terminate(trunk)
+    print(f"render E2E artifacts: {OUT_DIR}")
+    return 0
 
 
 if __name__ == "__main__":

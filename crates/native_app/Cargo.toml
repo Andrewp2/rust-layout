@@ -7,8 +7,8 @@ authors.workspace = true
 
 [features]
 default = ["native"]
-native = ["eframe/default_fonts", "eframe/wgpu", "eframe/x11", "eframe/wayland"]
-web = ["eframe/default_fonts", "eframe/glow", "eframe/wgpu"]
+native = []
+web = []
 
 [lib]
 name = "fabricad_app"
@@ -21,36 +21,20 @@ required-features = ["native"]
 
 [dependencies]
 drc = { path = "../drc" }
-eframe.workspace = true
-egui.workspace = true
-egui-wgpu.workspace = true
 geometry_core = { path = "../geometry_core" }
 layout_model = { path = "../layout_model" }
 operad.workspace = true
 pollster.workspace = true
 renderer = { path = "../renderer" }
-router = { path = "../router" }
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 uuid.workspace = true
-web-time.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-futures-util.workspace = true
-tokio.workspace = true
-tokio-tungstenite.workspace = true
+operad_wgpu = { package = "wgpu", version = "25.0.1", features = ["wgsl"] }
 tracing-subscriber.workspace = true
+winit = "0.30.13"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen.workspace = true
-web-sys = { workspace = true, features = [
-	"CloseEvent",
-	"ErrorEvent",
-	"Event",
-	"Location",
-	"MessageEvent",
-	"Storage",
-	"WebSocket",
-	"Window",
-] }

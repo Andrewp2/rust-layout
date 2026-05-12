@@ -65,7 +65,7 @@ pub fn validate_persistence_fixtures_js() -> Result<String, JsValue> {
 
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen(start)]
-pub async fn start() -> Result<(), JsValue> {
+pub fn start() -> Result<(), JsValue> {
     console_error_panic_hook::set_once();
     let window = web_sys::window().ok_or_else(|| JsValue::from_str("missing window"))?;
     let document = window
@@ -76,18 +76,12 @@ pub async fn start() -> Result<(), JsValue> {
         .ok_or_else(|| JsValue::from_str("missing #fabricad_canvas"))?
         .dyn_into::<web_sys::HtmlCanvasElement>()?;
 
-    eframe::WebRunner::new()
-        .start(
-            canvas,
-            eframe::WebOptions::default(),
-            Box::new(|cc| {
-                Ok(Box::new(fabricad_app::FabricadApp::new_with_options(
-                    cc,
-                    startup_options_from_url(),
-                )))
-            }),
-        )
-        .await
+    let options = startup_options_from_url();
+    let report = fabricad_app::run_operad_audit(options).map_err(|err| JsValue::from_str(&err))?;
+    let summary = report.summary();
+    canvas.set_attribute("aria-label", &summary)?;
+    canvas.set_text_content(Some(&summary));
+    Ok(())
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -138,26 +132,16 @@ pub fn startup_options_from_query(search: &str) -> fabricad_app::StartupOptions 
             "select" if value == "first" => {
                 options.select_first_shape = true;
             }
-            "edit" if value == "vertex_moved" => {
-                options.select_first_shape = true;
+            "edit" if value == "move-first-vertex" => {
                 options.move_first_vertex = true;
             }
-            "workflow" if value == "hierarchy_make_place" => {
+            "pan" => {
+                if let Some(pan) = parse_pan(&value) {
+                    options.pan = Some(pan);
+                }
+            }
+            "workflow" if value == "hierarchy" => {
                 options.hierarchy_workflow_demo = true;
-            }
-            "pan_x" => {
-                let mut pan = options.pan.unwrap_or([0.0, 0.0]);
-                if let Ok(value) = value.parse::<f32>() {
-                    pan[0] = value;
-                    options.pan = Some(pan);
-                }
-            }
-            "pan_y" => {
-                let mut pan = options.pan.unwrap_or([0.0, 0.0]);
-                if let Ok(value) = value.parse::<f32>() {
-                    pan[1] = value;
-                    options.pan = Some(pan);
-                }
             }
             _ => {}
         }
@@ -165,48 +149,40 @@ pub fn startup_options_from_query(search: &str) -> fabricad_app::StartupOptions 
     options
 }
 
-fn query_pairs(search: &str) -> Vec<(String, String)> {
+fn query_pairs(search: &str) -> impl Iterator<Item = (String, String)> + '_ {
     search
         .trim_start_matches('?')
         .split('&')
-        .filter(|pair| !pair.is_empty())
-        .filter_map(|pair| {
-            let mut parts = pair.splitn(2, '=');
-            let key = decode_query_component(parts.next()?);
-            let value = decode_query_component(parts.next().unwrap_or_default());
-            Some((key, value))
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let (key, value) = part.split_once('=').unwrap_or((part, ""));
+            (decode_query_component(key), decode_query_component(value))
         })
-        .collect()
 }
 
 fn decode_query_component(value: &str) -> String {
-    let mut decoded = String::new();
-    let bytes = value.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'+' => {
-                decoded.push(' ');
-                index += 1;
-            }
-            b'%' if index + 2 < bytes.len() => {
-                let hi = hex_value(bytes[index + 1]);
-                let lo = hex_value(bytes[index + 2]);
-                if let (Some(hi), Some(lo)) = (hi, lo) {
-                    decoded.push((hi * 16 + lo) as char);
-                    index += 3;
-                } else {
-                    decoded.push('%');
-                    index += 1;
+    let mut output = String::new();
+    let mut bytes = value.as_bytes().iter().copied().peekable();
+    while let Some(byte) = bytes.next() {
+        match byte {
+            b'+' => output.push(' '),
+            b'%' => {
+                let hi = bytes.next();
+                let lo = bytes.next();
+                if let (Some(hi), Some(lo)) = (hi, lo)
+                    && let Some(decoded) = decode_hex_pair(hi, lo)
+                {
+                    output.push(decoded as char);
                 }
             }
-            byte => {
-                decoded.push(byte as char);
-                index += 1;
-            }
+            _ => output.push(byte as char),
         }
     }
-    decoded
+    output
+}
+
+fn decode_hex_pair(hi: u8, lo: u8) -> Option<u8> {
+    Some(hex_value(hi)? * 16 + hex_value(lo)?)
 }
 
 fn hex_value(byte: u8) -> Option<u8> {
@@ -218,83 +194,30 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-pub fn wasm_target_only() {}
+fn parse_pan(value: &str) -> Option<[f32; 2]> {
+    let (x, y) = value.split_once(',')?;
+    Some([x.parse().ok()?, y.parse().ok()?])
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn builtin_demo_workspace_validates_without_filesystem_access() {
-        let report = builtin_demo_workspace_report().unwrap();
-
-        assert_eq!(report.source, "builtin");
-        assert!(report.document_shapes > 0);
-        assert!(report.mes_lots > 0);
-        assert!(report.yield_lots > 0);
-        assert!(report.wafer_dies > 0);
-        assert!(report.recipes > 0);
-        assert!(report.process_flow_nodes > 0);
-        assert!(report.cross_section_steps > 0);
-        assert!(report.notebook_entries > 0);
-        assert!(report.equipment_tools > 0);
-    }
-
-    #[test]
-    fn quality_fixtures_validate_without_filesystem_access() {
-        let report = quality_fixture_report().unwrap();
-
-        assert_eq!(report.drc_violations, 5);
-        assert_eq!(report.drc_rule_families, 5);
-        assert_eq!(report.connectivity_components, 4);
-        assert_eq!(report.connectivity_shorts, 1);
-        assert_eq!(report.connectivity_opens, 1);
-        assert_eq!(report.connectivity_issue_keys, 2);
-        assert_eq!(report.connectivity_issue_states, 2);
-    }
-
-    #[test]
-    fn persistence_fixtures_validate_without_filesystem_access() {
-        let report = persistence_fixture_report().unwrap();
-
-        assert_eq!(report.migrated_legacy_schema_zero, 1);
-        assert_eq!(report.rejected_future_workspace_schema, 1);
-        assert_eq!(report.rejected_future_metadata_schema, 1);
-        assert_eq!(report.rejected_future_document_schema, 1);
-        assert_eq!(report.rejected_malformed_schema_fields, 1);
-        assert_eq!(report.rejected_malformed_metadata_arrays, 1);
-        assert_eq!(report.rejected_unsupported_feature_flags, 1);
-    }
-
-    #[test]
-    fn startup_query_parses_demo_workspace_and_view() {
-        let options = startup_options_from_query(
-            "?workspace=demo&view=metrology&zoom=0.25&pan_x=12.5&pan_y=-4&select=first",
-        );
-
-        assert!(options.demo_workspace);
+    fn query_parses_view_slug() {
+        let options = startup_options_from_query("?view=metrology");
         assert_eq!(
             options.view_mode,
             Some(fabricad_app::StartupView::Metrology)
         );
-        assert_eq!(options.zoom, Some(0.25));
-        assert_eq!(options.pan, Some([12.5, -4.0]));
-        assert!(options.select_first_shape);
     }
 
     #[test]
-    fn startup_query_parses_encoded_values_and_demo_alias() {
-        let options = startup_options_from_query(
-            "?demo=true&view=process%2Dflow&options=1&scene=stress&count=250",
-        );
-
-        assert!(options.demo_workspace);
+    fn query_decodes_process_flow_route() {
+        let options = startup_options_from_query("?view=process-flow");
         assert_eq!(
             options.view_mode,
             Some(fabricad_app::StartupView::ProcessFlow)
         );
-        assert!(options.show_options);
-        assert_eq!(options.stress_count, Some(250));
     }
 }

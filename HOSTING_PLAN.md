@@ -1,9 +1,9 @@
 # Hosting Plan
 
 This repository is ready for an internet-hosted browser demo through its existing
-WebAssembly path. The native egui app remains the richest local path, but
-`crates/wasm_app` already starts the same `FabricadApp` through `eframe::WebRunner`,
-and `Trunk.toml` builds `crates/wasm_app/index.html` into `dist/`.
+WebAssembly path. `crates/wasm_app` exposes the shared Fabricad validation surface
+through wasm-bindgen, and `Trunk.toml` builds `crates/wasm_app/index.html` into
+`dist/`.
 
 Recommended first deployment: publish the Trunk `dist/` output as a static site on
 GitHub Pages with GitHub Actions. This is the smallest operational surface for the
@@ -13,8 +13,8 @@ WASM.
 
 ## Current Architecture
 
-- `native_app` is the primary desktop app, but it has a `web` feature used by
-  `wasm_app`.
+- `native_app` owns the Operad v4 native window, audit, and snapshot entry points,
+  and it has a `web` feature used by `wasm_app`.
 - `wasm_app` is browser-capable today. A release build succeeds with:
 
   ```bash
@@ -161,7 +161,7 @@ work in WebAssembly.
   stability is verified.
 - Public URL: GitHub Pages project sites need a subpath-aware Trunk build, for
   example `--public-url /rust-layout/`.
-- Browser rendering: verify Chrome, Firefox, and Safari behavior for egui, WebGL,
+- Browser rendering: verify Chrome, Firefox, and Safari behavior for WebGL,
   WebGPU, and large layouts.
 - Collaboration default URL: the current browser default assumes the sync server is
   on the same hostname at port `4141`, which is not how most static hosts expose TLS.

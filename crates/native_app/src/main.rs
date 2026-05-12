@@ -1,5 +1,15 @@
-use fabricad_app::{Benchmark3dOptions, OffscreenRenderOptions, OffscreenScene, StartupOptions};
-use std::{path::PathBuf, sync::Arc};
+use fabricad_app::{
+    Benchmark3dOptions, OffscreenRenderOptions, OffscreenScene, OperadSnapshotReport,
+    StartupOptions, StartupView, render_operad_snapshot, run_operad_audit,
+};
+use operad::ResourceFormat;
+use std::{
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+};
+
+mod native_window;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_logging();
@@ -18,141 +28,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("{}", report.summary());
         return Ok(());
     }
-    let startup_options = launch.startup_options();
 
-    let wgpu_options = wgpu_configuration(launch.benchmark_3d.is_some());
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Fabricad")
-            .with_inner_size([1440.0, 920.0]),
-        renderer: eframe::Renderer::Wgpu,
-        wgpu_options,
-        ..Default::default()
-    };
-    eframe::run_native(
-        "Fabricad",
-        options,
-        Box::new(|cc| {
-            Ok(Box::new(fabricad_app::FabricadApp::new_with_options(
-                cc,
-                startup_options,
-            )))
-        }),
-    )?;
+    let startup_options = launch.startup_options();
+    if let Some((width, height)) = launch.operad_snapshot {
+        let report = render_operad_snapshot(startup_options, width, height)?;
+        if let Some(path) = &launch.snapshot_rgba {
+            write_snapshot_rgba(path, &report)?;
+        }
+        println!("{}", report.summary());
+    } else if launch.audit {
+        let report = run_operad_audit(startup_options)?;
+        println!("{}", report.summary());
+    } else {
+        native_window::run(startup_options)?;
+    }
     Ok(())
 }
 
-fn wgpu_configuration(benchmark_3d: bool) -> egui_wgpu::WgpuConfiguration {
-    let mut config = if benchmark_3d {
-        egui_wgpu::WgpuConfiguration {
-            present_mode: egui_wgpu::wgpu::PresentMode::AutoNoVsync,
-            desired_maximum_frame_latency: Some(1),
-            ..Default::default()
-        }
-    } else {
-        Default::default()
-    };
-    if let egui_wgpu::WgpuSetup::CreateNew(create_new) = &mut config.wgpu_setup {
-        create_new.native_adapter_selector = Some(Arc::new(move |adapters, surface| {
-            select_preferred_native_adapter(adapters, surface, benchmark_3d)
-        }));
-    }
-    config
-}
-
-fn select_preferred_native_adapter(
-    adapters: &[egui_wgpu::wgpu::Adapter],
-    surface: Option<&egui_wgpu::wgpu::Surface<'_>>,
-    require_hardware: bool,
-) -> Result<egui_wgpu::wgpu::Adapter, String> {
-    let adapter = adapters
-        .iter()
-        .filter(|adapter| surface.is_none_or(|surface| adapter.is_surface_supported(surface)))
-        .min_by_key(|adapter| {
-            let info = adapter.get_info();
-            (
-                native_adapter_device_type_rank(info.device_type),
-                native_adapter_backend_rank(info.backend),
-                info.name,
-            )
-        })
-        .cloned()
-        .ok_or_else(|| "no compatible wgpu adapters found".to_string())?;
-
-    let info = adapter.get_info();
-    if require_hardware && !native_adapter_is_hardware(info.device_type) {
-        return Err(format!(
-            "3D benchmark requires a hardware wgpu adapter, but selected {}; available adapters: {}",
-            native_adapter_summary(&info),
-            native_adapter_list_summary(adapters)
-        ));
-    }
-
-    Ok(adapter)
-}
-
-fn native_adapter_is_hardware(device_type: egui_wgpu::wgpu::DeviceType) -> bool {
-    matches!(
-        device_type,
-        egui_wgpu::wgpu::DeviceType::DiscreteGpu | egui_wgpu::wgpu::DeviceType::IntegratedGpu
-    )
-}
-
-fn native_adapter_device_type_rank(device_type: egui_wgpu::wgpu::DeviceType) -> u8 {
-    match device_type {
-        egui_wgpu::wgpu::DeviceType::DiscreteGpu => 0,
-        egui_wgpu::wgpu::DeviceType::IntegratedGpu => 1,
-        egui_wgpu::wgpu::DeviceType::VirtualGpu => 2,
-        egui_wgpu::wgpu::DeviceType::Other => 3,
-        egui_wgpu::wgpu::DeviceType::Cpu => 4,
-    }
-}
-
-fn native_adapter_backend_rank(backend: egui_wgpu::wgpu::Backend) -> u8 {
-    match backend {
-        egui_wgpu::wgpu::Backend::Vulkan
-        | egui_wgpu::wgpu::Backend::Metal
-        | egui_wgpu::wgpu::Backend::Dx12 => 0,
-        egui_wgpu::wgpu::Backend::Gl => 1,
-        egui_wgpu::wgpu::Backend::BrowserWebGpu => 2,
-        egui_wgpu::wgpu::Backend::Noop => 3,
-    }
-}
-
-fn native_adapter_list_summary(adapters: &[egui_wgpu::wgpu::Adapter]) -> String {
-    if adapters.is_empty() {
-        return "none".to_string();
-    }
-    adapters
-        .iter()
-        .map(|adapter| native_adapter_summary(&adapter.get_info()))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn native_adapter_summary(info: &egui_wgpu::wgpu::AdapterInfo) -> String {
-    format!(
-        "{:?} {:?} \"{}\"",
-        info.backend, info.device_type, info.name
-    )
-}
-
 fn init_logging() {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|err| {
-        eprintln!("WARN invalid RUST_LOG filter; using warn: {err}");
-        tracing_subscriber::EnvFilter::new("warn")
-    });
+    let filter = match std::env::var("RUST_LOG") {
+        Ok(value) => tracing_subscriber::EnvFilter::try_new(value).unwrap_or_else(|err| {
+            eprintln!("WARN invalid RUST_LOG filter; using Fabricad defaults: {err}");
+            default_log_filter()
+        }),
+        Err(_) => default_log_filter(),
+    };
     if let Err(err) = tracing_subscriber::fmt().with_env_filter(filter).try_init() {
         eprintln!("WARN logging initialization skipped: {err}");
     }
 }
 
+fn default_log_filter() -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::new("fabricad_app=warn,renderer=warn,sync_server=warn")
+}
+
 #[derive(Debug, PartialEq)]
 struct LaunchOptions {
     help: bool,
+    audit: bool,
     offscreen: Option<OffscreenRenderOptions>,
     export_gds: Option<PathBuf>,
     benchmark_3d: Option<Benchmark3dLaunch>,
+    operad_snapshot: Option<(u32, u32)>,
+    snapshot_rgba: Option<PathBuf>,
+    startup_options: StartupOptions,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -172,50 +91,79 @@ impl LaunchOptions {
 
     fn parse(args: impl IntoIterator<Item = String>, env_offscreen: bool) -> Result<Self, String> {
         let mut help = false;
+        let mut audit = false;
         let mut offscreen_requested = env_offscreen;
         let mut offscreen = OffscreenRenderOptions::default();
         let mut export_gds = None;
         let mut benchmark_3d = None;
+        let mut operad_snapshot = None;
+        let mut snapshot_rgba = None;
+        let mut startup_options = StartupOptions::default();
         let mut args = args.into_iter();
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
-                "-h" | "--help" => {
-                    help = true;
+                "-h" | "--help" => help = true,
+                "--audit" | "--operad-audit" => audit = true,
+                "--offscreen" | "--headless" => offscreen_requested = true,
+                "--operad-snapshot" => operad_snapshot = Some((1440, 920)),
+                "--snapshot-rgba" => {
+                    snapshot_rgba = Some(PathBuf::from(next_value(&mut args, "--snapshot-rgba")?));
+                    operad_snapshot.get_or_insert((1440, 920));
                 }
-                "--offscreen" | "--headless" => {
-                    offscreen_requested = true;
+                "--workspace" => {
+                    apply_workspace(&mut startup_options, &next_value(&mut args, "--workspace")?)?;
+                }
+                "--view" => {
+                    apply_view(&mut startup_options, &next_value(&mut args, "--view")?)?;
+                }
+                "--options" => startup_options.show_options = true,
+                "--select" => {
+                    apply_select(&mut startup_options, &next_value(&mut args, "--select")?)?;
+                }
+                "--edit" => {
+                    apply_edit(&mut startup_options, &next_value(&mut args, "--edit")?)?;
                 }
                 "--scene" => {
                     let value = next_value(&mut args, "--scene")?;
                     offscreen.scene = parse_scene(&value)?;
+                    let stress_count = startup_options.stress_count;
+                    apply_scene(&mut startup_options, &value, stress_count)?;
                     offscreen_requested = true;
                 }
                 "--count" => {
                     let value = next_value(&mut args, "--count")?;
-                    offscreen.scene = OffscreenScene::Stress {
-                        count: parse_usize(&value, "--count")?,
-                    };
+                    let count = parse_usize(&value, "--count")?;
+                    offscreen.scene = OffscreenScene::Stress { count };
+                    startup_options.stress_count = Some(count);
                     offscreen_requested = true;
                 }
                 "--width" => {
                     let value = next_value(&mut args, "--width")?;
                     offscreen.width = parse_u32(&value, "--width")?;
+                    if let Some((_, height)) = operad_snapshot {
+                        operad_snapshot = Some((offscreen.width, height));
+                    }
                     offscreen_requested = true;
                 }
                 "--height" => {
                     let value = next_value(&mut args, "--height")?;
                     offscreen.height = parse_u32(&value, "--height")?;
+                    if let Some((width, _)) = operad_snapshot {
+                        operad_snapshot = Some((width, offscreen.height));
+                    }
                     offscreen_requested = true;
                 }
                 "--zoom" => {
                     let value = next_value(&mut args, "--zoom")?;
                     offscreen.zoom = parse_f32(&value, "--zoom")?;
+                    startup_options.zoom = Some(offscreen.zoom);
                     offscreen_requested = true;
                 }
                 "--pan" => {
                     let value = next_value(&mut args, "--pan")?;
                     offscreen.pan = parse_pan(&value)?;
+                    startup_options.pan = Some(offscreen.pan);
                     offscreen_requested = true;
                 }
                 "--export-gds" => {
@@ -247,26 +195,47 @@ impl LaunchOptions {
                 _ => {
                     if let Some(value) = arg.strip_prefix("--scene=") {
                         offscreen.scene = parse_scene(value)?;
+                        let stress_count = startup_options.stress_count;
+                        apply_scene(&mut startup_options, value, stress_count)?;
                         offscreen_requested = true;
                     } else if let Some(value) = arg.strip_prefix("--count=") {
-                        offscreen.scene = OffscreenScene::Stress {
-                            count: parse_usize(value, "--count")?,
-                        };
+                        let count = parse_usize(value, "--count")?;
+                        offscreen.scene = OffscreenScene::Stress { count };
+                        startup_options.stress_count = Some(count);
                         offscreen_requested = true;
                     } else if let Some(value) = arg.strip_prefix("--width=") {
                         offscreen.width = parse_u32(value, "--width")?;
+                        if let Some((_, height)) = operad_snapshot {
+                            operad_snapshot = Some((offscreen.width, height));
+                        }
                         offscreen_requested = true;
                     } else if let Some(value) = arg.strip_prefix("--height=") {
                         offscreen.height = parse_u32(value, "--height")?;
+                        if let Some((width, _)) = operad_snapshot {
+                            operad_snapshot = Some((width, offscreen.height));
+                        }
                         offscreen_requested = true;
                     } else if let Some(value) = arg.strip_prefix("--zoom=") {
                         offscreen.zoom = parse_f32(value, "--zoom")?;
+                        startup_options.zoom = Some(offscreen.zoom);
                         offscreen_requested = true;
                     } else if let Some(value) = arg.strip_prefix("--pan=") {
                         offscreen.pan = parse_pan(value)?;
+                        startup_options.pan = Some(offscreen.pan);
                         offscreen_requested = true;
                     } else if let Some(value) = arg.strip_prefix("--export-gds=") {
                         export_gds = Some(PathBuf::from(value));
+                    } else if let Some(value) = arg.strip_prefix("--snapshot-rgba=") {
+                        snapshot_rgba = Some(PathBuf::from(value));
+                        operad_snapshot.get_or_insert((1440, 920));
+                    } else if let Some(value) = arg.strip_prefix("--workspace=") {
+                        apply_workspace(&mut startup_options, value)?;
+                    } else if let Some(value) = arg.strip_prefix("--view=") {
+                        apply_view(&mut startup_options, value)?;
+                    } else if let Some(value) = arg.strip_prefix("--select=") {
+                        apply_select(&mut startup_options, value)?;
+                    } else if let Some(value) = arg.strip_prefix("--edit=") {
+                        apply_edit(&mut startup_options, value)?;
                     } else if let Some(value) = arg.strip_prefix("--bench-3d-count=") {
                         benchmark_3d
                             .get_or_insert_with(Benchmark3dLaunch::default)
@@ -290,9 +259,13 @@ impl LaunchOptions {
 
         Ok(Self {
             help,
-            offscreen: offscreen_requested.then_some(offscreen),
+            audit,
+            offscreen: (offscreen_requested && operad_snapshot.is_none()).then_some(offscreen),
             export_gds,
             benchmark_3d,
+            operad_snapshot,
+            snapshot_rgba,
+            startup_options,
         })
     }
 
@@ -302,10 +275,10 @@ impl LaunchOptions {
                 stress_count: Some(benchmark.count),
                 view_3d: true,
                 benchmark_3d: Some(benchmark.options),
-                ..Default::default()
+                ..self.startup_options
             }
         } else {
-            StartupOptions::default()
+            self.startup_options
         }
     }
 }
@@ -331,6 +304,67 @@ fn parse_scene(value: &str) -> Result<OffscreenScene, String> {
         "stress" => Ok(OffscreenScene::Stress { count: 20_000 }),
         _ => Err(format!(
             "unsupported scene {value:?}; expected demo, hierarchy, or stress"
+        )),
+    }
+}
+
+fn apply_workspace(options: &mut StartupOptions, value: &str) -> Result<(), String> {
+    match value {
+        "demo" => {
+            options.demo_workspace = true;
+            Ok(())
+        }
+        _ => Err(format!("unsupported workspace {value:?}; expected demo")),
+    }
+}
+
+fn apply_scene(
+    options: &mut StartupOptions,
+    value: &str,
+    count: Option<usize>,
+) -> Result<(), String> {
+    match value {
+        "demo" => Ok(()),
+        "hierarchy" => {
+            options.hierarchy_demo = true;
+            Ok(())
+        }
+        "stress" => {
+            options.stress_count = Some(count.unwrap_or(20_000));
+            Ok(())
+        }
+        _ => Err(format!(
+            "unsupported scene {value:?}; expected demo, hierarchy, or stress"
+        )),
+    }
+}
+
+fn apply_view(options: &mut StartupOptions, value: &str) -> Result<(), String> {
+    let view = StartupView::from_slug(value)
+        .ok_or_else(|| format!("unsupported view {value:?}; use a Fabricad view slug"))?;
+    options.view_3d = view == StartupView::Layout3d;
+    options.view_mode = Some(view);
+    Ok(())
+}
+
+fn apply_select(options: &mut StartupOptions, value: &str) -> Result<(), String> {
+    match value {
+        "first" => {
+            options.select_first_shape = true;
+            Ok(())
+        }
+        _ => Err(format!("unsupported selection {value:?}; expected first")),
+    }
+}
+
+fn apply_edit(options: &mut StartupOptions, value: &str) -> Result<(), String> {
+    match value {
+        "vertex_moved" | "move-first-vertex" => {
+            options.move_first_vertex = true;
+            Ok(())
+        }
+        _ => Err(format!(
+            "unsupported edit {value:?}; expected vertex_moved or move-first-vertex"
         )),
     }
 }
@@ -374,15 +408,38 @@ fn env_flag(name: &str) -> bool {
     })
 }
 
+fn write_snapshot_rgba(
+    path: &Path,
+    report: &OperadSnapshotReport,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let image = report.render.snapshot.as_ref().ok_or_else(|| {
+        std::io::Error::other("Operad snapshot render did not produce image pixels")
+    })?;
+    if image.format != ResourceFormat::Rgba8 {
+        return Err(Box::new(std::io::Error::other(format!(
+            "unsupported snapshot format {:?}; expected Rgba8",
+            image.format
+        ))));
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = fs::File::create(path)?;
+    file.write_all(&image.pixels)?;
+    Ok(())
+}
+
 fn print_usage() {
     println!(
         "Fabricad\n\n\
          Usage:\n  \
          fabricad\n  \
-         fabricad --offscreen [--scene demo|hierarchy|stress] [--count N] [--width W] [--height H] [--zoom Z] [--pan X,Y]\n\n\
-         fabricad --bench-3d [--bench-3d-count N] [--bench-3d-frames N] [--bench-3d-warmup N]\n\n\
+         fabricad --audit\n  \
+         fabricad --operad-snapshot [--width W] [--height H] [--snapshot-rgba PATH] [--view SLUG] [--scene demo|hierarchy|stress]\n  \
+         fabricad --offscreen [--scene demo|hierarchy|stress] [--count N] [--width W] [--height H] [--zoom Z] [--pan X,Y]\n  \
+         fabricad --bench-3d [--bench-3d-count N] [--bench-3d-frames N] [--bench-3d-warmup N]\n  \
          fabricad --export-gds PATH\n\n\
-         Set FABRICAD_OFFSCREEN=1 to make the binary use offscreen rendering by default."
+         The default path opens a native Operad v4 window. Use --audit for the noninteractive summary."
     );
 }
 
@@ -393,9 +450,11 @@ mod tests {
     #[test]
     fn parses_offscreen_flag() {
         let launch = LaunchOptions::parse(["--offscreen".to_string()], false).unwrap();
+        assert!(!launch.audit);
         assert_eq!(launch.offscreen, Some(OffscreenRenderOptions::default()));
         assert_eq!(launch.export_gds, None);
         assert_eq!(launch.benchmark_3d, None);
+        assert_eq!(launch.snapshot_rgba, None);
     }
 
     #[test]
@@ -468,34 +527,46 @@ mod tests {
     }
 
     #[test]
-    fn native_adapter_ranking_prefers_hardware_gpus() {
-        use egui_wgpu::wgpu::DeviceType;
+    fn parses_operad_snapshot_flag() {
+        let launch = LaunchOptions::parse(["--operad-snapshot".to_string()], false).unwrap();
+        assert!(!launch.audit);
+        assert_eq!(launch.offscreen, None);
+        assert_eq!(launch.operad_snapshot, Some((1440, 920)));
+        assert_eq!(launch.snapshot_rgba, None);
+    }
 
-        assert!(native_adapter_is_hardware(DeviceType::DiscreteGpu));
-        assert!(native_adapter_is_hardware(DeviceType::IntegratedGpu));
-        assert!(!native_adapter_is_hardware(DeviceType::Cpu));
-        assert!(
-            native_adapter_device_type_rank(DeviceType::DiscreteGpu)
-                < native_adapter_device_type_rank(DeviceType::IntegratedGpu)
+    #[test]
+    fn parses_operad_snapshot_scene_view_and_output() {
+        let launch = LaunchOptions::parse(
+            [
+                "--operad-snapshot".to_string(),
+                "--scene=hierarchy".to_string(),
+                "--view".to_string(),
+                "layout".to_string(),
+                "--snapshot-rgba=target/operad.rgba".to_string(),
+            ],
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(launch.offscreen, None);
+        assert_eq!(launch.operad_snapshot, Some((1440, 920)));
+        assert_eq!(
+            launch.snapshot_rgba,
+            Some(PathBuf::from("target/operad.rgba"))
         );
-        assert!(
-            native_adapter_device_type_rank(DeviceType::IntegratedGpu)
-                < native_adapter_device_type_rank(DeviceType::Cpu)
+        assert!(launch.startup_options().hierarchy_demo);
+        assert_eq!(
+            launch.startup_options().view_mode,
+            Some(StartupView::Layout2d)
         );
     }
 
     #[test]
-    fn native_adapter_ranking_prefers_primary_graphics_backends() {
-        use egui_wgpu::wgpu::Backend;
-
-        assert!(
-            native_adapter_backend_rank(Backend::Vulkan) < native_adapter_backend_rank(Backend::Gl)
-        );
-        assert!(
-            native_adapter_backend_rank(Backend::Metal) < native_adapter_backend_rank(Backend::Gl)
-        );
-        assert!(
-            native_adapter_backend_rank(Backend::Dx12) < native_adapter_backend_rank(Backend::Gl)
-        );
+    fn parses_audit_flag() {
+        let launch = LaunchOptions::parse(["--audit".to_string()], false).unwrap();
+        assert!(launch.audit);
+        assert_eq!(launch.offscreen, None);
+        assert_eq!(launch.operad_snapshot, None);
     }
 }

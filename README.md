@@ -13,9 +13,9 @@ crates/
   drc/            Simplified semiconductor rule deck and violation reporting
   router/         A* maze router over layout obstacles
   renderer/       GPU vertex batching, 3D viewport targets, and Slang WGSL/SPIR-V build hook
-  native_app/     egui/wgpu desktop editor
+  native_app/     Operad v4 native window, audit, and snapshot entry points
   sync_server/    Axum WebSocket collaboration server
-  wasm_app/       wasm-bindgen/eframe web entry point
+  wasm_app/       wasm-bindgen web validation entry point
 ```
 
 ```mermaid
@@ -62,17 +62,11 @@ Cargo also runs this through `crates/renderer/build.rs`. Set `FABRICAD_SLANGC=/p
 
 ## Rendering Architecture
 
-The 2D layout canvas uses egui-wgpu paint callbacks to draw batched layout triangles
-directly into the egui render pass, with a separate GPU picking pass. The 3D layout view
-now has a dedicated wgpu viewport render target: native_app builds opaque 3D layout
-geometry, renderer uploads it into a 3D pipeline, renders it into an offscreen color
-texture with a depth attachment and depth write/test enabled, then composites that texture
-back into the egui canvas. HUD text, edit handles, and other UI overlays stay in egui and
-are drawn after the 3D viewport composite.
-
-If a client starts without an egui wgpu render state, the 3D view falls back to the older
-egui painter projection path. That fallback is isolated in native_app and should not grow
-new painter-sort behavior.
+The native shell now builds an Operad v4 document directly and opens it in a winit/wgpu
+window by default. Use `fabricad --audit` to print the retained UI summary and exit, or
+`fabricad --operad-snapshot` to render through Operad's optional wgpu snapshot renderer.
+The domain renderer crate remains responsible for layout GPU batches, 3D viewport targets,
+offscreen document rendering, and the Slang WGSL/SPIR-V shader build hook.
 
 ## Technology Files
 
@@ -146,9 +140,10 @@ The offscreen native mode renders through the same wgpu layout pipeline, reads
 back pixels, prints a one-line render summary, and exits without opening a
 window. You can also enable it with `FABRICAD_OFFSCREEN=1`.
 
-Screenshot-based render E2E checks run the web build under Chrome, capture deterministic
-demo, selected-handle, hierarchy, stress-layout, and 3D-view screenshots, and assert targeted
-visual invariants such as nonblank canvas coverage and expected layer colors:
+Screenshot-based render E2E checks drive the native Operad v4 snapshot renderer,
+capture deterministic workflow, layout, hierarchy, stress-layout, 3D, and process-flow
+screenshots, and assert targeted visual invariants such as nonblank coverage,
+accent/chrome visibility, and expected layout-preview colors:
 
 ```bash
 ./scripts/render_e2e.py
@@ -167,9 +162,10 @@ When an intentional rendering change updates the quarantined expected output, re
 ./scripts/render_e2e.py --update-baselines
 ```
 
-Whole-app layout audits capture every Fabricad module across a fixed viewport matrix and
-write raw screenshots plus contact sheets for manual review of clipped labels, crowded
-margins, awkward wrapping, and misplaced scrollbars:
+Whole-app layout audits capture every Fabricad module through the native Operad v4
+snapshot renderer across a fixed viewport matrix and write raw screenshots plus contact
+sheets for manual review of clipped labels, crowded margins, awkward wrapping, and
+missing content:
 
 ```bash
 ./scripts/ui_layout_audit.py
@@ -192,7 +188,8 @@ rustup target add wasm32-unknown-unknown
 env -u NO_COLOR trunk serve
 ```
 
-The native editor is currently the primary demo path. The WebAssembly target shares the same core crates and eframe UI entry point.
+The native window is the primary demo path. The WebAssembly target shares the same core
+crates and exposes validation through wasm-bindgen.
 
 ## Collaboration Protocol
 

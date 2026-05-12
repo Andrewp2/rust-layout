@@ -13,8 +13,6 @@ fabricad_app = { package = "native_app", path = "../native_app", default-feature
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 console_error_panic_hook = "0.1.7"
-eframe = { workspace = true, features = ["default_fonts", "glow", "wgpu"] }
 fabricad_app = { package = "native_app", path = "../native_app", default-features = false, features = ["web"] }
 wasm-bindgen.workspace = true
-wasm-bindgen-futures.workspace = true
 web-sys = { workspace = true, features = ["Document", "Element", "HtmlCanvasElement", "Location", "Window"] }

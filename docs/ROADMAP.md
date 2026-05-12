@@ -8,7 +8,7 @@ This roadmap is the working checklist. Each milestone should leave the app in a 
 
 The app already has a usable baseline:
 
-- Native egui/wgpu editor.
+- Native Operad v4 winit/wgpu window, audit path, and wgpu snapshot path.
 - WebAssembly build through Trunk.
 - Shared Rust crates for geometry, layout data, DRC, routing, rendering, sync, native, and web.
 - Slang shader source compiled to WGSL and SPIR-V.
@@ -276,7 +276,7 @@ Completion pass:
 - Native performance overlay now reports resident/evicted tiles, resident/evicted shape batches, draw range count, pick candidate count, pick-build time, and tile-cache budget pressure.
 - Existing tiled rendering continues to use hierarchy-aware R-tree occurrence queries and dense-layout LOD overview tiles.
 - Added renderer tests for cache eviction under a tight budget, draw range emission, and pick batches being limited to visible tile occurrences instead of the full scene.
-- Existing render E2E scenes cover hierarchy, precise selected-handle rendering, moved-vertex rendering, and stress LOD rendering.
+- Operad snapshot render E2E scenes cover workflow, layout, hierarchy, 3D, process-flow, and stress LOD rendering.
 
 ## Milestone 8: Scriptable DRC And Marker Browser
 
@@ -352,9 +352,8 @@ Completed hierarchy polish pass:
 
 Started real 3D viewport renderer:
 
-- Added renderer-owned 3D vertex batches and an egui-wgpu callback path that renders the 3D view into a dedicated offscreen color texture with a depth attachment.
-- Added a wgpu 3D scene pipeline with depth test/write for opaque layout solids, followed by a separate composite pass back into the egui UI.
-- Kept HUD and future handles as egui overlays above the composited viewport, with the old painter-sorted 3D path isolated as a no-wgpu fallback.
+- Added renderer-owned 3D vertex batches that render into a dedicated offscreen color texture with a depth attachment.
+- Added a wgpu 3D scene pipeline with depth test/write for opaque layout solids.
 - Added focused invariants for 3D batch fingerprinting, face triangulation, and WGSL matrix upload ordering.
 
 ## Immediate Next Checkpoint

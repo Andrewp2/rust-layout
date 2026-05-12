@@ -2,25 +2,13 @@
 from __future__ import annotations
 
 import argparse
-import base64
-import contextlib
 import html
-import io
-import json
-import os
 import shutil
-import signal
-import socket
 import subprocess
 import sys
-import tempfile
-import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
-import requests
-import websocket
 from PIL import Image, ImageDraw, ImageFont
 
 
@@ -76,151 +64,59 @@ QUICK_VIEWS = {"workflow", "layout", "3d", "reticle", "diff", "maintenance", "en
 QUICK_SIZES = {"narrow", "laptop", "wide"}
 
 
-class Cdp:
-    def __init__(self, ws_url: str):
-        self.ws = websocket.create_connection(ws_url, timeout=10)
-        self.next_id = 1
-
-    def close(self) -> None:
-        self.ws.close()
-
-    def call(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        msg_id = self.next_id
-        self.next_id += 1
-        self.ws.send(json.dumps({"id": msg_id, "method": method, "params": params or {}}))
-        while True:
-            message = json.loads(self.ws.recv())
-            if message.get("id") == msg_id:
-                if "error" in message:
-                    raise RuntimeError(f"CDP {method} failed: {message['error']}")
-                return message.get("result", {})
-
-
-def free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
-def wait_http(url: str, timeout_s: float) -> None:
-    deadline = time.time() + timeout_s
-    last_error: Exception | None = None
-    while time.time() < deadline:
-        try:
-            response = requests.get(url, timeout=1)
-            if response.status_code < 500:
-                return
-        except Exception as error:
-            last_error = error
-        time.sleep(0.25)
-    raise RuntimeError(f"timed out waiting for {url}: {last_error}")
-
-
-def start_trunk(port: int, out_dir: Path) -> subprocess.Popen:
-    log = open(out_dir / "trunk.log", "w", encoding="utf-8")
-    env = os.environ.copy()
-    env.pop("NO_COLOR", None)
-    return subprocess.Popen(
-        ["trunk", "serve", "--address", "127.0.0.1", "--port", str(port)],
+def native_binary() -> Path:
+    subprocess.run(
+        ["cargo", "build", "-p", "native_app", "--bin", "fabricad"],
         cwd=ROOT,
-        env=env,
-        stdout=log,
-        stderr=subprocess.STDOUT,
-        text=True,
+        check=True,
     )
+    binary = ROOT / "target" / "debug" / "fabricad"
+    if not binary.exists():
+        raise RuntimeError(f"native binary was not built: {binary}")
+    return binary
 
 
-def chrome_binary() -> str:
-    override = os.environ.get("CHROME")
-    if override:
-        return override
-    for name in ("google-chrome", "chromium", "chromium-browser"):
-        path = shutil.which(name)
-        if path:
-            return path
-    raise RuntimeError("could not find Chrome/Chromium; set CHROME=/path/to/chrome")
-
-
-def start_chrome(debug_port: int, profile: Path, out_dir: Path) -> subprocess.Popen:
-    log = open(out_dir / "chrome.log", "w", encoding="utf-8")
+def capture_snapshot(binary: Path, view: ViewCase, size: ViewportSize, out_dir: Path) -> Path:
+    raw_path = out_dir / "raw" / size.name / f"{view.slug}.rgba"
+    png_path = out_dir / "screenshots" / size.name / f"{view.slug}.png"
+    summary_path = out_dir / "summaries" / size.name / f"{view.slug}.txt"
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+    png_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
     command = [
-        chrome_binary(),
-        "--headless=new",
-        "--no-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu-sandbox",
-        "--disable-extensions",
-        "--enable-unsafe-swiftshader",
-        "--enable-unsafe-webgpu",
-        "--ignore-gpu-blocklist",
-        "--use-angle=swiftshader",
-        "--remote-allow-origins=*",
-        f"--remote-debugging-port={debug_port}",
-        f"--user-data-dir={profile}",
-        "about:blank",
+        str(binary),
+        "--operad-snapshot",
+        "--workspace=demo",
+        "--view",
+        view.slug,
+        "--width",
+        str(size.width),
+        "--height",
+        str(size.height),
+        "--snapshot-rgba",
+        str(raw_path),
     ]
-    return subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, text=True)
-
-
-def connect_cdp(debug_port: int) -> Cdp:
-    version_url = f"http://127.0.0.1:{debug_port}/json"
-    deadline = time.time() + 10
-    while time.time() < deadline:
-        try:
-            targets = requests.get(version_url, timeout=1).json()
-            page = next(target for target in targets if target.get("type") == "page")
-            return Cdp(page["webSocketDebuggerUrl"])
-        except Exception:
-            time.sleep(0.2)
-    raise RuntimeError("timed out waiting for Chrome DevTools Protocol")
-
-
-def wait_for_app(cdp: Cdp, width: int, height: int) -> None:
-    deadline = time.time() + 45
-    min_width = min(width, 300)
-    min_height = min(height, 300)
-    while time.time() < deadline:
-        result = cdp.call(
-            "Runtime.evaluate",
-            {
-                "returnByValue": True,
-                "expression": f"""
-                    (() => {{
-                        const canvas = document.getElementById('fabricad_canvas');
-                        const rect = canvas ? canvas.getBoundingClientRect() : {{ width: 0, height: 0 }};
-                        return document.readyState === 'complete'
-                            && !!canvas
-                            && rect.width >= {min_width}
-                            && rect.height >= {min_height};
-                    }})()
-                """,
-            },
-        )
-        if result.get("result", {}).get("value"):
-            time.sleep(0.8)
-            return
-        time.sleep(0.2)
-    raise RuntimeError("timed out waiting for Fabricad canvas")
-
-
-def set_viewport(cdp: Cdp, size: ViewportSize) -> None:
-    cdp.call(
-        "Emulation.setDeviceMetricsOverride",
-        {
-            "width": size.width,
-            "height": size.height,
-            "deviceScaleFactor": 1,
-            "mobile": False,
-        },
+    result = subprocess.run(
+        command,
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=90,
     )
-
-
-def capture_png(cdp: Cdp, path: Path) -> Image.Image:
-    screenshot = cdp.call("Page.captureScreenshot", {"format": "png", "fromSurface": True})
-    data = base64.b64decode(screenshot["data"])
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(data)
-    return Image.open(io.BytesIO(data)).convert("RGB")
+    summary_path.write_text(result.stdout + result.stderr, encoding="utf-8")
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"snapshot failed for {size.name}/{view.slug} with {result.returncode}; see {summary_path}"
+        )
+    raw = raw_path.read_bytes()
+    expected = size.width * size.height * 4
+    if len(raw) != expected:
+        raise RuntimeError(
+            f"snapshot for {size.name}/{view.slug} wrote {len(raw)} RGBA bytes, expected {expected}"
+        )
+    Image.frombytes("RGBA", (size.width, size.height), raw).convert("RGB").save(png_path)
+    raw_path.unlink(missing_ok=True)
+    return png_path
 
 
 def make_contact_sheet(
@@ -330,7 +226,7 @@ figcaption {{
 }}
 </style>
 <h1>Fabricad UI Layout Audit</h1>
-<p>Review each screenshot for clipped labels, bad wrapping, floating scrollbars, crowded margins, and content that disappears at narrow or wide aspect ratios.</p>
+<p>Review each Operad snapshot for clipped labels, bad wrapping, crowded margins, and content that disappears at narrow or wide aspect ratios.</p>
 <h2>Contact sheets</h2>
 <ul>{sheet_links}</ul>
 {"".join(rows)}
@@ -338,17 +234,6 @@ figcaption {{
     path = out_dir / "index.html"
     path.write_text(html_text, encoding="utf-8")
     return path
-
-
-def terminate(process: subprocess.Popen) -> None:
-    if process.poll() is not None:
-        return
-    with contextlib.suppress(Exception):
-        process.send_signal(signal.SIGTERM)
-        process.wait(timeout=5)
-    if process.poll() is None:
-        with contextlib.suppress(Exception):
-            process.kill()
 
 
 def selected_views(values: list[str], quick: bool) -> list[ViewCase]:
@@ -379,53 +264,22 @@ def run_audit(views: list[ViewCase], sizes: list[ViewportSize], out_dir: Path) -
     if out_dir.exists():
         shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    port = free_port()
-    debug_port = free_port()
-    while debug_port == port:
-        debug_port = free_port()
-
-    base_url = f"http://127.0.0.1:{port}"
-    trunk = start_trunk(port, out_dir)
-    chrome_profile = Path(tempfile.mkdtemp(prefix="fabricad-chrome-", dir=out_dir))
-    chrome: subprocess.Popen | None = None
-    cdp: Cdp | None = None
+    binary = native_binary()
     screenshots: dict[tuple[str, str], Path] = {}
-    try:
-        wait_http(base_url, 60)
-        chrome = start_chrome(debug_port, chrome_profile, out_dir)
-        cdp = connect_cdp(debug_port)
-        cdp.call("Page.enable")
-        cdp.call("Runtime.enable")
-        for size in sizes:
-            set_viewport(cdp, size)
-            for view in views:
-                url = f"{base_url}/?workspace=demo&view={view.slug}"
-                cdp.call("Page.navigate", {"url": url})
-                wait_for_app(cdp, size.width, size.height)
-                path = out_dir / "screenshots" / size.name / f"{view.slug}.png"
-                capture_png(cdp, path)
-                screenshots[(size.name, view.slug)] = path
-                print(f"captured {size.name}/{view.slug}")
 
-        contact_sheets = [
-            make_contact_sheet(size, views, screenshots, out_dir) for size in sizes
-        ]
-        review = write_review_html(sizes, views, screenshots, contact_sheets, out_dir)
-        print(f"review: {review}")
-    finally:
-        if cdp:
-            with contextlib.suppress(Exception):
-                cdp.close()
-        if chrome:
-            terminate(chrome)
-        terminate(trunk)
-        with contextlib.suppress(Exception):
-            shutil.rmtree(chrome_profile)
+    for size in sizes:
+        for view in views:
+            screenshots[(size.name, view.slug)] = capture_snapshot(binary, view, size, out_dir)
+            print(f"captured {size.name}/{view.slug}")
+
+    contact_sheets = [make_contact_sheet(size, views, screenshots, out_dir) for size in sizes]
+    review = write_review_html(sizes, views, screenshots, contact_sheets, out_dir)
+    print(f"review: {review}")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Capture Fabricad whole-app screenshots across views and aspect ratios."
+        description="Capture Fabricad Operad UI snapshots across views and aspect ratios."
     )
     parser.add_argument("--quick", action="store_true", help="capture a smaller smoke matrix")
     parser.add_argument(
