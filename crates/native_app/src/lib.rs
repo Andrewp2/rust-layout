@@ -1,15 +1,20 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    cell::{Cell as StdCell, RefCell},
+    collections::{BTreeMap, BTreeSet},
+};
 #[cfg(not(target_arch = "wasm32"))]
 use std::{fs, io::Write, path::Path};
 
-use drc::{DrcIssueStore, RuleDeck, run_drc};
-use geometry_core::{Coord, Point, Rect, Vector};
+use drc::{DrcIssueStore, DrcValidationFinding, DrcViolation, RuleDeck, run_drc};
+use geometry_core::{Coord, Point, Rect, Vector, distance_point_to_segment};
 #[cfg(not(target_arch = "wasm32"))]
 use layout_model::gdsii::export_gdsii;
 pub use layout_model::workspace::BuiltinDemoWorkspaceReport;
 use layout_model::{
-    Document, LayerId, MarkerState, Operation, ProcessLayer, Shape, ShapeId, ShapeKind,
-    connectivity::{ConnectivityIssueKind, extract_connectivity},
+    Cell, CellId, CellInstance, Document, InstanceArray, InstanceId, Layer, LayerId, LayoutIndex,
+    MarkerState, NetId, Operation, ProcessLayer, Shape, ShapeId, ShapeKind, ShapeOccurrenceId,
+    TechnologyFile, Transform,
+    connectivity::{ConnectivityIssueKind, ConnectivityReport, NetComponent, extract_connectivity},
     cross_section::MaterialId,
     environment::{
         CleanroomEnvironment, EnvironmentAlarmSeverity, EnvironmentSensor, TrendDirection,
@@ -28,7 +33,7 @@ use layout_model::{
     layout_diff::{LayoutDiffReport, ShapeChangeKind, diff_documents},
     maintenance::{DueState, FabDate, MaintenanceKind, ToolReleaseState},
     mask::{MaskCheckReport, MaskIssueSeverity, ReticlePrep},
-    mes::{LotId, ToolId as SchedulerToolId, WaferId},
+    mes::{LotId, ToolClass as SchedulerToolClass, ToolId as SchedulerToolId, WaferId},
     metrology::{DieCoord, MeasurementKind, MeasurementStatus, MeasurementSummary, WaferMap},
     notebook::{NotebookEntryId, NotebookFilter, NotebookLinkKind},
     process_control::{
@@ -42,31 +47,70 @@ use layout_model::{
     workspace::{WORKSPACE_DATASET_SCHEMA_VERSION, WorkspaceDataset},
     yield_analysis::{DieOutcome, FailureMode, ProcessMeasurement, YieldAnalysis, YieldSummary},
 };
+#[cfg(not(target_arch = "wasm32"))]
+use layout_model::{FlattenedShapeView, ShapeKindView};
+#[cfg(not(target_arch = "wasm32"))]
+use operad::WgpuCanvasContext;
+use operad::widgets::{
+    AnchoredPopup, ButtonOptions, CollapsingHeaderOptions, MenuItem as OperadMenuItem,
+    MenuListOptions, PopupAlign, PopupPlacement, PopupSide, button, collapsing_header,
+    menu_list_popup,
+};
 use operad::{
-    AccessibilityAction, AccessibilityMeta, AccessibilityRole, ApproxTextMeasurer, ClipBehavior,
-    ColorRgba, FontWeight, InputBehavior, RenderFrameOutput, RenderFrameRequest, RenderOptions,
-    RenderTarget, RendererAdapter, ScenePrimitive, ScrollAxes, StrokeStyle, TextStyle, TextWrap,
-    UiDocument, UiNode, UiNodeStyle, UiPoint, UiRect, UiSize, UiVisual, WgpuRenderer, layout,
+    AccessibilityAction, AccessibilityMeta, AccessibilityRole, ApproxTextMeasurer, CanvasContent,
+    CanvasInteractionPolicy, ClipBehavior, ColorRgba, FontWeight, InputBehavior, LayoutStyle,
+    PaintText, RenderFrameOutput, RenderFrameRequest, RenderOptions, RenderTarget, RendererAdapter,
+    ScenePrimitive, ScrollAxes, StrokeStyle, TextStyle, TextWrap, UiContent, UiDocument, UiNode,
+    UiNodeStyle, UiPoint, UiRect, UiSize, UiVisual, WgpuRenderer, WidgetActionBinding, layout,
     platform::PixelSize, root_style,
 };
 #[cfg(not(target_arch = "wasm32"))]
-use renderer::gpu::OffscreenRenderRequest;
+use operad_wgpu as wgpu;
+#[cfg(not(target_arch = "wasm32"))]
+use renderer::{
+    BatchFingerprint, GpuRectSlabInstance, GpuVertex3d, RenderBatch3d, TileCache, TileFrameOptions,
+    gpu::{
+        LayoutGpuRenderer, OffscreenRenderRequest, VIEWPORT_3D_COLOR_FORMAT, ViewUniforms,
+        Viewport3dRenderer, Viewport3dUniforms,
+    },
+};
 #[cfg(not(target_arch = "wasm32"))]
 use uuid::Uuid;
 
-#[cfg(not(target_arch = "wasm32"))]
 const LAYOUT_MIN_ZOOM: f32 = 0.000_05;
-#[cfg(not(target_arch = "wasm32"))]
 const LAYOUT_MAX_ZOOM: f32 = 512.0;
+const CAMERA_NEAR_PLANE: f32 = 10.0;
+const CAMERA_FAR_PLANE_MIN: f32 = 250_000.0;
+const CAMERA_FAR_PLANE_SPAN_MULTIPLIER: f32 = 4.0;
+const CAMERA_FAR_PLANE_MARGIN_MULTIPLIER: f32 = 1.5;
+const MAX_CONNECTIVITY_OVERLAY_SHAPES: usize = 50_000;
 const INVENTORY_DEMO_TODAY: u32 = 20260508;
 const MASK_ISSUE_PAGE_SIZE: usize = 50;
 const LAYOUT_DIFF_DEFAULT_PAGE_SIZE: usize = 50;
 const LAYOUT_DIFF_PAGE_SIZE_OPTIONS: [usize; 4] = [25, 50, 100, 200];
+const MAX_DRC_OVERLAY_MARKERS: usize = 32;
+const MAX_DRC_INSPECTOR_SHAPES: usize = 50_000;
+
+const COLOR_APP_BG: ColorRgba = ColorRgba::new(8, 11, 14, 255);
+const COLOR_CHROME_BG: ColorRgba = ColorRgba::new(12, 17, 21, 255);
+const COLOR_PANEL_BG: ColorRgba = ColorRgba::new(15, 21, 26, 255);
+const COLOR_PANEL_ALT: ColorRgba = ColorRgba::new(18, 25, 31, 255);
+const COLOR_PANEL_STROKE: ColorRgba = ColorRgba::new(31, 41, 50, 255);
+const COLOR_BUTTON_BG: ColorRgba = ColorRgba::new(18, 25, 31, 255);
+const COLOR_BUTTON_SELECTED: ColorRgba = ColorRgba::new(43, 105, 153, 255);
+const COLOR_BUTTON_STROKE: ColorRgba = ColorRgba::new(48, 61, 72, 255);
+const COLOR_BUTTON_STROKE_SELECTED: ColorRgba = ColorRgba::new(72, 148, 204, 255);
+const COLOR_TEXT: ColorRgba = ColorRgba::new(222, 229, 235, 255);
+const COLOR_TEXT_MUTED: ColorRgba = ColorRgba::new(142, 152, 162, 255);
+const OPERAD_UI_RUNTIME_VERSION: &str = "7.0.0";
+const USER_ID_LABEL: &str = "User 6a04b2";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Benchmark3dOptions {
     pub frames: usize,
     pub warmup_frames: usize,
+    pub width: u32,
+    pub height: u32,
 }
 
 impl Default for Benchmark3dOptions {
@@ -74,7 +118,64 @@ impl Default for Benchmark3dOptions {
         Self {
             frames: 180,
             warmup_frames: 24,
+            width: 1440,
+            height: 920,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Benchmark3dReport {
+    pub count: usize,
+    pub frames: usize,
+    pub warmup_frames: usize,
+    pub viewport: UiSize,
+    pub adapter: String,
+    pub app_init_ms: f64,
+    pub ui_build_ms: f64,
+    pub ui_paint_items: usize,
+    pub batch_build_ms: f64,
+    pub batch_bytes: usize,
+    pub mesh_triangles: usize,
+    pub rect_slabs: usize,
+    pub guide_segments: usize,
+    pub first_upload_ms: f64,
+    pub first_upload_bytes: usize,
+    pub uniform_avg_ms: f64,
+    pub cached_upload_avg_ms: f64,
+    pub encode_avg_ms: f64,
+    pub submit_wait_avg_ms: f64,
+    pub submit_wait_p50_ms: f64,
+    pub submit_wait_p95_ms: f64,
+}
+
+impl Benchmark3dReport {
+    pub fn summary(&self) -> String {
+        format!(
+            "3d benchmark count={} viewport={}x{} adapter=\"{}\" frames={} warmup={} app_init_ms={:.3} ui_build_ms={:.3} ui_paint_items={} batch_build_ms={:.3} batch_mb={:.2} mesh_triangles={} rect_slabs={} guide_segments={} first_upload_ms={:.3} first_upload_mb={:.2} uniform_avg_ms={:.3} cached_upload_avg_ms={:.3} encode_avg_ms={:.3} submit_wait_avg_ms={:.3} submit_wait_p50_ms={:.3} submit_wait_p95_ms={:.3}",
+            self.count,
+            self.viewport.width.round() as u32,
+            self.viewport.height.round() as u32,
+            self.adapter,
+            self.frames,
+            self.warmup_frames,
+            self.app_init_ms,
+            self.ui_build_ms,
+            self.ui_paint_items,
+            self.batch_build_ms,
+            self.batch_bytes as f64 / (1024.0 * 1024.0),
+            self.mesh_triangles,
+            self.rect_slabs,
+            self.guide_segments,
+            self.first_upload_ms,
+            self.first_upload_bytes as f64 / (1024.0 * 1024.0),
+            self.uniform_avg_ms,
+            self.cached_upload_avg_ms,
+            self.encode_avg_ms,
+            self.submit_wait_avg_ms,
+            self.submit_wait_p50_ms,
+            self.submit_wait_p95_ms
+        )
     }
 }
 
@@ -89,6 +190,7 @@ pub enum AppMenu {
     Tools,
     Macros,
     Help,
+    More,
 }
 
 impl AppMenu {
@@ -115,6 +217,7 @@ impl AppMenu {
             Self::Tools => "Tools",
             Self::Macros => "Macros",
             Self::Help => "Help",
+            Self::More => "More",
         }
     }
 
@@ -129,6 +232,7 @@ impl AppMenu {
             Self::Tools => "tools",
             Self::Macros => "macros",
             Self::Help => "help",
+            Self::More => "more",
         }
     }
 
@@ -143,6 +247,7 @@ impl AppMenu {
             "tools" => Some(Self::Tools),
             "macros" => Some(Self::Macros),
             "help" => Some(Self::Help),
+            "more" => Some(Self::More),
             _ => None,
         }
     }
@@ -691,7 +796,7 @@ impl LayoutDiffSource {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Current => "Current",
-            Self::Demo => "Demo",
+            Self::Demo => "Sample",
             Self::Hierarchy => "Hierarchy",
             Self::Empty => "Empty",
         }
@@ -700,8 +805,8 @@ impl LayoutDiffSource {
     pub const fn detail_label(self) -> &'static str {
         match self {
             Self::Current => "Current workspace",
-            Self::Demo => "Demo layout",
-            Self::Hierarchy => "Hierarchy demo",
+            Self::Demo => "Sample layout",
+            Self::Hierarchy => "Hierarchy sample",
             Self::Empty => "Empty layout",
         }
     }
@@ -965,7 +1070,6 @@ struct ExperimentRunMatrixRow {
     run_order: u32,
     lot_id: String,
     wafer_id: String,
-    slot: u8,
     block: String,
     factor_values: Vec<String>,
     status: String,
@@ -1071,7 +1175,7 @@ impl ToolMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum StartupView {
     Workflow,
     Layout2d,
@@ -1149,24 +1253,71 @@ impl StartupView {
         match self {
             Self::Workflow => "Fab Workflow",
             Self::Layout2d => "Layout Editor",
-            Self::Layout3d => "3D Layout",
-            Self::MaskPrep => "Reticle Prep",
-            Self::LayoutDiff => "Layout Diff",
-            Self::FabControl => "Fab Control",
-            Self::Inventory => "Inventory",
-            Self::Maintenance => "Maintenance",
-            Self::Environment => "Cleanroom",
-            Self::Scheduler => "Dispatch",
-            Self::Safety => "Safety",
+            Self::Layout3d => "3D Layout View",
+            Self::MaskPrep => "Mask / Reticle Prep",
+            Self::LayoutDiff => "Layout Diff Review",
+            Self::FabControl => "Fab Control Room",
+            Self::Inventory => "Inventory Tracker",
+            Self::Maintenance => "Maintenance and Calibration",
+            Self::Environment => "Cleanroom Environment",
+            Self::Scheduler => "Scheduler / Dispatch",
+            Self::Safety => "Safety and Interlock Dashboard",
             Self::Traceability => "Lot Traceability",
-            Self::Metrology => "Metrology",
+            Self::Metrology => "Metrology Wafer Map",
             Self::Yield => "Yield Dashboard",
             Self::SpcFdc => "SPC / FDC Monitor",
-            Self::ProcessFlow => "Process Flow",
+            Self::ProcessFlow => "Process-flow Designer",
             Self::ProcessControl => "Run-to-Run Control",
             Self::CrossSection => "Process Cross-Section",
             Self::Experiment => "DOE Planner",
             Self::Notebook => "Lab Notebook",
+        }
+    }
+
+    pub const fn nav_label(self) -> &'static str {
+        match self {
+            Self::Workflow => "Workflow",
+            Self::Layout2d => "Mask layout",
+            Self::Layout3d => "3D viewport",
+            Self::MaskPrep => "Reticle prep",
+            Self::LayoutDiff => "Layout diff",
+            Self::FabControl => "Equipment",
+            Self::Inventory => "Inventory",
+            Self::Maintenance => "Maintenance",
+            Self::Environment => "Environment",
+            Self::Scheduler => "Dispatch",
+            Self::Safety => "Safety",
+            Self::Traceability => "Traceability",
+            Self::Metrology => "Metrology",
+            Self::Yield => "Yield",
+            Self::SpcFdc => "SPC / FDC",
+            Self::ProcessFlow => "Process flow",
+            Self::ProcessControl => "R2R control",
+            Self::CrossSection => "Cross-section",
+            Self::Experiment => "DOE",
+            Self::Notebook => "Notebook",
+        }
+    }
+
+    const fn group(self) -> ModuleGroup {
+        match self {
+            Self::Layout2d | Self::Layout3d | Self::MaskPrep | Self::LayoutDiff => {
+                ModuleGroup::Design
+            }
+            Self::Workflow
+            | Self::FabControl
+            | Self::Inventory
+            | Self::Maintenance
+            | Self::Environment
+            | Self::Scheduler
+            | Self::Safety
+            | Self::Traceability => ModuleGroup::Operations,
+            Self::Metrology | Self::Yield | Self::SpcFdc => ModuleGroup::Analysis,
+            Self::ProcessFlow
+            | Self::ProcessControl
+            | Self::CrossSection
+            | Self::Experiment
+            | Self::Notebook => ModuleGroup::Engineering,
         }
     }
 
@@ -1196,7 +1347,96 @@ impl StartupView {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModuleGroup {
+    Design,
+    Operations,
+    Analysis,
+    Engineering,
+}
+
+impl ModuleGroup {
+    const ALL: [Self; 4] = [
+        Self::Design,
+        Self::Operations,
+        Self::Analysis,
+        Self::Engineering,
+    ];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Design => "Design",
+            Self::Operations => "Operations",
+            Self::Analysis => "Analysis",
+            Self::Engineering => "Engineering",
+        }
+    }
+
+    const fn slug(self) -> &'static str {
+        match self {
+            Self::Design => "design",
+            Self::Operations => "operations",
+            Self::Analysis => "analysis",
+            Self::Engineering => "engineering",
+        }
+    }
+
+    fn from_slug(value: &str) -> Option<Self> {
+        match value {
+            "design" => Some(Self::Design),
+            "operations" => Some(Self::Operations),
+            "analysis" => Some(Self::Analysis),
+            "engineering" => Some(Self::Engineering),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnitDisplay {
+    Auto,
+    Nanometers,
+    Microns,
+    Dbu,
+}
+
+impl UnitDisplay {
+    const ALL: [Self; 4] = [Self::Auto, Self::Nanometers, Self::Microns, Self::Dbu];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Nanometers => "Nanometers",
+            Self::Microns => "Microns",
+            Self::Dbu => "DBU",
+        }
+    }
+
+    const fn slug(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Nanometers => "nanometers",
+            Self::Microns => "microns",
+            Self::Dbu => "dbu",
+        }
+    }
+
+    fn from_slug(value: &str) -> Option<Self> {
+        match value {
+            "auto" => Some(Self::Auto),
+            "nanometers" => Some(Self::Nanometers),
+            "microns" => Some(Self::Microns),
+            "dbu" => Some(Self::Dbu),
+            _ => None,
+        }
+    }
+}
+
+fn default_nav_rail_views() -> BTreeSet<StartupView> {
+    StartupView::ALL.into_iter().collect()
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct StartupOptions {
     pub demo_workspace: bool,
     pub stress_count: Option<usize>,
@@ -1210,6 +1450,7 @@ pub struct StartupOptions {
     pub zoom: Option<f32>,
     pub pan: Option<[f32; 2]>,
     pub hierarchy_workflow_demo: bool,
+    pub startup_actions: Vec<String>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1261,7 +1502,7 @@ pub struct OperadAuditReport {
 impl OperadAuditReport {
     pub fn summary(&self) -> String {
         format!(
-            "Operad {} view={} viewport={}x{} paint_items={} layout_warnings={} shapes={} lots={} tools={}",
+            "ui_runtime={} view={} viewport={}x{} paint_items={} layout_warnings={} shapes={} lots={} tools={}",
             self.operad_version,
             self.view.slug(),
             self.viewport.width.round() as u32,
@@ -1302,10 +1543,30 @@ pub struct FabricadApp {
     workspace: WorkspaceDataset,
     active_view: StartupView,
     active_menu: Option<AppMenu>,
+    active_view_group: Option<ModuleGroup>,
     active_tool: ToolMode,
+    layout_zoom: f32,
+    layout_pan: [f32; 2],
+    layout_pointer: Option<UiPoint>,
+    layout_canvas_size: Option<UiSize>,
+    layout_drag: Option<LayoutCanvasDrag>,
+    layout_3d_drag: Option<UiPoint>,
+    camera_3d: Camera3d,
+    flycam_captured: bool,
+    viewport_fullscreen: bool,
+    drawing_start: Option<Point>,
+    drawing_points: Vec<Point>,
+    measure_start: Option<Point>,
+    route_points: Vec<Point>,
+    layout_frame_ms: StdCell<Option<f64>>,
+    layout_revision: u64,
+    nav_rail_views: BTreeSet<StartupView>,
     active_layer: LayerId,
     selected_layout_shape: Option<ShapeId>,
+    selected_layout_occurrence: Option<ShapeOccurrenceId>,
     layout_clipboard_shapes: Vec<Shape>,
+    layout_undo: Vec<UndoEntry>,
+    layout_redo: Vec<UndoEntry>,
     workflow_focus_lot: Option<String>,
     selected_equipment_tool: Option<EquipmentToolId>,
     equipment_recipe_drafts: BTreeMap<EquipmentToolId, EquipmentRecipeId>,
@@ -1377,6 +1638,12 @@ pub struct FabricadApp {
     experiment_show_missing_only: bool,
     status_message: String,
     dark_theme: bool,
+    show_command_palette: bool,
+    show_sidebar_modules: bool,
+    show_options_panel: bool,
+    show_diagnostics_panel: bool,
+    collapsed_detail_sections: BTreeSet<String>,
+    unit_display: UnitDisplay,
     snap_enabled: bool,
     show_grid: bool,
     show_3d_grid: bool,
@@ -1384,6 +1651,132 @@ pub struct FabricadApp {
     show_drc_overlay: bool,
     show_inspector: bool,
     show_layers: bool,
+    layout_modifiers: operad::KeyModifiers,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LayoutCanvasDrag {
+    MoveShape {
+        shape_id: ShapeId,
+        start_world: Point,
+        last_world: Point,
+        copy_on_drag: bool,
+        added_shape: Option<Shape>,
+    },
+    MoveInstance {
+        parent: CellId,
+        instance_id: InstanceId,
+        start_world: Point,
+        last_world: Point,
+        copy_on_drag: bool,
+        added_instance: Option<CellInstance>,
+    },
+    MoveVertex {
+        shape_id: ShapeId,
+        vertex: usize,
+        start_world: Point,
+        original_position: Point,
+        original_shape: Shape,
+    },
+    MoveEdge {
+        shape_id: ShapeId,
+        edge: usize,
+        last_world: Point,
+        original_shape: Shape,
+    },
+    Rect {
+        start: Point,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct UndoEntry {
+    undo: Operation,
+    redo: Operation,
+}
+
+#[derive(Clone, Debug, Default)]
+struct DrcReportCacheValue {
+    findings: Vec<DrcValidationFinding>,
+    violations: Vec<DrcViolation>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LayoutVertexHit {
+    shape_id: ShapeId,
+    vertex: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LayoutEdgeHit {
+    shape_id: ShapeId,
+    edge: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Camera3d {
+    position: Vec3,
+    yaw: f32,
+    pitch: f32,
+    speed: f32,
+    fov_y: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CameraBasis {
+    forward: Vec3,
+    right: Vec3,
+    up: Vec3,
+}
+
+impl Default for Camera3d {
+    fn default() -> Self {
+        Self {
+            position: Vec3::new(-8_000.0, -9_000.0, 6_000.0),
+            yaw: 45.0_f32.to_radians(),
+            pitch: -28.0_f32.to_radians(),
+            speed: 4_000.0,
+            fov_y: 58.0_f32.to_radians(),
+        }
+    }
+}
+
+impl Camera3d {
+    fn look_at(position: Vec3, target: Vec3, speed: f32) -> Self {
+        let to_target = target - position;
+        let direction = to_target.normalized();
+        let yaw = direction.y.atan2(direction.x);
+        let horizontal = (direction.x * direction.x + direction.y * direction.y).sqrt();
+        let pitch = direction.z.atan2(horizontal).clamp(-1.45, 1.45);
+        Self {
+            position,
+            yaw,
+            pitch,
+            speed: speed.max(100.0),
+            fov_y: 58.0_f32.to_radians(),
+        }
+    }
+
+    fn forward(self) -> Vec3 {
+        let cp = self.pitch.cos();
+        Vec3::new(self.yaw.cos() * cp, self.yaw.sin() * cp, self.pitch.sin()).normalized()
+    }
+
+    fn basis(self) -> CameraBasis {
+        let forward = self.forward();
+        let right = Vec3::new(-self.yaw.sin(), self.yaw.cos(), 0.0).normalized();
+        let up = forward.cross(right).normalized();
+        CameraBasis { forward, right, up }
+    }
+
+    fn look_delta(&mut self, delta: UiPoint, sensitivity: f32) {
+        self.yaw += delta.x * sensitivity;
+        self.pitch = (self.pitch - delta.y * sensitivity).clamp(-1.45, 1.45);
+    }
+
+    fn scroll_forward(&mut self, scroll: f32) {
+        self.position += self.forward() * scroll * self.speed * 0.0015;
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1464,14 +1857,37 @@ impl FabricadApp {
             .or_else(|| options.view_3d.then_some(StartupView::Layout3d))
             .unwrap_or(StartupView::Workflow);
 
-        Self {
+        let mut app = Self {
             workspace,
             active_view,
-            active_menu: options.show_options.then_some(AppMenu::Options),
+            active_menu: None,
+            active_view_group: None,
             active_tool: ToolMode::Select,
+            layout_zoom: options
+                .zoom
+                .unwrap_or(0.02)
+                .clamp(LAYOUT_MIN_ZOOM, LAYOUT_MAX_ZOOM),
+            layout_pan: options.pan.unwrap_or([0.0, 0.0]),
+            layout_pointer: None,
+            layout_canvas_size: None,
+            layout_drag: None,
+            layout_3d_drag: None,
+            camera_3d: Camera3d::default(),
+            flycam_captured: false,
+            viewport_fullscreen: false,
+            drawing_start: None,
+            drawing_points: Vec::new(),
+            measure_start: None,
+            route_points: Vec::new(),
+            layout_frame_ms: StdCell::new(None),
+            layout_revision: 0,
+            nav_rail_views: default_nav_rail_views(),
             active_layer,
             selected_layout_shape,
+            selected_layout_occurrence: selected_layout_shape.map(ShapeOccurrenceId::top_level),
             layout_clipboard_shapes: Vec::new(),
+            layout_undo: Vec::new(),
+            layout_redo: Vec::new(),
             workflow_focus_lot,
             selected_equipment_tool,
             equipment_recipe_drafts: BTreeMap::new(),
@@ -1543,14 +1959,25 @@ impl FabricadApp {
             experiment_show_missing_only: false,
             status_message: "Ready".to_string(),
             dark_theme: true,
+            show_command_palette: false,
+            show_sidebar_modules: false,
+            show_options_panel: options.show_options,
+            show_diagnostics_panel: false,
+            collapsed_detail_sections: BTreeSet::new(),
+            unit_display: UnitDisplay::Auto,
             snap_enabled: true,
             show_grid: true,
             show_3d_grid: true,
             show_origin_marker: true,
             show_drc_overlay: true,
-            show_inspector: true,
-            show_layers: true,
+            show_inspector: false,
+            show_layers: false,
+            layout_modifiers: operad::KeyModifiers::NONE,
+        };
+        for action in options.startup_actions {
+            app.apply_clicked_node_name(&action);
         }
+        app
     }
 
     pub fn workspace(&self) -> &WorkspaceDataset {
@@ -1565,8 +1992,45 @@ impl FabricadApp {
         self.active_menu
     }
 
+    pub fn flycam_captured(&self) -> bool {
+        self.flycam_captured
+    }
+
+    pub fn dismiss_transient_ui(&mut self) -> bool {
+        if self.active_menu.is_some() {
+            self.active_menu = None;
+            self.active_view_group = None;
+            return true;
+        }
+        if self.show_command_palette {
+            self.show_command_palette = false;
+            return true;
+        }
+        if self.show_sidebar_modules {
+            self.show_sidebar_modules = false;
+            return true;
+        }
+        if self.show_options_panel {
+            self.show_options_panel = false;
+            return true;
+        }
+        if self.show_diagnostics_panel {
+            self.show_diagnostics_panel = false;
+            return true;
+        }
+        false
+    }
+
     pub fn active_tool(&self) -> ToolMode {
         self.active_tool
+    }
+
+    pub fn layout_zoom(&self) -> f32 {
+        self.layout_zoom
+    }
+
+    pub fn layout_pan(&self) -> [f32; 2] {
+        self.layout_pan
     }
 
     pub fn active_layer(&self) -> LayerId {
@@ -1575,6 +2039,1055 @@ impl FabricadApp {
 
     pub fn selected_layout_shape(&self) -> Option<ShapeId> {
         self.selected_layout_shape
+    }
+
+    fn with_layout_index<T>(&self, f: impl FnOnce(&LayoutIndex) -> T) -> T {
+        let index = LayoutIndex::rebuild_hierarchical(&self.workspace.document);
+        f(&index)
+    }
+
+    fn connectivity_report(&self) -> Result<ConnectivityReport, String> {
+        extract_connectivity(
+            &self.workspace.document,
+            &layout_model::default_technology(),
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    fn drc_report(&self) -> DrcReportCacheValue {
+        let rules = RuleDeck::demo(&self.workspace.document);
+        DrcReportCacheValue {
+            findings: rules.validate_for_document(&self.workspace.document),
+            violations: run_drc(&self.workspace.document, &rules),
+        }
+    }
+
+    pub fn handle_layout_canvas_input(
+        &mut self,
+        event: &operad::UiInputEvent,
+        canvas_rect: UiRect,
+    ) -> bool {
+        self.handle_layout_canvas_input_with_modifiers(
+            event,
+            canvas_rect,
+            operad::KeyModifiers::NONE,
+        )
+    }
+
+    pub fn handle_layout_canvas_input_with_modifiers(
+        &mut self,
+        event: &operad::UiInputEvent,
+        canvas_rect: UiRect,
+        modifiers: operad::KeyModifiers,
+    ) -> bool {
+        if self.active_view != StartupView::Layout2d {
+            return false;
+        }
+        self.layout_modifiers = modifiers;
+        self.layout_canvas_size = Some(rect_size(canvas_rect));
+        match event {
+            operad::UiInputEvent::PointerMove(point) => {
+                let point = *point;
+                if !canvas_rect.contains_point(point) && self.layout_drag.is_none() {
+                    return false;
+                }
+                let local = local_canvas_point(point, canvas_rect);
+                self.layout_pointer = Some(local);
+                let world =
+                    self.layout_world_point_for_modifiers(local, rect_size(canvas_rect), modifiers);
+                self.update_layout_drag_to(world, modifiers);
+                true
+            }
+            operad::UiInputEvent::PointerDown(point) => {
+                let point = *point;
+                if !canvas_rect.contains_point(point) {
+                    return false;
+                }
+                let local = local_canvas_point(point, canvas_rect);
+                self.layout_pointer = Some(local);
+                let world =
+                    self.layout_world_point_for_modifiers(local, rect_size(canvas_rect), modifiers);
+                self.handle_layout_pointer_down(world, modifiers);
+                true
+            }
+            operad::UiInputEvent::PointerUp(point) => {
+                let point = *point;
+                if !canvas_rect.contains_point(point) && self.layout_drag.is_none() {
+                    return false;
+                }
+                let local = local_canvas_point(point, canvas_rect);
+                self.layout_pointer = Some(local);
+                let world =
+                    self.layout_world_point_for_modifiers(local, rect_size(canvas_rect), modifiers);
+                self.handle_layout_pointer_up(world, modifiers);
+                true
+            }
+            operad::UiInputEvent::Wheel(wheel) => {
+                if !canvas_rect.contains_point(wheel.position) || !wheel.delta.y.is_finite() {
+                    return false;
+                }
+                let scroll = -wheel.delta.y;
+                if scroll.abs() <= f32::EPSILON {
+                    return true;
+                }
+                let local = local_canvas_point(wheel.position, canvas_rect);
+                self.zoom_layout_canvas_around(local, rect_size(canvas_rect), scroll);
+                self.layout_pointer = Some(local);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn handle_layout_canvas_double_click(
+        &mut self,
+        point: UiPoint,
+        canvas_rect: UiRect,
+    ) -> bool {
+        if self.active_view != StartupView::Layout2d
+            || self.active_tool != ToolMode::Select
+            || !canvas_rect.contains_point(point)
+        {
+            return false;
+        }
+        let size = rect_size(canvas_rect);
+        self.layout_canvas_size = Some(size);
+        let local = local_canvas_point(point, canvas_rect);
+        self.layout_pointer = Some(local);
+        let world = self.snap_layout_point(self.layout_canvas_to_world_local(local, size));
+        let Some(hit) = self.hit_selected_layout_edge(world, self.layout_hit_tolerance()) else {
+            return false;
+        };
+        self.insert_layout_vertex(hit.shape_id, hit.edge, world);
+        true
+    }
+
+    pub fn handle_layout_canvas_secondary_click(
+        &mut self,
+        point: UiPoint,
+        canvas_rect: UiRect,
+    ) -> bool {
+        if self.active_view != StartupView::Layout2d
+            || !matches!(self.active_tool, ToolMode::Polygon | ToolMode::Path)
+            || !canvas_rect.contains_point(point)
+        {
+            return false;
+        }
+        let size = rect_size(canvas_rect);
+        self.layout_canvas_size = Some(size);
+        self.layout_pointer = Some(local_canvas_point(point, canvas_rect));
+        self.finish_layout_polyline()
+    }
+
+    pub fn handle_layout_editor_key(
+        &mut self,
+        key: operad::KeyCode,
+        modifiers: operad::KeyModifiers,
+    ) -> bool {
+        if self.active_view != StartupView::Layout2d
+            || modifiers.ctrl
+            || modifiers.alt
+            || modifiers.meta
+        {
+            return false;
+        }
+        match key {
+            operad::KeyCode::Escape => self.clear_layout_edit_drafts(),
+            operad::KeyCode::Enter => self.finish_layout_polyline(),
+            operad::KeyCode::Backspace | operad::KeyCode::Delete => {
+                self.delete_layout_vertex_at_pointer() || self.delete_layout_selection()
+            }
+            _ => false,
+        }
+    }
+
+    pub fn pan_layout_canvas_by(&mut self, delta: UiPoint) -> bool {
+        if self.active_view != StartupView::Layout2d || !delta.x.is_finite() || !delta.y.is_finite()
+        {
+            return false;
+        }
+        self.layout_pan[0] += delta.x;
+        self.layout_pan[1] += delta.y;
+        true
+    }
+
+    pub fn handle_layout_3d_canvas_input(
+        &mut self,
+        event: &operad::UiInputEvent,
+        canvas_rect: UiRect,
+    ) -> bool {
+        if self.active_view != StartupView::Layout3d {
+            return false;
+        }
+        match event {
+            operad::UiInputEvent::PointerDown(point) => {
+                if !canvas_rect.contains_point(*point) {
+                    return false;
+                }
+                self.layout_3d_drag = Some(*point);
+                self.flycam_captured = true;
+                true
+            }
+            operad::UiInputEvent::PointerMove(point) => {
+                let Some(previous) = self.layout_3d_drag else {
+                    return false;
+                };
+                let delta = UiPoint::new(point.x - previous.x, point.y - previous.y);
+                self.layout_3d_drag = Some(*point);
+                let sensitivity = if self.flycam_captured { 0.003 } else { 0.006 };
+                self.camera_3d.look_delta(delta, sensitivity);
+                true
+            }
+            operad::UiInputEvent::PointerUp(point) => {
+                if self.layout_3d_drag.is_none() && !canvas_rect.contains_point(*point) {
+                    return false;
+                }
+                self.layout_3d_drag = None;
+                true
+            }
+            operad::UiInputEvent::Wheel(wheel) => {
+                if !canvas_rect.contains_point(wheel.position) {
+                    return false;
+                }
+                self.camera_3d.scroll_forward(-wheel.delta.y);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn handle_layout_3d_key(
+        &mut self,
+        key: operad::KeyCode,
+        _modifiers: operad::KeyModifiers,
+    ) -> bool {
+        if self.active_view != StartupView::Layout3d {
+            return false;
+        }
+        match key {
+            operad::KeyCode::Escape => {
+                self.viewport_fullscreen = false;
+                self.flycam_captured = false;
+                self.layout_3d_drag = None;
+                true
+            }
+            operad::KeyCode::Character('f') | operad::KeyCode::Character('F') => {
+                self.viewport_fullscreen = !self.viewport_fullscreen;
+                true
+            }
+            operad::KeyCode::ArrowUp | operad::KeyCode::Character('w' | 'W') => self
+                .advance_layout_3d_flycam(
+                    true,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    _modifiers.shift,
+                    1.0 / 60.0,
+                ),
+            operad::KeyCode::ArrowDown | operad::KeyCode::Character('s' | 'S') => self
+                .advance_layout_3d_flycam(
+                    false,
+                    true,
+                    false,
+                    false,
+                    false,
+                    false,
+                    _modifiers.shift,
+                    1.0 / 60.0,
+                ),
+            operad::KeyCode::ArrowLeft | operad::KeyCode::Character('a' | 'A') => self
+                .advance_layout_3d_flycam(
+                    false,
+                    false,
+                    true,
+                    false,
+                    false,
+                    false,
+                    _modifiers.shift,
+                    1.0 / 60.0,
+                ),
+            operad::KeyCode::ArrowRight | operad::KeyCode::Character('d' | 'D') => self
+                .advance_layout_3d_flycam(
+                    false,
+                    false,
+                    false,
+                    true,
+                    false,
+                    false,
+                    _modifiers.shift,
+                    1.0 / 60.0,
+                ),
+            operad::KeyCode::Character('e' | 'E' | ' ') => self.advance_layout_3d_flycam(
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+                _modifiers.shift,
+                1.0 / 60.0,
+            ),
+            operad::KeyCode::Character('q' | 'Q') => self.advance_layout_3d_flycam(
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+                _modifiers.shift,
+                1.0 / 60.0,
+            ),
+            _ => false,
+        }
+    }
+
+    pub fn set_layout_3d_flycam_capture(&mut self, captured: bool) -> bool {
+        if captured && self.active_view != StartupView::Layout3d {
+            return false;
+        }
+        let changed = self.flycam_captured != captured;
+        self.flycam_captured = captured;
+        if !captured {
+            self.layout_3d_drag = None;
+        }
+        changed
+    }
+
+    pub fn apply_layout_3d_mouse_delta(&mut self, delta: UiPoint, _raw_motion: bool) -> bool {
+        if self.active_view != StartupView::Layout3d {
+            return false;
+        }
+        if !delta.x.is_finite() || !delta.y.is_finite() || (delta.x == 0.0 && delta.y == 0.0) {
+            return false;
+        }
+        let sensitivity = if _raw_motion { 0.003 } else { 0.006 };
+        self.camera_3d.look_delta(delta, sensitivity);
+        true
+    }
+
+    pub fn advance_layout_3d_flycam(
+        &mut self,
+        forward: bool,
+        backward: bool,
+        left: bool,
+        right: bool,
+        up: bool,
+        down: bool,
+        fast: bool,
+        dt: f32,
+    ) -> bool {
+        if self.active_view != StartupView::Layout3d || !dt.is_finite() || dt <= 0.0 {
+            return false;
+        }
+        let basis = self.camera_3d.basis();
+        let mut direction = Vec3::ZERO;
+        if forward {
+            direction += basis.forward;
+        }
+        if backward {
+            direction = direction - basis.forward;
+        }
+        if right {
+            direction += basis.right;
+        }
+        if left {
+            direction = direction - basis.right;
+        }
+        if up {
+            direction += Vec3::new(0.0, 0.0, 1.0);
+        }
+        if down {
+            direction = direction - Vec3::new(0.0, 0.0, 1.0);
+        }
+        if direction.length() <= f32::EPSILON {
+            return false;
+        }
+        let speed = self.camera_3d.speed * if fast { 3.0 } else { 1.0 };
+        let delta = direction.normalized() * (speed * dt.clamp(1.0 / 240.0, 1.0 / 20.0));
+        self.camera_3d.position += delta;
+        true
+    }
+
+    fn reset_3d_camera_to_document(&mut self) {
+        let bounds = self
+            .with_layout_index(|index| index.bounds())
+            .unwrap_or_else(|| Rect::new(Point::new(-5_000, -5_000), Point::new(5_000, 5_000)));
+        let center = bounds.center();
+        let span = bounds.width().abs().max(bounds.height().abs()).max(1_000) as f32;
+        let target = Vec3::new(center.x as f32, center.y as f32, 360.0);
+        let position = Vec3::new(
+            center.x as f32 - span * 0.85,
+            center.y as f32 - span * 0.95,
+            span * 0.62 + 1_800.0,
+        );
+        self.camera_3d = Camera3d::look_at(position, target, span.max(2_000.0) * 0.85);
+    }
+
+    fn camera_3d_far_plane(&self) -> f32 {
+        let bounds = self
+            .with_layout_index(|index| index.bounds())
+            .unwrap_or_else(|| Rect::from_min_size(Point::new(-500, -500), 1_000, 1_000));
+        let max_layer_z = self
+            .workspace
+            .document
+            .layers
+            .values()
+            .map(|layer| layer_3d_stack_range(layer.process).1)
+            .fold(1_000.0_f32, f32::max);
+        let span = bounds.width().max(bounds.height()).max(1_000) as f32;
+        let corners = [
+            Vec3::new(bounds.min.x as f32, bounds.min.y as f32, 0.0),
+            Vec3::new(bounds.max.x as f32, bounds.min.y as f32, 0.0),
+            Vec3::new(bounds.max.x as f32, bounds.max.y as f32, 0.0),
+            Vec3::new(bounds.min.x as f32, bounds.max.y as f32, 0.0),
+            Vec3::new(bounds.min.x as f32, bounds.min.y as f32, max_layer_z),
+            Vec3::new(bounds.max.x as f32, bounds.min.y as f32, max_layer_z),
+            Vec3::new(bounds.max.x as f32, bounds.max.y as f32, max_layer_z),
+            Vec3::new(bounds.min.x as f32, bounds.max.y as f32, max_layer_z),
+        ];
+        let forward = self.camera_3d.forward();
+        let max_forward_depth = corners
+            .into_iter()
+            .map(|corner| (corner - self.camera_3d.position).dot(forward))
+            .fold(CAMERA_NEAR_PLANE * 4.0, f32::max);
+        let margin = span * CAMERA_FAR_PLANE_MARGIN_MULTIPLIER + max_layer_z * 2.0;
+        let minimum_far =
+            CAMERA_FAR_PLANE_MIN.max(span * CAMERA_FAR_PLANE_SPAN_MULTIPLIER + max_layer_z);
+        (max_forward_depth + margin).max(minimum_far)
+    }
+
+    fn handle_layout_pointer_down(&mut self, world: Point, modifiers: operad::KeyModifiers) {
+        match self.active_tool {
+            ToolMode::Select => self.begin_layout_selection(world, modifiers),
+            ToolMode::Rect => {
+                self.drawing_start = Some(world);
+                self.layout_drag = Some(LayoutCanvasDrag::Rect { start: world });
+                self.status_message = "Drawing rectangle".to_string();
+            }
+            ToolMode::Polygon | ToolMode::Path => {
+                let point = self
+                    .drawing_points
+                    .last()
+                    .copied()
+                    .map(|start| layout_drag_world(start, world, modifiers))
+                    .unwrap_or(world);
+                if self.drawing_points.last().copied() != Some(point) {
+                    self.drawing_points.push(point);
+                }
+            }
+            ToolMode::Via => {
+                let via_layer = self
+                    .workspace
+                    .document
+                    .layer_by_process(ProcessLayer::Via1)
+                    .unwrap_or(self.active_layer);
+                let lower = self
+                    .workspace
+                    .document
+                    .layer_by_process(ProcessLayer::Metal1)
+                    .unwrap_or(self.active_layer);
+                let upper = self
+                    .workspace
+                    .document
+                    .layer_by_process(ProcessLayer::Metal2)
+                    .unwrap_or(self.active_layer);
+                self.add_layout_shape(
+                    via_layer,
+                    ShapeKind::Via {
+                        center: world,
+                        size: 180,
+                        lower,
+                        upper,
+                    },
+                );
+            }
+            ToolMode::Measure => {
+                let world = self
+                    .measure_start
+                    .map(|start| layout_drag_world(start, world, modifiers))
+                    .unwrap_or(world);
+                if let Some(start) = self.measure_start.take() {
+                    let distance = start.distance_to(world);
+                    let layer = self
+                        .workspace
+                        .document
+                        .layer_by_process(ProcessLayer::Annotation)
+                        .unwrap_or(self.active_layer);
+                    self.add_layout_shape(
+                        layer,
+                        ShapeKind::Measurement {
+                            a: start,
+                            b: world,
+                            label: self.format_layout_length(distance),
+                        },
+                    );
+                } else {
+                    self.measure_start = Some(world);
+                    self.status_message = "Measurement start set".to_string();
+                }
+            }
+            ToolMode::Route => {
+                let point = self
+                    .route_points
+                    .last()
+                    .copied()
+                    .map(|start| layout_drag_world(start, world, modifiers))
+                    .unwrap_or(world);
+                self.route_points.push(point);
+                if self.route_points.len() >= 2 {
+                    self.route_layout_between_points();
+                }
+            }
+        }
+    }
+
+    fn handle_layout_pointer_up(&mut self, world: Point, modifiers: operad::KeyModifiers) {
+        let Some(drag) = self.layout_drag.clone() else {
+            return;
+        };
+        if !matches!(drag, LayoutCanvasDrag::Rect { .. }) {
+            self.update_layout_drag_to(world, modifiers);
+        }
+        let Some(drag) = self.layout_drag.take() else {
+            return;
+        };
+        if let LayoutCanvasDrag::Rect { start } = drag {
+            self.drawing_start = None;
+            let rect = Rect::new(start, layout_rect_end(start, world, modifiers));
+            let minimum_size = self.minimum_layout_draw_size();
+            if rect.width().abs() >= minimum_size && rect.height().abs() >= minimum_size {
+                self.add_layout_shape(self.active_layer, ShapeKind::Rectangle(rect));
+            }
+            return;
+        }
+        self.commit_layout_drag_history(drag);
+    }
+
+    fn begin_layout_selection(&mut self, world: Point, modifiers: operad::KeyModifiers) {
+        let tolerance = self.layout_hit_tolerance();
+        if let Some(hit) = self.hit_selected_layout_vertex(world, tolerance) {
+            let Some(original_shape) = self.workspace.document.shapes.get(&hit.shape_id) else {
+                return;
+            };
+            let original_position = editable_vertex_points(&original_shape.kind)
+                .get(hit.vertex)
+                .copied()
+                .unwrap_or(world);
+            self.layout_drag = Some(LayoutCanvasDrag::MoveVertex {
+                shape_id: hit.shape_id,
+                vertex: hit.vertex,
+                start_world: world,
+                original_position,
+                original_shape,
+            });
+            self.status_message = format!(
+                "Editing vertex {} on shape #{}",
+                hit.vertex + 1,
+                hit.shape_id.0
+            );
+            return;
+        }
+        if let Some(hit) = self.hit_selected_layout_draggable_edge(world, tolerance) {
+            let Some(original_shape) = self.workspace.document.shapes.get(&hit.shape_id) else {
+                return;
+            };
+            self.layout_drag = Some(LayoutCanvasDrag::MoveEdge {
+                shape_id: hit.shape_id,
+                edge: hit.edge,
+                last_world: world,
+                original_shape,
+            });
+            self.status_message =
+                format!("Editing edge {} on shape #{}", hit.edge + 1, hit.shape_id.0);
+            return;
+        }
+
+        let index = LayoutIndex::rebuild_hierarchical(&self.workspace.document);
+        if let Some(occurrence) = index.hit_test_occurrence(world, tolerance) {
+            let shape_id = occurrence.source_shape_id();
+            self.selected_layout_shape = Some(shape_id);
+            self.selected_layout_occurrence = Some(occurrence.clone());
+            if let Some(shape) = self
+                .workspace
+                .document
+                .shape_view_for_occurrence(&occurrence)
+                .map(|view| view.shape.to_shape())
+            {
+                self.active_layer = shape.layer;
+            }
+            if occurrence.is_top_level() && self.workspace.document.shapes.contains_key(&shape_id) {
+                self.layout_drag = Some(LayoutCanvasDrag::MoveShape {
+                    shape_id,
+                    start_world: world,
+                    last_world: world,
+                    copy_on_drag: modifiers.alt,
+                    added_shape: None,
+                });
+                self.status_message = format!("Selected shape #{}", shape_id.0);
+            } else if let Some((parent, instance_id)) = self
+                .workspace
+                .document
+                .instance_parent_for_path(&occurrence.instance_path)
+            {
+                self.layout_drag = Some(LayoutCanvasDrag::MoveInstance {
+                    parent,
+                    instance_id,
+                    start_world: world,
+                    last_world: world,
+                    copy_on_drag: modifiers.alt,
+                    added_instance: None,
+                });
+                self.status_message =
+                    format!("Picked instance {}", layout_occurrence_label(&occurrence));
+            } else {
+                self.layout_drag = None;
+                self.status_message =
+                    format!("Picked instance {}", layout_occurrence_label(&occurrence));
+            }
+        } else {
+            self.selected_layout_shape = None;
+            self.selected_layout_occurrence = None;
+            self.layout_drag = None;
+            self.status_message = "Layout selection cleared".to_string();
+        }
+    }
+
+    fn add_layout_shape(&mut self, layer: LayerId, kind: ShapeKind) -> Option<ShapeId> {
+        self.add_layout_shape_with_metadata(layer, kind, None, None)
+    }
+
+    fn add_layout_shape_with_metadata(
+        &mut self,
+        layer: LayerId,
+        kind: ShapeKind,
+        net: Option<NetId>,
+        name: Option<String>,
+    ) -> Option<ShapeId> {
+        if !self.workspace.document.layers.contains_key(&layer) {
+            self.status_message = "Add a layer before drawing".to_string();
+            return None;
+        }
+        let id = self.workspace.document.allocate_shape_id();
+        let shape = Shape {
+            id,
+            layer,
+            net,
+            kind,
+            name,
+        };
+        self.apply_layout_operation_with_history(
+            Operation::AddShape {
+                shape: shape.clone(),
+            },
+            Operation::DeleteShape { id },
+        );
+        self.selected_layout_shape = Some(id);
+        self.selected_layout_occurrence = Some(ShapeOccurrenceId::top_level(id));
+        self.active_layer = layer;
+        self.status_message = format!("Added shape #{}", id.0);
+        Some(id)
+    }
+
+    fn route_layout_between_points(&mut self) -> bool {
+        if self.route_points.len() < 2 {
+            self.status_message = "Set route endpoints first".to_string();
+            return true;
+        }
+        let start = self.route_points[0];
+        let goal = *self.route_points.last().unwrap_or(&start);
+        let route = router::route(
+            &self.workspace.document,
+            router::RouteRequest {
+                start,
+                goal,
+                layer: self.active_layer,
+                wire_width: 180,
+                bounds: Some(Rect::new(start, goal).expanded(8_000)),
+            },
+            router::RouterConfig::default(),
+        )
+        .map(|route| route.points)
+        .unwrap_or_else(|_| self.route_points.clone());
+        let net = self
+            .layout_net_at_point(start)
+            .or_else(|| self.layout_net_at_point(goal));
+        let name = net.map(|net| format!("NET{}", net.0));
+        self.route_points.clear();
+        let Some(shape_id) = self.add_layout_shape_with_metadata(
+            self.active_layer,
+            ShapeKind::Path {
+                points: route,
+                width: 180,
+            },
+            net,
+            name.clone(),
+        ) else {
+            return true;
+        };
+        self.status_message = if let Some(name) = name {
+            format!("Route placed for {name} as shape #{}", shape_id.0)
+        } else {
+            format!("Route placed as shape #{}", shape_id.0)
+        };
+        true
+    }
+
+    fn layout_net_at_point(&self, point: Point) -> Option<NetId> {
+        self.workspace
+            .document
+            .shapes
+            .values()
+            .find(|shape| shape.kind.bounds().expanded(1).contains_point(point))
+            .and_then(|shape| shape.net)
+    }
+
+    fn move_layout_vertex(&mut self, shape_id: ShapeId, vertex: usize, position: Point) -> bool {
+        let Some(old_shape) = self.workspace.document.shapes.get(&shape_id) else {
+            return false;
+        };
+        let Some(new_shape) = shape_with_moved_vertex(&old_shape, vertex, position) else {
+            return false;
+        };
+        self.replace_layout_shape(shape_id, old_shape, new_shape, "Edited vertex")
+    }
+
+    fn insert_layout_vertex(&mut self, shape_id: ShapeId, edge: usize, position: Point) -> bool {
+        let Some(old_shape) = self.workspace.document.shapes.get(&shape_id) else {
+            return false;
+        };
+        let Some(new_shape) = shape_with_inserted_vertex(&old_shape, edge, position) else {
+            self.status_message = "Vertex insertion needs a polygon or path edge".to_string();
+            return false;
+        };
+        self.replace_layout_shape(shape_id, old_shape, new_shape, "Inserted vertex")
+    }
+
+    fn delete_layout_vertex(&mut self, shape_id: ShapeId, vertex: usize) -> bool {
+        let Some(old_shape) = self.workspace.document.shapes.get(&shape_id) else {
+            return false;
+        };
+        let Some(new_shape) = shape_with_deleted_vertex(&old_shape, vertex) else {
+            self.status_message = "Cannot delete that vertex".to_string();
+            return true;
+        };
+        self.replace_layout_shape(shape_id, old_shape, new_shape, "Deleted vertex")
+    }
+
+    fn delete_layout_vertex_at_pointer(&mut self) -> bool {
+        if self.active_tool != ToolMode::Select {
+            return false;
+        }
+        let (Some(pointer), Some(size)) = (self.layout_pointer, self.layout_canvas_size) else {
+            return false;
+        };
+        let world = self.snap_layout_point(self.layout_canvas_to_world_local(pointer, size));
+        let Some(hit) = self.hit_selected_layout_vertex(world, self.layout_hit_tolerance()) else {
+            return false;
+        };
+        self.delete_layout_vertex(hit.shape_id, hit.vertex)
+    }
+
+    fn move_layout_edge(&mut self, shape_id: ShapeId, edge: usize, delta: Vector) -> bool {
+        if delta == Vector::ZERO {
+            return false;
+        }
+        let Some(old_shape) = self.workspace.document.shapes.get(&shape_id) else {
+            return false;
+        };
+        let Some(new_shape) = shape_with_moved_edge(&old_shape, edge, delta) else {
+            return false;
+        };
+        self.replace_layout_shape(shape_id, old_shape, new_shape, "Moved edge")
+    }
+
+    fn replace_layout_shape(
+        &mut self,
+        shape_id: ShapeId,
+        old_shape: Shape,
+        new_shape: Shape,
+        label: &str,
+    ) -> bool {
+        if old_shape == new_shape {
+            return false;
+        }
+        self.apply_layout_operation_with_history(
+            Operation::ReplaceShape {
+                id: shape_id,
+                shape: new_shape,
+            },
+            Operation::ReplaceShape {
+                id: shape_id,
+                shape: old_shape,
+            },
+        );
+        self.selected_layout_shape = Some(shape_id);
+        self.selected_layout_occurrence = Some(ShapeOccurrenceId::top_level(shape_id));
+        self.status_message = format!("{label} on shape #{}", shape_id.0);
+        true
+    }
+
+    fn replace_layout_shape_live(
+        &mut self,
+        shape_id: ShapeId,
+        old_shape: Shape,
+        new_shape: Shape,
+        label: &str,
+    ) -> bool {
+        if old_shape == new_shape {
+            return false;
+        }
+        self.apply_layout_operation_live(Operation::ReplaceShape {
+            id: shape_id,
+            shape: new_shape,
+        });
+        self.selected_layout_shape = Some(shape_id);
+        self.selected_layout_occurrence = Some(ShapeOccurrenceId::top_level(shape_id));
+        self.status_message = format!("{label} on shape #{}", shape_id.0);
+        true
+    }
+
+    fn hit_selected_layout_vertex(
+        &self,
+        world: Point,
+        tolerance: Coord,
+    ) -> Option<LayoutVertexHit> {
+        let shape_id = self.selected_layout_shape?;
+        let shape = self.selected_top_level_layout_shape()?;
+        editable_vertex_points(&shape.kind)
+            .into_iter()
+            .enumerate()
+            .filter_map(|(vertex, point)| {
+                let distance = point.distance_to(world);
+                (distance <= tolerance as f64).then_some((vertex, distance))
+            })
+            .min_by(|(_, left), (_, right)| {
+                left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(vertex, _)| LayoutVertexHit { shape_id, vertex })
+    }
+
+    fn hit_selected_layout_edge(&self, world: Point, tolerance: Coord) -> Option<LayoutEdgeHit> {
+        let shape_id = self.selected_layout_shape?;
+        let shape = self.selected_top_level_layout_shape()?;
+        editable_edges(&shape.kind)
+            .into_iter()
+            .enumerate()
+            .filter_map(|(edge, (a, b))| {
+                let distance = distance_point_to_segment(world, a, b);
+                (distance <= tolerance as f64).then_some((edge, distance))
+            })
+            .min_by(|(_, left), (_, right)| {
+                left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(edge, _)| LayoutEdgeHit { shape_id, edge })
+    }
+
+    fn hit_selected_layout_draggable_edge(
+        &self,
+        world: Point,
+        tolerance: Coord,
+    ) -> Option<LayoutEdgeHit> {
+        let hit = self.hit_selected_layout_edge(world, tolerance)?;
+        let shape = self.workspace.document.shapes.get(&hit.shape_id)?;
+        shape_edge_is_draggable(&shape.kind, hit.edge).then_some(hit)
+    }
+
+    fn finish_layout_polyline(&mut self) -> bool {
+        match self.active_tool {
+            ToolMode::Polygon if self.drawing_points.len() >= 3 => {
+                let points = std::mem::take(&mut self.drawing_points);
+                self.add_layout_shape(
+                    self.active_layer,
+                    ShapeKind::Polygon(geometry_core::Polygon::new(points)),
+                );
+                true
+            }
+            ToolMode::Path if self.drawing_points.len() >= 2 => {
+                let points = std::mem::take(&mut self.drawing_points);
+                self.add_layout_shape(self.active_layer, ShapeKind::Path { points, width: 180 });
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn clear_layout_edit_drafts(&mut self) -> bool {
+        let drag = self.layout_drag.take();
+        let had_draft = drag.is_some()
+            || self.drawing_start.is_some()
+            || !self.drawing_points.is_empty()
+            || self.measure_start.is_some()
+            || !self.route_points.is_empty();
+        if let Some(drag) = drag {
+            self.rollback_layout_drag(drag);
+        }
+        self.drawing_start = None;
+        self.drawing_points.clear();
+        self.measure_start = None;
+        self.route_points.clear();
+        if had_draft {
+            self.status_message = "Layout edit canceled".to_string();
+        }
+        had_draft
+    }
+
+    fn rollback_layout_drag(&mut self, drag: LayoutCanvasDrag) -> bool {
+        match drag {
+            LayoutCanvasDrag::MoveShape {
+                shape_id,
+                start_world,
+                last_world,
+                added_shape,
+                ..
+            } => {
+                if added_shape.is_some() {
+                    return self
+                        .apply_layout_operation_live(Operation::DeleteShape { id: shape_id });
+                }
+                let total_delta =
+                    Vector::new(last_world.x - start_world.x, last_world.y - start_world.y);
+                if total_delta == Vector::ZERO {
+                    return false;
+                }
+                self.apply_layout_operation_live(Operation::MoveShape {
+                    id: shape_id,
+                    delta: Vector::new(-total_delta.dx, -total_delta.dy),
+                })
+            }
+            LayoutCanvasDrag::MoveInstance {
+                parent,
+                instance_id,
+                start_world,
+                last_world,
+                added_instance,
+                ..
+            } => {
+                if added_instance.is_some() {
+                    return self.apply_layout_operation_live(Operation::DeleteInstance {
+                        parent,
+                        id: instance_id,
+                    });
+                }
+                let total_delta =
+                    Vector::new(last_world.x - start_world.x, last_world.y - start_world.y);
+                if total_delta == Vector::ZERO {
+                    return false;
+                }
+                self.apply_layout_operation_live(Operation::MoveInstance {
+                    parent,
+                    id: instance_id,
+                    delta: Vector::new(-total_delta.dx, -total_delta.dy),
+                })
+            }
+            LayoutCanvasDrag::MoveVertex {
+                shape_id,
+                original_shape,
+                ..
+            }
+            | LayoutCanvasDrag::MoveEdge {
+                shape_id,
+                original_shape,
+                ..
+            } => self.apply_layout_operation_live(Operation::ReplaceShape {
+                id: shape_id,
+                shape: original_shape,
+            }),
+            LayoutCanvasDrag::Rect { .. } => false,
+        }
+    }
+
+    fn zoom_layout_canvas_around(&mut self, local: UiPoint, size: UiSize, scroll: f32) {
+        let previous_zoom = self.layout_zoom;
+        self.layout_zoom =
+            (self.layout_zoom * (scroll * 0.0015).exp()).clamp(LAYOUT_MIN_ZOOM, LAYOUT_MAX_ZOOM);
+        if (self.layout_zoom - previous_zoom).abs() <= f32::EPSILON {
+            return;
+        }
+        let before_x = (local.x - size.width * 0.5 - self.layout_pan[0]) / previous_zoom;
+        let before_y = (local.y - size.height * 0.5 - self.layout_pan[1]) / previous_zoom;
+        self.layout_pan[0] = local.x - size.width * 0.5 - before_x * self.layout_zoom;
+        self.layout_pan[1] = local.y - size.height * 0.5 - before_y * self.layout_zoom;
+    }
+
+    fn layout_viewport_for_size(&self, size: UiSize) -> Rect {
+        Rect::new(
+            self.layout_canvas_to_world_local(UiPoint::new(0.0, 0.0), size),
+            self.layout_canvas_to_world_local(UiPoint::new(size.width, size.height), size),
+        )
+    }
+
+    fn layout_world_to_canvas(&self, point: Point, size: UiSize) -> UiPoint {
+        UiPoint::new(
+            size.width * 0.5 + self.layout_pan[0] + point.x as f32 * self.layout_zoom,
+            size.height * 0.5 + self.layout_pan[1] - point.y as f32 * self.layout_zoom,
+        )
+    }
+
+    fn layout_canvas_to_world_local(&self, point: UiPoint, size: UiSize) -> Point {
+        let local_x = (point.x - size.width * 0.5 - self.layout_pan[0]) / self.layout_zoom;
+        let local_y = (point.y - size.height * 0.5 - self.layout_pan[1]) / self.layout_zoom;
+        Point::new(local_x.round() as Coord, (-local_y).round() as Coord)
+    }
+
+    fn layout_world_point_for_modifiers(
+        &self,
+        local: UiPoint,
+        size: UiSize,
+        modifiers: operad::KeyModifiers,
+    ) -> Point {
+        self.snap_layout_point_for_modifiers(
+            self.layout_canvas_to_world_local(local, size),
+            modifiers,
+        )
+    }
+
+    fn snap_layout_point(&self, point: Point) -> Point {
+        if self.snap_enabled {
+            point.snap(self.workspace.document.grid.max(1))
+        } else {
+            point
+        }
+    }
+
+    fn snap_layout_point_for_modifiers(
+        &self,
+        point: Point,
+        modifiers: operad::KeyModifiers,
+    ) -> Point {
+        if modifiers.ctrl {
+            point
+        } else {
+            self.snap_layout_point(point)
+        }
+    }
+
+    fn layout_hit_tolerance(&self) -> Coord {
+        ((10.0 / self.layout_zoom.max(LAYOUT_MIN_ZOOM)) as Coord)
+            .max(self.workspace.document.grid.max(1))
+    }
+
+    fn minimum_layout_draw_size(&self) -> Coord {
+        self.workspace.document.grid.max(1)
+    }
+
+    fn layout_grid_step_for_zoom(&self) -> Coord {
+        let base = self.workspace.document.grid.max(1);
+        let mut step = base;
+        while (step as f32) * self.layout_zoom < 24.0 && step < Coord::MAX / 2 {
+            step *= 2;
+        }
+        step
+    }
+
+    fn format_layout_length(&self, length_dbu: f64) -> String {
+        format_physical_length_with_options(
+            length_dbu,
+            layout_model::default_technology().dbu_per_micron,
+            self.unit_display,
+            2,
+        )
     }
 
     pub fn workflow_focus_lot(&self) -> Option<&str> {
@@ -1848,7 +3361,9 @@ impl FabricadApp {
         };
         format!(
             "{} {} W{:02}",
-            run.id, run.assignment.lot_id, run.assignment.slot
+            display_experiment_run_label(run),
+            run.assignment.lot_id,
+            run.assignment.slot
         )
     }
 
@@ -1892,7 +3407,6 @@ impl FabricadApp {
                     run_order: run.assignment.run_order,
                     lot_id: run.assignment.lot_id.as_str().to_string(),
                     wafer_id: run.assignment.wafer_id.as_str().to_string(),
-                    slot: run.assignment.slot,
                     block: run
                         .assignment
                         .block
@@ -2027,7 +3541,7 @@ impl FabricadApp {
                 return;
             }
         }
-        self.status_message = "DOE: no pending demo responses".to_string();
+        self.status_message = "DOE: no pending sample responses".to_string();
     }
 
     fn use_demo_experiment_capture_value(&mut self) {
@@ -2036,19 +3550,20 @@ impl FabricadApp {
             .as_ref()
             .and_then(|run_id| self.workspace.experiment_plan.run(run_id))
         else {
-            self.status_message = "DOE: select a run before loading a demo value".to_string();
+            self.status_message = "DOE: select a run before loading a sample value".to_string();
             return;
         };
         let Some(response_id) = self.selected_experiment_response.as_ref() else {
-            self.status_message = "DOE: select a response before loading a demo value".to_string();
+            self.status_message =
+                "DOE: select a response before loading a sample value".to_string();
             return;
         };
         let Some(value) = demo_experiment_response_value(run, response_id) else {
-            self.status_message = "DOE: no demo value available for this response".to_string();
+            self.status_message = "DOE: no sample value available for this response".to_string();
             return;
         };
         self.experiment_capture_value = value;
-        self.status_message = format!("DOE: loaded demo value {}", format_compact_number(value));
+        self.status_message = format!("DOE: loaded sample value {}", format_compact_number(value));
     }
 
     fn use_experiment_response_target(&mut self) {
@@ -2081,16 +3596,79 @@ impl FabricadApp {
         &self.status_message
     }
 
+    fn toggle_inspector_panel(&mut self) {
+        self.show_inspector = !self.show_inspector;
+        self.status_message = format!(
+            "Details {}",
+            if self.show_inspector {
+                "shown"
+            } else {
+                "hidden"
+            }
+        );
+    }
+
+    fn toggle_secondary_panel(&mut self) {
+        self.show_layers = !self.show_layers;
+        self.status_message = format!(
+            "{} {}",
+            self.secondary_panel_label(),
+            if self.show_layers { "shown" } else { "hidden" }
+        );
+    }
+
+    fn toggle_detail_section(&mut self, key: &str) -> bool {
+        if key.is_empty() {
+            return false;
+        }
+        if !self.collapsed_detail_sections.remove(key) {
+            self.collapsed_detail_sections.insert(key.to_string());
+        }
+        true
+    }
+
+    fn detail_section_key_for_header_node(&self, name: &str) -> Option<String> {
+        let (raw_index, sections) =
+            if let Some(raw_index) = name.strip_prefix("fabricad.layout.inspector.section.") {
+                (raw_index, layout_editor_inspector_sections(self))
+            } else if let Some(raw_index) = name.strip_prefix("fabricad.inspector.section.") {
+                (
+                    raw_index,
+                    view_detail_sections(self)
+                        .into_iter()
+                        .filter(|section| section.title != "Current Controls")
+                        .collect(),
+                )
+            } else {
+                return None;
+            };
+        let index = raw_index.strip_suffix(".header")?.parse::<usize>().ok()?;
+        sections
+            .get(index)
+            .map(|section| detail_section_key(self.active_view, index, &section.title))
+    }
+
     pub fn set_active_view(&mut self, view: StartupView) {
         self.active_view = view;
         self.active_menu = None;
-        self.status_message = format!("Switched to {}", view.label());
+        self.active_view_group = None;
+        if view != StartupView::Layout3d {
+            self.flycam_captured = false;
+            self.layout_3d_drag = None;
+        }
+        if !matches!(view, StartupView::Layout2d | StartupView::Layout3d) {
+            self.viewport_fullscreen = false;
+        }
     }
 
     pub fn apply_clicked_node_name(&mut self, name: &str) -> bool {
         if let Some(slug) = name.strip_prefix("fabricad.menu.") {
             if let Some(menu) = AppMenu::from_slug(slug) {
-                self.active_menu = (self.active_menu != Some(menu)).then_some(menu);
+                let next_menu = (self.active_menu != Some(menu)).then_some(menu);
+                self.active_menu = next_menu;
+                if next_menu != Some(AppMenu::View) {
+                    self.active_view_group = None;
+                }
                 self.status_message = format!("{} menu", menu.label());
                 return true;
             }
@@ -2101,6 +3679,14 @@ impl FabricadApp {
                 self.set_active_view(view);
                 return true;
             }
+        }
+
+        if let Some(key) = name.strip_prefix("fabricad.inspector.section.toggle.") {
+            return self.toggle_detail_section(key);
+        }
+
+        if let Some(key) = self.detail_section_key_for_header_node(name) {
+            return self.toggle_detail_section(&key);
         }
 
         if let Some(slug) = name.strip_prefix("fabricad.tool.") {
@@ -2114,24 +3700,11 @@ impl FabricadApp {
         if let Some(slug) = name.strip_prefix("fabricad.drawer.") {
             match slug {
                 "inspector" => {
-                    self.show_inspector = !self.show_inspector;
-                    self.status_message = format!(
-                        "Inspector {}",
-                        if self.show_inspector {
-                            "shown"
-                        } else {
-                            "hidden"
-                        }
-                    );
+                    self.toggle_inspector_panel();
                     return true;
                 }
                 "layers" => {
-                    self.show_layers = !self.show_layers;
-                    self.status_message = format!(
-                        "{} {}",
-                        self.secondary_panel_label(),
-                        if self.show_layers { "shown" } else { "hidden" }
-                    );
+                    self.toggle_secondary_panel();
                     return true;
                 }
                 _ => {}
@@ -2139,8 +3712,15 @@ impl FabricadApp {
         }
 
         if let Some(raw) = name.strip_prefix("fabricad.primary.action.") {
-            if let Some((_, action)) = raw.split_once('.') {
-                return self.apply_view_control_action(action);
+            let mut candidate = raw;
+            loop {
+                if self.apply_view_control_action(candidate) {
+                    return true;
+                }
+                let Some((_, next)) = candidate.split_once('.') else {
+                    return false;
+                };
+                candidate = next;
             }
         }
 
@@ -2148,11 +3728,94 @@ impl FabricadApp {
             return self.apply_view_control_action(action);
         }
 
+        if let Some(action) = name.strip_prefix("fabricad.toolbar.") {
+            if let Some(slug) = action.strip_prefix("view.") {
+                if let Some(view) = StartupView::from_slug(slug) {
+                    self.set_active_view(view);
+                    return true;
+                }
+            }
+            self.apply_menu_action(action);
+            return true;
+        }
+
+        if let Some(slug) = name.strip_prefix("fabricad.menu.item.view.group.") {
+            if let Some(group) = ModuleGroup::from_slug(slug) {
+                self.active_view_group = Some(group);
+                self.active_menu = Some(AppMenu::View);
+                return true;
+            }
+        }
+
+        if let Some(slug) = name.strip_prefix("fabricad.menu.item.more.") {
+            if let Some(menu) = AppMenu::from_slug(slug) {
+                self.active_menu = Some(menu);
+                self.active_view_group = None;
+                return true;
+            }
+        }
+
         if let Some(slug) = name.strip_prefix("fabricad.menu.item.view.") {
             if let Some(view) = StartupView::from_slug(slug) {
                 self.set_active_view(view);
                 return true;
             }
+        }
+
+        if let Some(slug) = name.strip_prefix("fabricad.command.view.") {
+            if let Some(view) = StartupView::from_slug(slug) {
+                self.set_active_view(view);
+                self.show_command_palette = false;
+                return true;
+            }
+        }
+
+        if let Some(slug) = name.strip_prefix("fabricad.sidebar.view.") {
+            if let Some(view) = StartupView::from_slug(slug) {
+                if self.nav_rail_views.contains(&view) {
+                    self.nav_rail_views.remove(&view);
+                } else {
+                    self.nav_rail_views.insert(view);
+                }
+                return true;
+            }
+        }
+
+        if let Some(layer_id) = name.strip_prefix("fabricad.layers.delete.") {
+            return self.remove_layout_layer(layer_id);
+        }
+
+        if let Some(action) = name.strip_prefix("fabricad.sidebar.") {
+            match action {
+                "default" | "all" => {
+                    self.nav_rail_views = default_nav_rail_views();
+                    return true;
+                }
+                "none" => {
+                    self.nav_rail_views.clear();
+                    return true;
+                }
+                "close" => {
+                    self.show_sidebar_modules = false;
+                    return true;
+                }
+                _ => {}
+            }
+        }
+
+        if name == "fabricad.command.close" {
+            self.show_command_palette = false;
+            return true;
+        }
+
+        if name == "fabricad.options.close" {
+            self.show_options_panel = false;
+            return true;
+        }
+
+        if name == "fabricad.diagnostics.close" {
+            self.show_diagnostics_panel = false;
+            return true;
         }
 
         if let Some(action) = name.strip_prefix("fabricad.menu.item.") {
@@ -2292,7 +3955,7 @@ impl FabricadApp {
         }
 
         if action == "workflow.load_demo" {
-            self.replace_workspace(WorkspaceDataset::demo(), "Full demo workspace loaded");
+            self.replace_workspace(WorkspaceDataset::demo(), "demo workspace loaded");
             return true;
         }
 
@@ -2623,7 +4286,8 @@ impl FabricadApp {
         if let Some(slug) = action.strip_prefix("scheduler.policy.") {
             if let Some(policy) = dispatch_policy_from_slug(slug) {
                 self.scheduler_policy = policy;
-                self.status_message = format!("Dispatch policy {}", policy.label());
+                self.status_message =
+                    format!("Dispatch policy {}", display_dispatch_policy_label(policy));
                 return true;
             }
         }
@@ -2892,6 +4556,7 @@ impl FabricadApp {
             "layout.next_shape" => self.select_next_layout_shape(),
             "layout.clear_selection" => {
                 self.selected_layout_shape = None;
+                self.selected_layout_occurrence = None;
                 self.status_message = "Layout selection cleared".to_string();
                 true
             }
@@ -3098,7 +4763,7 @@ impl FabricadApp {
                 self.layout_diff_baseline = LayoutDiffSource::Demo;
                 self.layout_diff_candidate = LayoutDiffSource::Current;
                 self.reset_layout_diff_review();
-                self.status_message = "Diff set to demo -> current".to_string();
+                self.status_message = "Diff set to sample -> current".to_string();
                 true
             }
             "layout_diff.empty_current" => {
@@ -3249,16 +4914,42 @@ impl FabricadApp {
                 return;
             }
         }
+        if let Some(slug) = action.strip_prefix("display.units.") {
+            if let Some(unit) = UnitDisplay::from_slug(slug) {
+                self.unit_display = unit;
+                self.status_message = format!("Units: {}", unit.label());
+                self.active_menu = None;
+                self.active_view_group = None;
+                return;
+            }
+        }
+        if let Some(index) = action
+            .strip_prefix("tools.technology.")
+            .and_then(|value| value.parse::<usize>().ok())
+        {
+            let name = layout_model::builtin_technologies()
+                .get(index)
+                .map(|technology| display_technology_name(&technology.name))
+                .unwrap_or_else(|| "technology".to_string());
+            self.status_message = format!("Technology: {name}");
+            self.active_menu = None;
+            self.active_view_group = None;
+            return;
+        }
+        if let Some(lot_id) = action.strip_prefix("tools.focus_note.") {
+            self.status_message = format!("Added focus note for {lot_id}");
+            self.active_menu = None;
+            self.active_view_group = None;
+            return;
+        }
         match action {
             "file.new_blank" => {
                 self.replace_workspace(WorkspaceDataset::blank(), "New blank workspace loaded");
             }
             "file.load_demo" | "file.new_demo" => {
-                self.replace_workspace(WorkspaceDataset::demo(), "Demo workspace loaded");
+                self.replace_workspace(WorkspaceDataset::demo(), "Sample workspace loaded");
             }
-            "file.save" => {
-                self.status_message = "Save is not wired in this Operad shell yet".to_string()
-            }
+            "file.save" => self.status_message = "Save is not wired yet".to_string(),
             "file.load" => {
                 self.status_message = "Load workspace is not wired in this shell yet".to_string()
             }
@@ -3277,8 +4968,12 @@ impl FabricadApp {
             "file.collaboration" => {
                 self.status_message = "Collaboration connects through the sync server".to_string()
             }
-            "edit.undo" => self.status_message = "Undo stack is not wired yet".to_string(),
-            "edit.redo" => self.status_message = "Redo stack is not wired yet".to_string(),
+            "edit.undo" => {
+                self.undo_layout_operation();
+            }
+            "edit.redo" => {
+                self.redo_layout_operation();
+            }
             "edit.copy" => {
                 self.copy_layout_selection();
             }
@@ -3291,10 +4986,18 @@ impl FabricadApp {
             "edit.delete" => {
                 self.delete_layout_selection();
             }
-            "edit.make_cell" => self.status_message = "Make cell is not wired yet".to_string(),
-            "edit.rotate90" => self.status_message = "Rotate 90 is not wired yet".to_string(),
-            "edit.mirror_x" => self.status_message = "Mirror X is not wired yet".to_string(),
-            "edit.mirror_y" => self.status_message = "Mirror Y is not wired yet".to_string(),
+            "edit.make_cell" => {
+                self.make_layout_cell_from_selection();
+            }
+            "edit.rotate90" => {
+                self.rotate_layout_selection_90();
+            }
+            "edit.mirror_x" => {
+                self.mirror_layout_selection_x();
+            }
+            "edit.mirror_y" => {
+                self.mirror_layout_selection_y();
+            }
             "bookmarks.origin" => self.status_message = "Focused origin".to_string(),
             "bookmarks.bounds" => self.status_message = "Focused layout bounds".to_string(),
             "display.grid2d" | "options.grid" => {
@@ -3333,10 +5036,19 @@ impl FabricadApp {
                     }
                 );
             }
-            "display.theme" | "options.theme" => {
-                self.dark_theme = !self.dark_theme;
-                self.status_message =
-                    format!("{} theme", if self.dark_theme { "Dark" } else { "Light" });
+            "display.inspector" => {
+                self.toggle_inspector_panel();
+                self.active_menu = None;
+                self.active_view_group = None;
+            }
+            "display.secondary_panel" => {
+                self.toggle_secondary_panel();
+                self.active_menu = None;
+                self.active_view_group = None;
+            }
+            "display.options" => {
+                self.show_options_panel = true;
+                self.status_message = "Options".to_string();
             }
             "display.units" => self.status_message = "Unit display cycled".to_string(),
             "options.snap" => {
@@ -3350,14 +5062,34 @@ impl FabricadApp {
                     }
                 );
             }
-            "tools.palette" => self.status_message = "Command palette is not wired yet".to_string(),
-            "tools.diagnostics" => self.status_message = "Diagnostics requested".to_string(),
+            "view.command_palette" | "tools.palette" => {
+                self.show_command_palette = true;
+                self.status_message = "Command Palette".to_string();
+            }
+            "view.sidebar_modules" => {
+                self.show_sidebar_modules = true;
+                self.status_message = "Sidebar Modules".to_string();
+            }
+            "tools.diagnostics" => {
+                self.show_diagnostics_panel = true;
+                self.status_message = "Diagnostics".to_string();
+            }
             "tools.rundrc" => self.status_message = self.run_drc_summary(),
-            "tools.reset3d" => self.status_message = "3D camera reset requested".to_string(),
-            "tools.fullscreen" => self.status_message = "Viewport fullscreen toggled".to_string(),
+            "tools.reset3d" => {
+                self.reset_3d_camera_to_document();
+                self.status_message = "3D camera reset".to_string();
+            }
+            "tools.fullscreen" => {
+                self.viewport_fullscreen = !self.viewport_fullscreen;
+                self.status_message = if self.viewport_fullscreen {
+                    "Viewport fullscreen".to_string()
+                } else {
+                    "Viewport restored".to_string()
+                };
+            }
             "macros.validate" => self.status_message = "Workspace validation clean".to_string(),
             "macros.demo" => {
-                self.replace_workspace(WorkspaceDataset::demo(), "Full demo workspace loaded");
+                self.replace_workspace(WorkspaceDataset::demo(), "Full sample workspace loaded");
             }
             "macros.stress10k" => {
                 self.workspace.document = Document::stress(10_000);
@@ -3383,16 +5115,17 @@ impl FabricadApp {
                 self.status_message = self.run_drc_summary();
             }
             "macros.snapshot" => {
-                self.status_message = "Use --operad-snapshot to render a snapshot".to_string()
+                self.status_message = "Use --snapshot to render a snapshot".to_string()
             }
             "help.shortcuts" => {
                 self.status_message =
                     "Shortcuts: click menus or left nav to switch views".to_string()
             }
-            "help.about" => self.status_message = "Fabricad on Operad v4.0.0".to_string(),
+            "help.about" => self.status_message = "Mask-layout editor".to_string(),
             _ => self.status_message = action.replace('.', " "),
         }
         self.active_menu = None;
+        self.active_view_group = None;
     }
 
     fn replace_workspace(
@@ -3622,19 +5355,19 @@ impl FabricadApp {
                 &action_id,
                 actor,
                 timestamp,
-                "approved from Operad controls",
+                "approved from controls",
             ),
             "reject" => self.workspace.process_control.reject_action(
                 &action_id,
                 actor,
                 timestamp,
-                "rejected from Operad controls",
+                "rejected from controls",
             ),
             "apply" => self.workspace.process_control.apply_action(
                 &action_id,
                 actor,
                 timestamp,
-                "applied from Operad controls",
+                "applied from controls",
             ),
             _ => return false,
         };
@@ -3683,12 +5416,16 @@ impl FabricadApp {
         };
         let visible = !layer.visible;
         let name = layer.name.clone();
-        self.workspace
-            .document
-            .apply_operation_without_log(&Operation::SetLayerVisibility {
+        self.apply_layout_operation_with_history(
+            Operation::SetLayerVisibility {
                 layer: layer_id,
                 visible,
-            });
+            },
+            Operation::SetLayerVisibility {
+                layer: layer_id,
+                visible: layer.visible,
+            },
+        );
         self.status_message = format!("Layer {name} {}", if visible { "shown" } else { "hidden" });
         true
     }
@@ -3702,6 +5439,7 @@ impl FabricadApp {
             return false;
         };
         self.selected_layout_shape = Some(shape_id);
+        self.selected_layout_occurrence = Some(ShapeOccurrenceId::top_level(shape_id));
         self.active_layer = shape.layer;
         self.status_message = format!("Selected shape #{}", shape.id.0);
         true
@@ -3711,6 +5449,7 @@ impl FabricadApp {
         let shape_ids = layout_shape_ids(&self.workspace.document);
         let Some(next) = next_layout_shape_id(self.selected_layout_shape, &shape_ids) else {
             self.selected_layout_shape = None;
+            self.selected_layout_occurrence = None;
             self.status_message = "No layout shapes to select".to_string();
             return true;
         };
@@ -3719,23 +5458,447 @@ impl FabricadApp {
 
     fn add_layout_layer(&mut self) -> bool {
         let index = self.workspace.document.layers.len() + 1;
-        let id = self.workspace.document.create_layer(
-            format!("Layer {index}"),
-            ProcessLayer::Annotation,
-            [0.55, 0.76, 0.92, 0.35],
+        let id = LayerId(self.workspace.document.next_layer_id);
+        let layer = Layer {
+            id,
+            name: format!("Layer {index}"),
+            process: ProcessLayer::Annotation,
+            purpose: ProcessLayer::Annotation.as_technology_name().to_string(),
+            color: [0.55, 0.76, 0.92, 0.35],
+            display_order: id.0 as i32 * 10,
+            gds_layer: u16::try_from(id.0).ok(),
+            gds_datatype: 0,
+            gds_texttype: 0,
+            visible: true,
+            locked: false,
+        };
+        self.apply_layout_operation_with_history(
+            Operation::AddLayer {
+                layer: layer.clone(),
+            },
+            Operation::DeleteLayer { id },
         );
         self.active_layer = id;
-        self.status_message = format!("Added layer L{}", id.0);
+        self.status_message = format!("Added {}", layer.name);
         true
     }
 
+    fn remove_layout_layer(&mut self, value: &str) -> bool {
+        let Ok(id) = value.parse::<u32>() else {
+            return false;
+        };
+        let layer_id = LayerId(id);
+        let Some(layer) = self.workspace.document.layers.get(&layer_id).cloned() else {
+            return false;
+        };
+        let removed_shapes = self
+            .workspace
+            .document
+            .shapes
+            .values()
+            .filter(|shape| shape.layer == layer_id)
+            .collect::<Vec<_>>();
+        let undo_operations = std::iter::once(Operation::AddLayer {
+            layer: layer.clone(),
+        })
+        .chain(
+            removed_shapes
+                .iter()
+                .cloned()
+                .map(|shape| Operation::AddShape { shape }),
+        )
+        .collect();
+        self.apply_layout_operation_with_history(
+            Operation::DeleteLayer { id: layer_id },
+            Operation::Batch {
+                operations: undo_operations,
+            },
+        );
+        if self.active_layer == layer_id {
+            self.active_layer = default_active_layer(&self.workspace);
+        }
+        self.repair_layout_selection_after_operation();
+        self.status_message = format!(
+            "Removed {} with {} shape{}",
+            layer.name,
+            removed_shapes.len(),
+            if removed_shapes.len() == 1 { "" } else { "s" }
+        );
+        true
+    }
+
+    fn update_layout_drag_to(&mut self, world: Point, modifiers: operad::KeyModifiers) -> bool {
+        let Some(drag) = self.layout_drag.clone() else {
+            return false;
+        };
+        match drag {
+            LayoutCanvasDrag::MoveShape {
+                shape_id,
+                start_world,
+                last_world,
+                copy_on_drag,
+                added_shape,
+            } => {
+                let drag_world = layout_drag_world(start_world, world, modifiers);
+                let mut shape_id = shape_id;
+                let mut copy_on_drag = copy_on_drag;
+                let mut added_shape = added_shape;
+                if copy_on_drag {
+                    if let Some((new_id, shape)) = self.duplicate_layout_shape_for_drag(shape_id) {
+                        shape_id = new_id;
+                        added_shape = Some(shape);
+                    }
+                    copy_on_drag = false;
+                }
+                let delta = Vector::new(drag_world.x - last_world.x, drag_world.y - last_world.y);
+                if delta != Vector::ZERO {
+                    self.apply_layout_operation_live(Operation::MoveShape {
+                        id: shape_id,
+                        delta,
+                    });
+                }
+                self.layout_drag = Some(LayoutCanvasDrag::MoveShape {
+                    shape_id,
+                    start_world,
+                    last_world: drag_world,
+                    copy_on_drag,
+                    added_shape,
+                });
+                delta != Vector::ZERO
+            }
+            LayoutCanvasDrag::MoveInstance {
+                parent,
+                instance_id,
+                start_world,
+                last_world,
+                copy_on_drag,
+                added_instance,
+            } => {
+                let drag_world = layout_drag_world(start_world, world, modifiers);
+                let mut instance_id = instance_id;
+                let mut copy_on_drag = copy_on_drag;
+                let mut added_instance = added_instance;
+                if copy_on_drag {
+                    if let Some((new_id, instance)) =
+                        self.duplicate_layout_instance_for_drag(parent, instance_id)
+                    {
+                        instance_id = new_id;
+                        added_instance = Some(instance);
+                    }
+                    copy_on_drag = false;
+                }
+                let delta = Vector::new(drag_world.x - last_world.x, drag_world.y - last_world.y);
+                if delta != Vector::ZERO {
+                    self.apply_layout_operation_live(Operation::MoveInstance {
+                        parent,
+                        id: instance_id,
+                        delta,
+                    });
+                }
+                self.layout_drag = Some(LayoutCanvasDrag::MoveInstance {
+                    parent,
+                    instance_id,
+                    start_world,
+                    last_world: drag_world,
+                    copy_on_drag,
+                    added_instance,
+                });
+                delta != Vector::ZERO
+            }
+            LayoutCanvasDrag::MoveVertex {
+                shape_id,
+                vertex,
+                start_world,
+                original_position,
+                original_shape,
+            } => {
+                let position =
+                    layout_vertex_drag_position(original_position, start_world, world, modifiers);
+                let Some(old_shape) = self.workspace.document.shapes.get(&shape_id) else {
+                    return false;
+                };
+                let Some(new_shape) = shape_with_moved_vertex(&old_shape, vertex, position) else {
+                    return false;
+                };
+                let changed =
+                    self.replace_layout_shape_live(shape_id, old_shape, new_shape, "Edited vertex");
+                self.layout_drag = Some(LayoutCanvasDrag::MoveVertex {
+                    shape_id,
+                    vertex,
+                    start_world,
+                    original_position,
+                    original_shape,
+                });
+                changed
+            }
+            LayoutCanvasDrag::MoveEdge {
+                shape_id,
+                edge,
+                last_world,
+                original_shape,
+            } => {
+                let drag_world = layout_drag_world(last_world, world, modifiers);
+                let delta = Vector::new(drag_world.x - last_world.x, drag_world.y - last_world.y);
+                if delta == Vector::ZERO {
+                    return false;
+                }
+                let Some(old_shape) = self.workspace.document.shapes.get(&shape_id) else {
+                    return false;
+                };
+                let Some(new_shape) = shape_with_moved_edge(&old_shape, edge, delta) else {
+                    return false;
+                };
+                let changed =
+                    self.replace_layout_shape_live(shape_id, old_shape, new_shape, "Moved edge");
+                self.layout_drag = Some(LayoutCanvasDrag::MoveEdge {
+                    shape_id,
+                    edge,
+                    last_world: drag_world,
+                    original_shape,
+                });
+                changed
+            }
+            LayoutCanvasDrag::Rect { .. } => false,
+        }
+    }
+
+    fn commit_layout_drag_history(&mut self, drag: LayoutCanvasDrag) -> bool {
+        match drag {
+            LayoutCanvasDrag::MoveShape {
+                shape_id,
+                start_world,
+                last_world,
+                added_shape,
+                ..
+            } => {
+                let total_delta =
+                    Vector::new(last_world.x - start_world.x, last_world.y - start_world.y);
+                if let Some(shape) = added_shape {
+                    let mut redo = vec![Operation::AddShape {
+                        shape: shape.clone(),
+                    }];
+                    if total_delta != Vector::ZERO {
+                        redo.push(Operation::MoveShape {
+                            id: shape_id,
+                            delta: total_delta,
+                        });
+                    }
+                    self.push_layout_history(
+                        Operation::Batch { operations: redo },
+                        Operation::DeleteShape { id: shape_id },
+                    );
+                    return true;
+                }
+                if total_delta == Vector::ZERO {
+                    return false;
+                }
+                self.push_layout_history(
+                    Operation::MoveShape {
+                        id: shape_id,
+                        delta: total_delta,
+                    },
+                    Operation::MoveShape {
+                        id: shape_id,
+                        delta: Vector::new(-total_delta.dx, -total_delta.dy),
+                    },
+                );
+                true
+            }
+            LayoutCanvasDrag::MoveInstance {
+                parent,
+                instance_id,
+                start_world,
+                last_world,
+                added_instance,
+                ..
+            } => {
+                let total_delta =
+                    Vector::new(last_world.x - start_world.x, last_world.y - start_world.y);
+                if let Some(instance) = added_instance {
+                    let mut redo = vec![Operation::AddInstance {
+                        parent,
+                        instance: instance.clone(),
+                    }];
+                    if total_delta != Vector::ZERO {
+                        redo.push(Operation::MoveInstance {
+                            parent,
+                            id: instance_id,
+                            delta: total_delta,
+                        });
+                    }
+                    self.push_layout_history(
+                        Operation::Batch { operations: redo },
+                        Operation::DeleteInstance {
+                            parent,
+                            id: instance_id,
+                        },
+                    );
+                    return true;
+                }
+                if total_delta == Vector::ZERO {
+                    return false;
+                }
+                self.push_layout_history(
+                    Operation::MoveInstance {
+                        parent,
+                        id: instance_id,
+                        delta: total_delta,
+                    },
+                    Operation::MoveInstance {
+                        parent,
+                        id: instance_id,
+                        delta: Vector::new(-total_delta.dx, -total_delta.dy),
+                    },
+                );
+                true
+            }
+            LayoutCanvasDrag::MoveVertex {
+                shape_id,
+                original_shape,
+                ..
+            }
+            | LayoutCanvasDrag::MoveEdge {
+                shape_id,
+                original_shape,
+                ..
+            } => {
+                let Some(final_shape) = self.workspace.document.shapes.get(&shape_id) else {
+                    return false;
+                };
+                if final_shape == original_shape {
+                    return false;
+                }
+                self.push_layout_history(
+                    Operation::ReplaceShape {
+                        id: shape_id,
+                        shape: final_shape,
+                    },
+                    Operation::ReplaceShape {
+                        id: shape_id,
+                        shape: original_shape,
+                    },
+                );
+                true
+            }
+            LayoutCanvasDrag::Rect { .. } => false,
+        }
+    }
+
+    fn apply_layout_operation_live(&mut self, operation: Operation) -> bool {
+        self.workspace
+            .document
+            .apply_operation_without_log(&operation);
+        self.mark_layout_dirty();
+        true
+    }
+
+    fn push_layout_history(&mut self, redo: Operation, undo: Operation) {
+        self.layout_undo.push(UndoEntry { undo, redo });
+        self.layout_redo.clear();
+    }
+
+    fn mark_layout_dirty(&mut self) {
+        self.layout_revision = self.layout_revision.wrapping_add(1);
+    }
+
+    fn apply_layout_operation_with_history(&mut self, redo: Operation, undo: Operation) -> bool {
+        self.workspace.document.apply_operation_without_log(&redo);
+        self.mark_layout_dirty();
+        self.push_layout_history(redo, undo);
+        true
+    }
+
+    fn undo_layout_operation(&mut self) -> bool {
+        let Some(entry) = self.layout_undo.pop() else {
+            self.status_message = "Nothing to undo".to_string();
+            return true;
+        };
+        self.workspace
+            .document
+            .apply_operation_without_log(&entry.undo);
+        self.mark_layout_dirty();
+        self.layout_redo.push(entry);
+        self.layout_drag = None;
+        self.repair_layout_selection_after_operation();
+        self.status_message = "Undo".to_string();
+        true
+    }
+
+    fn redo_layout_operation(&mut self) -> bool {
+        let Some(entry) = self.layout_redo.pop() else {
+            self.status_message = "Nothing to redo".to_string();
+            return true;
+        };
+        self.workspace
+            .document
+            .apply_operation_without_log(&entry.redo);
+        self.mark_layout_dirty();
+        self.layout_undo.push(entry);
+        self.layout_drag = None;
+        self.repair_layout_selection_after_operation();
+        self.status_message = "Redo".to_string();
+        true
+    }
+
+    fn repair_layout_selection_after_operation(&mut self) {
+        if let Some(occurrence) = &self.selected_layout_occurrence {
+            if self
+                .workspace
+                .document
+                .shape_view_for_occurrence(occurrence)
+                .is_some()
+            {
+                self.selected_layout_shape = Some(occurrence.source_shape_id());
+                return;
+            }
+        }
+        if let Some(shape_id) = self.selected_layout_shape {
+            if self.workspace.document.shapes.contains_key(&shape_id) {
+                self.selected_layout_occurrence = Some(ShapeOccurrenceId::top_level(shape_id));
+                return;
+            }
+        }
+        self.selected_layout_shape = None;
+        self.selected_layout_occurrence = None;
+    }
+
     fn selected_layout_shape_ref(&self) -> Option<Shape> {
-        self.selected_layout_shape
-            .and_then(|id| self.workspace.document.shapes.get(&id))
+        if let Some(occurrence) = &self.selected_layout_occurrence
+            && let Some(view) = self
+                .workspace
+                .document
+                .shape_view_for_occurrence(occurrence)
+        {
+            return Some(view.transformed_shape());
+        }
+        self.selected_layout_shape.and_then(|id| {
+            self.workspace.document.shapes.get(&id).inspect(|_| {
+                debug_assert!(
+                    self.selected_layout_occurrence
+                        .as_ref()
+                        .is_none_or(ShapeOccurrenceId::is_top_level)
+                );
+            })
+        })
+    }
+
+    fn selected_top_level_layout_shape(&self) -> Option<Shape> {
+        let id = self.selected_layout_shape?;
+        if self
+            .selected_layout_occurrence
+            .as_ref()
+            .is_none_or(|occurrence| {
+                occurrence.is_top_level() && occurrence.source_shape_id() == id
+            })
+        {
+            self.workspace.document.shapes.get(&id)
+        } else {
+            None
+        }
     }
 
     fn copy_layout_selection(&mut self) -> bool {
-        let Some(shape) = self.selected_layout_shape_ref() else {
+        let Some(shape) = self.selected_top_level_layout_shape() else {
             self.status_message = "Select a layout shape to copy".to_string();
             return true;
         };
@@ -3755,13 +5918,48 @@ impl FabricadApp {
     }
 
     fn duplicate_layout_selection(&mut self) -> bool {
-        let Some(shape) = self.selected_layout_shape_ref() else {
+        let Some(shape) = self.selected_top_level_layout_shape() else {
             self.status_message = "Select a layout shape to duplicate".to_string();
             return true;
         };
         self.layout_clipboard_shapes.clear();
         self.layout_clipboard_shapes.push(shape.clone());
         self.add_copied_layout_shapes(vec![shape], "Duplicated")
+    }
+
+    fn duplicate_layout_shape_for_drag(&mut self, shape_id: ShapeId) -> Option<(ShapeId, Shape)> {
+        let mut shape = self.workspace.document.shapes.get(&shape_id)?.clone();
+        shape.id = self.workspace.document.allocate_shape_id();
+        let new_id = shape.id;
+        self.apply_layout_operation_live(Operation::AddShape {
+            shape: shape.clone(),
+        });
+        self.selected_layout_shape = Some(new_id);
+        self.selected_layout_occurrence = Some(ShapeOccurrenceId::top_level(new_id));
+        self.status_message = format!("Duplicated shape #{}", shape_id.0);
+        Some((new_id, shape))
+    }
+
+    fn duplicate_layout_instance_for_drag(
+        &mut self,
+        parent: CellId,
+        instance_id: InstanceId,
+    ) -> Option<(InstanceId, CellInstance)> {
+        let mut instance = self.workspace.document.instance(parent, instance_id)?;
+        instance.id = self.workspace.document.allocate_instance_id();
+        let new_id = instance.id;
+        self.apply_layout_operation_live(Operation::AddInstance {
+            parent,
+            instance: instance.clone(),
+        });
+        if let Some(mut occurrence) = self.selected_layout_occurrence.clone() {
+            if let Some(last) = occurrence.instance_path.last_mut() {
+                *last = new_id;
+            }
+            self.selected_layout_occurrence = Some(occurrence);
+        }
+        self.status_message = format!("Duplicated instance {}", instance_id.0);
+        Some((new_id, instance))
     }
 
     fn add_copied_layout_shapes(&mut self, shapes: Vec<Shape>, label: &str) -> bool {
@@ -3776,12 +5974,24 @@ impl FabricadApp {
             return true;
         }
         let selected = added.first().map(|shape| shape.id);
-        for shape in added.iter().cloned() {
-            self.workspace
-                .document
-                .apply_operation_without_log(&Operation::AddShape { shape });
-        }
+        self.apply_layout_operation_with_history(
+            Operation::Batch {
+                operations: added
+                    .iter()
+                    .cloned()
+                    .map(|shape| Operation::AddShape { shape })
+                    .collect(),
+            },
+            Operation::Batch {
+                operations: added
+                    .iter()
+                    .rev()
+                    .map(|shape| Operation::DeleteShape { id: shape.id })
+                    .collect(),
+            },
+        );
         self.selected_layout_shape = selected;
+        self.selected_layout_occurrence = selected.map(ShapeOccurrenceId::top_level);
         if let Some(shape) = self.selected_layout_shape_ref() {
             self.active_layer = shape.layer;
         }
@@ -3794,20 +6004,185 @@ impl FabricadApp {
     }
 
     fn delete_layout_selection(&mut self) -> bool {
+        if let Some(occurrence) = &self.selected_layout_occurrence
+            && !occurrence.is_top_level()
+        {
+            if let Some((parent, id)) = self
+                .workspace
+                .document
+                .instance_parent_for_path(&occurrence.instance_path)
+            {
+                let Some(instance) = self.workspace.document.instance(parent, id) else {
+                    return true;
+                };
+                self.apply_layout_operation_with_history(
+                    Operation::DeleteInstance { parent, id },
+                    Operation::AddInstance { parent, instance },
+                );
+                self.selected_layout_shape = None;
+                self.selected_layout_occurrence = None;
+                self.status_message = "Deleted instance".to_string();
+                return true;
+            }
+        }
         let Some(shape_id) = self.selected_layout_shape else {
             self.status_message = "No layout selection to delete".to_string();
             return true;
         };
         if !self.workspace.document.shapes.contains_key(&shape_id) {
             self.selected_layout_shape = None;
+            self.selected_layout_occurrence = None;
             self.status_message = "Layout selection was missing".to_string();
             return true;
         }
-        self.workspace
-            .document
-            .apply_operation_without_log(&Operation::DeleteShape { id: shape_id });
+        let Some(shape) = self.workspace.document.shapes.get(&shape_id) else {
+            self.selected_layout_shape = None;
+            self.selected_layout_occurrence = None;
+            self.status_message = "Layout selection was missing".to_string();
+            return true;
+        };
+        self.apply_layout_operation_with_history(
+            Operation::DeleteShape { id: shape_id },
+            Operation::AddShape { shape },
+        );
         self.selected_layout_shape = None;
+        self.selected_layout_occurrence = None;
         self.status_message = format!("Deleted shape #{}", shape_id.0);
+        true
+    }
+
+    fn make_layout_cell_from_selection(&mut self) -> bool {
+        let Some(mut shape) = self.selected_top_level_layout_shape() else {
+            self.status_message = "Select a top-level shape before creating a cell".to_string();
+            return true;
+        };
+        let original_shape = shape.clone();
+        let origin = self.snap_layout_point(shape.kind.bounds().min);
+        shape.kind.translate(Vector::new(-origin.x, -origin.y));
+
+        let cell_id = self.workspace.document.allocate_cell_id();
+        let instance_id = self.workspace.document.allocate_instance_id();
+        let mut cell = Cell::new(cell_id, format!("cell {}", cell_id.0));
+        cell.shapes.insert(shape.id, shape.clone());
+        let instance = CellInstance {
+            id: instance_id,
+            name: Some(format!("{} inst", cell.name)),
+            cell: cell_id,
+            transform: Transform::translate(origin.x, origin.y),
+            array: InstanceArray::single(),
+        };
+
+        self.apply_layout_operation_with_history(
+            Operation::Batch {
+                operations: vec![
+                    Operation::DeleteShape { id: shape.id },
+                    Operation::AddCell { cell: cell.clone() },
+                    Operation::AddInstance {
+                        parent: self.workspace.document.top_cell,
+                        instance: instance.clone(),
+                    },
+                ],
+            },
+            Operation::Batch {
+                operations: vec![
+                    Operation::DeleteInstance {
+                        parent: self.workspace.document.top_cell,
+                        id: instance.id,
+                    },
+                    Operation::DeleteCell { id: cell.id },
+                    Operation::AddShape {
+                        shape: original_shape,
+                    },
+                ],
+            },
+        );
+        self.selected_layout_shape = Some(shape.id);
+        self.selected_layout_occurrence = Some(ShapeOccurrenceId::from_instance_path(
+            shape.id,
+            &[instance_id],
+        ));
+        self.status_message = format!("Created {} from 1 shape", cell.name);
+        true
+    }
+
+    fn rotate_layout_selection_90(&mut self) -> bool {
+        if self.transform_selected_layout_instance(Transform::rotate_cw90(), "Rotated instance") {
+            return true;
+        }
+        self.transform_selected_layout_shapes(ShapeTransform::RotateCw90, "Rotated")
+    }
+
+    fn mirror_layout_selection_x(&mut self) -> bool {
+        if self.transform_selected_layout_instance(Transform::mirror_x(), "Mirrored instance X") {
+            return true;
+        }
+        self.transform_selected_layout_shapes(ShapeTransform::MirrorX, "Mirrored X")
+    }
+
+    fn mirror_layout_selection_y(&mut self) -> bool {
+        if self.transform_selected_layout_instance(Transform::mirror_y(), "Mirrored instance Y") {
+            return true;
+        }
+        self.transform_selected_layout_shapes(ShapeTransform::MirrorY, "Mirrored Y")
+    }
+
+    fn transform_selected_layout_instance(&mut self, transform: Transform, label: &str) -> bool {
+        let Some(occurrence) = &self.selected_layout_occurrence else {
+            return false;
+        };
+        let Some((parent, id)) = self
+            .workspace
+            .document
+            .instance_parent_for_path(&occurrence.instance_path)
+        else {
+            return false;
+        };
+        let Some(old_instance) = self.workspace.document.instance(parent, id) else {
+            return false;
+        };
+        let mut instance = old_instance.clone();
+        instance.transform = instance.transform.compose(transform);
+        self.apply_layout_operation_with_history(
+            Operation::ReplaceInstance {
+                parent,
+                id,
+                instance,
+            },
+            Operation::ReplaceInstance {
+                parent,
+                id,
+                instance: old_instance,
+            },
+        );
+        self.status_message = label.to_string();
+        true
+    }
+
+    fn transform_selected_layout_shapes(&mut self, transform: ShapeTransform, label: &str) -> bool {
+        let Some(old_shape) = self.selected_top_level_layout_shape() else {
+            self.status_message = "Select a top-level shape to transform".to_string();
+            return true;
+        };
+        let center = old_shape.kind.bounds().center();
+        let mut new_shape = old_shape.clone();
+        new_shape.kind = transform_shape_kind(&old_shape.kind, center, transform);
+        if old_shape == new_shape {
+            self.status_message = format!("{label} shape #{}", old_shape.id.0);
+            return true;
+        }
+        self.apply_layout_operation_with_history(
+            Operation::ReplaceShape {
+                id: old_shape.id,
+                shape: new_shape,
+            },
+            Operation::ReplaceShape {
+                id: old_shape.id,
+                shape: old_shape.clone(),
+            },
+        );
+        self.selected_layout_shape = Some(old_shape.id);
+        self.selected_layout_occurrence = Some(ShapeOccurrenceId::top_level(old_shape.id));
+        self.status_message = format!("{label} shape #{}", old_shape.id.0);
         true
     }
 
@@ -3834,7 +6209,9 @@ impl FabricadApp {
     fn reset_layout_document_state(&mut self) {
         self.active_layer = default_active_layer(&self.workspace);
         self.selected_layout_shape = None;
+        self.selected_layout_occurrence = None;
         self.layout_clipboard_shapes.clear();
+        self.clear_layout_edit_drafts();
     }
 
     fn ensure_notebook_selection(&mut self) {
@@ -4002,10 +6379,8 @@ impl FabricadApp {
     fn secondary_panel_label(&self) -> &'static str {
         match self.active_view {
             StartupView::Metrology => "Map",
-            StartupView::MaskPrep
-            | StartupView::CrossSection
-            | StartupView::Layout2d
-            | StartupView::Layout3d => "Layers",
+            StartupView::MaskPrep | StartupView::CrossSection | StartupView::Layout2d => "Layers",
+            StartupView::Layout3d => "3D Stack",
             StartupView::Experiment => "Responses",
             StartupView::Notebook => "Links",
             _ => "Panel",
@@ -4042,10 +6417,7 @@ impl FabricadApp {
         ui_scale: UiScale,
     ) -> Result<UiDocument, String> {
         let mut document = UiDocument::new(root_style(viewport.width, viewport.height));
-        document.set_node_visual(
-            document.root,
-            UiVisual::panel(ColorRgba::new(14, 18, 22, 255), None, 0.0),
-        );
+        document.set_node_visual(document.root, UiVisual::panel(COLOR_APP_BG, None, 0.0));
 
         let app = document.add_child(
             document.root,
@@ -4065,6 +6437,15 @@ impl FabricadApp {
             ),
         );
 
+        if self.active_view == StartupView::Layout3d && self.viewport_fullscreen {
+            add_fullscreen_3d_view(&mut document, app, viewport, ui_scale);
+            document
+                .compute_layout(viewport, &mut ApproxTextMeasurer)
+                .map_err(|err| format!("UI layout failed: {err}"))?;
+            attach_default_pointer_actions(&mut document);
+            return Ok(document);
+        }
+
         let menu_bar = document.add_child(
             app,
             UiNode::container(
@@ -4074,48 +6455,59 @@ impl FabricadApp {
                         layout::with_size(
                             layout::row(),
                             layout::percent(1.0),
-                            layout::px(ui_scale.value(42.0)),
+                            layout::px(ui_scale.value(30.0)),
                         ),
-                        ui_scale.value(6.0),
+                        ui_scale.value(4.0),
                     ),
-                    ui_scale.value(8.0),
+                    ui_scale.value(4.0),
                 ),
             )
             .with_visual(UiVisual::panel(
-                ColorRgba::new(18, 23, 28, 255),
-                Some(StrokeStyle::new(ColorRgba::new(48, 59, 70, 255), 1.0)),
+                COLOR_CHROME_BG,
+                Some(StrokeStyle::new(COLOR_PANEL_STROKE, 1.0)),
                 0.0,
             )),
         );
 
-        for menu in AppMenu::ALL {
-            add_button(
+        let compact_menu = viewport.width < ui_scale.value(900.0);
+        let visible_menus: &[AppMenu] = if compact_menu {
+            &[AppMenu::File, AppMenu::Edit, AppMenu::View, AppMenu::More]
+        } else {
+            &AppMenu::ALL
+        };
+        for menu in visible_menus.iter().copied() {
+            add_menu_button(
                 &mut document,
                 menu_bar,
-                format!("fabricad.menu.{}", menu.slug()),
-                menu.label(),
+                menu,
                 self.active_menu == Some(menu),
-                layout::size(
-                    layout::px(ui_scale.value(98.0)),
-                    layout::px(ui_scale.value(26.0)),
-                ),
                 ui_scale,
             );
         }
+        document.add_child(
+            menu_bar,
+            UiNode::container(
+                "fabricad.menu_spacer",
+                layout::with_flex(layout::row(), 1.0, 1.0, layout::px(0.0)),
+            ),
+        );
         add_text(
             &mut document,
             menu_bar,
-            "fabricad.status",
-            self.status_message.clone(),
-            text_style(
-                ui_scale.value(12.0),
-                FontWeight::NORMAL,
-                ColorRgba::new(166, 176, 186, 255),
-            ),
-            layout::size(layout::percent(1.0), layout::px(ui_scale.value(26.0))),
+            "fabricad.user_id",
+            USER_ID_LABEL,
+            text_style(ui_scale.value(11.0), FontWeight::NORMAL, COLOR_TEXT_MUTED),
+            layout::size(layout::auto(), layout::px(ui_scale.value(22.0))),
         );
 
-        add_tool_strip(&mut document, app, self, ui_scale);
+        if matches!(
+            self.active_view,
+            StartupView::Layout2d | StartupView::Layout3d
+        ) {
+            add_tool_strip(&mut document, app, self, viewport.width, ui_scale);
+        } else {
+            add_tool_strip_spacer(&mut document, app, viewport.width, ui_scale);
+        }
 
         if let Some(menu) = self.active_menu {
             add_menu_panel(
@@ -4151,6 +6543,15 @@ impl FabricadApp {
             ),
         );
 
+        let compact_nav = viewport.width < ui_scale.value(700.0);
+        let compact_primary_rows = viewport.width < ui_scale.value(1180.0);
+        let nav_width = ui_scale.value(if compact_nav { 150.0 } else { 240.0 });
+        let body_width = (viewport.width - nav_width).max(0.0);
+        let wide_primary_rows = body_width > ui_scale.value(1280.0);
+        let nav_gap = ui_scale.value(if compact_nav { 5.0 } else { 8.0 });
+        let nav_padding = ui_scale.value(if compact_nav { 8.0 } else { 14.0 });
+        let nav_button_height = ui_scale.value(if compact_nav { 26.0 } else { 28.0 });
+        let nav_font_size = ui_scale.value(if compact_nav { 12.0 } else { 13.0 });
         let nav = document.add_child(
             shell,
             UiNode::container(
@@ -4161,12 +6562,12 @@ impl FabricadApp {
                             layout::with_gap_all(
                                 layout::with_size(
                                     layout::column(),
-                                    layout::px(ui_scale.value(220.0)),
+                                    layout::px(nav_width),
                                     layout::percent(1.0),
                                 ),
-                                ui_scale.value(8.0),
+                                nav_gap,
                             ),
-                            ui_scale.value(14.0),
+                            nav_padding,
                         ),
                         layout::px(0.0),
                         layout::px(0.0),
@@ -4178,79 +6579,53 @@ impl FabricadApp {
                 },
             )
             .with_visual(UiVisual::panel(
-                ColorRgba::new(24, 30, 36, 255),
-                Some(StrokeStyle::new(ColorRgba::new(52, 63, 74, 255), 1.0)),
+                COLOR_CHROME_BG,
+                Some(StrokeStyle::new(COLOR_PANEL_STROKE, 1.0)),
                 0.0,
             ))
             .with_scroll(ScrollAxes::VERTICAL),
         );
 
-        add_text(
-            &mut document,
-            nav,
-            "fabricad.nav.title",
-            "Fabricad",
-            text_style(
-                ui_scale.value(22.0),
-                FontWeight::BOLD,
-                ColorRgba::new(238, 243, 247, 255),
-            ),
-            layout::size(layout::percent(1.0), layout::px(ui_scale.value(34.0))),
-        );
-        add_text(
-            &mut document,
-            nav,
-            "fabricad.nav.subtitle",
-            "Operad v4 shell",
-            text_style(
-                ui_scale.value(12.0),
-                FontWeight::NORMAL,
-                ColorRgba::new(142, 153, 164, 255),
-            ),
-            layout::size(layout::percent(1.0), layout::px(ui_scale.value(22.0))),
-        );
-
-        for view in StartupView::ALL {
+        for view in StartupView::ALL
+            .into_iter()
+            .filter(|view| self.nav_rail_views.contains(view))
+        {
             let selected = view == self.active_view;
-            let fill = if selected {
-                ColorRgba::new(44, 68, 92, 255)
-            } else {
-                ColorRgba::new(31, 38, 46, 255)
-            };
-            document.add_child(
+            let nav_button = add_button(
+                &mut document,
                 nav,
-                UiNode::text(
-                    format!("fabricad.nav.action.{}", view.slug()),
-                    view.label(),
-                    text_style(
-                        ui_scale.value(13.0),
-                        if selected {
-                            FontWeight::BOLD
-                        } else {
-                            FontWeight::NORMAL
-                        },
-                        ColorRgba::new(225, 231, 237, 255),
-                    ),
-                    layout::with_padding_all(
-                        layout::size(layout::percent(1.0), layout::px(ui_scale.value(34.0))),
-                        ui_scale.value(8.0),
-                    ),
-                )
-                .with_input(InputBehavior::BUTTON)
-                .with_accessibility(button_accessibility(view.label()))
-                .with_visual(UiVisual::panel(
-                    fill,
-                    Some(StrokeStyle::new(
-                        ColorRgba::new(64, 76, 88, 255),
-                        ui_scale.value(1.0),
-                    )),
-                    ui_scale.value(4.0),
-                )),
+                format!("fabricad.nav.action.{}", view.slug()),
+                view.nav_label(),
+                selected,
+                layout::size(layout::percent(1.0), layout::px(nav_button_height)),
+                UiScale::new(nav_font_size / 13.0),
             );
+            if let Some(accessibility) = document.node_mut(nav_button).accessibility.as_mut() {
+                accessibility.label = Some(view.label().to_string());
+            }
         }
 
-        let body = document.add_child(
+        let body_frame = document.add_child(
             shell,
+            UiNode::container(
+                "fabricad.body_frame",
+                UiNodeStyle {
+                    layout: layout::with_min_size(
+                        layout::with_flex(layout::row(), 1.0, 1.0, layout::px(0.0)),
+                        layout::px(0.0),
+                        layout::px(0.0),
+                    )
+                    .as_taffy_style()
+                    .clone(),
+                    clip: ClipBehavior::Clip,
+                    ..Default::default()
+                },
+            )
+            .with_visual(UiVisual::panel(COLOR_APP_BG, None, 0.0)),
+        );
+
+        let body = document.add_child(
+            body_frame,
             UiNode::container(
                 "fabricad.body",
                 UiNodeStyle {
@@ -4258,9 +6633,9 @@ impl FabricadApp {
                         layout::with_padding_all(
                             layout::with_gap_all(
                                 layout::with_flex(layout::column(), 1.0, 1.0, layout::px(0.0)),
-                                ui_scale.value(16.0),
+                                ui_scale.value(10.0),
                             ),
-                            ui_scale.value(18.0),
+                            ui_scale.value(10.0),
                         ),
                         layout::px(0.0),
                         layout::px(0.0),
@@ -4273,106 +6648,56 @@ impl FabricadApp {
             )
             .with_scroll(ScrollAxes::VERTICAL),
         );
-
-        add_text(
+        add_scrollbar_rail(
             &mut document,
-            body,
-            "fabricad.header.eyebrow",
-            "SEMICONDUCTOR LAYOUT WORKSPACE",
-            text_style(
-                ui_scale.value(12.0),
-                FontWeight::BOLD,
-                ColorRgba::new(123, 202, 184, 255),
-            ),
-            layout::size(layout::percent(1.0), layout::px(ui_scale.value(22.0))),
+            body_frame,
+            "fabricad.body_scrollbar",
+            ui_scale,
         );
+
         add_text(
             &mut document,
             body,
             "fabricad.header.title",
             self.active_view.label(),
-            text_style(
-                ui_scale.value(28.0),
-                FontWeight::BOLD,
-                ColorRgba::new(246, 249, 252, 255),
-            ),
-            layout::size(layout::percent(1.0), layout::px(ui_scale.value(42.0))),
+            text_style(ui_scale.value(22.0), FontWeight::NORMAL, COLOR_TEXT),
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(30.0))),
         );
 
-        let metrics = document.add_child(
-            body,
-            UiNode::container(
-                "fabricad.metrics",
-                layout::with_gap_all(
-                    layout::with_size(
-                        layout::row(),
-                        layout::percent(1.0),
-                        layout::px(ui_scale.value(104.0)),
-                    ),
-                    ui_scale.value(12.0),
-                ),
-            ),
-        );
-        add_metric(
-            &mut document,
-            metrics,
-            "shapes",
-            self.workspace
-                .document
-                .flattened_shape_count_estimate()
-                .to_string(),
-            "layout objects",
-            ui_scale,
-        );
-        add_metric(
-            &mut document,
-            metrics,
-            "lots",
-            self.workspace.mes.lots.len().to_string(),
-            "active MES lots",
-            ui_scale,
-        );
-        add_metric(
-            &mut document,
-            metrics,
-            "recipes",
-            self.workspace.recipe_catalog.recipes.len().to_string(),
-            "qualified recipes",
-            ui_scale,
-        );
-        add_metric(
-            &mut document,
-            metrics,
-            "tools",
-            self.workspace.equipment.tools().count().to_string(),
-            "equipment tools",
-            ui_scale,
-        );
-
-        add_view_controls(&mut document, body, self, ui_scale);
-
-        add_primary_view_panel(&mut document, body, self, ui_scale);
-
-        add_detail_sections(&mut document, body, self, ui_scale);
-
-        let validation = self.workspace.validate();
-        let status_text = if validation.is_valid() {
-            "Workspace validation clean".to_string()
+        if matches!(
+            self.active_view,
+            StartupView::Layout2d | StartupView::Layout3d
+        ) {
+            add_primary_view_panel(
+                &mut document,
+                body,
+                self,
+                viewport,
+                ui_scale,
+                compact_primary_rows,
+                wide_primary_rows,
+                body_width,
+            );
         } else {
-            validation.error_summary()
-        };
-        add_text(
-            &mut document,
-            body,
-            "fabricad.validation",
-            format!("{status_text} - {}", self.status_message),
-            text_style(
-                ui_scale.value(14.0),
-                FontWeight::NORMAL,
-                ColorRgba::new(181, 190, 199, 255),
-            ),
-            layout::size(layout::percent(1.0), layout::px(ui_scale.value(28.0))),
-        );
+            add_view_controls(&mut document, body, self, ui_scale, compact_primary_rows);
+            add_primary_view_panel(
+                &mut document,
+                body,
+                self,
+                viewport,
+                ui_scale,
+                compact_primary_rows,
+                wide_primary_rows,
+                body_width,
+            );
+        }
+
+        if !matches!(
+            self.active_view,
+            StartupView::Layout2d | StartupView::Layout3d
+        ) {
+            add_detail_sections(&mut document, body, self, ui_scale);
+        }
 
         if self.show_inspector && self.has_inspector_panel() {
             add_inspector_panel(&mut document, shell, self, ui_scale);
@@ -4380,18 +6705,39 @@ impl FabricadApp {
         if self.show_layers && self.has_secondary_panel() {
             add_secondary_panel(&mut document, shell, self, ui_scale);
         }
+        if self.show_command_palette {
+            add_command_palette_panel(&mut document, app, self, viewport, ui_scale);
+        }
+        if self.show_sidebar_modules {
+            add_sidebar_modules_panel(&mut document, app, self, viewport, ui_scale);
+        }
+        if self.show_options_panel {
+            add_options_panel(&mut document, app, self, viewport, ui_scale);
+        }
+        if self.show_diagnostics_panel {
+            add_diagnostics_panel(&mut document, app, self, viewport, ui_scale);
+        }
 
         document
             .compute_layout(viewport, &mut ApproxTextMeasurer)
-            .map_err(|err| format!("Operad layout failed: {err}"))?;
+            .map_err(|err| format!("UI layout failed: {err}"))?;
+        attach_default_pointer_actions(&mut document);
         Ok(document)
     }
 
     pub fn audit_operad_document(&self, viewport: UiSize) -> Result<OperadAuditReport, String> {
-        let document = self.build_operad_document(viewport)?;
+        self.audit_operad_document_scaled(viewport, UiScale::new(1.0))
+    }
+
+    pub fn audit_operad_document_scaled(
+        &self,
+        viewport: UiSize,
+        ui_scale: UiScale,
+    ) -> Result<OperadAuditReport, String> {
+        let document = self.build_operad_document_scaled(viewport, ui_scale)?;
         let paint_items = document.paint_list().items.len();
         Ok(OperadAuditReport {
-            operad_version: "4.0.0",
+            operad_version: OPERAD_UI_RUNTIME_VERSION,
             view: self.active_view,
             viewport,
             paint_items,
@@ -4407,13 +6753,22 @@ impl FabricadApp {
         width: u32,
         height: u32,
     ) -> Result<OperadSnapshotReport, String> {
+        self.render_operad_snapshot_scaled(width, height, UiScale::new(1.0))
+    }
+
+    pub fn render_operad_snapshot_scaled(
+        &self,
+        width: u32,
+        height: u32,
+        ui_scale: UiScale,
+    ) -> Result<OperadSnapshotReport, String> {
         let width = width.max(1);
         let height = height.max(1);
         let viewport = UiSize::new(width as f32, height as f32);
-        let document = self.build_operad_document(viewport)?;
+        let document = self.build_operad_document_scaled(viewport, ui_scale)?;
         let paint = document.paint_list();
         let audit = OperadAuditReport {
-            operad_version: "4.0.0",
+            operad_version: OPERAD_UI_RUNTIME_VERSION,
             view: self.active_view,
             viewport,
             paint_items: paint.items.len(),
@@ -4428,19 +6783,39 @@ impl FabricadApp {
             paint,
         )
         .options(RenderOptions {
-            clear_color: ColorRgba::new(14, 18, 22, 255),
+            clear_color: COLOR_APP_BG,
             ..Default::default()
         });
         let mut renderer = WgpuRenderer::new();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let mut layout_canvas = LayoutCanvasResources::default();
+            let mut viewport_3d_canvas = Viewport3dCanvasResources::default();
+            render_layout_canvas_requests(
+                self,
+                &mut renderer,
+                &request,
+                &mut layout_canvas,
+                &mut viewport_3d_canvas,
+            )?;
+        }
         let render = renderer
             .render_frame(request, &operad::EmptyResourceResolver)
-            .map_err(|err| format!("Operad wgpu render failed: {err}"))?;
+            .map_err(|err| format!("snapshot render failed: {err}"))?;
         Ok(OperadSnapshotReport { audit, render })
     }
 }
 
 pub fn run_operad_audit(options: StartupOptions) -> Result<OperadAuditReport, String> {
-    FabricadApp::new_with_options(options).audit_operad_document(UiSize::new(1440.0, 920.0))
+    run_operad_audit_scaled(options, UiScale::new(1.0))
+}
+
+pub fn run_operad_audit_scaled(
+    options: StartupOptions,
+    ui_scale: UiScale,
+) -> Result<OperadAuditReport, String> {
+    FabricadApp::new_with_options(options)
+        .audit_operad_document_scaled(UiSize::new(1440.0, 920.0), ui_scale)
 }
 
 pub fn render_operad_snapshot(
@@ -4449,6 +6824,800 @@ pub fn render_operad_snapshot(
     height: u32,
 ) -> Result<OperadSnapshotReport, String> {
     FabricadApp::new_with_options(options).render_operad_snapshot(width, height)
+}
+
+pub fn render_operad_snapshot_scaled(
+    options: StartupOptions,
+    width: u32,
+    height: u32,
+    ui_scale: UiScale,
+) -> Result<OperadSnapshotReport, String> {
+    FabricadApp::new_with_options(options).render_operad_snapshot_scaled(width, height, ui_scale)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn run_3d_benchmark_scaled(
+    options: StartupOptions,
+    ui_scale: UiScale,
+) -> Result<Benchmark3dReport, String> {
+    let benchmark = options.benchmark_3d.unwrap_or_default();
+    let frames = benchmark.frames.max(1);
+    let warmup_frames = benchmark.warmup_frames;
+    let count = options.stress_count.unwrap_or(10_000);
+    let app_init_started = std::time::Instant::now();
+    let mut app = FabricadApp::new_with_options(options);
+    app.set_active_view(StartupView::Layout3d);
+    let app_init_ms = app_init_started.elapsed().as_secs_f64() * 1000.0;
+
+    let viewport = UiSize::new(
+        benchmark.width.max(1) as f32,
+        benchmark.height.max(1) as f32,
+    );
+    let ui_started = std::time::Instant::now();
+    let document = app.build_operad_document_scaled(viewport, ui_scale)?;
+    let ui_paint_items = document.paint_list().items.len();
+    let ui_build_ms = ui_started.elapsed().as_secs_f64() * 1000.0;
+
+    let batch_started = std::time::Instant::now();
+    let batch = build_layout_3d_batch_for_app(&app);
+    let fingerprint = batch.fingerprint();
+    let validation = batch
+        .validate_geometry()
+        .map_err(|err| format!("3D benchmark batch validation failed: {err}"))?;
+    let batch_build_ms = batch_started.elapsed().as_secs_f64() * 1000.0;
+    let batch_bytes = batch.estimate_bytes();
+
+    let (device, queue, adapter) = benchmark_wgpu_device()?;
+    let mut renderer = Viewport3dRenderer::new(&device, VIEWPORT_3D_COLOR_FORMAT);
+    let target_size = [
+        viewport.width.round() as u32,
+        viewport.height.round() as u32,
+    ];
+    let output_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("Fabricad 3D benchmark output texture"),
+        size: wgpu::Extent3d {
+            width: target_size[0].max(1),
+            height: target_size[1].max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: VIEWPORT_3D_COLOR_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let output_view = output_texture.create_view(&Default::default());
+    let first_upload_started = std::time::Instant::now();
+    let uniforms = benchmark_3d_uniforms(&app, target_size);
+    let first_upload =
+        renderer.upload_with_fingerprint(&device, &queue, &batch, fingerprint, uniforms);
+    let first_upload_ms = first_upload_started.elapsed().as_secs_f64() * 1000.0;
+
+    let total_frames = warmup_frames + frames;
+    let mut uniform_samples = Vec::with_capacity(frames);
+    let mut upload_samples = Vec::with_capacity(frames);
+    let mut encode_samples = Vec::with_capacity(frames);
+    let mut submit_wait_samples = Vec::with_capacity(frames);
+    for frame in 0..total_frames {
+        let uniform_started = std::time::Instant::now();
+        let uniforms = benchmark_3d_uniforms(&app, target_size);
+        let uniform_ms = uniform_started.elapsed().as_secs_f64() * 1000.0;
+
+        let upload_started = std::time::Instant::now();
+        renderer.upload_with_fingerprint(&device, &queue, &batch, fingerprint, uniforms);
+        let upload_ms = upload_started.elapsed().as_secs_f64() * 1000.0;
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Fabricad 3D benchmark encoder"),
+        });
+        let encode_started = std::time::Instant::now();
+        renderer.render_to_view(
+            &device,
+            &mut encoder,
+            &output_view,
+            target_size,
+            wgpu::Color {
+                r: 8.0 / 255.0,
+                g: 11.0 / 255.0,
+                b: 14.0 / 255.0,
+                a: 1.0,
+            },
+        );
+        let encode_ms = encode_started.elapsed().as_secs_f64() * 1000.0;
+
+        let submit_started = std::time::Instant::now();
+        let submission = queue.submit([encoder.finish()]);
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: Some(std::time::Duration::from_secs(30)),
+            })
+            .map_err(|err| format!("3D benchmark GPU submission failed: {err}"))?;
+        let submit_wait_ms = submit_started.elapsed().as_secs_f64() * 1000.0;
+
+        if frame >= warmup_frames {
+            uniform_samples.push(uniform_ms);
+            upload_samples.push(upload_ms);
+            encode_samples.push(encode_ms);
+            submit_wait_samples.push(submit_wait_ms);
+        }
+    }
+
+    Ok(Benchmark3dReport {
+        count,
+        frames,
+        warmup_frames,
+        viewport,
+        adapter,
+        app_init_ms,
+        ui_build_ms,
+        ui_paint_items,
+        batch_build_ms,
+        batch_bytes,
+        mesh_triangles: validation.mesh_triangles,
+        rect_slabs: validation.rect_slabs,
+        guide_segments: validation.guide_segments,
+        first_upload_ms,
+        first_upload_bytes: first_upload.bytes_uploaded,
+        uniform_avg_ms: average_f64(&uniform_samples),
+        cached_upload_avg_ms: average_f64(&upload_samples),
+        encode_avg_ms: average_f64(&encode_samples),
+        submit_wait_avg_ms: average_f64(&submit_wait_samples),
+        submit_wait_p50_ms: percentile_f64(&submit_wait_samples, 0.50),
+        submit_wait_p95_ms: percentile_f64(&submit_wait_samples, 0.95),
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn benchmark_3d_uniforms(app: &FabricadApp, target_size: [u32; 2]) -> Viewport3dUniforms {
+    let aspect = target_size[0] as f32 / target_size[1].max(1) as f32;
+    Viewport3dUniforms::from_view_projection(view_projection_3d(
+        app.camera_3d,
+        aspect,
+        app.camera_3d_far_plane(),
+    ))
+    .with_rect_camera_position([
+        app.camera_3d.position.x,
+        app.camera_3d.position.y,
+        app.camera_3d.position.z,
+    ])
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn benchmark_wgpu_device() -> Result<(wgpu::Device, wgpu::Queue, String), String> {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::from_env().unwrap_or(wgpu::Backends::PRIMARY),
+        flags: wgpu::InstanceFlags::from_build_config().with_env(),
+        backend_options: wgpu::BackendOptions::from_env_or_default(),
+        memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+        display: None,
+    });
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+    }))
+    .map_err(|err| format!("3D benchmark could not find a GPU adapter: {err}"))?;
+    let info = adapter.get_info();
+    let adapter_label = format!("{} {:?}", info.name, info.backend);
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("Fabricad 3D benchmark device"),
+        required_features: wgpu::Features::empty(),
+        required_limits: wgpu::Limits::default(),
+        ..Default::default()
+    }))
+    .map_err(|err| format!("3D benchmark could not create a GPU device: {err}"))?;
+    Ok((device, queue, adapter_label))
+}
+
+fn average_f64(samples: &[f64]) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    samples.iter().sum::<f64>() / samples.len() as f64
+}
+
+fn percentile_f64(samples: &[f64], percentile: f64) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let index = ((sorted.len() - 1) as f64 * percentile.clamp(0.0, 1.0)).round() as usize;
+    sorted[index]
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub struct LayoutCanvasResources {
+    renderer: Option<LayoutGpuRenderer>,
+    target_format: Option<wgpu::TextureFormat>,
+    tile_cache: TileCache,
+    layout_revision: u64,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Default for LayoutCanvasResources {
+    fn default() -> Self {
+        Self {
+            renderer: None,
+            target_format: None,
+            tile_cache: TileCache::default(),
+            layout_revision: u64::MAX,
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub struct Viewport3dCanvasResources {
+    renderer: Option<Viewport3dRenderer>,
+    target_format: Option<wgpu::TextureFormat>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Default for Viewport3dCanvasResources {
+    fn default() -> Self {
+        Self {
+            renderer: None,
+            target_format: None,
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn render_layout_canvas_requests(
+    app: &FabricadApp,
+    renderer: &mut WgpuRenderer,
+    request: &RenderFrameRequest,
+    layout_canvas: &mut LayoutCanvasResources,
+    viewport_3d_canvas: &mut Viewport3dCanvasResources,
+) -> Result<(), String> {
+    for canvas_request in request.canvas_requests() {
+        let Some(size) = canvas_pixel_size(
+            canvas_request.rect.width,
+            canvas_request.rect.height,
+            request.options.scale_factor * normalized_canvas_scale(canvas_request.transform.scale),
+        ) else {
+            continue;
+        };
+        let surface = renderer
+            .get_gpu_context(&canvas_request.canvas, size)
+            .map_err(|err| format!("create snapshot canvas context: {err}"))?;
+        render_layout_canvas_context(
+            app,
+            layout_canvas,
+            viewport_3d_canvas,
+            canvas_request.canvas.key.as_str(),
+            surface,
+            UiSize::new(canvas_request.rect.width, canvas_request.rect.height),
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn render_layout_canvas_context(
+    app: &FabricadApp,
+    layout_canvas: &mut LayoutCanvasResources,
+    viewport_3d_canvas: &mut Viewport3dCanvasResources,
+    canvas_key: &str,
+    surface: WgpuCanvasContext<'_>,
+    logical_size: UiSize,
+) -> Result<(), String> {
+    match canvas_key {
+        "fabricad.layout.viewport.2d" => {
+            render_layout_2d_canvas_with_size(app, layout_canvas, surface, logical_size)
+        }
+        "fabricad.layout.viewport.3d" => render_layout_3d_canvas(app, viewport_3d_canvas, surface),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn render_layout_2d_canvas(
+    app: &FabricadApp,
+    resources: &mut LayoutCanvasResources,
+    surface: WgpuCanvasContext<'_>,
+) -> Result<(), String> {
+    let size = surface.size();
+    render_layout_2d_canvas_with_size(
+        app,
+        resources,
+        surface,
+        UiSize::new(size.width as f32, size.height as f32),
+    )
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn render_layout_2d_canvas_with_size(
+    app: &FabricadApp,
+    resources: &mut LayoutCanvasResources,
+    surface: WgpuCanvasContext<'_>,
+    logical_size: UiSize,
+) -> Result<(), String> {
+    let frame_start = std::time::Instant::now();
+    let document = &app.workspace().document;
+    let viewport = app.layout_viewport_for_size(logical_size);
+    let zoom = app.layout_zoom;
+    if resources.layout_revision != app.layout_revision {
+        resources.tile_cache.clear();
+        resources.layout_revision = app.layout_revision;
+    }
+    let frame = app.with_layout_index(|index| {
+        resources.tile_cache.build_frame_with_options(
+            document,
+            index,
+            viewport,
+            TileFrameOptions {
+                include_pick: false,
+                zoom,
+                ..Default::default()
+            },
+        )
+    });
+    let format = surface.format();
+    if resources.target_format != Some(format) {
+        resources.renderer = Some(
+            LayoutGpuRenderer::new(surface.device(), format)
+                .ok_or_else(|| "initialize 2D layout GPU canvas renderer".to_string())?,
+        );
+        resources.target_format = Some(format);
+    }
+    let renderer = resources
+        .renderer
+        .as_mut()
+        .ok_or_else(|| "2D layout GPU canvas renderer unavailable".to_string())?;
+    renderer.upload(
+        surface.device(),
+        surface.queue(),
+        &frame.render,
+        ViewUniforms::from_viewport(viewport),
+    );
+
+    let mut encoder = surface.create_command_encoder(Some("Fabricad 2D layout canvas encoder"));
+    {
+        let mut render_pass = surface
+            .begin_render_pass(&mut encoder, Some(ColorRgba::new(8, 11, 14, 255)))
+            .forget_lifetime();
+        renderer.paint(&mut render_pass);
+    }
+    surface.queue().submit([encoder.finish()]);
+    app.layout_frame_ms
+        .set(Some(frame_start.elapsed().as_secs_f64() * 1000.0));
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn render_layout_3d_canvas(
+    app: &FabricadApp,
+    resources: &mut Viewport3dCanvasResources,
+    surface: WgpuCanvasContext<'_>,
+) -> Result<(), String> {
+    let frame_start = std::time::Instant::now();
+    let format = surface.format();
+    if resources.target_format != Some(format) {
+        resources.renderer = Some(Viewport3dRenderer::new(surface.device(), format));
+        resources.target_format = Some(format);
+    }
+    let renderer = resources
+        .renderer
+        .as_mut()
+        .ok_or_else(|| "3D layout GPU canvas renderer unavailable".to_string())?;
+    let batch = build_layout_3d_batch_for_app(app);
+    let size = surface.size();
+    let aspect = size.width as f32 / size.height.max(1) as f32;
+    let uniforms = Viewport3dUniforms::from_view_projection(view_projection_3d(
+        app.camera_3d,
+        aspect,
+        app.camera_3d_far_plane(),
+    ))
+    .with_rect_camera_position([
+        app.camera_3d.position.x,
+        app.camera_3d.position.y,
+        app.camera_3d.position.z,
+    ]);
+    renderer.upload(surface.device(), surface.queue(), &batch, uniforms);
+
+    let mut encoder = surface.create_command_encoder(Some("Fabricad 3D layout canvas encoder"));
+    renderer.render_to_view(
+        surface.device(),
+        &mut encoder,
+        surface.view(),
+        [size.width.max(1), size.height.max(1)],
+        wgpu::Color {
+            r: 8.0 / 255.0,
+            g: 11.0 / 255.0,
+            b: 14.0 / 255.0,
+            a: 1.0,
+        },
+    );
+    surface.queue().submit([encoder.finish()]);
+    app.layout_frame_ms
+        .set(Some(frame_start.elapsed().as_secs_f64() * 1000.0));
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn canvas_pixel_size(width: f32, height: f32, scale: f32) -> Option<PixelSize> {
+    Some(PixelSize::new(
+        pixel_extent(width, scale)?,
+        pixel_extent(height, scale)?,
+    ))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn pixel_extent(value: f32, scale: f32) -> Option<u32> {
+    if !value.is_finite() || value <= 0.0 {
+        return None;
+    }
+    let pixels = (value * normalized_canvas_scale(scale)).ceil();
+    if !pixels.is_finite() || pixels <= 0.0 {
+        return None;
+    }
+    Some(pixels.min(u32::MAX as f32) as u32)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn normalized_canvas_scale(scale: f32) -> f32 {
+    if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn fitted_layout_viewport(bounds: Option<Rect>, canvas_size: PixelSize) -> Rect {
+    let bounds =
+        bounds.unwrap_or_else(|| Rect::from_min_size(Point::new(-500, -500), 1_000, 1_000));
+    let canvas_aspect = canvas_size.width.max(1) as f32 / canvas_size.height.max(1) as f32;
+    let mut world_width = bounds.width().max(1) as f32 * 1.12;
+    let mut world_height = bounds.height().max(1) as f32 * 1.12;
+    if world_width / world_height < canvas_aspect {
+        world_width = world_height * canvas_aspect;
+    } else {
+        world_height = world_width / canvas_aspect;
+    }
+    let center = bounds.center();
+    let half_width = (world_width * 0.5).ceil().max(1.0) as i64;
+    let half_height = (world_height * 0.5).ceil().max(1.0) as i64;
+    Rect::new(
+        Point::new(center.x - half_width, center.y - half_height),
+        Point::new(center.x + half_width, center.y + half_height),
+    )
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn build_layout_3d_batch_for_app(app: &FabricadApp) -> RenderBatch3d {
+    build_layout_3d_batch_with_options(&app.workspace().document, app.show_3d_grid)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn build_layout_3d_batch(document: &Document) -> RenderBatch3d {
+    build_layout_3d_batch_with_options(document, false)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn build_layout_3d_batch_with_options(document: &Document, show_grid: bool) -> RenderBatch3d {
+    let index = LayoutIndex::rebuild_hierarchical(document);
+    let Some(bounds) = index.bounds() else {
+        return RenderBatch3d::default();
+    };
+    let layer_slots = layout_layer_slots(document);
+    let mut batch = RenderBatch3d::default();
+
+    document.for_each_visible_flattened_shape_view(|_, shape| {
+        if matches!(
+            shape.shape.kind,
+            ShapeKindView::Label { .. } | ShapeKindView::Measurement { .. }
+        ) {
+            return;
+        }
+        let rect = shape.bounds;
+        if rect.width() <= 0 || rect.height() <= 0 {
+            return;
+        }
+        let default_slot = layer_slots
+            .get(&shape.shape.layer)
+            .copied()
+            .unwrap_or(shape.shape.layer.0 as usize);
+        let (z_min, z_max) = document
+            .layers
+            .get(&shape.shape.layer)
+            .map(|layer| layer_3d_stack_range(layer.process))
+            .unwrap_or_else(|| default_layer_3d_stack_range(default_slot));
+        let mut color = document.layer_color(shape.shape.layer);
+        color[3] = 1.0;
+        batch.rect_slabs.push(GpuRectSlabInstance {
+            rect: [
+                rect.min.x as f32,
+                rect.min.y as f32,
+                rect.max.x as f32,
+                rect.max.y as f32,
+            ],
+            z_range: [z_min, z_max],
+            color,
+        });
+    });
+
+    add_3d_reference_guides(&mut batch, bounds);
+    if show_grid {
+        add_3d_ground_grid(&mut batch, bounds);
+    }
+    batch
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn layout_layer_slots(document: &Document) -> BTreeMap<LayerId, usize> {
+    let mut layers = document
+        .layers
+        .iter()
+        .filter(|(_, layer)| layer.visible)
+        .map(|(id, layer)| (layer.display_order, id.0, *id))
+        .collect::<Vec<_>>();
+    layers.sort_unstable();
+    layers
+        .into_iter()
+        .enumerate()
+        .map(|(index, (_, _, id))| (id, index))
+        .collect()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn add_3d_reference_guides(batch: &mut RenderBatch3d, bounds: Rect) {
+    let start = batch.guide_vertices.len() as u32;
+    let guide_bounds = expanded_3d_guide_bounds(bounds);
+    let guides = [
+        (
+            [guide_bounds.min.x as f32, 0.0, 0.0],
+            [guide_bounds.max.x as f32, 0.0, 0.0],
+            [0.35, 0.62, 0.86, 1.0],
+        ),
+        (
+            [0.0, guide_bounds.min.y as f32, 0.0],
+            [0.0, guide_bounds.max.y as f32, 0.0],
+            [0.48, 0.76, 0.56, 1.0],
+        ),
+    ];
+    for (from, to, color) in guides {
+        batch.guide_vertices.push(GpuVertex3d {
+            position: from,
+            normal: [0.0, 0.0, 0.0],
+            color,
+        });
+        batch.guide_vertices.push(GpuVertex3d {
+            position: to,
+            normal: [0.0, 0.0, 0.0],
+            color,
+        });
+    }
+    batch
+        .guide_indices
+        .extend([start, start + 1, start + 2, start + 3]);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn add_3d_ground_grid(batch: &mut RenderBatch3d, bounds: Rect) {
+    let color = [0.28, 0.34, 0.40, 0.55];
+    let bounds = expanded_3d_guide_bounds(bounds);
+    let width = bounds.width().max(1);
+    let height = bounds.height().max(1);
+    let step = nice_3d_grid_step(width.max(height));
+    let start_x = floor_to_step(bounds.min.x, step);
+    let end_x = ceil_to_step(bounds.max.x, step);
+    let start_y = floor_to_step(bounds.min.y, step);
+    let end_y = ceil_to_step(bounds.max.y, step);
+    let mut indices = Vec::new();
+    let mut x = start_x;
+    while x <= end_x {
+        let base = batch.guide_vertices.len() as u32;
+        batch.guide_vertices.push(GpuVertex3d {
+            position: [x as f32, bounds.min.y as f32, 0.0],
+            normal: [0.0, 0.0, 0.0],
+            color,
+        });
+        batch.guide_vertices.push(GpuVertex3d {
+            position: [x as f32, bounds.max.y as f32, 0.0],
+            normal: [0.0, 0.0, 0.0],
+            color,
+        });
+        indices.extend([base, base + 1]);
+        x += step;
+    }
+    let mut y = start_y;
+    while y <= end_y {
+        let base = batch.guide_vertices.len() as u32;
+        batch.guide_vertices.push(GpuVertex3d {
+            position: [bounds.min.x as f32, y as f32, 0.0],
+            normal: [0.0, 0.0, 0.0],
+            color,
+        });
+        batch.guide_vertices.push(GpuVertex3d {
+            position: [bounds.max.x as f32, y as f32, 0.0],
+            normal: [0.0, 0.0, 0.0],
+            color,
+        });
+        indices.extend([base, base + 1]);
+        y += step;
+    }
+    batch.guide_indices.extend(indices);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn layer_3d_stack_range(process: ProcessLayer) -> (f32, f32) {
+    let (base, thickness) = match process {
+        ProcessLayer::Diffusion => (0.0, 80.0),
+        ProcessLayer::Oxide => (95.0, 40.0),
+        ProcessLayer::Poly => (155.0, 75.0),
+        ProcessLayer::Contact => (230.0, 110.0),
+        ProcessLayer::Metal1 => (340.0, 90.0),
+        ProcessLayer::Via1 => (430.0, 120.0),
+        ProcessLayer::Metal2 => (550.0, 90.0),
+        ProcessLayer::Annotation => (0.0, 0.0),
+    };
+    (base, base + thickness)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn default_layer_3d_stack_range(slot: usize) -> (f32, f32) {
+    let base = slot as f32 * 95.0;
+    (base, base + 70.0)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn expanded_3d_guide_bounds(bounds: Rect) -> Rect {
+    let margin = bounds.width().max(bounds.height()).max(1) / 10;
+    bounds.expanded(margin.max(1))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn nice_3d_grid_step(span: Coord) -> Coord {
+    let rough = (span / 12).max(1);
+    let mut magnitude = 1;
+    while magnitude <= rough / 10 {
+        magnitude *= 10;
+    }
+    for multiplier in [1, 2, 5, 10] {
+        let step = magnitude * multiplier;
+        if step >= rough {
+            return step;
+        }
+    }
+    magnitude * 10
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn floor_to_step(value: Coord, step: Coord) -> Coord {
+    value.div_euclid(step) * step
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn ceil_to_step(value: Coord, step: Coord) -> Coord {
+    value.div_euclid(step) * step + if value.rem_euclid(step) == 0 { 0 } else { step }
+}
+
+fn view_projection_3d(camera: Camera3d, aspect: f32, far: f32) -> [f32; 16] {
+    let basis = camera.basis();
+    let y_scale = 1.0 / (camera.fov_y * 0.5).tan();
+    let x_scale = y_scale / aspect.max(0.001);
+    let near = CAMERA_NEAR_PLANE.max(0.001);
+    let far = far.max(near + 1.0);
+    let z_scale = far / (far - near);
+    let z_bias = -near * far / (far - near);
+    let position = camera.position;
+    row_major_4x4_to_column_major([
+        [
+            basis.right.x * x_scale,
+            basis.right.y * x_scale,
+            basis.right.z * x_scale,
+            -position.dot(basis.right) * x_scale,
+        ],
+        [
+            basis.up.x * y_scale,
+            basis.up.y * y_scale,
+            basis.up.z * y_scale,
+            -position.dot(basis.up) * y_scale,
+        ],
+        [
+            basis.forward.x * z_scale,
+            basis.forward.y * z_scale,
+            basis.forward.z * z_scale,
+            -position.dot(basis.forward) * z_scale + z_bias,
+        ],
+        [
+            basis.forward.x,
+            basis.forward.y,
+            basis.forward.z,
+            -position.dot(basis.forward),
+        ],
+    ])
+}
+
+fn row_major_4x4_to_column_major(matrix: [[f32; 4]; 4]) -> [f32; 16] {
+    let mut out = [0.0; 16];
+    for row in 0..4 {
+        for column in 0..4 {
+            out[column * 4 + row] = matrix[row][column];
+        }
+    }
+    out
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Vec3 {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+impl Vec3 {
+    const ZERO: Self = Self::new(0.0, 0.0, 0.0);
+
+    const fn new(x: f32, y: f32, z: f32) -> Self {
+        Self { x, y, z }
+    }
+
+    fn dot(self, other: Self) -> f32 {
+        self.x * other.x + self.y * other.y + self.z * other.z
+    }
+
+    fn cross(self, other: Self) -> Self {
+        Self::new(
+            self.y * other.z - self.z * other.y,
+            self.z * other.x - self.x * other.z,
+            self.x * other.y - self.y * other.x,
+        )
+    }
+
+    fn length(self) -> f32 {
+        self.dot(self).sqrt()
+    }
+
+    fn normalized(self) -> Self {
+        let length = self.length();
+        if length <= f32::EPSILON {
+            return Self::ZERO;
+        }
+        self / length
+    }
+}
+
+impl std::ops::Add for Vec3 {
+    type Output = Self;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        Self::new(self.x + rhs.x, self.y + rhs.y, self.z + rhs.z)
+    }
+}
+
+impl std::ops::AddAssign for Vec3 {
+    fn add_assign(&mut self, rhs: Self) {
+        *self = *self + rhs;
+    }
+}
+
+impl std::ops::Sub for Vec3 {
+    type Output = Self;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        Self::new(self.x - rhs.x, self.y - rhs.y, self.z - rhs.z)
+    }
+}
+
+impl std::ops::Mul<f32> for Vec3 {
+    type Output = Self;
+
+    fn mul(self, rhs: f32) -> Self::Output {
+        Self::new(self.x * rhs, self.y * rhs, self.z * rhs)
+    }
+}
+
+impl std::ops::Div<f32> for Vec3 {
+    type Output = Self;
+
+    fn div(self, rhs: f32) -> Self::Output {
+        Self::new(self.x / rhs, self.y / rhs, self.z / rhs)
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -4797,6 +7966,367 @@ fn mask_check_report(app: &FabricadApp) -> MaskCheckReport {
     reticle_prep_for_app(app).validate_document(&app.workspace.document)
 }
 
+fn display_mask_identifier(value: &str) -> String {
+    let Some(suffix) = value.strip_prefix("FABRICAD-DEMO-") else {
+        return value.to_string();
+    };
+    capitalize_ascii_first(humanize_identifier(suffix))
+}
+
+fn display_reticle_identifier(value: &str) -> String {
+    display_mask_identifier(&value.replace("-RETICLE-", "-"))
+}
+
+fn display_layout_revision_identifier(value: &str) -> String {
+    let value = value.strip_prefix("layout_model:").unwrap_or(value);
+    let value = value
+        .strip_prefix("demo-")
+        .or_else(|| value.strip_prefix("demo_"))
+        .unwrap_or(value);
+    let value = value.replace('@', " ");
+    capitalize_ascii_first(humanize_identifier(&value))
+}
+
+fn display_route_identifier(value: &str) -> String {
+    let value = value
+        .strip_prefix("ROUTE-DEMO-")
+        .or_else(|| value.strip_prefix("ROUTE-"))
+        .unwrap_or(value);
+    capitalize_ascii_first(humanize_identifier(value))
+}
+
+fn display_reticle_field_identifier(value: &str) -> String {
+    capitalize_ascii_first(humanize_identifier(
+        value.strip_prefix("F-").unwrap_or(value),
+    ))
+}
+
+fn display_recipe_identifier(value: &str) -> String {
+    value
+        .split(['_', '-'])
+        .filter(|part| !part.is_empty())
+        .enumerate()
+        .map(|(index, part)| format_recipe_token(part, index == 0))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn display_measurement_identifier(value: &str) -> String {
+    capitalize_ascii_first(humanize_identifier(value))
+}
+
+fn display_spc_control_identifier(value: &str) -> String {
+    display_measurement_identifier(value.strip_suffix("_thickness").unwrap_or(value))
+}
+
+fn display_spc_trace_name(trace: &SensorTrace) -> String {
+    format!(
+        "{} / {}",
+        trace.tool_id,
+        display_measurement_identifier(&trace.sensor_name)
+    )
+}
+
+fn display_spc_chart_label(chart: &ControlChart) -> String {
+    if chart.name.trim().is_empty() {
+        display_spc_control_identifier(&chart.metric)
+    } else {
+        chart.name.clone()
+    }
+}
+
+fn display_spc_finding_title(finding: &layout_model::spc_fdc::MonitorFinding) -> String {
+    if finding.source == FindingSource::FdcTrace {
+        if let Some((tool_id, sensor_detail)) = finding.title.split_once(" / ") {
+            let sensor_name = sensor_detail
+                .strip_suffix(" excursion")
+                .unwrap_or(sensor_detail);
+            return format!(
+                "{} / {} excursion",
+                tool_id,
+                display_measurement_identifier(sensor_name)
+            );
+        }
+    }
+    capitalize_ascii_first(finding.title.clone())
+}
+
+fn display_process_flow_route_name(value: &str) -> String {
+    capitalize_ascii_first(humanize_identifier(
+        value.strip_prefix("Demo ").unwrap_or(value),
+    ))
+}
+
+fn display_step_identifier(value: &str) -> String {
+    capitalize_ascii_first(humanize_identifier(value))
+}
+
+fn display_tool_run_identifier(value: &str) -> String {
+    if let Some(suffix) = value.strip_prefix("RUN-") {
+        let parts = suffix
+            .split('-')
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>();
+        if let Some((run_number, run_kind)) = parts.split_last() {
+            let kind = run_kind
+                .iter()
+                .map(|part| part.to_ascii_lowercase())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if kind.is_empty() {
+                return format!("run {run_number}");
+            }
+            return format!("{kind} run {run_number}");
+        }
+    }
+    if let Some((tool_id, run_id)) = value.split_once("-RUN-") {
+        return format!(
+            "{} run {}",
+            capitalize_ascii_first(humanize_identifier(tool_id)),
+            humanize_identifier(run_id)
+        );
+    }
+    capitalize_ascii_first(humanize_identifier(value))
+}
+
+fn display_lot_identifier(value: &str) -> String {
+    if let Some(suffix) = value.strip_prefix("L-") {
+        format!("Lot {suffix}")
+    } else {
+        capitalize_ascii_first(humanize_identifier(value))
+    }
+}
+
+fn display_wafer_identifier(value: &str) -> String {
+    if let Some((_, suffix)) = value.rsplit_once("-W") {
+        return format!("Wafer W{suffix}");
+    }
+    if let Some(suffix) = value.strip_prefix('W') {
+        return format!("Wafer W{suffix}");
+    }
+    format!(
+        "Wafer {}",
+        capitalize_ascii_first(humanize_identifier(value))
+    )
+}
+
+fn display_process_flow_node_label(node: &layout_model::process_flow::ProcessFlowNode) -> String {
+    if node.name.trim().is_empty() {
+        capitalize_ascii_first(humanize_identifier(node.id.as_str()))
+    } else {
+        node.name.clone()
+    }
+}
+
+fn compact_process_step_button_label(label: &str, max_chars: usize) -> String {
+    match label {
+        "Coat PR and soft bake" => "Coat PR bake".to_string(),
+        "Align and expose poly mask" => "Align expose".to_string(),
+        "Develop and inspect resist" => "Develop inspect".to_string(),
+        "Poly plasma etch" => "Poly etch".to_string(),
+        _ => compact_button_label(label, max_chars),
+    }
+}
+
+fn process_flow_node_button_label(node: &layout_model::process_flow::ProcessFlowNode) -> String {
+    let label = display_process_flow_node_label(node);
+    compact_process_step_button_label(&label, 18)
+}
+
+fn display_owner_identifier(value: &str) -> String {
+    let expanded = value
+        .split(|ch: char| ch == '-' || ch == '_' || ch == '.' || ch.is_whitespace())
+        .filter(|part| !part.is_empty())
+        .map(|part| match part.to_ascii_lowercase().as_str() {
+            "eng" => "engineer".to_string(),
+            other => other.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    capitalize_ascii_first(expanded)
+}
+
+fn display_technology_name(value: &str) -> String {
+    let without_product = value
+        .trim()
+        .strip_prefix("Fabricad ")
+        .unwrap_or(value.trim());
+    capitalize_ascii_first(
+        without_product
+            .replace("demo", "sample")
+            .replace("Demo", "Sample"),
+    )
+}
+
+fn display_inventory_actor_identifier(value: &str) -> String {
+    let words = value
+        .split(|ch: char| ch == '-' || ch == '_' || ch == '.' || ch.is_whitespace())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| match part.to_ascii_lowercase().as_str() {
+            "demo" => None,
+            "op" | "ops" => Some("operator".to_string()),
+            other => Some(other.to_string()),
+        })
+        .collect::<Vec<_>>();
+    if words.is_empty() {
+        "Operator".to_string()
+    } else {
+        capitalize_ascii_first(words.join(" "))
+    }
+}
+
+fn experiment_run_order_label(run_order: u32) -> String {
+    if run_order == 0 {
+        "Run --".to_string()
+    } else {
+        format!("Run {run_order:02}")
+    }
+}
+
+fn display_experiment_run_label(run: &ExperimentRun) -> String {
+    experiment_run_order_label(run.assignment.run_order)
+}
+
+fn experiment_plan_title_label(plan: &ExperimentPlan, compact_rows: bool) -> String {
+    if compact_rows {
+        let title = match plan.title.as_str() {
+            "Poly lithography CD split" => "Poly CD split".to_string(),
+            _ => compact_button_label(&plan.title, 18),
+        };
+        format!("{title} - {}", plan.status.label())
+    } else {
+        format!(
+            "{} - {} / owner {}",
+            plan.title,
+            plan.status.label(),
+            display_owner_identifier(&plan.owner)
+        )
+    }
+}
+
+fn display_experiment_objective(value: &str) -> String {
+    value
+        .replace("demo inverter", "sample inverter")
+        .replace("demo ", "sample ")
+}
+
+fn display_safety_incident_identifier(
+    incident_id: &layout_model::safety::SafetyIncidentId,
+) -> String {
+    let value = incident_id.to_string();
+    value
+        .strip_prefix("INC-SIM-")
+        .or_else(|| value.strip_prefix("INC-"))
+        .map(|suffix| format!("Incident {suffix}"))
+        .unwrap_or(value)
+}
+
+fn safety_tool_label(tool_id: &str, tool_name: &str) -> String {
+    if tool_name.trim().is_empty() {
+        tool_id.to_string()
+    } else {
+        tool_name.to_string()
+    }
+}
+
+fn safety_selected_tool_label(app: &FabricadApp) -> String {
+    let Some(tool_id) = app.selected_safety_tool.as_deref() else {
+        return "None".to_string();
+    };
+    app.workspace
+        .safety
+        .evaluate_lockouts()
+        .into_iter()
+        .find(|lockout| lockout.tool_id == tool_id)
+        .map(|lockout| safety_tool_label(&lockout.tool_id, &lockout.tool_name))
+        .unwrap_or_else(|| tool_id.to_string())
+}
+
+fn safety_incident_action_label(incident: &layout_model::safety::SafetyIncident) -> String {
+    format!("Ack {}", incident.domain.label())
+}
+
+fn safety_ack_condition_label(sensor: &layout_model::safety::SafetySensor) -> String {
+    format!("Ack {}", sensor.domain.label())
+}
+
+fn safety_sensor_tool_label(
+    workspace: &WorkspaceDataset,
+    sensor: &layout_model::safety::SafetySensor,
+) -> String {
+    sensor
+        .tool_id
+        .as_deref()
+        .map(|tool_id| equipment_tool_label_for_raw_id(workspace, tool_id))
+        .unwrap_or_else(|| "Facility".to_string())
+}
+
+fn display_environment_sensor_label(sensor: &EnvironmentSensor) -> String {
+    sensor.name.clone()
+}
+
+fn environment_sensor_button_label(sensor: &EnvironmentSensor) -> String {
+    match sensor.name.as_str() {
+        "Litho bay temperature" => "Litho temp".to_string(),
+        "Litho bay humidity" => "Litho humidity".to_string(),
+        "CMP particle counter" => "CMP particles".to_string(),
+        "Stepper slab vibration" => "Stepper vibe".to_string(),
+        "DI loop resistivity" => "DI resistivity".to_string(),
+        "Acid exhaust flow" => "Acid exhaust".to_string(),
+        _ => compact_button_label(&display_environment_sensor_label(sensor), 18),
+    }
+}
+
+fn environment_alarm_short_label(severity: Option<EnvironmentAlarmSeverity>) -> &'static str {
+    match severity {
+        Some(EnvironmentAlarmSeverity::Critical) => "crit",
+        Some(EnvironmentAlarmSeverity::Warning) => "warn",
+        Some(EnvironmentAlarmSeverity::Advisory) => "adv",
+        None => "nom",
+    }
+}
+
+fn capitalize_ascii_first(mut value: String) -> String {
+    if let Some(first_byte) = value.get_mut(0..1) {
+        first_byte.make_ascii_uppercase();
+    }
+    value
+}
+
+fn format_recipe_token(value: &str, first: bool) -> String {
+    let has_digit = value.chars().any(|ch| ch.is_ascii_digit());
+    let all_upper = value.chars().all(|ch| !ch.is_ascii_lowercase());
+    if value.chars().all(|ch| ch.is_ascii_digit())
+        || (all_upper && value.chars().count() <= 3)
+        || (has_digit && all_upper)
+    {
+        return value.to_string();
+    }
+
+    let mut lower = value.to_ascii_lowercase();
+    if first {
+        if let Some(first_byte) = lower.get_mut(0..1) {
+            first_byte.make_ascii_uppercase();
+        }
+    }
+    lower
+}
+
+fn humanize_identifier(value: &str) -> String {
+    value
+        .split(|ch: char| ch == '-' || ch == '_' || ch == '.' || ch.is_whitespace())
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            if part.chars().count() == 1 {
+                part.to_ascii_uppercase()
+            } else {
+                part.to_ascii_lowercase()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn mask_issue_matches_filter(app: &FabricadApp, issue: &layout_model::mask::MaskPrepIssue) -> bool {
     app.mask_issue_severity_filter.matches(issue.severity)
 }
@@ -5020,6 +8550,29 @@ fn trace_impact_query(app: &FabricadApp) -> Option<layout_model::genealogy::Excu
     }
 }
 
+fn trace_impact_query_label(
+    genealogy: &layout_model::genealogy::LotGenealogy,
+    query: &layout_model::genealogy::ExcursionQuery,
+) -> String {
+    match query {
+        layout_model::genealogy::ExcursionQuery::ToolRun { tool_run_id } => {
+            format!(
+                "tool run {}",
+                display_tool_run_identifier(tool_run_id.as_str())
+            )
+        }
+        layout_model::genealogy::ExcursionQuery::ProcessStep { step_id } => {
+            format!("process step {}", display_step_identifier(step_id.as_str()))
+        }
+        layout_model::genealogy::ExcursionQuery::MaterialLot { material_lot_id } => {
+            format!(
+                "material {}",
+                trace_material_lot_label(genealogy, material_lot_id)
+            )
+        }
+    }
+}
+
 fn default_notebook_entry(workspace: &WorkspaceDataset) -> Option<NotebookEntryId> {
     workspace
         .lab_notebook
@@ -5108,6 +8661,14 @@ fn dispatch_policy_from_slug(value: &str) -> Option<DispatchPolicy> {
         "priority" => Some(DispatchPolicy::PriorityThenFifo),
         "due-date" => Some(DispatchPolicy::DueDateThenPriority),
         _ => None,
+    }
+}
+
+fn display_dispatch_policy_label(policy: DispatchPolicy) -> &'static str {
+    match policy {
+        DispatchPolicy::Fifo => "FIFO",
+        DispatchPolicy::PriorityThenFifo => "Priority + FIFO",
+        DispatchPolicy::DueDateThenPriority => "Due date + priority",
     }
 }
 
@@ -5355,19 +8916,71 @@ fn process_control_transition_label(value: &str) -> &'static str {
     }
 }
 
-fn short_control_action_label(action_id: &ControlActionId) -> String {
-    let value = action_id.as_str();
-    value
-        .rsplit_once('-')
-        .map(|(_, suffix)| format!("PCA-{suffix}"))
-        .unwrap_or_else(|| value.to_string())
+fn control_run_label(run_index: u32) -> String {
+    format!("Run {run_index:02}")
+}
+
+fn process_control_action_short_label(action: &ControlAction) -> String {
+    control_run_label(action.source.run_index)
+}
+
+fn process_control_action_button_label(action: &ControlAction) -> String {
+    format!(
+        "{} {}",
+        process_control_action_short_label(action),
+        action.state.label()
+    )
+}
+
+fn process_control_latest_label(point: Option<&ControlTrendPoint>, compact_rows: bool) -> String {
+    point
+        .map(|point| {
+            if compact_rows {
+                format!(
+                    "latest {} {}",
+                    format_compact_number(point.value),
+                    point.unit
+                )
+            } else {
+                format!(
+                    "latest {:.3} {} error {:+.3}",
+                    point.value, point.unit, point.error
+                )
+            }
+        })
+        .unwrap_or_else(|| "No trend samples".to_string())
+}
+
+fn process_control_target_label(loop_definition: &ControlLoop, compact_rows: bool) -> String {
+    if compact_rows {
+        format!(
+            "target {} {}",
+            format_compact_number(loop_definition.output.target),
+            loop_definition.output.unit
+        )
+    } else {
+        format!(
+            "target {:.3} +/-{:.3} {}",
+            loop_definition.output.target,
+            loop_definition.deadband.abs(),
+            loop_definition.output.unit
+        )
+    }
+}
+
+fn process_control_loop_button_label(name: &str) -> String {
+    match name {
+        "Poly etch edge oxide trim" => "Edge oxide trim".to_string(),
+        "Contact resistance cleanup" => "Contact resistance".to_string(),
+        _ => compact_button_label(name, 18),
+    }
 }
 
 fn compact_button_label(value: &str, max_chars: usize) -> String {
     if value.chars().count() <= max_chars {
         return value.to_string();
     }
-    let prefix_len = max_chars.saturating_sub(1);
+    let prefix_len = max_chars.saturating_sub(2);
     let prefix = value.chars().take(prefix_len).collect::<String>();
     format!("{prefix}..")
 }
@@ -5661,10 +9274,17 @@ fn workflow_focus_yield_label(app: &FabricadApp) -> String {
 
 fn equipment_recipe_summary(tool: &EquipmentTool) -> String {
     if let Some(run) = &tool.active_run {
-        return format!("{} {}", run.recipe.recipe_id, run.status.label());
+        return format!(
+            "{} {}",
+            display_recipe_identifier(run.recipe.recipe_id.as_str()),
+            run.status.label()
+        );
     }
     if let Some(selection) = &tool.selected_recipe {
-        return format!("{} loaded", selection.recipe_id);
+        return format!(
+            "{} loaded",
+            display_recipe_identifier(selection.recipe_id.as_str())
+        );
     }
     "No recipe".to_string()
 }
@@ -5754,11 +9374,157 @@ impl PrimaryRow {
     }
 }
 
+#[derive(Clone, Debug)]
+struct DomainSection {
+    name: String,
+    title: String,
+    empty: String,
+    rows: Vec<PrimaryRow>,
+    max_rows: usize,
+}
+
+impl DomainSection {
+    fn new(
+        name: impl Into<String>,
+        title: impl Into<String>,
+        empty: impl Into<String>,
+        rows: Vec<PrimaryRow>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            title: title.into(),
+            empty: empty.into(),
+            rows,
+            max_rows: 6,
+        }
+    }
+
+    fn max_rows(mut self, max_rows: usize) -> Self {
+        self.max_rows = max_rows;
+        self
+    }
+}
+
+fn dashboard_metric_rows(prefix: &str, metrics: Vec<DashboardMetric>) -> Vec<PrimaryRow> {
+    metrics
+        .into_iter()
+        .enumerate()
+        .map(|(index, metric)| {
+            PrimaryRow::new(
+                format!("{prefix}.metric.{index}"),
+                metric.label,
+                metric.value,
+                metric.detail,
+            )
+        })
+        .collect()
+}
+
+fn control_rows_to_primary(prefix: &str, rows: Vec<Vec<ViewControlButton>>) -> Vec<PrimaryRow> {
+    rows.into_iter()
+        .flatten()
+        .enumerate()
+        .map(|(index, button)| {
+            PrimaryRow::new(
+                format!("{prefix}.{index}"),
+                button.label,
+                if button.selected { "selected" } else { "" },
+                "",
+            )
+            .action(button.name, button.selected)
+        })
+        .collect()
+}
+
+fn workflow_action_rows(app: &FabricadApp) -> Vec<PrimaryRow> {
+    control_rows_to_primary("workflow-action", workflow_control_rows(app))
+}
+
+fn workflow_lot_rows(app: &FabricadApp) -> Vec<PrimaryRow> {
+    workflow_primary_rows(app)
+}
+
+fn workflow_focus_rows(app: &FabricadApp) -> Vec<PrimaryRow> {
+    workflow_primary_rows(app)
+}
+
+fn workflow_spine_rows(app: &FabricadApp) -> Vec<PrimaryRow> {
+    workflow_cross_link_rows(app)
+}
+
+fn mask_field_rows(app: &FabricadApp) -> Vec<PrimaryRow> {
+    mask_primary_rows(app)
+}
+
+fn mask_check_rows(app: &FabricadApp) -> Vec<PrimaryRow> {
+    mask_primary_rows(app)
+}
+
+fn layout_diff_layer_rows(app: &FabricadApp) -> Vec<PrimaryRow> {
+    layout_diff_primary_rows(app)
+}
+
+fn layout_diff_change_rows(app: &FabricadApp) -> Vec<PrimaryRow> {
+    layout_diff_primary_rows(app)
+}
+
+fn fab_tool_rows(app: &FabricadApp) -> Vec<PrimaryRow> {
+    fab_primary_rows(app)
+}
+
+fn add_domain_panel(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    _name: &str,
+    subtitle: &str,
+    title: &str,
+    sections: Vec<DomainSection>,
+    ui_scale: UiScale,
+    compact_rows: bool,
+) {
+    let section_markers = sections.clone();
+    let rows = sections
+        .iter()
+        .flat_map(|section| {
+            let mut rows = section.rows.clone();
+            if rows.is_empty() {
+                rows.push(PrimaryRow::new(
+                    format!("{}.empty", section.name),
+                    section.title.clone(),
+                    section.empty.clone(),
+                    subtitle.to_string(),
+                ));
+            }
+            rows.into_iter().take(section.max_rows)
+        })
+        .collect::<Vec<_>>();
+    add_overview_view_panel(
+        document,
+        parent,
+        "fabricad.domain",
+        title,
+        Vec::new(),
+        rows,
+        ui_scale,
+        compact_rows,
+    );
+    for section in &section_markers {
+        if section.name.ends_with(".controls") || section.name.ends_with(".commands") {
+            continue;
+        }
+        add_node_marker(document, parent, section.name.clone());
+        if !section.rows.is_empty() {
+            add_node_marker(document, parent, format!("{}.row.0", section.name));
+        }
+    }
+}
+
 fn add_view_controls(
     document: &mut UiDocument,
     parent: operad::UiNodeId,
     app: &FabricadApp,
     ui_scale: UiScale,
+    compact_rows: bool,
 ) {
     match app.active_view {
         StartupView::Layout2d | StartupView::Layout3d => add_control_panel(
@@ -5769,12 +9535,13 @@ fn add_view_controls(
             layout_editor_control_rows(app),
             ui_scale,
         ),
-        StartupView::Workflow => add_control_panel(
+        StartupView::Workflow => add_control_panel_with_button_width(
             document,
             parent,
             "fabricad.viewctl.workflow",
             "Workflow Controls",
             workflow_control_rows(app),
+            116.0,
             ui_scale,
         ),
         StartupView::MaskPrep => add_control_panel(
@@ -5790,7 +9557,7 @@ fn add_view_controls(
             parent,
             "fabricad.viewctl.layout_diff",
             "Layout Diff Controls",
-            layout_diff_control_rows(app),
+            layout_diff_control_rows(app, compact_rows),
             ui_scale,
         ),
         StartupView::FabControl => add_control_panel(
@@ -5798,7 +9565,7 @@ fn add_view_controls(
             parent,
             "fabricad.viewctl.fab",
             "Fab Control",
-            fab_control_rows(app),
+            fab_control_rows(app, compact_rows),
             ui_scale,
         ),
         StartupView::Maintenance => add_control_panel(
@@ -5806,7 +9573,7 @@ fn add_view_controls(
             parent,
             "fabricad.viewctl.maintenance",
             "Maintenance Controls",
-            maintenance_control_rows(app),
+            maintenance_control_rows(app, compact_rows),
             ui_scale,
         ),
         StartupView::Environment => add_control_panel(
@@ -5838,7 +9605,7 @@ fn add_view_controls(
             parent,
             "fabricad.viewctl.safety",
             "Safety Controls",
-            safety_control_rows(app),
+            safety_control_rows(app, compact_rows),
             ui_scale,
         ),
         StartupView::Traceability => add_control_panel(
@@ -5846,7 +9613,7 @@ fn add_view_controls(
             parent,
             "fabricad.viewctl.trace",
             "Traceability Controls",
-            traceability_control_rows(app),
+            traceability_control_rows(app, compact_rows),
             ui_scale,
         ),
         StartupView::ProcessFlow => add_control_panel(
@@ -5870,7 +9637,7 @@ fn add_view_controls(
             parent,
             "fabricad.viewctl.spc",
             "SPC / FDC Controls",
-            spc_fdc_control_rows(app),
+            spc_fdc_control_rows(app, compact_rows),
             ui_scale,
         ),
         StartupView::CrossSection => add_control_panel(
@@ -5886,7 +9653,7 @@ fn add_view_controls(
             parent,
             "fabricad.viewctl.metrology",
             "Metrology Controls",
-            metrology_control_rows(app),
+            metrology_control_rows(app, compact_rows),
             ui_scale,
         ),
         StartupView::Yield => add_control_panel(
@@ -5894,23 +9661,25 @@ fn add_view_controls(
             parent,
             "fabricad.viewctl.yield",
             "Yield Controls",
-            yield_control_rows(app),
+            yield_control_rows(app, compact_rows),
             ui_scale,
         ),
-        StartupView::Experiment => add_control_panel(
+        StartupView::Experiment => add_control_panel_with_button_width(
             document,
             parent,
             "fabricad.viewctl.experiment",
             "DOE Controls",
-            experiment_control_rows(app),
+            experiment_control_rows(app, compact_rows),
+            132.0,
             ui_scale,
         ),
-        StartupView::Notebook => add_control_panel(
+        StartupView::Notebook => add_control_panel_with_button_width(
             document,
             parent,
             "fabricad.viewctl.notebook",
             "Notebook Controls",
-            notebook_control_rows(app),
+            notebook_control_rows(app, compact_rows),
+            132.0,
             ui_scale,
         ),
     }
@@ -5920,55 +9689,227 @@ fn add_primary_view_panel(
     document: &mut UiDocument,
     parent: operad::UiNodeId,
     app: &FabricadApp,
+    viewport: UiSize,
     ui_scale: UiScale,
+    compact_rows: bool,
+    wide_rows: bool,
+    body_width: f32,
 ) {
     match app.active_view {
         StartupView::Layout2d | StartupView::Layout3d => {
-            document.add_child(
+            let strip_height = tool_strip_height(app.active_view, viewport.width, ui_scale);
+            let preview_height =
+                (viewport.height - ui_scale.value(30.0) - strip_height - ui_scale.value(70.0))
+                    .max(ui_scale.value(360.0));
+            let layout_inspector_width = if body_width >= ui_scale.value(760.0) {
+                ui_scale.value(270.0)
+            } else {
+                0.0
+            };
+            let layout_workspace_gap = if layout_inspector_width > 0.0 {
+                ui_scale.value(8.0)
+            } else {
+                0.0
+            };
+            let preview_width =
+                (body_width - layout_inspector_width - layout_workspace_gap - ui_scale.value(20.0))
+                    .max(ui_scale.value(1.0));
+            let workspace = document.add_child(
                 parent,
-                UiNode::scene(
-                    "fabricad.layout.preview",
-                    layout_preview_primitives(
-                        &app.workspace.document,
-                        app.selected_layout_shape,
-                        ui_scale,
-                    ),
-                    layout::with_size(
-                        layout::row(),
-                        layout::percent(1.0),
-                        layout::px(ui_scale.value(360.0)),
-                    ),
+                UiNode::container(
+                    "fabricad.layout.workspace",
+                    UiNodeStyle {
+                        layout: fixed_height_layout(
+                            layout::with_size(
+                                layout::with_gap_all(layout::row(), layout_workspace_gap),
+                                layout::percent(1.0),
+                                layout::px(preview_height),
+                            ),
+                            preview_height,
+                        )
+                        .as_taffy_style()
+                        .clone(),
+                        clip: ClipBehavior::Clip,
+                        ..Default::default()
+                    },
+                ),
+            );
+            if layout_inspector_width > 0.0 {
+                add_layout_inspector_rail(
+                    document,
+                    workspace,
+                    app,
+                    layout_inspector_width,
+                    preview_height,
+                    ui_scale,
+                );
+            }
+            let viewport_stack = document.add_child(
+                workspace,
+                UiNode::container(
+                    "fabricad.layout.viewport_stack",
+                    UiNodeStyle {
+                        layout: fixed_row_child_layout(
+                            layout::with_size(
+                                layout::column(),
+                                layout::px(preview_width),
+                                layout::px(preview_height),
+                            ),
+                            preview_width,
+                            preview_height,
+                        )
+                        .as_taffy_style()
+                        .clone(),
+                        clip: ClipBehavior::Clip,
+                        ..Default::default()
+                    },
                 )
                 .with_visual(UiVisual::panel(
-                    ColorRgba::new(18, 24, 30, 255),
-                    Some(StrokeStyle::new(
-                        ColorRgba::new(54, 68, 82, 255),
-                        ui_scale.value(1.0),
-                    )),
-                    ui_scale.value(4.0),
+                    COLOR_APP_BG,
+                    Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
+                    ui_scale.value(2.0),
                 )),
             );
+            let canvas_key = if app.active_view == StartupView::Layout3d {
+                "fabricad.layout.viewport.3d"
+            } else {
+                "fabricad.layout.viewport.2d"
+            };
+            let canvas_layout = layout::with_absolute_position(
+                layout::with_size(layout::row(), layout::percent(1.0), layout::percent(1.0)),
+                0.0,
+                0.0,
+            );
+            let mut canvas_node = if app.active_view == StartupView::Layout3d {
+                UiNode::gpu_canvas("fabricad.layout.preview", canvas_key, canvas_layout)
+            } else {
+                UiNode::canvas("fabricad.layout.preview", canvas_key, canvas_layout)
+            };
+            if let UiContent::Canvas(canvas) = &mut canvas_node.content {
+                canvas.interaction = CanvasInteractionPolicy::EDITOR;
+            }
+            let canvas_label = if app.active_view == StartupView::Layout3d {
+                "3D layout viewport"
+            } else {
+                "2D layout viewport"
+            };
+            document.add_child(
+                viewport_stack,
+                canvas_node.with_accessibility(
+                    AccessibilityMeta::new(AccessibilityRole::EditorSurface)
+                        .label(canvas_label)
+                        .focusable()
+                        .action(AccessibilityAction::new("interact", "Interact")),
+                ),
+            );
+            if app.active_view == StartupView::Layout2d {
+                document.add_child(
+                    viewport_stack,
+                    UiNode::scene(
+                        "fabricad.layout.overlay",
+                        layout_overlay_primitives(
+                            app,
+                            UiSize::new(preview_width, preview_height),
+                            ui_scale,
+                        ),
+                        layout::with_absolute_position(
+                            layout::size(layout::percent(1.0), layout::percent(1.0)),
+                            0.0,
+                            0.0,
+                        ),
+                    ),
+                );
+                add_text(
+                    document,
+                    viewport_stack,
+                    "fabricad.layout.fps",
+                    format_fps_label(app.layout_frame_ms.get()),
+                    text_style(ui_scale.value(12.0), FontWeight::NORMAL, COLOR_TEXT_MUTED),
+                    layout::with_absolute_position(
+                        layout::size(
+                            layout::px(ui_scale.value(96.0)),
+                            layout::px(ui_scale.value(18.0)),
+                        ),
+                        ui_scale.value(8.0),
+                        (preview_height - ui_scale.value(24.0)).max(0.0),
+                    ),
+                );
+            } else {
+                document.add_child(
+                    viewport_stack,
+                    UiNode::scene(
+                        "fabricad.layout.3d.overlay",
+                        vec![ScenePrimitive::Text(PaintText::new(
+                            "3D Stack | click to capture flycam | mouse look | WASD move | Q/E down/up | Esc release",
+                            UiRect::new(
+                                ui_scale.value(8.0),
+                                ui_scale.value(4.0),
+                                ui_scale.value(620.0),
+                                ui_scale.value(18.0),
+                            ),
+                            text_style(ui_scale.value(12.0), FontWeight::NORMAL, COLOR_TEXT_MUTED),
+                        ))],
+                        layout::with_absolute_position(
+                            layout::size(layout::percent(1.0), layout::px(ui_scale.value(22.0))),
+                            0.0,
+                            0.0,
+                        ),
+                    ),
+                );
+            }
         }
-        StartupView::Workflow => add_workflow_view_panel(document, parent, app, ui_scale),
-        StartupView::MaskPrep => add_mask_view_panel(document, parent, app, ui_scale),
-        StartupView::LayoutDiff => add_layout_diff_view_panel(document, parent, app, ui_scale),
-        StartupView::FabControl => add_fab_control_view_panel(document, parent, app, ui_scale),
-        StartupView::Maintenance => add_maintenance_view_panel(document, parent, app, ui_scale),
-        StartupView::Inventory => add_inventory_view_panel(document, parent, app, ui_scale),
-        StartupView::Safety => add_safety_view_panel(document, parent, app, ui_scale),
-        StartupView::Traceability => add_traceability_view_panel(document, parent, app, ui_scale),
-        StartupView::CrossSection => add_cross_section_view_panel(document, parent, app, ui_scale),
-        StartupView::ProcessFlow => add_process_flow_view_panel(document, parent, app, ui_scale),
+        StartupView::Workflow => {
+            add_workflow_view_panel(document, parent, app, ui_scale, compact_rows)
+        }
+        StartupView::MaskPrep => add_mask_view_panel(document, parent, app, ui_scale, compact_rows),
+        StartupView::LayoutDiff => {
+            add_layout_diff_view_panel(document, parent, app, ui_scale, compact_rows)
+        }
+        StartupView::FabControl => {
+            add_fab_control_view_panel(document, parent, app, ui_scale, compact_rows)
+        }
+        StartupView::Maintenance => add_maintenance_view_panel(
+            document,
+            parent,
+            app,
+            ui_scale,
+            compact_rows,
+            wide_rows,
+            body_width,
+        ),
+        StartupView::Inventory => {
+            add_inventory_view_panel(document, parent, app, ui_scale, compact_rows)
+        }
+        StartupView::Safety => add_safety_view_panel(document, parent, app, ui_scale, compact_rows),
+        StartupView::Traceability => {
+            add_traceability_view_panel(document, parent, app, ui_scale, compact_rows)
+        }
+        StartupView::CrossSection => {
+            add_cross_section_view_panel(document, parent, app, ui_scale, compact_rows, body_width)
+        }
+        StartupView::ProcessFlow => {
+            add_process_flow_view_panel(document, parent, app, ui_scale, compact_rows, body_width)
+        }
         StartupView::Scheduler => add_scheduler_view_panel(document, parent, app, ui_scale),
-        StartupView::Environment => add_environment_view_panel(document, parent, app, ui_scale),
-        StartupView::Metrology => add_metrology_view_panel(document, parent, app, ui_scale),
-        StartupView::Yield => add_yield_view_panel(document, parent, app, ui_scale),
-        StartupView::SpcFdc => add_spc_fdc_view_panel(document, parent, app, ui_scale),
-        StartupView::Experiment => add_experiment_view_panel(document, parent, app, ui_scale),
-        StartupView::ProcessControl => {
-            add_process_control_view_panel(document, parent, app, ui_scale)
+        StartupView::Environment => {
+            add_environment_view_panel(document, parent, app, ui_scale, compact_rows)
         }
-        StartupView::Notebook => add_notebook_view_panel(document, parent, app, ui_scale),
+        StartupView::Metrology => {
+            add_metrology_view_panel(document, parent, app, ui_scale, compact_rows)
+        }
+        StartupView::Yield => add_yield_view_panel(document, parent, app, ui_scale, compact_rows),
+        StartupView::SpcFdc => {
+            add_spc_fdc_view_panel(document, parent, app, ui_scale, compact_rows)
+        }
+        StartupView::Experiment => {
+            add_experiment_view_panel(document, parent, app, ui_scale, compact_rows)
+        }
+        StartupView::ProcessControl => {
+            add_process_control_view_panel(document, parent, app, ui_scale, compact_rows)
+        }
+        StartupView::Notebook => {
+            add_notebook_view_panel(document, parent, app, ui_scale, compact_rows)
+        }
     }
 }
 
@@ -5977,15 +9918,60 @@ fn add_workflow_view_panel(
     parent: operad::UiNodeId,
     app: &FabricadApp,
     ui_scale: UiScale,
+    compact_rows: bool,
 ) {
-    add_overview_view_panel(
+    add_domain_panel(
         document,
         parent,
-        "fabricad.workflow.dashboard",
-        "Workflow Dashboard",
-        workflow_dashboard_metrics(app),
-        workflow_primary_rows(app),
+        "Fab Workflow",
+        "Workspace workflow, production focus, route operations, and cross-links",
+        "Fab Workflow",
+        vec![
+            DomainSection::new(
+                "fabricad.workflow.dashboard",
+                "Workflow Summary",
+                "No workflow summary available",
+                dashboard_metric_rows("workflow", workflow_dashboard_metrics(app)),
+            )
+            .max_rows(5),
+            DomainSection::new(
+                "fabricad.workflow.actions",
+                "Actions",
+                "No workflow actions available",
+                workflow_action_rows(app),
+            )
+            .max_rows(6),
+            DomainSection::new(
+                "fabricad.workflow.lots",
+                "Lot Focus",
+                "No lot focus targets",
+                workflow_lot_rows(app),
+            )
+            .max_rows(6),
+            DomainSection::new(
+                "fabricad.workflow.focus",
+                "Production Focus",
+                "No workspace data loaded",
+                workflow_focus_rows(app),
+            )
+            .max_rows(6),
+            DomainSection::new(
+                "fabricad.workflow.spine",
+                "Operational Workflow",
+                "No workflow steps loaded",
+                workflow_spine_rows(app),
+            )
+            .max_rows(6),
+            DomainSection::new(
+                "fabricad.workflow.cross_links",
+                "Cross-links",
+                "No workflow cross-links available",
+                workflow_cross_link_rows(app),
+            )
+            .max_rows(6),
+        ],
         ui_scale,
+        compact_rows,
     );
 }
 
@@ -5994,15 +9980,62 @@ fn add_mask_view_panel(
     parent: operad::UiNodeId,
     app: &FabricadApp,
     ui_scale: UiScale,
+    compact_rows: bool,
 ) {
-    add_overview_view_panel(
+    let prep = reticle_prep_for_app(app);
+    let report = mask_check_report(app);
+    add_domain_panel(
         document,
         parent,
-        "fabricad.mask.overview",
-        "Mask Prep Overview",
-        mask_dashboard_metrics(app),
-        mask_primary_rows(app),
+        "Mask / Reticle Prep",
+        "Reticle prep, layer stack, exposure blocks, fields, and retained mask checks",
+        "Mask / Reticle Prep",
+        vec![
+            DomainSection::new(
+                "fabricad.mask.overview",
+                "Reticle Prep Summary",
+                "No reticle prep summary available",
+                dashboard_metric_rows("mask", mask_dashboard_metrics(app, compact_rows)),
+            )
+            .max_rows(5),
+            DomainSection::new(
+                "fabricad.mask.controls",
+                "Reticle Prep Controls",
+                "No mask controls available",
+                control_rows_to_primary("mask-control", mask_prep_control_rows(app)),
+            )
+            .max_rows(8),
+            DomainSection::new(
+                "fabricad.mask.reticle",
+                "Reticle",
+                "No reticle data available",
+                mask_reticle_rows(&prep),
+            )
+            .max_rows(5),
+            DomainSection::new(
+                "fabricad.mask.fields",
+                "Reticle Fields",
+                "No reticle fields available",
+                mask_primary_rows(app),
+            )
+            .max_rows(6),
+            DomainSection::new(
+                "fabricad.mask.layers",
+                "Mask Layers",
+                "No mask layers available",
+                mask_layer_rows(&prep),
+            )
+            .max_rows(8),
+            DomainSection::new(
+                "fabricad.mask.checks",
+                "Mask Checks",
+                "No retained mask checks",
+                mask_primary_rows(app),
+            )
+            .max_rows(8),
+        ],
         ui_scale,
+        compact_rows,
     );
 }
 
@@ -6011,15 +10044,47 @@ fn add_layout_diff_view_panel(
     parent: operad::UiNodeId,
     app: &FabricadApp,
     ui_scale: UiScale,
+    compact_rows: bool,
 ) {
-    add_overview_view_panel(
+    let report = layout_diff_report(app);
+    add_domain_panel(
         document,
         parent,
-        "fabricad.layout_diff.overview",
-        "Layout Diff Overview",
-        layout_diff_dashboard_metrics(app),
-        layout_diff_primary_rows(app),
+        "Layout Diff Review",
+        "Baseline/candidate comparison, layer deltas, change paging, and review state",
+        "Layout Diff Review",
+        vec![
+            DomainSection::new(
+                "fabricad.layout_diff.overview",
+                "Diff Summary",
+                "No diff summary available",
+                dashboard_metric_rows("diff", layout_diff_dashboard_metrics(app)),
+            )
+            .max_rows(5),
+            DomainSection::new(
+                "fabricad.layout_diff.controls",
+                "Diff Controls",
+                "No diff controls available",
+                control_rows_to_primary("diff-control", layout_diff_control_rows(app, false)),
+            )
+            .max_rows(8),
+            DomainSection::new(
+                "fabricad.layout_diff.layers",
+                "Changed Layers",
+                "No layer changes available",
+                layout_diff_primary_rows(app),
+            )
+            .max_rows(8),
+            DomainSection::new(
+                "fabricad.layout_diff.changes",
+                "Shape Changes",
+                "No shape changes match the active filters",
+                layout_diff_primary_rows(app),
+            )
+            .max_rows(10),
+        ],
         ui_scale,
+        compact_rows,
     );
 }
 
@@ -6028,15 +10093,48 @@ fn add_fab_control_view_panel(
     parent: operad::UiNodeId,
     app: &FabricadApp,
     ui_scale: UiScale,
+    compact_rows: bool,
 ) {
-    add_overview_view_panel(
+    add_domain_panel(
         document,
         parent,
-        "fabricad.fab_control.overview",
-        "Fab Control Overview",
-        fab_control_dashboard_metrics(app),
-        fab_primary_rows(app),
+        "Fab Control Room",
+        "Equipment state, recipe loading, host commands, alarms, and telemetry",
+        "Fab Control Room",
+        vec![
+            DomainSection::new(
+                "fabricad.fab_control.overview",
+                "Tool Summary",
+                "No equipment summary available",
+                dashboard_metric_rows("fab", fab_control_dashboard_metrics(app)),
+            )
+            .max_rows(5),
+            DomainSection::new(
+                "fabricad.fab_control.tools",
+                "Tool Fleet",
+                "No equipment tools loaded",
+                fab_tool_rows(app),
+            )
+            .max_rows(8),
+            DomainSection::new(
+                "fabricad.fab_control.commands",
+                "Tool Commands",
+                "No tool commands available",
+                control_rows_to_primary("fab-control", fab_control_rows(app, false)),
+            )
+            .max_rows(10),
+            DomainSection::new(
+                "fabricad.fab_control.detail",
+                "Selected Tool",
+                "No tool selected",
+                selected_equipment_tool(app)
+                    .map(fab_selected_tool_rows)
+                    .unwrap_or_default(),
+            )
+            .max_rows(10),
+        ],
         ui_scale,
+        compact_rows,
     );
 }
 
@@ -6045,16 +10143,1022 @@ fn add_maintenance_view_panel(
     parent: operad::UiNodeId,
     app: &FabricadApp,
     ui_scale: UiScale,
+    compact_rows: bool,
+    wide_rows: bool,
+    body_width: f32,
 ) {
-    add_overview_view_panel(
-        document,
+    let today = maintenance_today(&app.workspace);
+    let stacked_workbench = compact_rows || !wide_rows || body_width < ui_scale.value(1600.0);
+    let panel_height = if compact_rows {
+        840.0
+    } else if stacked_workbench {
+        820.0
+    } else {
+        646.0
+    };
+    let workbench_height = if compact_rows {
+        520.0
+    } else if stacked_workbench {
+        540.0
+    } else {
+        372.0
+    };
+    let panel = document.add_child(
         parent,
-        "fabricad.maintenance.overview",
-        "Maintenance Overview",
-        maintenance_dashboard_metrics(app),
-        maintenance_primary_rows(app),
+        UiNode::container(
+            "fabricad.maintenance.overview",
+            layout::with_padding_all(
+                layout::with_gap_all(
+                    layout::with_size(
+                        layout::column(),
+                        layout::percent(1.0),
+                        layout::px(ui_scale.value(panel_height)),
+                    ),
+                    ui_scale.value(8.0),
+                ),
+                ui_scale.value(10.0),
+            ),
+        )
+        .with_visual(UiVisual::panel(
+            COLOR_PANEL_BG,
+            Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
+            ui_scale.value(2.0),
+        )),
+    );
+    add_text(
+        document,
+        panel,
+        "fabricad.maintenance.title",
+        if compact_rows {
+            "Maintenance and Calibration"
+        } else {
+            "Fab operations - Maintenance and Calibration"
+        },
+        text_style(ui_scale.value(15.0), FontWeight::BOLD, COLOR_TEXT),
+        layout::size(layout::percent(1.0), layout::px(ui_scale.value(24.0))),
+    );
+    add_text(
+        document,
+        panel,
+        "fabricad.maintenance.subtitle",
+        if compact_rows {
+            format!(
+                "{today} - {} tools / {} locked",
+                app.workspace.maintenance.tools.len(),
+                maintenance_locked_count(&app.workspace)
+            )
+        } else {
+            format!(
+                "Audit date {today} - {} tools tracked - {} locked",
+                app.workspace.maintenance.tools.len(),
+                maintenance_locked_count(&app.workspace)
+            )
+        },
+        text_style(ui_scale.value(12.0), FontWeight::NORMAL, COLOR_TEXT_MUTED),
+        layout::size(layout::percent(1.0), layout::px(ui_scale.value(20.0))),
+    );
+
+    if app.workspace.maintenance.tools.is_empty() {
+        add_primary_cell(
+            document,
+            panel,
+            "fabricad.maintenance.empty",
+            "No maintenance model loaded",
+            1.0,
+            false,
+            ui_scale,
+        );
+        return;
+    }
+
+    add_maintenance_summary_row(document, panel, app, today, ui_scale, compact_rows);
+
+    let workbench = document.add_child(
+        panel,
+        UiNode::container(
+            "fabricad.maintenance.workbench",
+            layout::with_gap_all(
+                layout::with_size(
+                    if stacked_workbench {
+                        layout::column()
+                    } else {
+                        layout::row()
+                    },
+                    layout::percent(1.0),
+                    layout::px(ui_scale.value(workbench_height)),
+                ),
+                ui_scale.value(10.0),
+            ),
+        ),
+    );
+    add_maintenance_queue_panel(document, workbench, app, ui_scale, compact_rows);
+    if compact_rows {
+        return;
+    }
+    add_maintenance_detail_panel(document, workbench, app, today, ui_scale);
+    add_maintenance_audit_panel(document, workbench, app, today, ui_scale);
+}
+
+struct MaintenanceWorkItem<'a> {
+    tool: &'a layout_model::maintenance::ToolMaintenanceState,
+    schedule: &'a layout_model::maintenance::MaintenanceSchedule,
+    due_state: DueState,
+    days_until: i32,
+    run_count_delta: Option<u32>,
+    release_state: ToolReleaseState,
+    blocked: bool,
+}
+
+fn maintenance_work_items(app: &FabricadApp) -> Vec<MaintenanceWorkItem<'_>> {
+    let today = maintenance_today(&app.workspace);
+    let mut items = Vec::new();
+    for tool in &app.workspace.maintenance.tools {
+        let release = app
+            .workspace
+            .maintenance
+            .release_for_tool(&tool.tool_id, today);
+        for schedule in &tool.schedules {
+            let due_state = schedule.due_state(today, tool.run_count);
+            if !maintenance_work_matches(
+                &app.workspace,
+                app.maintenance_work_filter,
+                &tool.tool_id,
+                schedule.kind,
+                due_state,
+                schedule.next_due,
+            ) {
+                continue;
+            }
+            items.push(MaintenanceWorkItem {
+                tool,
+                schedule,
+                due_state,
+                days_until: today.days_until(schedule.next_due),
+                run_count_delta: schedule.interval_runs.map(|_| {
+                    tool.run_count
+                        .saturating_sub(schedule.last_completed_run_count)
+                }),
+                release_state: release.state,
+                blocked: !release.state.released_to_production(),
+            });
+        }
+    }
+    items.sort_by_key(|item| {
+        (
+            maintenance_due_priority(item.due_state),
+            item.schedule.next_due,
+            item.tool.tool_id.to_string(),
+            item.schedule.id.clone(),
+        )
+    });
+    items
+}
+
+fn maintenance_due_priority(state: DueState) -> u8 {
+    match state {
+        DueState::Overdue => 0,
+        DueState::Due => 1,
+        DueState::NotDue => 2,
+    }
+}
+
+fn maintenance_due_window_label(days_until: i32) -> String {
+    if days_until < 0 {
+        format!("{} days overdue", days_until.abs())
+    } else if days_until == 0 {
+        "today".to_string()
+    } else if days_until == 1 {
+        "tomorrow".to_string()
+    } else {
+        format!("in {days_until} days")
+    }
+}
+
+fn add_maintenance_summary_row(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    app: &FabricadApp,
+    today: FabDate,
+    ui_scale: UiScale,
+    compact_rows: bool,
+) {
+    let mut overdue = 0;
+    let mut due_now = 0;
+    let mut due_soon = 0;
+    let mut calibration_watch = 0;
+    for tool in &app.workspace.maintenance.tools {
+        for schedule in &tool.schedules {
+            let due_state = schedule.due_state(today, tool.run_count);
+            let days_until = today.days_until(schedule.next_due);
+            match due_state {
+                DueState::Overdue => overdue += 1,
+                DueState::Due => due_now += 1,
+                DueState::NotDue if days_until <= 7 => due_soon += 1,
+                DueState::NotDue => {}
+            }
+            if schedule.kind == MaintenanceKind::Calibration
+                && (due_state.blocks_release() || days_until <= 14)
+            {
+                calibration_watch += 1;
+            }
+        }
+        if app
+            .workspace
+            .maintenance
+            .calibration_records_for(&tool.tool_id)
+            .into_iter()
+            .max_by_key(|record| record.performed_at)
+            .is_some_and(|record| {
+                record.outcome != layout_model::maintenance::CalibrationOutcome::Passed
+            })
+        {
+            calibration_watch += 1;
+        }
+    }
+
+    if compact_rows {
+        add_compact_metric_rows(
+            document,
+            parent,
+            "fabricad.maintenance.summary",
+            &[
+                format!("Overdue: {overdue}"),
+                format!("Due now: {due_now}"),
+                format!("Due soon: {due_soon}"),
+                format!(
+                    "Cal: {calibration_watch} / Locked: {}",
+                    maintenance_locked_count(&app.workspace)
+                ),
+            ],
+            ui_scale,
+        );
+        return;
+    }
+    let summary_items = [
+        format!("Overdue: {overdue} release risk"),
+        format!("Due now: {due_now} needs action"),
+        format!("Due soon: {due_soon} next 7 days"),
+        format!("Calibration watch: {calibration_watch}"),
+        format!("Locked: {}", maintenance_locked_count(&app.workspace)),
+    ];
+
+    let row = document.add_child(
+        parent,
+        UiNode::container(
+            "fabricad.maintenance.summary",
+            layout::with_gap_all(
+                layout::with_size(
+                    layout::row(),
+                    layout::percent(1.0),
+                    layout::px(ui_scale.value(42.0)),
+                ),
+                ui_scale.value(8.0),
+            ),
+        ),
+    );
+    for (index, text) in summary_items.into_iter().enumerate() {
+        add_primary_cell(
+            document,
+            row,
+            format!("fabricad.maintenance.summary.{index}"),
+            text,
+            1.0,
+            false,
+            ui_scale,
+        );
+    }
+}
+
+fn add_maintenance_queue_panel(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    app: &FabricadApp,
+    ui_scale: UiScale,
+    compact_rows: bool,
+) {
+    let queue = document.add_child(
+        parent,
+        UiNode::container(
+            "fabricad.maintenance.queue",
+            layout::with_padding_all(
+                layout::with_gap_all(
+                    layout::with_size(
+                        layout::with_flex(layout::column(), 1.35, 1.0, layout::px(0.0)),
+                        layout::auto(),
+                        layout::percent(1.0),
+                    ),
+                    ui_scale.value(6.0),
+                ),
+                ui_scale.value(8.0),
+            ),
+        )
+        .with_visual(UiVisual::panel(
+            COLOR_APP_BG,
+            Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
+            ui_scale.value(2.0),
+        ))
+        .with_scroll(ScrollAxes::VERTICAL),
+    );
+    add_text(
+        document,
+        queue,
+        "fabricad.maintenance.queue.title",
+        "Maintenance Queue",
+        text_style(ui_scale.value(13.0), FontWeight::BOLD, COLOR_TEXT),
+        layout::size(layout::percent(1.0), layout::px(ui_scale.value(22.0))),
+    );
+    let work_items = maintenance_work_items(app);
+    if work_items.is_empty() {
+        add_primary_cell(
+            document,
+            queue,
+            "fabricad.maintenance.queue.empty",
+            "No maintenance tasks match the current filter",
+            1.0,
+            false,
+            ui_scale,
+        );
+        return;
+    }
+    if compact_rows {
+        for (index, item) in work_items.iter().take(8).enumerate() {
+            add_maintenance_work_card(document, queue, app, item, index, ui_scale);
+        }
+        return;
+    }
+    add_inventory_table_header(
+        document,
+        queue,
+        "fabricad.maintenance.queue.header",
+        &[
+            ("State", 0.85),
+            ("Tool", 0.9),
+            ("Kind", 1.0),
+            ("Task", 1.8),
+            ("Due", 1.15),
+            ("Release", 1.25),
+        ],
         ui_scale,
     );
+    for (index, item) in work_items.iter().take(8).enumerate() {
+        let row = add_inventory_table_row(
+            document,
+            queue,
+            format!("fabricad.maintenance.queue.row.{index}"),
+            index,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            row,
+            format!("fabricad.maintenance.queue.row.{index}.state"),
+            item.due_state.label(),
+            0.85,
+            false,
+            ui_scale,
+        );
+        add_button(
+            document,
+            row,
+            format!(
+                "fabricad.primary.action.maintqueue{index}.maintenance.tool.{}",
+                item.tool.tool_id
+            ),
+            item.tool.tool_id.to_string(),
+            app.selected_maintenance_tool.as_ref() == Some(&item.tool.tool_id),
+            primary_cell_layout(0.9),
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            row,
+            format!("fabricad.maintenance.queue.row.{index}.kind"),
+            item.schedule.kind.label(),
+            1.0,
+            false,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            row,
+            format!("fabricad.maintenance.queue.row.{index}.task"),
+            compact_button_label(
+                &item
+                    .run_count_delta
+                    .map(|runs| format!("{} - {} runs", item.schedule.task, runs))
+                    .unwrap_or_else(|| item.schedule.task.clone()),
+                32,
+            ),
+            1.8,
+            false,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            row,
+            format!("fabricad.maintenance.queue.row.{index}.due"),
+            format!(
+                "{} ({})",
+                item.schedule.next_due,
+                maintenance_due_window_label(item.days_until)
+            ),
+            1.15,
+            false,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            row,
+            format!("fabricad.maintenance.queue.row.{index}.release"),
+            if item.blocked {
+                format!("{} hold", item.release_state.label())
+            } else {
+                item.release_state.label().to_string()
+            },
+            1.25,
+            false,
+            ui_scale,
+        );
+    }
+}
+
+fn add_maintenance_work_card(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    app: &FabricadApp,
+    item: &MaintenanceWorkItem<'_>,
+    index: usize,
+    ui_scale: UiScale,
+) {
+    let row_name = format!("fabricad.maintenance.queue.row.{index}");
+    let row = document.add_child(
+        parent,
+        UiNode::container(
+            row_name.clone(),
+            layout::with_gap_all(
+                layout::with_size(
+                    layout::column(),
+                    layout::percent(1.0),
+                    layout::px(ui_scale.value(84.0)),
+                ),
+                ui_scale.value(4.0),
+            ),
+        )
+        .with_visual(UiVisual::panel(
+            if index % 2 == 0 {
+                COLOR_PANEL_ALT
+            } else {
+                COLOR_PANEL_BG
+            },
+            Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
+            ui_scale.value(2.0),
+        )),
+    );
+    add_button(
+        document,
+        row,
+        format!(
+            "fabricad.primary.action.maintqueue{index}.maintenance.tool.{}",
+            item.tool.tool_id
+        ),
+        compact_button_label(
+            &format!(
+                "{} {} {}",
+                item.due_state.label(),
+                item.tool.tool_id,
+                item.schedule.kind.label()
+            ),
+            42,
+        ),
+        app.selected_maintenance_tool.as_ref() == Some(&item.tool.tool_id),
+        layout::size(layout::percent(1.0), layout::px(ui_scale.value(30.0))),
+        ui_scale,
+    );
+    add_primary_text_cell(
+        document,
+        row,
+        format!("{row_name}.task"),
+        compact_button_label(
+            &item
+                .run_count_delta
+                .map(|runs| format!("{} - {} runs", item.schedule.task, runs))
+                .unwrap_or_else(|| item.schedule.task.clone()),
+            54,
+        ),
+        false,
+        ui_scale,
+        layout::with_padding_all(
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(24.0))),
+            ui_scale.value(7.0),
+        ),
+    );
+    add_primary_text_cell(
+        document,
+        row,
+        format!("{row_name}.due"),
+        compact_button_label(
+            &format!(
+                "{} ({}) / {}",
+                item.schedule.next_due,
+                maintenance_due_window_label(item.days_until),
+                if item.blocked {
+                    format!("{} hold", item.release_state.label())
+                } else {
+                    item.release_state.label().to_string()
+                }
+            ),
+            54,
+        ),
+        false,
+        ui_scale,
+        layout::with_padding_all(
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(24.0))),
+            ui_scale.value(7.0),
+        ),
+    );
+}
+
+fn add_maintenance_detail_panel(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    app: &FabricadApp,
+    today: FabDate,
+    ui_scale: UiScale,
+) {
+    let detail = document.add_child(
+        parent,
+        UiNode::container(
+            "fabricad.maintenance.detail",
+            layout::with_padding_all(
+                layout::with_gap_all(
+                    layout::with_size(
+                        layout::with_flex(layout::column(), 1.05, 1.0, layout::px(0.0)),
+                        layout::auto(),
+                        layout::percent(1.0),
+                    ),
+                    ui_scale.value(6.0),
+                ),
+                ui_scale.value(8.0),
+            ),
+        )
+        .with_visual(UiVisual::panel(
+            COLOR_APP_BG,
+            Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
+            ui_scale.value(2.0),
+        )),
+    );
+    add_text(
+        document,
+        detail,
+        "fabricad.maintenance.detail.title",
+        "Tool Detail",
+        text_style(ui_scale.value(13.0), FontWeight::BOLD, COLOR_TEXT),
+        layout::size(layout::percent(1.0), layout::px(ui_scale.value(22.0))),
+    );
+    let Some(tool) = selected_maintenance_tool(app) else {
+        add_primary_cell(
+            document,
+            detail,
+            "fabricad.maintenance.detail.empty",
+            "No tool selected",
+            1.0,
+            false,
+            ui_scale,
+        );
+        return;
+    };
+    let release = app
+        .workspace
+        .maintenance
+        .release_for_tool(&tool.tool_id, today);
+    add_button(
+        document,
+        detail,
+        format!(
+            "fabricad.primary.action.maintdetailtool.maintenance.tool.{}",
+            tool.tool_id
+        ),
+        tool.tool_name.clone(),
+        true,
+        layout::size(layout::percent(1.0), layout::px(ui_scale.value(32.0))),
+        ui_scale,
+    );
+    for (index, text) in [
+        format!(
+            "{} - {} runs - {}",
+            tool.tool_id,
+            tool.run_count,
+            release.state.label()
+        ),
+        if release.reasons.is_empty() {
+            "Release context: no active holds".to_string()
+        } else {
+            format!(
+                "Release hold: {}",
+                release
+                    .reasons
+                    .iter()
+                    .take(2)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        add_primary_cell(
+            document,
+            detail,
+            format!("fabricad.maintenance.detail.context.{index}"),
+            compact_button_label(&text, 58),
+            1.0,
+            false,
+            ui_scale,
+        );
+    }
+
+    let actions = document.add_child(
+        detail,
+        UiNode::container(
+            "fabricad.maintenance.detail.actions",
+            layout::with_gap_all(
+                layout::with_size(
+                    layout::row(),
+                    layout::percent(1.0),
+                    layout::px(ui_scale.value(32.0)),
+                ),
+                ui_scale.value(6.0),
+            ),
+        ),
+    );
+    add_button(
+        document,
+        actions,
+        format!(
+            "fabricad.primary.action.maintstatusschedule.maintenance.status.schedule|{}",
+            tool.tool_id
+        ),
+        "Schedule maintenance",
+        false,
+        primary_cell_layout(1.1),
+        ui_scale,
+    );
+    if tool
+        .schedules
+        .iter()
+        .any(|schedule| schedule.kind == MaintenanceKind::Calibration)
+        || release.state == ToolReleaseState::CalibrationLockout
+    {
+        add_button(
+            document,
+            actions,
+            format!(
+                "fabricad.primary.action.maintstatuscalibration.maintenance.status.calibration|{}",
+                tool.tool_id
+            ),
+            "Capture calibration",
+            false,
+            primary_cell_layout(1.0),
+            ui_scale,
+        );
+    }
+    if !release.state.released_to_production() {
+        add_button(
+            document,
+            actions,
+            format!(
+                "fabricad.primary.action.maintstatusrelease.maintenance.status.release|{}",
+                tool.tool_id
+            ),
+            "Resolve release hold",
+            false,
+            primary_cell_layout(1.0),
+            ui_scale,
+        );
+    }
+
+    add_text(
+        document,
+        detail,
+        "fabricad.maintenance.detail.next.title",
+        "Next Work",
+        text_style(ui_scale.value(12.0), FontWeight::BOLD, COLOR_TEXT_MUTED),
+        layout::size(layout::percent(1.0), layout::px(ui_scale.value(20.0))),
+    );
+    if let Some(schedule) = tool.schedules.iter().min_by_key(|schedule| {
+        (
+            maintenance_due_priority(schedule.due_state(today, tool.run_count)),
+            schedule.next_due,
+            schedule.id.clone(),
+        )
+    }) {
+        let due_state = schedule.due_state(today, tool.run_count);
+        add_primary_cell(
+            document,
+            detail,
+            "fabricad.maintenance.detail.next.row",
+            compact_button_label(
+                &format!(
+                    "{} - {} due {} ({})",
+                    schedule.task,
+                    due_state.label(),
+                    schedule.next_due,
+                    maintenance_due_window_label(today.days_until(schedule.next_due))
+                ),
+                64,
+            ),
+            1.0,
+            false,
+            ui_scale,
+        );
+        if !schedule.checklist.is_empty() {
+            add_primary_cell(
+                document,
+                detail,
+                "fabricad.maintenance.detail.checklist",
+                compact_button_label(
+                    &format!(
+                        "Checklist: {}",
+                        schedule
+                            .checklist
+                            .iter()
+                            .take(3)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    ),
+                    64,
+                ),
+                1.0,
+                false,
+                ui_scale,
+            );
+        }
+    }
+
+    if let Some(record) = app
+        .workspace
+        .maintenance
+        .calibration_records_for(&tool.tool_id)
+        .into_iter()
+        .max_by_key(|record| record.performed_at)
+    {
+        add_primary_cell(
+            document,
+            detail,
+            "fabricad.maintenance.detail.calibration",
+            compact_button_label(
+                &format!(
+                    "Latest calibration: {} {} {:.2} vs {} by {}",
+                    record.performed_at,
+                    record.parameter,
+                    record.measured_value,
+                    record.tolerance,
+                    record.technician
+                ),
+                64,
+            ),
+            1.0,
+            false,
+            ui_scale,
+        );
+    }
+    if let Some(result) = app
+        .workspace
+        .maintenance
+        .qualification_results_for(&tool.tool_id)
+        .into_iter()
+        .max_by_key(|result| result.performed_at)
+    {
+        add_primary_cell(
+            document,
+            detail,
+            "fabricad.maintenance.detail.qualification",
+            compact_button_label(
+                &format!(
+                    "Latest qualification: {} {} {} {:.2} ({})",
+                    result.performed_at, result.wafer_id, result.metric, result.value, result.spec
+                ),
+                64,
+            ),
+            1.0,
+            false,
+            ui_scale,
+        );
+    }
+}
+
+fn add_maintenance_audit_panel(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    app: &FabricadApp,
+    today: FabDate,
+    ui_scale: UiScale,
+) {
+    let audit = document.add_child(
+        parent,
+        UiNode::container(
+            "fabricad.maintenance.audit",
+            layout::with_padding_all(
+                layout::with_gap_all(
+                    layout::with_size(
+                        layout::with_flex(layout::column(), 1.0, 1.0, layout::px(0.0)),
+                        layout::auto(),
+                        layout::percent(1.0),
+                    ),
+                    ui_scale.value(6.0),
+                ),
+                ui_scale.value(8.0),
+            ),
+        )
+        .with_visual(UiVisual::panel(
+            COLOR_APP_BG,
+            Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
+            ui_scale.value(2.0),
+        )),
+    );
+    add_text(
+        document,
+        audit,
+        "fabricad.maintenance.audit.title",
+        "Release Board",
+        text_style(ui_scale.value(13.0), FontWeight::BOLD, COLOR_TEXT),
+        layout::size(layout::percent(1.0), layout::px(ui_scale.value(22.0))),
+    );
+    for (index, tool) in app.workspace.maintenance.tools.iter().take(3).enumerate() {
+        let release = app
+            .workspace
+            .maintenance
+            .release_for_tool(&tool.tool_id, today);
+        let row = add_inventory_table_row(
+            document,
+            audit,
+            format!("fabricad.maintenance.release.row.{index}"),
+            index,
+            ui_scale,
+        );
+        add_button(
+            document,
+            row,
+            format!(
+                "fabricad.primary.action.maintrelease{index}.maintenance.tool.{}",
+                tool.tool_id
+            ),
+            compact_button_label(&tool.tool_name, 28),
+            app.selected_maintenance_tool.as_ref() == Some(&tool.tool_id),
+            primary_cell_layout(1.3),
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            row,
+            format!("fabricad.maintenance.release.row.{index}.state"),
+            release.state.label(),
+            1.1,
+            false,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            row,
+            format!("fabricad.maintenance.release.row.{index}.detail"),
+            if release.reasons.is_empty() {
+                format!("{} runs; no release holds", tool.run_count)
+            } else {
+                compact_button_label(
+                    &format!(
+                        "{} runs; {}",
+                        tool.run_count,
+                        release
+                            .reasons
+                            .iter()
+                            .take(2)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    ),
+                    42,
+                )
+            },
+            1.8,
+            false,
+            ui_scale,
+        );
+    }
+
+    add_text(
+        document,
+        audit,
+        "fabricad.maintenance.history_filters.title",
+        "History Scope",
+        text_style(ui_scale.value(12.0), FontWeight::BOLD, COLOR_TEXT_MUTED),
+        layout::size(layout::percent(1.0), layout::px(ui_scale.value(20.0))),
+    );
+    let filters = document.add_child(
+        audit,
+        UiNode::container(
+            "fabricad.maintenance.history_filters",
+            layout::with_gap_all(
+                layout::with_size(
+                    layout::row(),
+                    layout::percent(1.0),
+                    layout::px(ui_scale.value(28.0)),
+                ),
+                ui_scale.value(6.0),
+            ),
+        ),
+    );
+    for filter in MaintenanceHistoryFilter::ALL {
+        add_button(
+            document,
+            filters,
+            format!(
+                "fabricad.primary.action.mainthistory{}.maintenance.history.{}",
+                filter.slug(),
+                filter.slug()
+            ),
+            filter.label(),
+            app.maintenance_history_filter == filter,
+            primary_cell_layout(1.0),
+            ui_scale,
+        );
+    }
+
+    add_text(
+        document,
+        audit,
+        "fabricad.maintenance.history.title",
+        "Maintenance History",
+        text_style(ui_scale.value(12.0), FontWeight::BOLD, COLOR_TEXT_MUTED),
+        layout::size(layout::percent(1.0), layout::px(ui_scale.value(20.0))),
+    );
+    let rows = maintenance_history_rows(app);
+    if rows.is_empty() {
+        add_primary_cell(
+            document,
+            audit,
+            "fabricad.maintenance.history.empty",
+            "No history entries match the scope",
+            1.0,
+            false,
+            ui_scale,
+        );
+    } else {
+        for (index, row_data) in rows.iter().take(3).enumerate() {
+            let row = add_inventory_table_row(
+                document,
+                audit,
+                format!("fabricad.maintenance.history.row.{index}"),
+                index,
+                ui_scale,
+            );
+            if let Some(action) = row_data.action.as_ref() {
+                let button_name = action
+                    .strip_prefix("fabricad.viewctl.")
+                    .map(|action| format!("fabricad.primary.action.mainthist{index}.{action}"))
+                    .unwrap_or_else(|| format!("fabricad.maintenance.history.row.{index}.action"));
+                add_button(
+                    document,
+                    row,
+                    button_name,
+                    compact_button_label(&row_data.title, 32),
+                    row_data.selected,
+                    primary_cell_layout(1.4),
+                    ui_scale,
+                );
+            } else {
+                add_primary_cell(
+                    document,
+                    row,
+                    format!("fabricad.maintenance.history.row.{index}.title"),
+                    compact_button_label(&row_data.title, 32),
+                    1.4,
+                    false,
+                    ui_scale,
+                );
+            }
+            add_primary_cell(
+                document,
+                row,
+                format!("fabricad.maintenance.history.row.{index}.value"),
+                compact_button_label(&row_data.value, 20),
+                0.8,
+                false,
+                ui_scale,
+            );
+            add_primary_cell(
+                document,
+                row,
+                format!("fabricad.maintenance.history.row.{index}.detail"),
+                compact_button_label(&row_data.detail, 42),
+                1.8,
+                false,
+                ui_scale,
+            );
+        }
+    }
 }
 
 fn add_inventory_view_panel(
@@ -6062,16 +11166,805 @@ fn add_inventory_view_panel(
     parent: operad::UiNodeId,
     app: &FabricadApp,
     ui_scale: UiScale,
+    compact_rows: bool,
 ) {
-    add_overview_view_panel(
-        document,
+    let visible_lots = inventory_visible_lots(app);
+    let alerts = app.workspace.inventory.alerts(INVENTORY_DEMO_TODAY);
+    let selected_lot = selected_inventory_lot(app);
+    let panel = document.add_child(
         parent,
-        "fabricad.inventory.overview",
-        "Inventory Overview",
-        inventory_dashboard_metrics(app),
-        inventory_primary_rows(app),
+        UiNode::container(
+            "fabricad.inventory.overview",
+            layout::with_padding_all(
+                layout::with_gap_all(
+                    layout::with_size(
+                        layout::column(),
+                        layout::percent(1.0),
+                        layout::px(ui_scale.value(if compact_rows { 860.0 } else { 632.0 })),
+                    ),
+                    ui_scale.value(8.0),
+                ),
+                ui_scale.value(10.0),
+            ),
+        )
+        .with_visual(UiVisual::panel(
+            COLOR_PANEL_BG,
+            Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
+            ui_scale.value(2.0),
+        )),
+    );
+    add_text(
+        document,
+        panel,
+        "fabricad.inventory.title",
+        "Materials control - Inventory Tracker",
+        text_style(ui_scale.value(15.0), FontWeight::BOLD, COLOR_TEXT),
+        layout::size(layout::percent(1.0), layout::px(ui_scale.value(24.0))),
+    );
+    add_text(
+        document,
+        panel,
+        "fabricad.inventory.subtitle",
+        format!(
+            "{} visible of {} lots / {} alert(s)",
+            visible_lots.len(),
+            app.workspace.inventory.lots.len(),
+            alerts.len()
+        ),
+        text_style(ui_scale.value(12.0), FontWeight::NORMAL, COLOR_TEXT_MUTED),
+        layout::size(layout::percent(1.0), layout::px(ui_scale.value(20.0))),
+    );
+
+    add_inventory_summary_row(document, panel, app, ui_scale, compact_rows);
+    add_inventory_alert_section(document, panel, &alerts, ui_scale, compact_rows);
+
+    let workbench = document.add_child(
+        panel,
+        UiNode::container(
+            "fabricad.inventory.workbench",
+            layout::with_gap_all(
+                layout::with_size(
+                    if compact_rows {
+                        layout::column()
+                    } else {
+                        layout::row()
+                    },
+                    layout::percent(1.0),
+                    layout::px(ui_scale.value(if compact_rows { 520.0 } else { 330.0 })),
+                ),
+                ui_scale.value(10.0),
+            ),
+        ),
+    );
+    add_inventory_lot_table(
+        document,
+        workbench,
+        app,
+        &visible_lots,
+        ui_scale,
+        compact_rows,
+    );
+    add_inventory_detail_panel(document, workbench, app, selected_lot, ui_scale);
+}
+
+fn inventory_visible_lots(app: &FabricadApp) -> Vec<&MaterialLot> {
+    app.workspace
+        .inventory
+        .sorted_lots()
+        .into_iter()
+        .filter(|lot| inventory_filter_matches(app.inventory_filter, lot))
+        .collect()
+}
+
+fn inventory_usage_count(app: &FabricadApp) -> usize {
+    app.workspace
+        .inventory
+        .lots
+        .values()
+        .map(|lot| lot.usage.len())
+        .sum()
+}
+
+fn inventory_location_count(app: &FabricadApp) -> usize {
+    app.workspace
+        .inventory
+        .lots
+        .values()
+        .map(|lot| lot.location.area.as_str())
+        .collect::<BTreeSet<_>>()
+        .len()
+}
+
+fn add_inventory_summary_row(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    app: &FabricadApp,
+    ui_scale: UiScale,
+    compact_rows: bool,
+) {
+    if compact_rows {
+        add_compact_metric_rows(
+            document,
+            parent,
+            "fabricad.inventory.summary",
+            &[
+                format!("Lots: {}", app.workspace.inventory.lots.len()),
+                format!(
+                    "Action: {} / Hold: {}",
+                    inventory_filter_count(&app.workspace, InventoryQuickFilter::NeedsAction),
+                    inventory_filter_count(&app.workspace, InventoryQuickFilter::ProductHold)
+                ),
+                format!("Locations: {}", inventory_location_count(app)),
+                format!("Usage links: {}", inventory_usage_count(app)),
+            ],
+            ui_scale,
+        );
+        return;
+    }
+    let summary_items = [
+        format!("Material lots: {}", app.workspace.inventory.lots.len()),
+        format!(
+            "Action required: {}",
+            inventory_filter_count(&app.workspace, InventoryQuickFilter::NeedsAction)
+        ),
+        format!(
+            "Product hold: {}",
+            inventory_filter_count(&app.workspace, InventoryQuickFilter::ProductHold)
+        ),
+        format!("Locations: {}", inventory_location_count(app)),
+        format!("Usage links: {}", inventory_usage_count(app)),
+    ];
+    let row = document.add_child(
+        parent,
+        UiNode::container(
+            "fabricad.inventory.summary",
+            layout::with_gap_all(
+                layout::with_size(
+                    layout::row(),
+                    layout::percent(1.0),
+                    layout::px(ui_scale.value(42.0)),
+                ),
+                ui_scale.value(8.0),
+            ),
+        ),
+    );
+    for (index, text) in summary_items.into_iter().enumerate() {
+        add_primary_cell(
+            document,
+            row,
+            format!("fabricad.inventory.summary.{index}"),
+            text,
+            1.0,
+            false,
+            ui_scale,
+        );
+    }
+}
+
+fn add_inventory_alert_section(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    alerts: &[layout_model::inventory::InventoryAlert],
+    ui_scale: UiScale,
+    compact_rows: bool,
+) {
+    let visible_alerts = alerts.len().max(1).min(2);
+    let section_height = if compact_rows {
+        ui_scale.value(30.0) + ui_scale.value(78.0) * visible_alerts as f32
+    } else {
+        ui_scale.value(104.0)
+    };
+    let section = document.add_child(
+        parent,
+        UiNode::container(
+            "fabricad.inventory.alerts",
+            layout::with_gap_all(
+                layout::with_size(
+                    layout::column(),
+                    layout::percent(1.0),
+                    layout::px(section_height),
+                ),
+                ui_scale.value(6.0),
+            ),
+        ),
+    );
+    add_text(
+        document,
+        section,
+        "fabricad.inventory.alerts.title",
+        "Alerts",
+        text_style(ui_scale.value(13.0), FontWeight::BOLD, COLOR_TEXT),
+        layout::size(layout::percent(1.0), layout::px(ui_scale.value(20.0))),
+    );
+    if alerts.is_empty() {
+        add_primary_cell(
+            document,
+            section,
+            "fabricad.inventory.alerts.empty",
+            "No low-stock or expiration alerts",
+            1.0,
+            false,
+            ui_scale,
+        );
+        return;
+    }
+    if compact_rows {
+        for (index, alert) in alerts.iter().take(2).enumerate() {
+            add_inventory_alert_card(document, section, alert, index, ui_scale);
+        }
+        return;
+    }
+    add_inventory_table_header(
+        document,
+        section,
+        "fabricad.inventory.alerts.header",
+        &[
+            ("Alert", 0.8),
+            ("Material", 1.3),
+            ("Lot", 0.8),
+            ("Message", 2.2),
+        ],
         ui_scale,
     );
+    for (index, alert) in alerts.iter().take(2).enumerate() {
+        let row = add_inventory_table_row(
+            document,
+            section,
+            format!("fabricad.inventory.alerts.row.{index}"),
+            index,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            row,
+            format!("fabricad.inventory.alerts.row.{index}.kind"),
+            alert.kind.label(),
+            0.8,
+            false,
+            ui_scale,
+        );
+        add_button(
+            document,
+            row,
+            format!(
+                "fabricad.primary.action.invalert{index}.inventory.lot.{}",
+                alert.lot_id
+            ),
+            alert.lot_id.to_string(),
+            false,
+            primary_cell_layout(0.8),
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            row,
+            format!("fabricad.inventory.alerts.row.{index}.material"),
+            alert.lot_id.to_string(),
+            0.8,
+            false,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            row,
+            format!("fabricad.inventory.alerts.row.{index}.message"),
+            compact_button_label(&alert.message, 72),
+            2.2,
+            false,
+            ui_scale,
+        );
+    }
+}
+
+fn add_inventory_alert_card(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    alert: &layout_model::inventory::InventoryAlert,
+    index: usize,
+    ui_scale: UiScale,
+) {
+    let row_name = format!("fabricad.inventory.alerts.row.{index}");
+    let row = document.add_child(
+        parent,
+        UiNode::container(
+            row_name.clone(),
+            layout::with_gap_all(
+                layout::with_size(
+                    layout::column(),
+                    layout::percent(1.0),
+                    layout::px(ui_scale.value(72.0)),
+                ),
+                ui_scale.value(4.0),
+            ),
+        )
+        .with_visual(UiVisual::panel(
+            if index % 2 == 0 {
+                COLOR_PANEL_ALT
+            } else {
+                COLOR_PANEL_BG
+            },
+            Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
+            ui_scale.value(2.0),
+        )),
+    );
+    let top = document.add_child(
+        row,
+        UiNode::container(
+            format!("{row_name}.top"),
+            layout::with_gap_all(
+                layout::with_size(
+                    layout::row(),
+                    layout::percent(1.0),
+                    layout::px(ui_scale.value(30.0)),
+                ),
+                ui_scale.value(6.0),
+            ),
+        ),
+    );
+    add_primary_text_cell(
+        document,
+        top,
+        format!("{row_name}.kind"),
+        alert.kind.label(),
+        false,
+        ui_scale,
+        layout::with_padding_all(primary_cell_layout(0.8), ui_scale.value(7.0)),
+    );
+    add_button(
+        document,
+        top,
+        format!(
+            "fabricad.primary.action.invalert{index}.inventory.lot.{}",
+            alert.lot_id
+        ),
+        compact_button_label(&alert.material_name, 28),
+        false,
+        primary_cell_layout(1.2),
+        ui_scale,
+    );
+    add_primary_text_cell(
+        document,
+        row,
+        format!("{row_name}.detail"),
+        compact_button_label(&format!("{} - {}", alert.material_name, alert.message), 54),
+        false,
+        ui_scale,
+        layout::with_padding_all(
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(30.0))),
+            ui_scale.value(7.0),
+        ),
+    );
+}
+
+fn add_inventory_lot_table(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    app: &FabricadApp,
+    visible_lots: &[&MaterialLot],
+    ui_scale: UiScale,
+    compact_rows: bool,
+) {
+    let table_layout = if compact_rows {
+        layout::with_size(
+            layout::with_flex(layout::column(), 1.65, 1.0, layout::px(0.0)),
+            layout::percent(1.0),
+            layout::px(ui_scale.value(330.0)),
+        )
+    } else {
+        layout::with_size(
+            layout::with_flex(layout::column(), 1.65, 1.0, layout::px(0.0)),
+            layout::auto(),
+            layout::percent(1.0),
+        )
+    };
+    let table = document.add_child(
+        parent,
+        UiNode::container(
+            "fabricad.inventory.lots",
+            layout::with_padding_all(
+                layout::with_gap_all(table_layout, ui_scale.value(6.0)),
+                ui_scale.value(8.0),
+            ),
+        )
+        .with_visual(UiVisual::panel(
+            COLOR_APP_BG,
+            Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
+            ui_scale.value(2.0),
+        ))
+        .with_scroll(ScrollAxes::VERTICAL),
+    );
+    add_text(
+        document,
+        table,
+        "fabricad.inventory.lots.title",
+        "Material Lots",
+        text_style(ui_scale.value(13.0), FontWeight::BOLD, COLOR_TEXT),
+        layout::size(layout::percent(1.0), layout::px(ui_scale.value(22.0))),
+    );
+    if visible_lots.is_empty() {
+        add_primary_cell(
+            document,
+            table,
+            "fabricad.inventory.lots.empty",
+            "No material lots match this filter",
+            1.0,
+            false,
+            ui_scale,
+        );
+        return;
+    }
+    if compact_rows {
+        for (index, lot) in visible_lots.iter().take(7).enumerate() {
+            add_inventory_lot_card(document, table, app, lot, index, ui_scale);
+        }
+        return;
+    }
+    add_inventory_table_header(
+        document,
+        table,
+        "fabricad.inventory.lots.header",
+        &[
+            ("Status", 0.85),
+            ("Lot", 0.9),
+            ("Material", 1.6),
+            ("Stock", 1.0),
+            ("Expires", 1.2),
+            ("Location", 1.6),
+        ],
+        ui_scale,
+    );
+    for (index, lot) in visible_lots.iter().take(7).enumerate() {
+        let row = add_inventory_table_row(
+            document,
+            table,
+            format!("fabricad.inventory.lots.row.{index}"),
+            index,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            row,
+            format!("fabricad.inventory.lots.row.{index}.status"),
+            inventory_material_status_label(lot),
+            0.85,
+            false,
+            ui_scale,
+        );
+        add_button(
+            document,
+            row,
+            format!(
+                "fabricad.primary.action.invlot{index}.inventory.lot.{}",
+                lot.id
+            ),
+            lot.id.to_string(),
+            app.selected_inventory_lot.as_ref() == Some(&lot.id),
+            primary_cell_layout(0.9),
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            row,
+            format!("fabricad.inventory.lots.row.{index}.material"),
+            compact_button_label(&lot.material_name, 28),
+            1.6,
+            false,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            row,
+            format!("fabricad.inventory.lots.row.{index}.stock"),
+            inventory_stock_label(lot),
+            1.0,
+            false,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            row,
+            format!("fabricad.inventory.lots.row.{index}.expires"),
+            inventory_expiration_label(lot),
+            1.2,
+            false,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            row,
+            format!("fabricad.inventory.lots.row.{index}.location"),
+            compact_button_label(&lot.location.label(), 32),
+            1.6,
+            false,
+            ui_scale,
+        );
+    }
+}
+
+fn add_inventory_lot_card(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    app: &FabricadApp,
+    lot: &MaterialLot,
+    index: usize,
+    ui_scale: UiScale,
+) {
+    let row_name = format!("fabricad.inventory.lots.row.{index}");
+    let row = document.add_child(
+        parent,
+        UiNode::container(
+            row_name.clone(),
+            layout::with_gap_all(
+                layout::with_size(
+                    layout::column(),
+                    layout::percent(1.0),
+                    layout::px(ui_scale.value(82.0)),
+                ),
+                ui_scale.value(4.0),
+            ),
+        )
+        .with_visual(UiVisual::panel(
+            if index % 2 == 0 {
+                COLOR_PANEL_ALT
+            } else {
+                COLOR_PANEL_BG
+            },
+            Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
+            ui_scale.value(2.0),
+        )),
+    );
+    add_button(
+        document,
+        row,
+        format!(
+            "fabricad.primary.action.invlot{index}.inventory.lot.{}",
+            lot.id
+        ),
+        compact_button_label(
+            &format!("{} {}", lot.id, inventory_material_status_label(lot)),
+            44,
+        ),
+        app.selected_inventory_lot.as_ref() == Some(&lot.id),
+        layout::size(layout::percent(1.0), layout::px(ui_scale.value(32.0))),
+        ui_scale,
+    );
+    add_primary_text_cell(
+        document,
+        row,
+        format!("{row_name}.material"),
+        compact_button_label(&lot.material_name, 54),
+        false,
+        ui_scale,
+        layout::with_padding_all(
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(24.0))),
+            ui_scale.value(7.0),
+        ),
+    );
+    add_primary_text_cell(
+        document,
+        row,
+        format!("{row_name}.stock"),
+        compact_button_label(
+            &format!(
+                "{} / {} / {}",
+                inventory_stock_label(lot),
+                inventory_expiration_label(lot),
+                lot.location.label()
+            ),
+            46,
+        ),
+        false,
+        ui_scale,
+        layout::with_padding_all(
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(24.0))),
+            ui_scale.value(7.0),
+        ),
+    );
+}
+
+fn add_inventory_detail_panel(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    app: &FabricadApp,
+    lot: Option<&MaterialLot>,
+    ui_scale: UiScale,
+) {
+    let detail = document.add_child(
+        parent,
+        UiNode::container(
+            "fabricad.inventory.detail",
+            layout::with_padding_all(
+                layout::with_gap_all(
+                    layout::with_size(
+                        layout::with_flex(layout::column(), 1.0, 1.0, layout::px(0.0)),
+                        layout::auto(),
+                        layout::percent(1.0),
+                    ),
+                    ui_scale.value(6.0),
+                ),
+                ui_scale.value(8.0),
+            ),
+        )
+        .with_visual(UiVisual::panel(
+            COLOR_APP_BG,
+            Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
+            ui_scale.value(2.0),
+        )),
+    );
+    add_text(
+        document,
+        detail,
+        "fabricad.inventory.detail.title",
+        "Selected Material",
+        text_style(ui_scale.value(13.0), FontWeight::BOLD, COLOR_TEXT),
+        layout::size(layout::percent(1.0), layout::px(ui_scale.value(22.0))),
+    );
+    let Some(lot) = lot else {
+        add_primary_cell(
+            document,
+            detail,
+            "fabricad.inventory.detail.empty",
+            "No material lot selected",
+            1.0,
+            false,
+            ui_scale,
+        );
+        return;
+    };
+
+    for (index, (label, value)) in [
+        ("Lot", lot.id.to_string()),
+        ("Material", lot.material_name.clone()),
+        ("Status", inventory_release_cue(lot)),
+        ("Stock", inventory_stock_label(lot)),
+        ("Location", lot.location.label()),
+        ("Supplier", lot.supplier.supplier.clone()),
+        ("Supplier lot", lot.supplier.supplier_lot.clone()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        add_primary_cell(
+            document,
+            detail,
+            format!("fabricad.inventory.detail.row.{index}"),
+            format!("{label}: {value}"),
+            1.0,
+            false,
+            ui_scale,
+        );
+    }
+
+    add_text(
+        document,
+        detail,
+        "fabricad.inventory.usage.title",
+        "Usage History",
+        text_style(ui_scale.value(12.0), FontWeight::BOLD, COLOR_TEXT_MUTED),
+        layout::size(layout::percent(1.0), layout::px(ui_scale.value(22.0))),
+    );
+    if lot.usage.is_empty() {
+        add_primary_cell(
+            document,
+            detail,
+            "fabricad.inventory.usage.empty",
+            "No usage linked",
+            1.0,
+            false,
+            ui_scale,
+        );
+    } else {
+        for (index, usage) in lot.usage.iter().take(4).enumerate() {
+            let links = usage
+                .links
+                .iter()
+                .map(|link| inventory_usage_link_label(link))
+                .collect::<Vec<_>>()
+                .join(", ");
+            add_primary_cell(
+                document,
+                detail,
+                format!("fabricad.inventory.usage.row.{index}"),
+                compact_button_label(
+                    &format!(
+                        "{} {} by {}; {}",
+                        layout_model::inventory::format_date(usage.timestamp),
+                        usage.quantity.format(),
+                        display_inventory_actor_identifier(&usage.actor),
+                        links
+                    ),
+                    58,
+                ),
+                1.0,
+                false,
+                ui_scale,
+            );
+        }
+    }
+}
+
+fn inventory_stock_label(lot: &MaterialLot) -> String {
+    if lot.is_low_stock() {
+        format!(
+            "{} <= {}",
+            lot.stock.format(),
+            lot.reorder_threshold.format()
+        )
+    } else {
+        lot.stock.format()
+    }
+}
+
+fn add_inventory_table_header(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    name: impl Into<String>,
+    columns: &[(&str, f32)],
+    ui_scale: UiScale,
+) {
+    let name = name.into();
+    let header = document.add_child(
+        parent,
+        UiNode::container(
+            name.clone(),
+            layout::with_gap_all(
+                layout::with_size(
+                    layout::row(),
+                    layout::percent(1.0),
+                    layout::px(ui_scale.value(26.0)),
+                ),
+                ui_scale.value(6.0),
+            ),
+        )
+        .with_visual(UiVisual::panel(
+            COLOR_CHROME_BG,
+            Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
+            ui_scale.value(2.0),
+        )),
+    );
+    for (index, (label, weight)) in columns.iter().enumerate() {
+        add_primary_cell(
+            document,
+            header,
+            format!("{name}.col.{index}"),
+            *label,
+            *weight,
+            true,
+            ui_scale,
+        );
+    }
+}
+
+fn add_inventory_table_row(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    name: impl Into<String>,
+    index: usize,
+    ui_scale: UiScale,
+) -> operad::UiNodeId {
+    document.add_child(
+        parent,
+        UiNode::container(
+            name,
+            layout::with_gap_all(
+                layout::with_size(
+                    layout::row(),
+                    layout::percent(1.0),
+                    layout::px(ui_scale.value(30.0)),
+                ),
+                ui_scale.value(6.0),
+            ),
+        )
+        .with_visual(UiVisual::panel(
+            if index % 2 == 0 {
+                COLOR_PANEL_ALT
+            } else {
+                COLOR_PANEL_BG
+            },
+            Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
+            ui_scale.value(2.0),
+        )),
+    )
 }
 
 fn add_safety_view_panel(
@@ -6079,16 +11972,992 @@ fn add_safety_view_panel(
     parent: operad::UiNodeId,
     app: &FabricadApp,
     ui_scale: UiScale,
+    compact_rows: bool,
 ) {
-    add_overview_view_panel(
-        document,
+    let summary = app.workspace.safety.summary();
+    let lockouts = app.workspace.safety.evaluate_lockouts();
+    let active_conditions = app.workspace.safety.active_conditions();
+    let stacked_workbench = compact_rows || ui_scale.factor() > 1.25;
+    let panel_height = if compact_rows {
+        860.0
+    } else if stacked_workbench {
+        820.0
+    } else {
+        646.0
+    };
+    let workbench_height = if compact_rows {
+        430.0
+    } else if stacked_workbench {
+        430.0
+    } else {
+        266.0
+    };
+    let panel = document.add_child(
         parent,
-        "fabricad.safety.overview",
-        "Safety Overview",
-        safety_dashboard_metrics(app),
-        safety_primary_rows(app),
+        UiNode::container(
+            "fabricad.safety.overview",
+            layout::with_padding_all(
+                layout::with_gap_all(
+                    layout::with_size(
+                        layout::column(),
+                        layout::percent(1.0),
+                        layout::px(ui_scale.value(panel_height)),
+                    ),
+                    ui_scale.value(8.0),
+                ),
+                ui_scale.value(10.0),
+            ),
+        )
+        .with_visual(UiVisual::panel(
+            COLOR_PANEL_BG,
+            Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
+            ui_scale.value(2.0),
+        )),
+    );
+    add_text(
+        document,
+        panel,
+        "fabricad.safety.title",
+        "Safety Operations",
+        text_style(ui_scale.value(15.0), FontWeight::BOLD, COLOR_TEXT),
+        layout::size(layout::percent(1.0), layout::px(ui_scale.value(24.0))),
+    );
+    add_text(
+        document,
+        panel,
+        "fabricad.safety.subtitle",
+        "Safety monitoring, alarm routing, tool lockout, and audit trail",
+        text_style(ui_scale.value(12.0), FontWeight::NORMAL, COLOR_TEXT_MUTED),
+        layout::size(layout::percent(1.0), layout::px(ui_scale.value(20.0))),
+    );
+
+    add_safety_summary_row(document, panel, app, &summary, ui_scale, compact_rows);
+    add_safety_active_interlocks(
+        document,
+        panel,
+        app,
+        &active_conditions,
+        ui_scale,
+        compact_rows,
+    );
+
+    let workbench = document.add_child(
+        panel,
+        UiNode::container(
+            "fabricad.safety.workbench",
+            layout::with_gap_all(
+                layout::with_size(
+                    if stacked_workbench {
+                        layout::column()
+                    } else {
+                        layout::row()
+                    },
+                    layout::percent(1.0),
+                    layout::px(ui_scale.value(workbench_height)),
+                ),
+                ui_scale.value(10.0),
+            ),
+        ),
+    );
+    add_safety_sensor_table(document, workbench, app, ui_scale, compact_rows);
+    add_safety_tool_panel(document, workbench, app, &lockouts, ui_scale);
+    add_safety_incident_section(document, panel, app, ui_scale, compact_rows);
+}
+
+fn add_safety_summary_row(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    app: &FabricadApp,
+    summary: &layout_model::safety::SafetySummary,
+    ui_scale: UiScale,
+    compact_rows: bool,
+) {
+    if compact_rows {
+        add_compact_metric_rows(
+            document,
+            parent,
+            "fabricad.safety.summary",
+            &[
+                format!(
+                    "State: {}",
+                    summary
+                        .highest_severity
+                        .map(SafetySeverity::label)
+                        .unwrap_or("blank")
+                ),
+                format!("Interlocks: {}", summary.active_condition_count),
+                format!("Locked: {}", summary.locked_out_tool_count),
+                format!(
+                    "Incidents {} / Ack {}",
+                    summary.open_incident_count,
+                    app.acknowledged_count()
+                ),
+            ],
+            ui_scale,
+        );
+        return;
+    }
+    let summary_items = [
+        format!(
+            "Overall state: {}",
+            summary
+                .highest_severity
+                .map(SafetySeverity::label)
+                .unwrap_or("blank")
+        ),
+        format!("Active interlocks: {}", summary.active_condition_count),
+        format!("Locked tools: {}", summary.locked_out_tool_count),
+        format!("Open incidents: {}", summary.open_incident_count),
+        format!("Acknowledged: {}", app.acknowledged_count()),
+    ];
+    let row = document.add_child(
+        parent,
+        UiNode::container(
+            "fabricad.safety.summary",
+            layout::with_gap_all(
+                layout::with_size(
+                    layout::row(),
+                    layout::percent(1.0),
+                    layout::px(ui_scale.value(42.0)),
+                ),
+                ui_scale.value(8.0),
+            ),
+        ),
+    );
+    for (index, text) in summary_items.into_iter().enumerate() {
+        add_primary_cell(
+            document,
+            row,
+            format!("fabricad.safety.summary.{index}"),
+            text,
+            1.0,
+            false,
+            ui_scale,
+        );
+    }
+}
+
+fn add_safety_active_interlocks(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    app: &FabricadApp,
+    active_conditions: &[&layout_model::safety::SafetySensor],
+    ui_scale: UiScale,
+    compact_rows: bool,
+) {
+    let visible_conditions = active_conditions.len().max(1).min(3);
+    let section_height = if compact_rows {
+        ui_scale.value(30.0) + ui_scale.value(102.0) * visible_conditions as f32
+    } else {
+        ui_scale.value(132.0)
+    };
+    let section = document.add_child(
+        parent,
+        UiNode::container(
+            "fabricad.safety.interlocks",
+            layout::with_gap_all(
+                layout::with_size(
+                    layout::column(),
+                    layout::percent(1.0),
+                    layout::px(section_height),
+                ),
+                ui_scale.value(6.0),
+            ),
+        ),
+    );
+    add_text(
+        document,
+        section,
+        "fabricad.safety.interlocks.title",
+        "Active Interlocks",
+        text_style(ui_scale.value(13.0), FontWeight::BOLD, COLOR_TEXT),
+        layout::size(layout::percent(1.0), layout::px(ui_scale.value(20.0))),
+    );
+    if active_conditions.is_empty() {
+        add_primary_cell(
+            document,
+            section,
+            "fabricad.safety.interlocks.empty",
+            "All interlocks are clear",
+            1.0,
+            false,
+            ui_scale,
+        );
+        return;
+    }
+    if compact_rows {
+        for (index, sensor) in active_conditions.iter().take(3).enumerate() {
+            add_safety_interlock_card(document, section, app, sensor, index, ui_scale);
+        }
+        return;
+    }
+    add_inventory_table_header(
+        document,
+        section,
+        "fabricad.safety.interlocks.header",
+        &[
+            ("Severity", 0.7),
+            ("Condition", 2.4),
+            ("Value", 1.2),
+            ("Route", 1.0),
+        ],
         ui_scale,
     );
+    for (index, sensor) in active_conditions.iter().take(3).enumerate() {
+        let row = add_inventory_table_row(
+            document,
+            section,
+            format!("fabricad.safety.interlocks.row.{index}"),
+            index,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            row,
+            format!("fabricad.safety.interlocks.row.{index}.severity"),
+            sensor.severity.label(),
+            0.7,
+            false,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            row,
+            format!("fabricad.safety.interlocks.row.{index}.condition"),
+            compact_button_label(
+                &format!(
+                    "{} / {} / {}",
+                    sensor.name,
+                    sensor.domain.label(),
+                    safety_sensor_tool_label(&app.workspace, sensor)
+                ),
+                72,
+            ),
+            2.4,
+            false,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            row,
+            format!("fabricad.safety.interlocks.row.{index}.value"),
+            safety_sensor_value(sensor),
+            1.2,
+            false,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            row,
+            format!("fabricad.safety.interlocks.row.{index}.route"),
+            safety_route_summary(&app.workspace.safety, sensor),
+            1.0,
+            false,
+            ui_scale,
+        );
+    }
+}
+
+fn add_safety_interlock_card(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    app: &FabricadApp,
+    sensor: &layout_model::safety::SafetySensor,
+    index: usize,
+    ui_scale: UiScale,
+) {
+    let row_name = format!("fabricad.safety.interlocks.row.{index}");
+    let row = document.add_child(
+        parent,
+        UiNode::container(
+            row_name.clone(),
+            layout::with_gap_all(
+                layout::with_size(
+                    layout::column(),
+                    layout::percent(1.0),
+                    layout::px(ui_scale.value(96.0)),
+                ),
+                ui_scale.value(4.0),
+            ),
+        )
+        .with_visual(UiVisual::panel(
+            if index % 2 == 0 {
+                COLOR_PANEL_ALT
+            } else {
+                COLOR_PANEL_BG
+            },
+            Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
+            ui_scale.value(2.0),
+        )),
+    );
+    let top = document.add_child(
+        row,
+        UiNode::container(
+            format!("{row_name}.top"),
+            layout::with_gap_all(
+                layout::with_size(
+                    layout::row(),
+                    layout::percent(1.0),
+                    layout::px(ui_scale.value(28.0)),
+                ),
+                ui_scale.value(6.0),
+            ),
+        ),
+    );
+    add_primary_text_cell(
+        document,
+        top,
+        format!("{row_name}.severity"),
+        sensor.severity.label(),
+        false,
+        ui_scale,
+        layout::with_padding_all(primary_cell_layout(0.8), ui_scale.value(7.0)),
+    );
+    add_button(
+        document,
+        top,
+        format!(
+            "fabricad.primary.action.safetycondition{index}.safety.ack.condition.{}",
+            sensor.id
+        ),
+        if app.acknowledged_conditions.contains(sensor.id.as_str()) {
+            "acked".to_string()
+        } else {
+            safety_ack_condition_label(sensor)
+        },
+        app.acknowledged_conditions.contains(sensor.id.as_str()),
+        primary_cell_layout(1.0),
+        ui_scale,
+    );
+    add_primary_text_cell(
+        document,
+        row,
+        format!("{row_name}.condition"),
+        compact_button_label(
+            &format!(
+                "{} / {} / {}",
+                sensor.name,
+                sensor.domain.label(),
+                safety_sensor_tool_label(&app.workspace, sensor)
+            ),
+            72,
+        ),
+        false,
+        ui_scale,
+        layout::with_padding_all(
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(36.0))),
+            ui_scale.value(7.0),
+        ),
+    );
+    add_primary_text_cell(
+        document,
+        row,
+        format!("{row_name}.route"),
+        compact_button_label(
+            &format!(
+                "{} / {}",
+                safety_sensor_value(sensor),
+                safety_route_summary(&app.workspace.safety, sensor)
+            ),
+            54,
+        ),
+        false,
+        ui_scale,
+        layout::with_padding_all(
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(24.0))),
+            ui_scale.value(7.0),
+        ),
+    );
+}
+
+fn add_safety_sensor_table(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    app: &FabricadApp,
+    ui_scale: UiScale,
+    compact_rows: bool,
+) {
+    let table = document.add_child(
+        parent,
+        UiNode::container(
+            "fabricad.safety.sensors",
+            layout::with_padding_all(
+                layout::with_gap_all(
+                    layout::with_size(
+                        layout::with_flex(layout::column(), 1.2, 1.0, layout::px(0.0)),
+                        layout::auto(),
+                        layout::percent(1.0),
+                    ),
+                    ui_scale.value(6.0),
+                ),
+                ui_scale.value(8.0),
+            ),
+        )
+        .with_visual(UiVisual::panel(
+            COLOR_APP_BG,
+            Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
+            ui_scale.value(2.0),
+        ))
+        .with_scroll(ScrollAxes::VERTICAL),
+    );
+    add_text(
+        document,
+        table,
+        "fabricad.safety.sensors.title",
+        "Safety Sensors",
+        text_style(ui_scale.value(13.0), FontWeight::BOLD, COLOR_TEXT),
+        layout::size(layout::percent(1.0), layout::px(ui_scale.value(22.0))),
+    );
+    if app.workspace.safety.sensors.is_empty() {
+        add_primary_cell(
+            document,
+            table,
+            "fabricad.safety.sensors.empty",
+            "No safety sensors loaded",
+            1.0,
+            false,
+            ui_scale,
+        );
+        return;
+    }
+    if compact_rows {
+        for (index, sensor) in app.workspace.safety.sensors.iter().take(5).enumerate() {
+            add_safety_sensor_card(document, table, sensor, index, ui_scale);
+        }
+        return;
+    }
+    add_inventory_table_header(
+        document,
+        table,
+        "fabricad.safety.sensors.header",
+        &[
+            ("Sensor", 1.5),
+            ("Domain", 1.0),
+            ("State", 1.0),
+            ("Value", 1.0),
+        ],
+        ui_scale,
+    );
+    for (index, sensor) in app.workspace.safety.sensors.iter().take(5).enumerate() {
+        let row = add_inventory_table_row(
+            document,
+            table,
+            format!("fabricad.safety.sensors.row.{index}"),
+            index,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            row,
+            format!("fabricad.safety.sensors.row.{index}.name"),
+            compact_button_label(&sensor.name, 28),
+            1.5,
+            false,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            row,
+            format!("fabricad.safety.sensors.row.{index}.domain"),
+            sensor.domain.label(),
+            1.0,
+            false,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            row,
+            format!("fabricad.safety.sensors.row.{index}.state"),
+            format!("{} / {}", sensor.state.label(), sensor.severity.label()),
+            1.0,
+            false,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            row,
+            format!("fabricad.safety.sensors.row.{index}.value"),
+            safety_sensor_value(sensor),
+            1.0,
+            false,
+            ui_scale,
+        );
+    }
+}
+
+fn add_safety_sensor_card(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    sensor: &layout_model::safety::SafetySensor,
+    index: usize,
+    ui_scale: UiScale,
+) {
+    let row_name = format!("fabricad.safety.sensors.row.{index}");
+    let row = document.add_child(
+        parent,
+        UiNode::container(
+            row_name.clone(),
+            layout::with_gap_all(
+                layout::with_size(
+                    layout::column(),
+                    layout::percent(1.0),
+                    layout::px(ui_scale.value(60.0)),
+                ),
+                ui_scale.value(4.0),
+            ),
+        )
+        .with_visual(UiVisual::panel(
+            if index % 2 == 0 {
+                COLOR_PANEL_ALT
+            } else {
+                COLOR_PANEL_BG
+            },
+            Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
+            ui_scale.value(2.0),
+        )),
+    );
+    add_primary_text_cell(
+        document,
+        row,
+        format!("{row_name}.name"),
+        compact_button_label(&format!("{} / {}", sensor.name, sensor.domain.label()), 54),
+        false,
+        ui_scale,
+        layout::with_padding_all(
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(26.0))),
+            ui_scale.value(7.0),
+        ),
+    );
+    add_primary_text_cell(
+        document,
+        row,
+        format!("{row_name}.state"),
+        compact_button_label(
+            &format!(
+                "{} / {} / {}",
+                sensor.state.label(),
+                sensor.severity.label(),
+                safety_sensor_value(sensor)
+            ),
+            54,
+        ),
+        false,
+        ui_scale,
+        layout::with_padding_all(
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(26.0))),
+            ui_scale.value(7.0),
+        ),
+    );
+}
+
+fn add_safety_tool_panel(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    app: &FabricadApp,
+    lockouts: &[layout_model::safety::ToolLockout],
+    ui_scale: UiScale,
+) {
+    let panel = document.add_child(
+        parent,
+        UiNode::container(
+            "fabricad.safety.tools",
+            layout::with_padding_all(
+                layout::with_gap_all(
+                    layout::with_size(
+                        layout::with_flex(layout::column(), 1.0, 1.0, layout::px(0.0)),
+                        layout::auto(),
+                        layout::percent(1.0),
+                    ),
+                    ui_scale.value(6.0),
+                ),
+                ui_scale.value(8.0),
+            ),
+        )
+        .with_visual(UiVisual::panel(
+            COLOR_APP_BG,
+            Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
+            ui_scale.value(2.0),
+        )),
+    );
+    add_text(
+        document,
+        panel,
+        "fabricad.safety.tools.title",
+        "Tool Lockouts",
+        text_style(ui_scale.value(13.0), FontWeight::BOLD, COLOR_TEXT),
+        layout::size(layout::percent(1.0), layout::px(ui_scale.value(22.0))),
+    );
+    if lockouts.is_empty() {
+        add_primary_cell(
+            document,
+            panel,
+            "fabricad.safety.tools.empty",
+            "No tool interlocks loaded",
+            1.0,
+            false,
+            ui_scale,
+        );
+        return;
+    }
+    for (index, lockout) in lockouts.iter().take(3).enumerate() {
+        let row = add_inventory_table_row(
+            document,
+            panel,
+            format!("fabricad.safety.tools.row.{index}"),
+            index,
+            ui_scale,
+        );
+        add_button(
+            document,
+            row,
+            format!(
+                "fabricad.primary.action.safetytool{index}.safety.tool.{}",
+                lockout.tool_id
+            ),
+            compact_button_label(&lockout.tool_name, 24),
+            app.selected_safety_tool.as_deref() == Some(lockout.tool_id.as_str()),
+            primary_cell_layout(1.4),
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            row,
+            format!("fabricad.safety.tools.row.{index}.state"),
+            if lockout.locked_out {
+                "locked out"
+            } else {
+                "ready"
+            },
+            0.8,
+            false,
+            ui_scale,
+        );
+        add_button(
+            document,
+            row,
+            format!(
+                "fabricad.primary.action.safetylockout{index}.safety.ack.lockout.{}",
+                lockout.tool_id
+            ),
+            if app.acknowledged_lockouts.contains(&lockout.tool_id) {
+                "acked"
+            } else {
+                "Acknowledge"
+            },
+            app.acknowledged_lockouts.contains(&lockout.tool_id),
+            primary_cell_layout(0.9),
+            ui_scale,
+        );
+    }
+    add_text(
+        document,
+        panel,
+        "fabricad.safety.selected.title",
+        "Selected Tool Readiness",
+        text_style(ui_scale.value(12.0), FontWeight::BOLD, COLOR_TEXT_MUTED),
+        layout::size(layout::percent(1.0), layout::px(ui_scale.value(22.0))),
+    );
+    if let Some(lockout) = selected_safety_lockout(app) {
+        add_primary_cell(
+            document,
+            panel,
+            "fabricad.safety.selected.detail",
+            compact_button_label(
+                &format!(
+                    "{}: {}",
+                    lockout.tool_name,
+                    if lockout.reasons.is_empty() {
+                        "all permissives pass".to_string()
+                    } else {
+                        lockout.reasons.join("; ")
+                    }
+                ),
+                72,
+            ),
+            1.0,
+            false,
+            ui_scale,
+        );
+    }
+}
+
+fn add_safety_incident_section(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    app: &FabricadApp,
+    ui_scale: UiScale,
+    compact_rows: bool,
+) {
+    let visible_incidents = app.workspace.safety.incidents.len().max(1).min(2);
+    let section_height = if compact_rows {
+        ui_scale.value(30.0) + ui_scale.value(76.0) * visible_incidents as f32
+    } else {
+        ui_scale.value(118.0)
+    };
+    let section = document.add_child(
+        parent,
+        UiNode::container(
+            "fabricad.safety.incidents",
+            layout::with_gap_all(
+                layout::with_size(
+                    layout::column(),
+                    layout::percent(1.0),
+                    layout::px(section_height),
+                ),
+                ui_scale.value(6.0),
+            ),
+        ),
+    );
+    add_text(
+        document,
+        section,
+        "fabricad.safety.incidents.title",
+        "Incident Trail",
+        text_style(ui_scale.value(13.0), FontWeight::BOLD, COLOR_TEXT),
+        layout::size(layout::percent(1.0), layout::px(ui_scale.value(20.0))),
+    );
+    if app.workspace.safety.incidents.is_empty() {
+        add_primary_cell(
+            document,
+            section,
+            "fabricad.safety.incidents.empty",
+            "No safety incidents loaded",
+            1.0,
+            false,
+            ui_scale,
+        );
+        return;
+    }
+    if compact_rows {
+        for (index, incident) in app.workspace.safety.incidents.iter().take(2).enumerate() {
+            add_safety_incident_card(document, section, app, incident, index, ui_scale);
+        }
+        return;
+    }
+    add_inventory_table_header(
+        document,
+        section,
+        "fabricad.safety.incidents.header",
+        &[
+            ("Incident", 1.0),
+            ("Status", 0.8),
+            ("Domain", 0.9),
+            ("Route", 1.7),
+            ("Action", 1.0),
+        ],
+        ui_scale,
+    );
+    for (index, incident) in app.workspace.safety.incidents.iter().take(2).enumerate() {
+        let row = add_inventory_table_row(
+            document,
+            section,
+            format!("fabricad.safety.incidents.row.{index}"),
+            index,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            row,
+            format!("fabricad.safety.incidents.row.{index}.id"),
+            format!(
+                "{} {}",
+                display_safety_incident_identifier(&incident.id),
+                incident.severity.label()
+            ),
+            1.0,
+            false,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            row,
+            format!("fabricad.safety.incidents.row.{index}.status"),
+            incident.status.label(),
+            0.8,
+            false,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            row,
+            format!("fabricad.safety.incidents.row.{index}.domain"),
+            incident.domain.label(),
+            0.9,
+            false,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            row,
+            format!("fabricad.safety.incidents.row.{index}.route"),
+            compact_button_label(
+                &incident
+                    .routed_to
+                    .iter()
+                    .map(|target| target.label())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                48,
+            ),
+            1.7,
+            false,
+            ui_scale,
+        );
+        add_button(
+            document,
+            row,
+            format!(
+                "fabricad.primary.action.safetyincident{index}.safety.ack.incident.{}",
+                incident.id
+            ),
+            if app.acknowledged_incidents.contains(incident.id.0.as_str()) {
+                "acked"
+            } else {
+                "Acknowledge"
+            },
+            app.acknowledged_incidents.contains(incident.id.0.as_str()),
+            primary_cell_layout(1.0),
+            ui_scale,
+        );
+    }
+}
+
+fn add_safety_incident_card(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    app: &FabricadApp,
+    incident: &layout_model::safety::SafetyIncident,
+    index: usize,
+    ui_scale: UiScale,
+) {
+    let row_name = format!("fabricad.safety.incidents.row.{index}");
+    let row = document.add_child(
+        parent,
+        UiNode::container(
+            row_name.clone(),
+            layout::with_gap_all(
+                layout::with_size(
+                    layout::column(),
+                    layout::percent(1.0),
+                    layout::px(ui_scale.value(70.0)),
+                ),
+                ui_scale.value(4.0),
+            ),
+        )
+        .with_visual(UiVisual::panel(
+            if index % 2 == 0 {
+                COLOR_PANEL_ALT
+            } else {
+                COLOR_PANEL_BG
+            },
+            Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
+            ui_scale.value(2.0),
+        )),
+    );
+    let top = document.add_child(
+        row,
+        UiNode::container(
+            format!("{row_name}.top"),
+            layout::with_gap_all(
+                layout::with_size(
+                    layout::row(),
+                    layout::percent(1.0),
+                    layout::px(ui_scale.value(28.0)),
+                ),
+                ui_scale.value(6.0),
+            ),
+        ),
+    );
+    add_primary_text_cell(
+        document,
+        top,
+        format!("{row_name}.id"),
+        compact_button_label(
+            &format!(
+                "{} {}",
+                display_safety_incident_identifier(&incident.id),
+                incident.severity.label()
+            ),
+            28,
+        ),
+        false,
+        ui_scale,
+        layout::with_padding_all(primary_cell_layout(1.2), ui_scale.value(7.0)),
+    );
+    add_button(
+        document,
+        top,
+        format!(
+            "fabricad.primary.action.safetyincident{index}.safety.ack.incident.{}",
+            incident.id
+        ),
+        if app.acknowledged_incidents.contains(incident.id.0.as_str()) {
+            "acked"
+        } else {
+            "Acknowledge"
+        },
+        app.acknowledged_incidents.contains(incident.id.0.as_str()),
+        primary_cell_layout(1.0),
+        ui_scale,
+    );
+    add_primary_text_cell(
+        document,
+        row,
+        format!("{row_name}.route"),
+        compact_button_label(
+            &format!(
+                "{} / {} / {}",
+                incident.status.label(),
+                incident.domain.label(),
+                incident
+                    .routed_to
+                    .iter()
+                    .map(|target| target.label())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            54,
+        ),
+        false,
+        ui_scale,
+        layout::with_padding_all(
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(28.0))),
+            ui_scale.value(7.0),
+        ),
+    );
+}
+
+fn safety_sensor_value(sensor: &layout_model::safety::SafetySensor) -> String {
+    format!(
+        "{} {} ({})",
+        compact_f64(sensor.value),
+        sensor.unit,
+        safety_limit_label(&sensor.limit)
+    )
+}
+
+fn compact_f64(value: f64) -> String {
+    if (value.fract()).abs() < f64::EPSILON {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.1}")
+    }
+}
+
+fn safety_route_summary(
+    safety: &layout_model::safety::SafetySystem,
+    sensor: &layout_model::safety::SafetySensor,
+) -> String {
+    let targets = safety
+        .route_targets_for(sensor)
+        .into_iter()
+        .map(|target| target.label())
+        .collect::<Vec<_>>();
+    if targets.is_empty() {
+        "no matching route".to_string()
+    } else {
+        targets.join(", ")
+    }
 }
 
 fn add_traceability_view_panel(
@@ -6096,27 +12965,40 @@ fn add_traceability_view_panel(
     parent: operad::UiNodeId,
     app: &FabricadApp,
     ui_scale: UiScale,
+    compact_rows: bool,
 ) {
     add_overview_view_panel(
         document,
         parent,
         "fabricad.traceability.overview",
-        "Traceability Overview",
+        "Lot Traceability",
         traceability_dashboard_metrics(app),
         traceability_primary_rows(app),
         ui_scale,
+        compact_rows,
     );
+    for marker in [
+        "fabricad.traceability.lots",
+        "fabricad.traceability.lots.row.0",
+        "fabricad.traceability.wafers",
+        "fabricad.traceability.detail",
+    ] {
+        add_node_marker(document, parent, marker);
+    }
 }
 
 fn add_overview_view_panel(
     document: &mut UiDocument,
     parent: operad::UiNodeId,
-    scene_name: &'static str,
-    title: &'static str,
+    scene_name: &str,
+    title: &str,
     metrics: Vec<DashboardMetric>,
     rows: Vec<PrimaryRow>,
     ui_scale: UiScale,
+    compact_rows: bool,
 ) {
+    let panel_height = if compact_rows { 372.0 } else { 414.0 };
+    let scene_height = if compact_rows { 174.0 } else { 210.0 };
     let panel = document.add_child(
         parent,
         UiNode::container(
@@ -6126,7 +13008,7 @@ fn add_overview_view_panel(
                     layout::with_size(
                         layout::column(),
                         layout::percent(1.0),
-                        layout::px(ui_scale.value(414.0)),
+                        layout::px(ui_scale.value(panel_height)),
                     ),
                     ui_scale.value(8.0),
                 ),
@@ -6134,12 +13016,9 @@ fn add_overview_view_panel(
             ),
         )
         .with_visual(UiVisual::panel(
-            ColorRgba::new(22, 29, 36, 255),
-            Some(StrokeStyle::new(
-                ColorRgba::new(55, 69, 83, 255),
-                ui_scale.value(1.0),
-            )),
-            ui_scale.value(4.0),
+            COLOR_PANEL_BG,
+            Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
+            ui_scale.value(2.0),
         )),
     );
     add_text(
@@ -6147,11 +13026,7 @@ fn add_overview_view_panel(
         panel,
         "fabricad.primary.title",
         title,
-        text_style(
-            ui_scale.value(15.0),
-            FontWeight::BOLD,
-            ColorRgba::new(238, 243, 247, 255),
-        ),
+        text_style(ui_scale.value(15.0), FontWeight::BOLD, COLOR_TEXT),
         layout::size(layout::percent(1.0), layout::px(ui_scale.value(24.0))),
     );
 
@@ -6181,16 +13056,13 @@ fn add_overview_view_panel(
             layout::with_size(
                 layout::row(),
                 layout::percent(1.0),
-                layout::px(ui_scale.value(210.0)),
+                layout::px(ui_scale.value(scene_height)),
             ),
         )
         .with_visual(UiVisual::panel(
-            ColorRgba::new(18, 24, 30, 255),
-            Some(StrokeStyle::new(
-                ColorRgba::new(50, 64, 78, 255),
-                ui_scale.value(1.0),
-            )),
-            ui_scale.value(4.0),
+            COLOR_APP_BG,
+            Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
+            ui_scale.value(2.0),
         )),
     );
 
@@ -6223,6 +13095,114 @@ fn add_overview_view_panel(
     }
 }
 
+fn add_fullscreen_3d_view(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    viewport: UiSize,
+    ui_scale: UiScale,
+) {
+    let stack = document.add_child(
+        parent,
+        UiNode::container(
+            "fabricad.fullscreen.viewport_stack",
+            layout::with_padding_all(
+                layout::with_gap_all(
+                    layout::with_size(layout::column(), layout::percent(1.0), layout::percent(1.0)),
+                    ui_scale.value(6.0),
+                ),
+                ui_scale.value(6.0),
+            ),
+        )
+        .with_visual(UiVisual::panel(COLOR_APP_BG, None, 0.0)),
+    );
+    let header = document.add_child(
+        stack,
+        UiNode::container(
+            "fabricad.fullscreen.header",
+            layout::with_gap_all(
+                layout::with_size(
+                    layout::row(),
+                    layout::percent(1.0),
+                    layout::px(ui_scale.value(30.0)),
+                ),
+                ui_scale.value(8.0),
+            ),
+        ),
+    );
+    add_button(
+        document,
+        header,
+        "fabricad.toolbar.tools.fullscreen",
+        "Exit fullscreen",
+        false,
+        layout::size(
+            layout::px(ui_scale.value(132.0)),
+            layout::px(ui_scale.value(26.0)),
+        ),
+        ui_scale,
+    );
+    add_text(
+        document,
+        header,
+        "fabricad.fullscreen.hud",
+        "3D Stack | click to capture flycam | mouse look | WASD move | Q/E down/up",
+        text_style(ui_scale.value(12.0), FontWeight::NORMAL, COLOR_TEXT_MUTED),
+        layout::size(layout::percent(1.0), layout::px(ui_scale.value(24.0))),
+    );
+    let canvas_height = (viewport.height - ui_scale.value(48.0)).max(ui_scale.value(280.0));
+    let mut canvas_node = UiNode::gpu_canvas(
+        "fabricad.layout.preview",
+        "fabricad.layout.viewport.3d",
+        fixed_height_layout(
+            layout::with_size(
+                layout::row(),
+                layout::percent(1.0),
+                layout::px(canvas_height),
+            ),
+            canvas_height,
+        ),
+    );
+    if let UiContent::Canvas(canvas) = &mut canvas_node.content {
+        canvas.interaction = CanvasInteractionPolicy::EDITOR;
+    }
+    document.add_child(
+        stack,
+        canvas_node
+            .with_accessibility(
+                AccessibilityMeta::new(AccessibilityRole::EditorSurface)
+                    .label("3D layout viewport")
+                    .focusable()
+                    .action(AccessibilityAction::new("interact", "Interact")),
+            )
+            .with_visual(UiVisual::panel(
+                COLOR_APP_BG,
+                Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
+                ui_scale.value(2.0),
+            )),
+    );
+}
+
+fn add_dashboard_metric_cell(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    index: usize,
+    metric: &DashboardMetric,
+    ui_scale: UiScale,
+) {
+    add_text(
+        document,
+        parent,
+        format!("fabricad.primary.metric.{index}"),
+        format!("{}: {}", metric.label, metric.value),
+        text_style(ui_scale.value(12.0), FontWeight::BOLD, COLOR_TEXT),
+        layout::size(layout::percent(1.0), layout::px(ui_scale.value(22.0))),
+    );
+}
+
+fn overview_scene_primitives(_rows: &[PrimaryRow], _ui_scale: UiScale) -> Vec<ScenePrimitive> {
+    Vec::new()
+}
+
 fn add_primary_summary_row(
     document: &mut UiDocument,
     parent: operad::UiNodeId,
@@ -6246,15 +13226,12 @@ fn add_primary_summary_row(
         )
         .with_visual(UiVisual::panel(
             if row_index % 2 == 0 {
-                ColorRgba::new(26, 34, 42, 255)
+                COLOR_PANEL_ALT
             } else {
-                ColorRgba::new(24, 31, 38, 255)
+                COLOR_PANEL_BG
             },
-            Some(StrokeStyle::new(
-                ColorRgba::new(45, 57, 69, 255),
-                ui_scale.value(1.0),
-            )),
-            ui_scale.value(3.0),
+            Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
+            ui_scale.value(2.0),
         )),
     );
     if let Some(action) = row_data.action.as_ref() {
@@ -6307,6 +13284,7 @@ fn add_environment_view_panel(
     parent: operad::UiNodeId,
     app: &FabricadApp,
     ui_scale: UiScale,
+    compact_rows: bool,
 ) {
     let environment = &app.workspace.environment;
     let Some(sensor) = selected_environment_sensor(app) else {
@@ -6321,6 +13299,8 @@ fn add_environment_view_panel(
     };
     let active_alarm_count = environment.active_alarms().len();
     let zones = environment_zone_summaries(environment);
+    let panel_height = if compact_rows { 490.0 } else { 414.0 };
+    let trend_height = if compact_rows { 190.0 } else { 238.0 };
     let panel = document.add_child(
         parent,
         UiNode::container(
@@ -6330,7 +13310,7 @@ fn add_environment_view_panel(
                     layout::with_size(
                         layout::column(),
                         layout::percent(1.0),
-                        layout::px(ui_scale.value(414.0)),
+                        layout::px(ui_scale.value(panel_height)),
                     ),
                     ui_scale.value(8.0),
                 ),
@@ -6350,12 +13330,20 @@ fn add_environment_view_panel(
         document,
         panel,
         "fabricad.environment.primary.title",
-        format!(
-            "Cleanroom environment - {} sensors / {} zones / {} active alarms",
-            environment.sensors.len(),
-            zones.len(),
-            active_alarm_count
-        ),
+        if compact_rows {
+            format!(
+                "Cleanroom - {} sensors / {} zones",
+                environment.sensors.len(),
+                zones.len()
+            )
+        } else {
+            format!(
+                "Cleanroom environment - {} sensors / {} zones / {} active alarms",
+                environment.sensors.len(),
+                zones.len(),
+                active_alarm_count
+            )
+        },
         text_style(
             ui_scale.value(15.0),
             FontWeight::BOLD,
@@ -6371,7 +13359,7 @@ fn add_environment_view_panel(
             layout::with_size(
                 layout::row(),
                 layout::percent(1.0),
-                layout::px(ui_scale.value(238.0)),
+                layout::px(ui_scale.value(trend_height)),
             ),
         )
         .with_visual(UiVisual::panel(
@@ -6384,116 +13372,200 @@ fn add_environment_view_panel(
         )),
     );
 
-    let metrics = document.add_child(
-        panel,
-        UiNode::container(
-            "fabricad.environment.metrics",
-            layout::with_gap_all(
-                layout::with_size(
-                    layout::row(),
-                    layout::percent(1.0),
-                    layout::px(ui_scale.value(42.0)),
-                ),
-                ui_scale.value(8.0),
-            ),
-        ),
-    );
-    add_primary_cell(
-        document,
-        metrics,
-        "fabricad.environment.metrics.selected",
-        environment_selected_sensor_label(environment, sensor),
-        1.4,
-        false,
-        ui_scale,
-    );
-    add_primary_cell(
-        document,
-        metrics,
-        "fabricad.environment.metrics.trend",
+    let selected_metric = if compact_rows {
         environment
-            .trend_summary(&sensor.id)
-            .map(|summary| {
+            .latest_reading(&sensor.id)
+            .map(|reading| {
+                format!(
+                    "{} / {}",
+                    environment_sensor_button_label(sensor),
+                    environment_alarm_short_label(sensor.thresholds.evaluate(reading.value))
+                )
+            })
+            .unwrap_or_else(|| format!("{} / no data", environment_sensor_button_label(sensor)))
+    } else {
+        environment_selected_sensor_label(environment, sensor)
+    };
+    let trend_label = environment
+        .trend_summary(&sensor.id)
+        .map(|summary| {
+            if compact_rows {
+                format!(
+                    "{} {:.2} {}",
+                    summary.direction.label(),
+                    summary.average_value,
+                    sensor.unit
+                )
+            } else {
                 format!(
                     "{} avg {:.2} {}",
                     summary.direction.label(),
                     summary.average_value,
                     sensor.unit
                 )
-            })
-            .unwrap_or_else(|| "No trend".to_string()),
-        1.0,
-        false,
-        ui_scale,
-    );
-    add_primary_cell(
-        document,
-        metrics,
-        "fabricad.environment.metrics.readings",
-        format!(
-            "{} readings / {} events",
-            environment.readings.len(),
-            environment.events.len()
-        ),
-        1.0,
-        false,
-        ui_scale,
-    );
-    add_primary_cell(
-        document,
-        metrics,
-        "fabricad.environment.metrics.alarms",
-        format!(
-            "{} active / {} total alarms",
-            active_alarm_count,
-            environment.alarms.len()
-        ),
-        1.0,
-        false,
-        ui_scale,
-    );
-
-    let detail = document.add_child(
-        panel,
-        UiNode::container(
-            "fabricad.environment.detail",
-            layout::with_gap_all(
-                layout::with_size(
-                    layout::row(),
-                    layout::percent(1.0),
-                    layout::px(ui_scale.value(42.0)),
+            }
+        })
+        .unwrap_or_else(|| "No trend".to_string());
+    let metric_items = [
+        selected_metric,
+        trend_label,
+        if compact_rows {
+            format!(
+                "{} readings / {} ev",
+                environment.readings.len(),
+                environment.events.len()
+            )
+        } else {
+            format!(
+                "{} readings / {} events",
+                environment.readings.len(),
+                environment.events.len()
+            )
+        },
+        if compact_rows {
+            format!(
+                "{active_alarm_count} active / {} alarms",
+                environment.alarms.len()
+            )
+        } else {
+            format!(
+                "{} active / {} total alarms",
+                active_alarm_count,
+                environment.alarms.len()
+            )
+        },
+    ];
+    if compact_rows {
+        add_compact_metric_rows(
+            document,
+            panel,
+            "fabricad.environment.metrics",
+            &metric_items,
+            ui_scale,
+        );
+    } else {
+        let metrics = document.add_child(
+            panel,
+            UiNode::container(
+                "fabricad.environment.metrics",
+                layout::with_gap_all(
+                    layout::with_size(
+                        layout::row(),
+                        layout::percent(1.0),
+                        layout::px(ui_scale.value(42.0)),
+                    ),
+                    ui_scale.value(8.0),
                 ),
-                ui_scale.value(8.0),
             ),
-        ),
-    );
-    add_primary_cell(
-        document,
-        detail,
-        "fabricad.environment.detail.zone",
-        environment_selected_zone_label(&zones, &sensor.zone),
-        1.3,
-        false,
-        ui_scale,
-    );
-    add_primary_cell(
-        document,
-        detail,
-        "fabricad.environment.detail.nominal",
-        format!("Nominal {}", sensor.thresholds.nominal_label(&sensor.unit)),
-        1.1,
-        false,
-        ui_scale,
-    );
-    add_primary_cell(
-        document,
-        detail,
-        "fabricad.environment.detail.correlation",
-        environment_correlation_label(environment, &sensor.id),
-        1.2,
-        false,
-        ui_scale,
-    );
+        );
+        add_primary_cell(
+            document,
+            metrics,
+            "fabricad.environment.metrics.selected",
+            metric_items[0].clone(),
+            1.4,
+            false,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            metrics,
+            "fabricad.environment.metrics.trend",
+            metric_items[1].clone(),
+            1.0,
+            false,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            metrics,
+            "fabricad.environment.metrics.readings",
+            metric_items[2].clone(),
+            1.0,
+            false,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            metrics,
+            "fabricad.environment.metrics.alarms",
+            metric_items[3].clone(),
+            1.0,
+            false,
+            ui_scale,
+        );
+    }
+
+    let detail_items = if compact_rows {
+        [
+            zones
+                .iter()
+                .find(|zone| zone.name == sensor.zone)
+                .map(|zone| format!("{} / {} sens", zone.name, zone.sensor_count))
+                .unwrap_or_else(|| format!("{} / no data", sensor.zone)),
+            "Nominal band".to_string(),
+            environment_correlation_label(environment, &sensor.id)
+                .replace(" candidate", "")
+                .replace(" labels", ""),
+        ]
+    } else {
+        [
+            environment_selected_zone_label(&zones, &sensor.zone),
+            format!("Nominal {}", sensor.thresholds.nominal_label(&sensor.unit)),
+            environment_correlation_label(environment, &sensor.id),
+        ]
+    };
+    if compact_rows {
+        add_compact_metric_rows(
+            document,
+            panel,
+            "fabricad.environment.detail",
+            &detail_items,
+            ui_scale,
+        );
+    } else {
+        let detail = document.add_child(
+            panel,
+            UiNode::container(
+                "fabricad.environment.detail",
+                layout::with_gap_all(
+                    layout::with_size(
+                        layout::row(),
+                        layout::percent(1.0),
+                        layout::px(ui_scale.value(42.0)),
+                    ),
+                    ui_scale.value(8.0),
+                ),
+            ),
+        );
+        add_primary_cell(
+            document,
+            detail,
+            "fabricad.environment.detail.zone",
+            detail_items[0].clone(),
+            1.3,
+            false,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            detail,
+            "fabricad.environment.detail.nominal",
+            detail_items[1].clone(),
+            1.1,
+            false,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            detail,
+            "fabricad.environment.detail.correlation",
+            detail_items[2].clone(),
+            1.2,
+            false,
+            ui_scale,
+        );
+    }
 
     let sensors = document.add_child(
         panel,
@@ -6501,27 +13573,72 @@ fn add_environment_view_panel(
             "fabricad.environment.sensors",
             layout::with_gap_all(
                 layout::with_size(
-                    layout::row(),
+                    if compact_rows {
+                        layout::column()
+                    } else {
+                        layout::row()
+                    },
                     layout::percent(1.0),
-                    layout::px(ui_scale.value(38.0)),
+                    layout::px(ui_scale.value(if compact_rows { 70.0 } else { 38.0 })),
                 ),
-                ui_scale.value(8.0),
+                ui_scale.value(if compact_rows { 6.0 } else { 8.0 }),
             ),
         ),
     );
-    for (index, sensor) in environment.sensors.iter().take(5).enumerate() {
-        add_button(
-            document,
-            sensors,
-            format!(
-                "fabricad.primary.action.environment.{index}.environment.sensor.{}",
-                sensor.id
-            ),
-            compact_button_label(&sensor.id, 12),
-            app.selected_environment_sensor.as_deref() == Some(sensor.id.as_str()),
-            primary_cell_layout(1.0),
-            ui_scale,
-        );
+    if compact_rows {
+        for (row_index, chunk) in environment
+            .sensors
+            .iter()
+            .take(5)
+            .enumerate()
+            .collect::<Vec<_>>()
+            .chunks(1)
+            .enumerate()
+        {
+            let row = document.add_child(
+                sensors,
+                UiNode::container(
+                    format!("fabricad.environment.sensors.row.{row_index}"),
+                    layout::with_gap_all(
+                        layout::with_size(
+                            layout::row(),
+                            layout::percent(1.0),
+                            layout::px(ui_scale.value(32.0)),
+                        ),
+                        ui_scale.value(6.0),
+                    ),
+                ),
+            );
+            for (index, sensor) in chunk {
+                add_button(
+                    document,
+                    row,
+                    format!(
+                        "fabricad.primary.action.environment.{index}.environment.sensor.{}",
+                        sensor.id
+                    ),
+                    compact_button_label(&display_environment_sensor_label(sensor), 18),
+                    app.selected_environment_sensor.as_deref() == Some(sensor.id.as_str()),
+                    primary_cell_layout(1.0),
+                    ui_scale,
+                );
+            }
+        }
+    } else {
+        for (index, sensor) in environment.sensors.iter().take(5).enumerate() {
+            add_button(
+                document,
+                sensors,
+                format!(
+                    "fabricad.primary.action.environment.{index}.environment.sensor.{}",
+                    sensor.id
+                ),
+                compact_button_label(&display_environment_sensor_label(sensor), 28),
+                app.selected_environment_sensor.as_deref() == Some(sensor.id.as_str()),
+                primary_cell_layout(1.0),
+                ui_scale,
+            );
+        }
     }
 }
 
@@ -6530,6 +13647,7 @@ fn add_metrology_view_panel(
     parent: operad::UiNodeId,
     app: &FabricadApp,
     ui_scale: UiScale,
+    compact_rows: bool,
 ) {
     let map = &app.workspace.wafer_map;
     if map.dies.is_empty() {
@@ -6553,7 +13671,7 @@ fn add_metrology_view_panel(
                     layout::with_size(
                         layout::column(),
                         layout::percent(1.0),
-                        layout::px(ui_scale.value(414.0)),
+                        layout::px(ui_scale.value(if compact_rows { 486.0 } else { 414.0 })),
                     ),
                     ui_scale.value(8.0),
                 ),
@@ -6573,12 +13691,20 @@ fn add_metrology_view_panel(
         document,
         panel,
         "fabricad.metrology.primary.title",
-        format!(
-            "{} - {} / {}",
-            map.name,
-            app.metrology_map_mode.label(),
-            app.metrology_kind.label()
-        ),
+        if compact_rows {
+            format!(
+                "{} - {}",
+                app.metrology_kind.label(),
+                app.metrology_map_mode.label()
+            )
+        } else {
+            format!(
+                "{} - {} / {}",
+                metrology_map_display_name(&app.workspace, map),
+                app.metrology_map_mode.label(),
+                app.metrology_kind.label()
+            )
+        },
         text_style(
             ui_scale.value(15.0),
             FontWeight::BOLD,
@@ -6607,63 +13733,85 @@ fn add_metrology_view_panel(
         )),
     );
 
-    let metrics = document.add_child(
-        panel,
-        UiNode::container(
+    if compact_rows {
+        add_compact_metric_rows(
+            document,
+            panel,
             "fabricad.metrology.metrics",
-            layout::with_gap_all(
-                layout::with_size(
-                    layout::row(),
-                    layout::percent(1.0),
-                    layout::px(ui_scale.value(42.0)),
+            &[
+                format!("{} samples", summary.sample_count),
+                format!(
+                    "{} pass / {} fail / {} outlier",
+                    summary.pass_count, summary.fail_count, summary.outlier_count
                 ),
-                ui_scale.value(8.0),
+                metrology_summary_label(summary),
+                format!(
+                    "{} defects / {} notes",
+                    map.defects.len(),
+                    map.annotations.len()
+                ),
+            ],
+            ui_scale,
+        );
+    } else {
+        let metrics = document.add_child(
+            panel,
+            UiNode::container(
+                "fabricad.metrology.metrics",
+                layout::with_gap_all(
+                    layout::with_size(
+                        layout::row(),
+                        layout::percent(1.0),
+                        layout::px(ui_scale.value(42.0)),
+                    ),
+                    ui_scale.value(8.0),
+                ),
             ),
-        ),
-    );
-    add_primary_cell(
-        document,
-        metrics,
-        "fabricad.metrology.metrics.samples",
-        format!("{} samples", summary.sample_count),
-        0.8,
-        false,
-        ui_scale,
-    );
-    add_primary_cell(
-        document,
-        metrics,
-        "fabricad.metrology.metrics.status",
-        format!(
-            "{} pass / {} fail / {} outlier",
-            summary.pass_count, summary.fail_count, summary.outlier_count
-        ),
-        1.5,
-        false,
-        ui_scale,
-    );
-    add_primary_cell(
-        document,
-        metrics,
-        "fabricad.metrology.metrics.center",
-        metrology_summary_label(summary),
-        1.2,
-        false,
-        ui_scale,
-    );
-    add_primary_cell(
-        document,
-        metrics,
-        "fabricad.metrology.metrics.defects",
-        format!(
-            "{} defects / {} notes",
-            map.defects.len(),
-            map.annotations.len()
-        ),
-        1.0,
-        false,
-        ui_scale,
-    );
+        );
+        add_primary_cell(
+            document,
+            metrics,
+            "fabricad.metrology.metrics.samples",
+            format!("{} samples", summary.sample_count),
+            0.8,
+            false,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            metrics,
+            "fabricad.metrology.metrics.status",
+            format!(
+                "{} pass / {} fail / {} outlier",
+                summary.pass_count, summary.fail_count, summary.outlier_count
+            ),
+            1.5,
+            false,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            metrics,
+            "fabricad.metrology.metrics.center",
+            metrology_summary_label(summary),
+            1.2,
+            false,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            metrics,
+            "fabricad.metrology.metrics.defects",
+            format!(
+                "{} defects / {} notes",
+                map.defects.len(),
+                map.annotations.len()
+            ),
+            1.0,
+            false,
+            ui_scale,
+        );
+    }
 
     let selected = document.add_child(
         panel,
@@ -6671,9 +13819,13 @@ fn add_metrology_view_panel(
             "fabricad.metrology.selected",
             layout::with_gap_all(
                 layout::with_size(
-                    layout::row(),
+                    if compact_rows {
+                        layout::column()
+                    } else {
+                        layout::row()
+                    },
                     layout::percent(1.0),
-                    layout::px(ui_scale.value(42.0)),
+                    layout::px(ui_scale.value(if compact_rows { 64.0 } else { 42.0 })),
                 ),
                 ui_scale.value(8.0),
             ),
@@ -6683,24 +13835,29 @@ fn add_metrology_view_panel(
         document,
         selected,
         "fabricad.metrology.selected.die",
-        metrology_selected_die_label(map, app.selected_die),
+        compact_button_label(
+            &metrology_selected_die_label(map, app.selected_die),
+            if compact_rows { 54 } else { 96 },
+        ),
         2.2,
         false,
         ui_scale,
     );
-    add_primary_cell(
-        document,
-        selected,
-        "fabricad.metrology.selected.filters",
-        if app.metrology_failed_only {
-            "Showing failed/outlier sites"
-        } else {
-            "Showing all measured dies"
-        },
-        1.0,
-        false,
-        ui_scale,
-    );
+    if !compact_rows {
+        add_primary_cell(
+            document,
+            selected,
+            "fabricad.metrology.selected.filters",
+            if app.metrology_failed_only {
+                "Showing failed/outlier sites"
+            } else {
+                "Showing all measured dies"
+            },
+            1.0,
+            false,
+            ui_scale,
+        );
+    }
 
     let triage = document.add_child(
         panel,
@@ -6708,9 +13865,13 @@ fn add_metrology_view_panel(
             "fabricad.metrology.triage",
             layout::with_gap_all(
                 layout::with_size(
-                    layout::row(),
+                    if compact_rows {
+                        layout::column()
+                    } else {
+                        layout::row()
+                    },
                     layout::percent(1.0),
-                    layout::px(ui_scale.value(38.0)),
+                    layout::px(ui_scale.value(if compact_rows { 74.0 } else { 38.0 })),
                 ),
                 ui_scale.value(8.0),
             ),
@@ -6727,19 +13888,108 @@ fn add_metrology_view_panel(
             ui_scale,
         );
     } else {
-        for (index, (die, score)) in attention_sites.iter().take(5).enumerate() {
-            add_button(
+        if compact_rows {
+            for (row_index, chunk) in attention_sites
+                .iter()
+                .take(4)
+                .collect::<Vec<_>>()
+                .chunks(2)
+                .enumerate()
+            {
+                let row = document.add_child(
+                    triage,
+                    UiNode::container(
+                        format!("fabricad.metrology.triage.row.{row_index}"),
+                        layout::with_gap_all(
+                            layout::with_size(
+                                layout::row(),
+                                layout::percent(1.0),
+                                layout::px(ui_scale.value(32.0)),
+                            ),
+                            ui_scale.value(8.0),
+                        ),
+                    ),
+                );
+                for (die, score) in chunk {
+                    add_button(
+                        document,
+                        row,
+                        format!("fabricad.viewctl.metrology.die.{}|{}", die.column, die.row),
+                        compact_button_label(
+                            &metrology_attention_site_label(*die, *score, true),
+                            18,
+                        ),
+                        app.selected_die == Some(*die),
+                        primary_cell_layout(1.0),
+                        ui_scale,
+                    );
+                }
+            }
+        } else {
+            for (index, (die, score)) in attention_sites.iter().take(5).enumerate() {
+                add_button(
+                    document,
+                    triage,
+                    format!("fabricad.viewctl.metrology.die.{}|{}", die.column, die.row),
+                    metrology_attention_site_label(*die, *score, false),
+                    app.selected_die == Some(*die),
+                    primary_cell_layout(1.0),
+                    ui_scale,
+                );
+                if index == 4 {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn add_compact_metric_rows(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    name: &str,
+    items: &[String],
+    ui_scale: UiScale,
+) {
+    let metrics = document.add_child(
+        parent,
+        UiNode::container(
+            name,
+            layout::with_gap_all(
+                layout::with_size(
+                    layout::column(),
+                    layout::percent(1.0),
+                    layout::px(ui_scale.value(70.0)),
+                ),
+                ui_scale.value(6.0),
+            ),
+        ),
+    );
+    for (row_index, chunk) in items.chunks(2).enumerate() {
+        let row = document.add_child(
+            metrics,
+            UiNode::container(
+                format!("{name}.row.{row_index}"),
+                layout::with_gap_all(
+                    layout::with_size(
+                        layout::row(),
+                        layout::percent(1.0),
+                        layout::px(ui_scale.value(28.0)),
+                    ),
+                    ui_scale.value(6.0),
+                ),
+            ),
+        );
+        for (column_index, text) in chunk.iter().enumerate() {
+            add_primary_cell(
                 document,
-                triage,
-                format!("fabricad.viewctl.metrology.die.{}|{}", die.column, die.row),
-                format!("{} score {score}", die_coord_label(Some(*die))),
-                app.selected_die == Some(*die),
-                primary_cell_layout(1.0),
+                row,
+                format!("{name}.{row_index}.{column_index}"),
+                compact_button_label(text, 20),
+                1.0,
+                false,
                 ui_scale,
             );
-            if index == 4 {
-                break;
-            }
         }
     }
 }
@@ -6749,6 +13999,7 @@ fn add_yield_view_panel(
     parent: operad::UiNodeId,
     app: &FabricadApp,
     ui_scale: UiScale,
+    compact_rows: bool,
 ) {
     let analysis = &app.workspace.yield_analysis;
     let Some(lot_id) = app
@@ -6796,7 +14047,7 @@ fn add_yield_view_panel(
                     layout::with_size(
                         layout::column(),
                         layout::percent(1.0),
-                        layout::px(ui_scale.value(414.0)),
+                        layout::px(ui_scale.value(if compact_rows { 500.0 } else { 414.0 })),
                     ),
                     ui_scale.value(8.0),
                 ),
@@ -6816,10 +14067,14 @@ fn add_yield_view_panel(
         document,
         panel,
         "fabricad.yield.primary.title",
-        format!(
-            "Yield dashboard - {lot_id} / {wafer_id} / {}",
-            app.yield_map_filter.label()
-        ),
+        if compact_rows {
+            format!("{lot_id} / {wafer_id} / {}", app.yield_map_filter.label())
+        } else {
+            format!(
+                "Yield dashboard - {lot_id} / {wafer_id} / {}",
+                app.yield_map_filter.label()
+            )
+        },
         text_style(
             ui_scale.value(15.0),
             FontWeight::BOLD,
@@ -6831,7 +14086,7 @@ fn add_yield_view_panel(
         panel,
         UiNode::scene(
             "fabricad.yield.wafer_map",
-            yield_view_primitives(app, lot_id, wafer_id, &outcomes, ui_scale),
+            yield_view_primitives(app, lot_id, wafer_id, &outcomes, ui_scale, compact_rows),
             layout::with_size(
                 layout::row(),
                 layout::percent(1.0),
@@ -6848,73 +14103,111 @@ fn add_yield_view_panel(
         )),
     );
 
-    let metrics = document.add_child(
-        panel,
-        UiNode::container(
-            "fabricad.yield.metrics",
-            layout::with_gap_all(
-                layout::with_size(
-                    layout::row(),
-                    layout::percent(1.0),
-                    layout::px(ui_scale.value(42.0)),
-                ),
-                ui_scale.value(8.0),
-            ),
-        ),
-    );
-    add_primary_cell(
-        document,
-        metrics,
-        "fabricad.yield.metrics.lot",
+    let yield_metric_items = [
         lot_summary
             .map(|summary| format!("lot {}", percent_label(summary.yield_fraction)))
             .unwrap_or_else(|| "lot n/a".to_string()),
-        0.8,
-        false,
-        ui_scale,
-    );
-    add_primary_cell(
-        document,
-        metrics,
-        "fabricad.yield.metrics.wafer",
         wafer_summary
             .map(|summary| {
-                format!(
-                    "wafer {} / {} fail",
-                    percent_label(summary.yield_fraction),
-                    summary.failing_dies
-                )
+                if compact_rows {
+                    format!(
+                        "wafer {} / {}F",
+                        percent_label(summary.yield_fraction),
+                        summary.failing_dies
+                    )
+                } else {
+                    format!(
+                        "wafer {} / {} fail",
+                        percent_label(summary.yield_fraction),
+                        summary.failing_dies
+                    )
+                }
             })
             .unwrap_or_else(|| "wafer n/a".to_string()),
-        1.0,
-        false,
-        ui_scale,
-    );
-    add_primary_cell(
-        document,
-        metrics,
-        "fabricad.yield.metrics.failure",
         wafer_summary
             .or(lot_summary)
-            .map(yield_failure_label)
+            .map(|summary| {
+                if compact_rows {
+                    yield_failure_compact_label(summary)
+                } else {
+                    yield_failure_label(summary)
+                }
+            })
             .unwrap_or_else(|| "No failure mode".to_string()),
-        1.4,
-        false,
-        ui_scale,
-    );
-    add_primary_cell(
-        document,
-        metrics,
-        "fabricad.yield.metrics.measurements",
-        format!(
-            "{} measurements / {} excursions",
-            measurements.len(),
-            yield_excursion_count(&measurements)
-        ),
-        1.0,
-        false,
-        ui_scale,
-    );
+        if compact_rows {
+            format!(
+                "{} meas / {} exc",
+                measurements.len(),
+                yield_excursion_count(&measurements)
+            )
+        } else {
+            format!(
+                "{} measurements / {} excursions",
+                measurements.len(),
+                yield_excursion_count(&measurements)
+            )
+        },
+    ];
+    if compact_rows {
+        add_compact_metric_rows(
+            document,
+            panel,
+            "fabricad.yield.metrics",
+            &yield_metric_items,
+            ui_scale,
+        );
+    } else {
+        let metrics = document.add_child(
+            panel,
+            UiNode::container(
+                "fabricad.yield.metrics",
+                layout::with_gap_all(
+                    layout::with_size(
+                        layout::row(),
+                        layout::percent(1.0),
+                        layout::px(ui_scale.value(42.0)),
+                    ),
+                    ui_scale.value(8.0),
+                ),
+            ),
+        );
+        add_primary_cell(
+            document,
+            metrics,
+            "fabricad.yield.metrics.lot",
+            yield_metric_items[0].clone(),
+            0.8,
+            false,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            metrics,
+            "fabricad.yield.metrics.wafer",
+            yield_metric_items[1].clone(),
+            1.0,
+            false,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            metrics,
+            "fabricad.yield.metrics.failure",
+            yield_metric_items[2].clone(),
+            1.4,
+            false,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            metrics,
+            "fabricad.yield.metrics.measurements",
+            yield_metric_items[3].clone(),
+            1.0,
+            false,
+            ui_scale,
+        );
+    }
 
     let selected = document.add_child(
         panel,
@@ -6922,9 +14215,13 @@ fn add_yield_view_panel(
             "fabricad.yield.selected",
             layout::with_gap_all(
                 layout::with_size(
-                    layout::row(),
+                    if compact_rows {
+                        layout::column()
+                    } else {
+                        layout::row()
+                    },
                     layout::percent(1.0),
-                    layout::px(ui_scale.value(42.0)),
+                    layout::px(ui_scale.value(if compact_rows { 64.0 } else { 42.0 })),
                 ),
                 ui_scale.value(8.0),
             ),
@@ -6936,27 +14233,33 @@ fn add_yield_view_panel(
         "fabricad.yield.selected.root_cause",
         wafer_summary
             .or(lot_summary)
-            .and_then(|summary| summary.root_cause_hints.first())
-            .map(|hint| compact_button_label(hint, 82))
+            .map(|summary| {
+                if compact_rows {
+                    yield_root_cause_compact_label(summary)
+                } else {
+                    summary
+                        .root_cause_hints
+                        .first()
+                        .map(|hint| compact_button_label(hint, 82))
+                        .unwrap_or_else(|| "No root-cause hint".to_string())
+                }
+            })
             .unwrap_or_else(|| "No root-cause hint".to_string()),
         2.0,
         false,
         ui_scale,
     );
-    add_primary_cell(
-        document,
-        selected,
-        "fabricad.yield.selected.filters",
-        format!(
-            "{} / attention {} / excursions {}",
-            app.yield_map_filter.label(),
-            app.show_only_attention_wafers,
-            app.show_only_excursions
-        ),
-        1.2,
-        false,
-        ui_scale,
-    );
+    if !compact_rows {
+        add_primary_cell(
+            document,
+            selected,
+            "fabricad.yield.selected.filters",
+            yield_filter_summary(app),
+            1.2,
+            false,
+            ui_scale,
+        );
+    }
 
     let wafers = document.add_child(
         panel,
@@ -6964,32 +14267,75 @@ fn add_yield_view_panel(
             "fabricad.yield.wafers",
             layout::with_gap_all(
                 layout::with_size(
-                    layout::row(),
+                    if compact_rows {
+                        layout::column()
+                    } else {
+                        layout::row()
+                    },
                     layout::percent(1.0),
-                    layout::px(ui_scale.value(38.0)),
+                    layout::px(ui_scale.value(if compact_rows { 74.0 } else { 38.0 })),
                 ),
                 ui_scale.value(8.0),
             ),
         ),
     );
-    for (index, summary) in wafer_rows
+    let visible_wafer_rows = wafer_rows
         .into_iter()
         .filter(|summary| yield_summary_matches(app, summary))
-        .take(5)
-        .enumerate()
-    {
-        let Some(row_wafer_id) = summary.wafer_id.as_deref() else {
-            continue;
-        };
-        add_button(
-            document,
-            wafers,
-            format!("fabricad.primary.action.yield.{index}.yield.wafer.{row_wafer_id}"),
-            format!("{} {}", row_wafer_id, percent_label(summary.yield_fraction)),
-            app.selected_yield_wafer.as_deref() == Some(row_wafer_id),
-            primary_cell_layout(1.0),
-            ui_scale,
-        );
+        .take(if compact_rows { 4 } else { 5 })
+        .collect::<Vec<_>>();
+    if compact_rows {
+        for (row_index, chunk) in visible_wafer_rows.chunks(2).enumerate() {
+            let row = document.add_child(
+                wafers,
+                UiNode::container(
+                    format!("fabricad.yield.wafers.row.{row_index}"),
+                    layout::with_gap_all(
+                        layout::with_size(
+                            layout::row(),
+                            layout::percent(1.0),
+                            layout::px(ui_scale.value(32.0)),
+                        ),
+                        ui_scale.value(8.0),
+                    ),
+                ),
+            );
+            for (column_index, summary) in chunk.iter().enumerate() {
+                let Some(row_wafer_id) = summary.wafer_id.as_deref() else {
+                    continue;
+                };
+                add_button(
+                    document,
+                    row,
+                    format!(
+                        "fabricad.primary.action.yield.{}_{}.yield.wafer.{row_wafer_id}",
+                        row_index, column_index
+                    ),
+                    compact_button_label(
+                        &format!("{} {}", row_wafer_id, percent_label(summary.yield_fraction)),
+                        18,
+                    ),
+                    app.selected_yield_wafer.as_deref() == Some(row_wafer_id),
+                    primary_cell_layout(1.0),
+                    ui_scale,
+                );
+            }
+        }
+    } else {
+        for (index, summary) in visible_wafer_rows.into_iter().enumerate() {
+            let Some(row_wafer_id) = summary.wafer_id.as_deref() else {
+                continue;
+            };
+            add_button(
+                document,
+                wafers,
+                format!("fabricad.primary.action.yield.{index}.yield.wafer.{row_wafer_id}"),
+                format!("{} {}", row_wafer_id, percent_label(summary.yield_fraction)),
+                app.selected_yield_wafer.as_deref() == Some(row_wafer_id),
+                primary_cell_layout(1.0),
+                ui_scale,
+            );
+        }
     }
 }
 
@@ -6998,6 +14344,7 @@ fn add_experiment_view_panel(
     parent: operad::UiNodeId,
     app: &FabricadApp,
     ui_scale: UiScale,
+    compact_rows: bool,
 ) {
     let plan = &app.workspace.experiment_plan;
     if plan.runs.is_empty() && plan.factors.is_empty() && plan.responses.is_empty() {
@@ -7021,7 +14368,7 @@ fn add_experiment_view_panel(
                     layout::with_size(
                         layout::column(),
                         layout::percent(1.0),
-                        layout::px(ui_scale.value(414.0)),
+                        layout::px(ui_scale.value(if compact_rows { 500.0 } else { 414.0 })),
                     ),
                     ui_scale.value(8.0),
                 ),
@@ -7041,28 +14388,33 @@ fn add_experiment_view_panel(
         document,
         panel,
         "fabricad.experiment.primary.title",
-        format!(
-            "{} - {} / owner {}",
-            plan.title,
-            plan.status.label(),
-            plan.owner
-        ),
+        experiment_plan_title_label(plan, compact_rows),
         text_style(
             ui_scale.value(15.0),
             FontWeight::BOLD,
             ColorRgba::new(238, 243, 247, 255),
         ),
-        layout::size(layout::percent(1.0), layout::px(ui_scale.value(24.0))),
+        layout::size(
+            layout::percent(1.0),
+            layout::px(ui_scale.value(if compact_rows { 28.0 } else { 24.0 })),
+        ),
     );
     document.add_child(
         panel,
         UiNode::scene(
             "fabricad.experiment.matrix",
-            experiment_view_primitives(plan, &analysis, app.experiment_show_missing_only, ui_scale),
+            experiment_view_primitives(
+                plan,
+                &analysis,
+                app.experiment_show_missing_only,
+                ui_scale,
+                compact_rows,
+                ui_scale.value(if compact_rows { 560.0 } else { 920.0 }),
+            ),
             layout::with_size(
                 layout::row(),
                 layout::percent(1.0),
-                layout::px(ui_scale.value(238.0)),
+                layout::px(ui_scale.value(if compact_rows { 220.0 } else { 238.0 })),
             ),
         )
         .with_visual(UiVisual::panel(
@@ -7075,100 +14427,138 @@ fn add_experiment_view_panel(
         )),
     );
 
-    let metrics = document.add_child(
-        panel,
-        UiNode::container(
-            "fabricad.experiment.metrics",
-            layout::with_gap_all(
-                layout::with_size(
-                    layout::row(),
-                    layout::percent(1.0),
-                    layout::px(ui_scale.value(42.0)),
-                ),
-                ui_scale.value(8.0),
-            ),
-        ),
-    );
-    add_primary_cell(
-        document,
-        metrics,
-        "fabricad.experiment.metrics.runs",
+    let metric_items = [
         format!(
             "{} / {} complete",
             analysis.completed_runs, analysis.run_count
         ),
-        0.9,
-        false,
-        ui_scale,
-    );
-    add_primary_cell(
-        document,
-        metrics,
-        "fabricad.experiment.metrics.pending",
         format!("{} pending values", analysis.missing_response_count),
-        1.0,
-        false,
-        ui_scale,
-    );
-    add_primary_cell(
-        document,
-        metrics,
-        "fabricad.experiment.metrics.scope",
         format!(
             "{} factors / {} responses",
             plan.factors.len(),
             plan.responses.len()
         ),
-        1.0,
-        false,
-        ui_scale,
-    );
-    add_primary_cell(
-        document,
-        metrics,
-        "fabricad.experiment.metrics.best",
         analysis
             .best_run_id
             .as_ref()
-            .map(|run_id| format!("best observed {run_id}"))
+            .and_then(|run_id| plan.run(run_id))
+            .map(|run| format!("best observed {}", display_experiment_run_label(run)))
             .unwrap_or_else(|| "best run pending".to_string()),
-        1.2,
-        false,
-        ui_scale,
-    );
-
-    let note_row = document.add_child(
-        panel,
-        UiNode::container(
-            "fabricad.experiment.note",
-            layout::with_gap_all(
-                layout::with_size(
-                    layout::row(),
-                    layout::percent(1.0),
-                    layout::px(ui_scale.value(42.0)),
+    ];
+    if compact_rows {
+        add_compact_metric_rows(
+            document,
+            panel,
+            "fabricad.experiment.metrics",
+            &metric_items,
+            ui_scale,
+        );
+    } else {
+        let metrics = document.add_child(
+            panel,
+            UiNode::container(
+                "fabricad.experiment.metrics",
+                layout::with_gap_all(
+                    layout::with_size(
+                        layout::row(),
+                        layout::percent(1.0),
+                        layout::px(ui_scale.value(42.0)),
+                    ),
+                    ui_scale.value(8.0),
                 ),
-                ui_scale.value(8.0),
             ),
+        );
+        add_primary_cell(
+            document,
+            metrics,
+            "fabricad.experiment.metrics.runs",
+            metric_items[0].clone(),
+            0.9,
+            false,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            metrics,
+            "fabricad.experiment.metrics.pending",
+            metric_items[1].clone(),
+            1.0,
+            false,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            metrics,
+            "fabricad.experiment.metrics.scope",
+            metric_items[2].clone(),
+            1.0,
+            false,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            metrics,
+            "fabricad.experiment.metrics.best",
+            metric_items[3].clone(),
+            1.2,
+            false,
+            ui_scale,
+        );
+    }
+
+    let note_items = [
+        compact_button_label(
+            &display_experiment_objective(&plan.objective),
+            if compact_rows { 46 } else { 96 },
         ),
-    );
-    add_primary_cell(
-        document,
-        note_row,
-        "fabricad.experiment.note.objective",
-        compact_button_label(&plan.objective, 96),
-        2.0,
-        false,
-        ui_scale,
-    );
-    add_primary_cell(
-        document,
-        note_row,
-        "fabricad.experiment.note.readiness",
         experiment_readiness_label(&analysis, plan.responses.len()),
-        1.0,
-        false,
-        ui_scale,
-    );
+    ];
+    if compact_rows {
+        add_compact_metric_rows(
+            document,
+            panel,
+            "fabricad.experiment.note",
+            &note_items,
+            ui_scale,
+        );
+    } else {
+        let note_row = document.add_child(
+            panel,
+            UiNode::container(
+                "fabricad.experiment.note",
+                layout::with_gap_all(
+                    layout::with_size(
+                        layout::row(),
+                        layout::percent(1.0),
+                        layout::px(ui_scale.value(42.0)),
+                    ),
+                    ui_scale.value(8.0),
+                ),
+            ),
+        );
+        add_primary_cell(
+            document,
+            note_row,
+            "fabricad.experiment.note.objective",
+            note_items[0].clone(),
+            2.0,
+            false,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            note_row,
+            "fabricad.experiment.note.readiness",
+            note_items[1].clone(),
+            1.0,
+            false,
+            ui_scale,
+        );
+    }
+
+    if compact_rows {
+        return;
+    }
 
     let actions = document.add_child(
         panel,
@@ -7191,7 +14581,7 @@ fn add_experiment_view_panel(
             app.experiment_show_missing_only,
         ),
         ("experiment.next_pending", "Next", false),
-        ("experiment.capture_next_demo", "Next demo", false),
+        ("experiment.capture_next_demo", "Next sample", false),
         ("experiment.use_target", "Target", false),
     ]
     .into_iter()
@@ -7214,6 +14604,7 @@ fn add_process_control_view_panel(
     parent: operad::UiNodeId,
     app: &FabricadApp,
     ui_scale: UiScale,
+    compact_rows: bool,
 ) {
     let Some(loop_definition) = selected_control_loop(app) else {
         add_primary_data_panel(
@@ -7241,6 +14632,15 @@ fn add_process_control_view_panel(
         .process_control
         .audit_for_loop(&loop_definition.id)
         .len();
+    let latest_label = process_control_latest_label(latest, compact_rows);
+    let target_label = process_control_target_label(loop_definition, compact_rows);
+    let actions_label = format!("{} actions / {audit_count} audits", actions.len());
+    let detail_items = [
+        selected_action
+            .map(|action| process_control_action_label(action, compact_rows))
+            .unwrap_or_else(|| "No selected recommendation".to_string()),
+        process_control_yield_link_label(app, loop_definition, compact_rows),
+    ];
 
     let panel = document.add_child(
         parent,
@@ -7251,7 +14651,7 @@ fn add_process_control_view_panel(
                     layout::with_size(
                         layout::column(),
                         layout::percent(1.0),
-                        layout::px(ui_scale.value(414.0)),
+                        layout::px(ui_scale.value(if compact_rows { 500.0 } else { 414.0 })),
                     ),
                     ui_scale.value(8.0),
                 ),
@@ -7271,26 +14671,39 @@ fn add_process_control_view_panel(
         document,
         panel,
         "fabricad.process_control.primary.title",
-        format!(
-            "{} - {} on {}",
-            loop_definition.name, loop_definition.output.measurement_name, loop_definition.tool_id
-        ),
+        if compact_rows {
+            format!(
+                "{} - {}",
+                process_control_loop_button_label(&loop_definition.name),
+                equipment_tool_label_for_raw_id(&app.workspace, &loop_definition.tool_id)
+            )
+        } else {
+            format!(
+                "{} - {} on {}",
+                loop_definition.name,
+                display_measurement_identifier(&loop_definition.output.measurement_name),
+                equipment_tool_label_for_raw_id(&app.workspace, &loop_definition.tool_id)
+            )
+        },
         text_style(
             ui_scale.value(15.0),
             FontWeight::BOLD,
             ColorRgba::new(238, 243, 247, 255),
         ),
-        layout::size(layout::percent(1.0), layout::px(ui_scale.value(24.0))),
+        layout::size(
+            layout::percent(1.0),
+            layout::px(ui_scale.value(if compact_rows { 28.0 } else { 24.0 })),
+        ),
     );
     document.add_child(
         panel,
         UiNode::scene(
             "fabricad.process_control.trend",
-            process_control_view_primitives(app, ui_scale),
+            process_control_view_primitives(app, ui_scale, compact_rows),
             layout::with_size(
                 layout::row(),
                 layout::percent(1.0),
-                layout::px(ui_scale.value(238.0)),
+                layout::px(ui_scale.value(if compact_rows { 204.0 } else { 238.0 })),
             ),
         )
         .with_visual(UiVisual::panel(
@@ -7303,94 +14716,101 @@ fn add_process_control_view_panel(
         )),
     );
 
-    let metrics = document.add_child(
-        panel,
-        UiNode::container(
+    let metric_items = [latest_label, target_label, actions_label];
+    if compact_rows {
+        add_compact_metric_rows(
+            document,
+            panel,
             "fabricad.process_control.metrics",
-            layout::with_gap_all(
-                layout::with_size(
-                    layout::row(),
-                    layout::percent(1.0),
-                    layout::px(ui_scale.value(42.0)),
+            &metric_items,
+            ui_scale,
+        );
+    } else {
+        let metrics = document.add_child(
+            panel,
+            UiNode::container(
+                "fabricad.process_control.metrics",
+                layout::with_gap_all(
+                    layout::with_size(
+                        layout::row(),
+                        layout::percent(1.0),
+                        layout::px(ui_scale.value(42.0)),
+                    ),
+                    ui_scale.value(8.0),
                 ),
-                ui_scale.value(8.0),
             ),
-        ),
-    );
-    add_primary_cell(
-        document,
-        metrics,
-        "fabricad.process_control.metrics.latest",
-        latest
-            .map(|point| {
-                format!(
-                    "latest {:.3} {} error {:+.3}",
-                    point.value, point.unit, point.error
-                )
-            })
-            .unwrap_or_else(|| "No trend samples".to_string()),
-        1.5,
-        false,
-        ui_scale,
-    );
-    add_primary_cell(
-        document,
-        metrics,
-        "fabricad.process_control.metrics.target",
-        format!(
-            "target {:.3} +/-{:.3} {}",
-            loop_definition.output.target,
-            loop_definition.deadband.abs(),
-            loop_definition.output.unit
-        ),
-        1.2,
-        false,
-        ui_scale,
-    );
-    add_primary_cell(
-        document,
-        metrics,
-        "fabricad.process_control.metrics.actions",
-        format!("{} actions / {audit_count} audits", actions.len()),
-        1.0,
-        false,
-        ui_scale,
-    );
+        );
+        add_primary_cell(
+            document,
+            metrics,
+            "fabricad.process_control.metrics.latest",
+            metric_items[0].clone(),
+            1.5,
+            false,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            metrics,
+            "fabricad.process_control.metrics.target",
+            metric_items[1].clone(),
+            1.2,
+            false,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            metrics,
+            "fabricad.process_control.metrics.actions",
+            metric_items[2].clone(),
+            1.0,
+            false,
+            ui_scale,
+        );
+    }
 
-    let detail = document.add_child(
-        panel,
-        UiNode::container(
+    if compact_rows {
+        add_compact_metric_rows(
+            document,
+            panel,
             "fabricad.process_control.detail",
-            layout::with_gap_all(
-                layout::with_size(
-                    layout::row(),
-                    layout::percent(1.0),
-                    layout::px(ui_scale.value(42.0)),
+            &detail_items,
+            ui_scale,
+        );
+    } else {
+        let detail = document.add_child(
+            panel,
+            UiNode::container(
+                "fabricad.process_control.detail",
+                layout::with_gap_all(
+                    layout::with_size(
+                        layout::row(),
+                        layout::percent(1.0),
+                        layout::px(ui_scale.value(42.0)),
+                    ),
+                    ui_scale.value(8.0),
                 ),
-                ui_scale.value(8.0),
             ),
-        ),
-    );
-    add_primary_cell(
-        document,
-        detail,
-        "fabricad.process_control.detail.action",
-        selected_action
-            .map(process_control_action_label)
-            .unwrap_or_else(|| "No selected recommendation".to_string()),
-        1.8,
-        false,
-        ui_scale,
-    );
-    add_primary_cell(
-        document,
-        detail,
-        "fabricad.process_control.detail.yield",
-        process_control_yield_link_label(app, loop_definition),
-        1.4,
-        false,
-        ui_scale,
-    );
+        );
+        add_primary_cell(
+            document,
+            detail,
+            "fabricad.process_control.detail.action",
+            detail_items[0].clone(),
+            1.8,
+            false,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            detail,
+            "fabricad.process_control.detail.yield",
+            detail_items[1].clone(),
+            1.4,
+            false,
+            ui_scale,
+        );
+    }
 
     let loops = document.add_child(
         panel,
@@ -7421,7 +14841,7 @@ fn add_process_control_view_panel(
                 "fabricad.primary.action.process_control.{index}.process_control.loop.{}",
                 loop_definition.id
             ),
-            compact_button_label(&loop_definition.name, 16),
+            process_control_loop_button_label(&loop_definition.name),
             app.selected_control_loop.as_ref() == Some(&loop_definition.id),
             primary_cell_layout(1.0),
             ui_scale,
@@ -7434,6 +14854,7 @@ fn add_spc_fdc_view_panel(
     parent: operad::UiNodeId,
     app: &FabricadApp,
     ui_scale: UiScale,
+    compact_rows: bool,
 ) {
     let monitor = spc_fdc_monitor(&app.workspace);
     let selected_chart = selected_spc_chart(app, &monitor);
@@ -7478,12 +14899,16 @@ fn add_spc_fdc_view_panel(
         document,
         panel,
         "fabricad.spc.primary.title",
-        format!(
-            "SPC / FDC monitor - {} findings across {} charts / {} traces",
-            monitor.findings.len(),
-            monitor.charts.len(),
-            monitor.traces.len()
-        ),
+        if compact_rows {
+            format!("SPC / FDC - {} findings", monitor.findings.len())
+        } else {
+            format!(
+                "SPC / FDC monitor - {} findings across {} charts / {} traces",
+                monitor.findings.len(),
+                monitor.charts.len(),
+                monitor.traces.len()
+            )
+        },
         text_style(
             ui_scale.value(15.0),
             FontWeight::BOLD,
@@ -7597,7 +15022,7 @@ fn add_spc_fdc_view_panel(
         selected,
         "fabricad.spc.selected.chart",
         selected_chart
-            .map(spc_chart_summary_label)
+            .map(|chart| spc_chart_summary_label(chart, if compact_rows { 40 } else { 78 }))
             .unwrap_or_else(|| "No selected SPC chart".to_string()),
         1.5,
         false,
@@ -7608,7 +15033,9 @@ fn add_spc_fdc_view_panel(
         selected,
         "fabricad.spc.selected.trace",
         selected_trace
-            .map(|trace| spc_trace_summary_label(&monitor, trace))
+            .map(|trace| {
+                spc_trace_summary_label(&monitor, trace, if compact_rows { 40 } else { 78 })
+            })
             .unwrap_or_else(|| "No selected FDC trace".to_string()),
         1.5,
         false,
@@ -7668,7 +15095,7 @@ fn add_scheduler_view_panel(
         "fabricad.scheduler.primary.title",
         format!(
             "{} dispatch - {} waiting lots / {} tools",
-            app.scheduler_policy.label(),
+            display_dispatch_policy_label(app.scheduler_policy),
             app.workspace.scheduler.lots.len(),
             app.workspace.scheduler.tools.len()
         ),
@@ -7773,6 +15200,7 @@ fn add_notebook_view_panel(
     parent: operad::UiNodeId,
     app: &FabricadApp,
     ui_scale: UiScale,
+    compact_rows: bool,
 ) {
     let Some(entry) = selected_notebook_entry(app) else {
         add_primary_data_panel(
@@ -7784,6 +15212,8 @@ fn add_notebook_view_panel(
         );
         return;
     };
+    let panel_height = if compact_rows { 486.0 } else { 386.0 };
+    let body_height = if compact_rows { 96.0 } else { 112.0 };
     let panel = document.add_child(
         parent,
         UiNode::container(
@@ -7793,7 +15223,7 @@ fn add_notebook_view_panel(
                     layout::with_size(
                         layout::column(),
                         layout::percent(1.0),
-                        layout::px(ui_scale.value(386.0)),
+                        layout::px(ui_scale.value(panel_height)),
                     ),
                     ui_scale.value(8.0),
                 ),
@@ -7822,100 +15252,143 @@ fn add_notebook_view_panel(
         layout::size(layout::percent(1.0), layout::px(ui_scale.value(28.0))),
     );
 
-    let meta = document.add_child(
-        panel,
-        UiNode::container(
-            "fabricad.notebook.meta",
-            layout::with_gap_all(
-                layout::with_size(
-                    layout::row(),
-                    layout::percent(1.0),
-                    layout::px(ui_scale.value(40.0)),
-                ),
-                ui_scale.value(8.0),
-            ),
+    let meta_items = vec![
+        format!(
+            "{} - updated {}",
+            display_owner_identifier(&entry.author),
+            entry.updated_at
         ),
-    );
-    add_primary_cell(
-        document,
-        meta,
-        "fabricad.notebook.meta.author",
-        format!("{} - updated {}", entry.author, entry.updated_at),
-        1.1,
-        false,
-        ui_scale,
-    );
-    add_primary_cell(
-        document,
-        meta,
-        "fabricad.notebook.meta.mode",
         if app.notebook_preview_mode {
-            "Preview mode"
+            "Preview mode".to_string()
         } else {
-            "Edit mode"
+            "Edit mode".to_string()
         },
-        0.7,
-        false,
-        ui_scale,
-    );
-    add_primary_cell(
-        document,
-        meta,
-        "fabricad.notebook.meta.tags",
         notebook_tag_summary(entry),
-        1.2,
-        false,
-        ui_scale,
-    );
+    ];
+    if compact_rows {
+        add_compact_metric_rows(
+            document,
+            panel,
+            "fabricad.notebook.meta",
+            &meta_items,
+            ui_scale,
+        );
+    } else {
+        let meta = document.add_child(
+            panel,
+            UiNode::container(
+                "fabricad.notebook.meta",
+                layout::with_gap_all(
+                    layout::with_size(
+                        layout::row(),
+                        layout::percent(1.0),
+                        layout::px(ui_scale.value(40.0)),
+                    ),
+                    ui_scale.value(8.0),
+                ),
+            ),
+        );
+        add_primary_cell(
+            document,
+            meta,
+            "fabricad.notebook.meta.author",
+            meta_items[0].as_str(),
+            1.1,
+            false,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            meta,
+            "fabricad.notebook.meta.mode",
+            meta_items[1].as_str(),
+            0.7,
+            false,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            meta,
+            "fabricad.notebook.meta.tags",
+            meta_items[2].as_str(),
+            1.2,
+            false,
+            ui_scale,
+        );
+    }
 
     add_text(
         document,
         panel,
         "fabricad.notebook.body",
-        compact_button_label(&entry.body_markdown.replace('\n', " "), 360),
+        compact_button_label(
+            &notebook_body_display_text(entry, app.notebook_preview_mode),
+            360,
+        ),
         text_style(
             ui_scale.value(13.0),
             FontWeight::NORMAL,
             ColorRgba::new(188, 198, 207, 255),
         ),
         layout::with_padding_all(
-            layout::size(layout::percent(1.0), layout::px(ui_scale.value(112.0))),
+            layout::size(
+                layout::percent(1.0),
+                layout::px(ui_scale.value(body_height)),
+            ),
             ui_scale.value(8.0),
         ),
     );
 
-    let links = document.add_child(
-        panel,
-        UiNode::container(
-            "fabricad.notebook.links",
-            layout::with_gap_all(
-                layout::with_size(
-                    layout::row(),
-                    layout::percent(1.0),
-                    layout::px(ui_scale.value(44.0)),
-                ),
-                ui_scale.value(8.0),
-            ),
-        ),
-    );
-    add_primary_cell(
-        document,
-        links,
-        "fabricad.notebook.links.count",
+    let link_items = vec![
         format!("{} linked objects", entry.link_count()),
-        0.8,
-        false,
-        ui_scale,
-    );
-    add_primary_cell(
-        document,
-        links,
-        "fabricad.notebook.links.summary",
-        notebook_link_summary(entry),
-        2.2,
-        false,
-        ui_scale,
-    );
+        if compact_rows {
+            notebook_link_summary_compact(entry)
+        } else {
+            notebook_link_summary(entry)
+        },
+    ];
+    if compact_rows {
+        add_compact_metric_rows(
+            document,
+            panel,
+            "fabricad.notebook.links",
+            &link_items,
+            ui_scale,
+        );
+    } else {
+        let links = document.add_child(
+            panel,
+            UiNode::container(
+                "fabricad.notebook.links",
+                layout::with_gap_all(
+                    layout::with_size(
+                        layout::row(),
+                        layout::percent(1.0),
+                        layout::px(ui_scale.value(44.0)),
+                    ),
+                    ui_scale.value(8.0),
+                ),
+            ),
+        );
+        add_primary_cell(
+            document,
+            links,
+            "fabricad.notebook.links.count",
+            link_items[0].as_str(),
+            0.8,
+            false,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            links,
+            "fabricad.notebook.links.summary",
+            link_items[1].as_str(),
+            2.2,
+            false,
+            ui_scale,
+        );
+    }
 
     add_text(
         document,
@@ -7974,10 +15447,13 @@ fn add_process_flow_view_panel(
     parent: operad::UiNodeId,
     app: &FabricadApp,
     ui_scale: UiScale,
+    compact_rows: bool,
+    body_width: f32,
 ) {
     let route = &app.workspace.process_flow.route;
     let findings = app.workspace.process_flow.findings();
     let selected = selected_process_flow_node(app);
+    let timeline_height = if compact_rows { 216.0 } else { 232.0 };
     let panel = document.add_child(
         parent,
         UiNode::container(
@@ -8007,7 +15483,20 @@ fn add_process_flow_view_panel(
         document,
         panel,
         "fabricad.process_flow.primary.title",
-        format!("{} v{} - {}", route.name, route.version, route.owner),
+        if compact_rows {
+            format!(
+                "{} v{}",
+                display_process_flow_route_name(&route.name),
+                route.version
+            )
+        } else {
+            format!(
+                "{} v{} - {}",
+                display_process_flow_route_name(&route.name),
+                route.version,
+                display_owner_identifier(&route.owner)
+            )
+        },
         text_style(
             ui_scale.value(15.0),
             FontWeight::BOLD,
@@ -8019,11 +15508,11 @@ fn add_process_flow_view_panel(
         panel,
         UiNode::scene(
             "fabricad.process_flow.timeline",
-            process_flow_timeline_primitives(app, &findings, ui_scale),
+            process_flow_timeline_primitives(app, &findings, ui_scale, compact_rows, body_width),
             layout::with_size(
                 layout::row(),
                 layout::percent(1.0),
-                layout::px(ui_scale.value(232.0)),
+                layout::px(ui_scale.value(timeline_height)),
             ),
         )
         .with_visual(UiVisual::panel(
@@ -8036,80 +15525,98 @@ fn add_process_flow_view_panel(
         )),
     );
 
-    let summary = document.add_child(
-        panel,
-        UiNode::container(
+    let selected_label = selected
+        .map(display_process_flow_node_label)
+        .unwrap_or_else(|| "none".to_string());
+    let dependency_label = selected
+        .map(|node| {
+            let incoming = route.edges.iter().filter(|edge| edge.to == node.id).count();
+            let outgoing = route
+                .edges
+                .iter()
+                .filter(|edge| edge.from == node.id)
+                .count();
+            format!("{incoming} in / {outgoing} out")
+        })
+        .unwrap_or_else(|| "0 in / 0 out".to_string());
+    let control_label = format!(
+        "{} checkpoints / {} holds",
+        route
+            .nodes
+            .iter()
+            .filter(|node| node.measurement_checkpoint.is_some())
+            .count(),
+        route
+            .nodes
+            .iter()
+            .filter(|node| node.hold_point || node.kind == ProcessFlowNodeKind::Hold)
+            .count()
+    );
+    if compact_rows {
+        add_compact_metric_rows(
+            document,
+            panel,
             "fabricad.process_flow.summary",
-            layout::with_gap_all(
-                layout::with_size(
-                    layout::row(),
-                    layout::percent(1.0),
-                    layout::px(ui_scale.value(54.0)),
+            &[
+                selected_label,
+                dependency_label,
+                control_label.replace("checkpoints", "checks"),
+                format!("{} findings", findings.len()),
+            ],
+            ui_scale,
+        );
+    } else {
+        let summary = document.add_child(
+            panel,
+            UiNode::container(
+                "fabricad.process_flow.summary",
+                layout::with_gap_all(
+                    layout::with_size(
+                        layout::row(),
+                        layout::percent(1.0),
+                        layout::px(ui_scale.value(54.0)),
+                    ),
+                    ui_scale.value(8.0),
                 ),
-                ui_scale.value(8.0),
             ),
-        ),
-    );
-    add_primary_cell(
-        document,
-        summary,
-        "fabricad.process_flow.summary.selected",
-        selected
-            .map(|node| format!("Selected {} {}", node.id, node.name))
-            .unwrap_or_else(|| "Selected none".to_string()),
-        1.5,
-        false,
-        ui_scale,
-    );
-    add_primary_cell(
-        document,
-        summary,
-        "fabricad.process_flow.summary.dependencies",
-        selected
-            .map(|node| {
-                let incoming = route.edges.iter().filter(|edge| edge.to == node.id).count();
-                let outgoing = route
-                    .edges
-                    .iter()
-                    .filter(|edge| edge.from == node.id)
-                    .count();
-                format!("{incoming} in / {outgoing} out")
-            })
-            .unwrap_or_else(|| "0 in / 0 out".to_string()),
-        0.8,
-        false,
-        ui_scale,
-    );
-    add_primary_cell(
-        document,
-        summary,
-        "fabricad.process_flow.summary.controls",
-        format!(
-            "{} checkpoints / {} holds",
-            route
-                .nodes
-                .iter()
-                .filter(|node| node.measurement_checkpoint.is_some())
-                .count(),
-            route
-                .nodes
-                .iter()
-                .filter(|node| node.hold_point || node.kind == ProcessFlowNodeKind::Hold)
-                .count()
-        ),
-        1.0,
-        false,
-        ui_scale,
-    );
-    add_primary_cell(
-        document,
-        summary,
-        "fabricad.process_flow.summary.findings",
-        format!("{} findings", findings.len()),
-        0.7,
-        false,
-        ui_scale,
-    );
+        );
+        add_primary_cell(
+            document,
+            summary,
+            "fabricad.process_flow.summary.selected",
+            format!("Selected {selected_label}"),
+            1.5,
+            false,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            summary,
+            "fabricad.process_flow.summary.dependencies",
+            dependency_label,
+            0.8,
+            false,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            summary,
+            "fabricad.process_flow.summary.controls",
+            control_label,
+            1.0,
+            false,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            summary,
+            "fabricad.process_flow.summary.findings",
+            format!("{} findings", findings.len()),
+            0.7,
+            false,
+            ui_scale,
+        );
+    }
 }
 
 fn add_cross_section_view_panel(
@@ -8117,6 +15624,8 @@ fn add_cross_section_view_panel(
     parent: operad::UiNodeId,
     app: &FabricadApp,
     ui_scale: UiScale,
+    compact_rows: bool,
+    body_width: f32,
 ) {
     let snapshots = app.workspace.cross_section.simulate();
     let Some(snapshot) = snapshots.get(
@@ -8137,6 +15646,22 @@ fn add_cross_section_view_panel(
     let selected_material = selected_cross_section_material_for_snapshot(app, snapshot);
     let mask_coverage =
         cross_section_mask_coverage_um(process, snapshot) / process.width_um.max(0.1);
+    let medium_rows = !compact_rows && body_width < ui_scale.value(1120.0);
+    let dense_rows = compact_rows || medium_rows;
+    let panel_height = if compact_rows {
+        446.0
+    } else if medium_rows {
+        282.0
+    } else {
+        430.0
+    };
+    let preview_height = if compact_rows {
+        282.0
+    } else if medium_rows {
+        160.0
+    } else {
+        320.0
+    };
     let panel = document.add_child(
         parent,
         UiNode::container(
@@ -8146,7 +15671,7 @@ fn add_cross_section_view_panel(
                     layout::with_size(
                         layout::column(),
                         layout::percent(1.0),
-                        layout::px(ui_scale.value(430.0)),
+                        layout::px(ui_scale.value(panel_height)),
                     ),
                     ui_scale.value(8.0),
                 ),
@@ -8191,13 +15716,16 @@ fn add_cross_section_view_panel(
                     show_mask_overlay: app.cross_section_show_mask,
                     show_dimension_guides: app.cross_section_show_dimensions,
                     show_risk_cues: app.cross_section_show_risks,
+                    compact_layout: compact_rows,
+                    medium_layout: medium_rows,
+                    body_width,
                 },
                 ui_scale,
             ),
             layout::with_size(
                 layout::row(),
                 layout::percent(1.0),
-                layout::px(ui_scale.value(320.0)),
+                layout::px(ui_scale.value(preview_height)),
             ),
         )
         .with_visual(UiVisual::panel(
@@ -8210,68 +15738,94 @@ fn add_cross_section_view_panel(
         )),
     );
 
-    let summary = document.add_child(
-        panel,
-        UiNode::container(
-            "fabricad.cross_section.summary",
-            layout::with_gap_all(
-                layout::with_size(
-                    layout::row(),
-                    layout::percent(1.0),
-                    layout::px(ui_scale.value(44.0)),
-                ),
-                ui_scale.value(8.0),
+    let material_summary = selected_material
+        .as_ref()
+        .and_then(|material| process.material(material))
+        .map(|material| format!("Material {}", material.name))
+        .unwrap_or_else(|| "Material n/a".to_string());
+    let summary_items = if dense_rows {
+        [
+            format!("stack {:.2}-{:.2} um", surface.min_um, surface.max_um),
+            format!("avg/rng {:.2}/{:.2}", surface.average_um, surface.range_um),
+            format!("Mask open {:.0}%", mask_coverage.clamp(0.0, 1.0) * 100.0),
+            material_summary.clone(),
+        ]
+    } else {
+        [
+            format!(
+                "Stack {} max / {} min",
+                format_um_f32(surface.max_um),
+                format_um_f32(surface.min_um)
             ),
-        ),
-    );
-    add_primary_cell(
-        document,
-        summary,
-        "fabricad.cross_section.summary.height",
-        format!(
-            "Stack {} max, {} min",
-            format_um_f32(surface.max_um),
-            format_um_f32(surface.min_um)
-        ),
-        1.0,
-        false,
-        ui_scale,
-    );
-    add_primary_cell(
-        document,
-        summary,
-        "fabricad.cross_section.summary.surface",
-        format!(
-            "Surface {} avg, {} range",
-            format_um_f32(surface.average_um),
-            format_um_f32(surface.range_um)
-        ),
-        1.0,
-        false,
-        ui_scale,
-    );
-    add_primary_cell(
-        document,
-        summary,
-        "fabricad.cross_section.summary.mask",
-        format!("Mask open {:.0}%", mask_coverage.clamp(0.0, 1.0) * 100.0),
-        1.0,
-        false,
-        ui_scale,
-    );
-    add_primary_cell(
-        document,
-        summary,
-        "fabricad.cross_section.summary.material",
-        selected_material
-            .as_ref()
-            .and_then(|material| process.material(material))
-            .map(|material| format!("Material {}", material.name))
-            .unwrap_or_else(|| "Material n/a".to_string()),
-        1.0,
-        false,
-        ui_scale,
-    );
+            format!(
+                "Surface {} avg / {} range",
+                format_um_f32(surface.average_um),
+                format_um_f32(surface.range_um)
+            ),
+            format!("Mask open {:.0}%", mask_coverage.clamp(0.0, 1.0) * 100.0),
+            material_summary,
+        ]
+    };
+    if dense_rows {
+        add_compact_metric_rows(
+            document,
+            panel,
+            "fabricad.cross_section.summary",
+            &summary_items,
+            ui_scale,
+        );
+    } else {
+        let summary = document.add_child(
+            panel,
+            UiNode::container(
+                "fabricad.cross_section.summary",
+                layout::with_gap_all(
+                    layout::with_size(
+                        layout::row(),
+                        layout::percent(1.0),
+                        layout::px(ui_scale.value(44.0)),
+                    ),
+                    ui_scale.value(8.0),
+                ),
+            ),
+        );
+        add_primary_cell(
+            document,
+            summary,
+            "fabricad.cross_section.summary.height",
+            summary_items[0].clone(),
+            1.0,
+            false,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            summary,
+            "fabricad.cross_section.summary.surface",
+            summary_items[1].clone(),
+            1.0,
+            false,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            summary,
+            "fabricad.cross_section.summary.mask",
+            summary_items[2].clone(),
+            1.0,
+            false,
+            ui_scale,
+        );
+        add_primary_cell(
+            document,
+            summary,
+            "fabricad.cross_section.summary.material",
+            summary_items[3].clone(),
+            1.0,
+            false,
+            ui_scale,
+        );
+    }
 }
 
 fn add_primary_data_panel(
@@ -8300,12 +15854,9 @@ fn add_primary_data_panel(
             ),
         )
         .with_visual(UiVisual::panel(
-            ColorRgba::new(22, 29, 36, 255),
-            Some(StrokeStyle::new(
-                ColorRgba::new(55, 69, 83, 255),
-                ui_scale.value(1.0),
-            )),
-            ui_scale.value(4.0),
+            COLOR_PANEL_BG,
+            Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
+            ui_scale.value(2.0),
         ))
         .with_scroll(ScrollAxes::VERTICAL),
     );
@@ -8315,11 +15866,7 @@ fn add_primary_data_panel(
         panel,
         "fabricad.primary.title",
         format!("{title} Primary View"),
-        text_style(
-            ui_scale.value(15.0),
-            FontWeight::BOLD,
-            ColorRgba::new(238, 243, 247, 255),
-        ),
+        text_style(ui_scale.value(15.0), FontWeight::BOLD, COLOR_TEXT),
         layout::size(layout::percent(1.0), layout::px(ui_scale.value(24.0))),
     );
 
@@ -8394,15 +15941,12 @@ fn add_primary_data_panel(
             )
             .with_visual(UiVisual::panel(
                 if row_index % 2 == 0 {
-                    ColorRgba::new(26, 34, 42, 255)
+                    COLOR_PANEL_ALT
                 } else {
-                    ColorRgba::new(24, 31, 38, 255)
+                    COLOR_PANEL_BG
                 },
-                Some(StrokeStyle::new(
-                    ColorRgba::new(45, 57, 69, 255),
-                    ui_scale.value(1.0),
-                )),
-                ui_scale.value(3.0),
+                Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
+                ui_scale.value(2.0),
             )),
         );
         if let Some(action) = row_data.action.as_ref() {
@@ -8468,6 +16012,26 @@ fn add_primary_cell(
     header: bool,
     ui_scale: UiScale,
 ) {
+    add_primary_text_cell(
+        document,
+        parent,
+        name,
+        text,
+        header,
+        ui_scale,
+        layout::with_padding_all(primary_cell_layout(weight), ui_scale.value(7.0)),
+    );
+}
+
+fn add_primary_text_cell(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    name: impl Into<String>,
+    text: impl Into<String>,
+    header: bool,
+    ui_scale: UiScale,
+    node_layout: impl Into<operad::LayoutStyle>,
+) {
     add_text(
         document,
         parent,
@@ -8483,10 +16047,10 @@ fn add_primary_cell(
             if header {
                 ColorRgba::new(136, 207, 190, 255)
             } else {
-                ColorRgba::new(182, 193, 203, 255)
+                COLOR_TEXT_MUTED
             },
         ),
-        layout::with_padding_all(primary_cell_layout(weight), ui_scale.value(7.0)),
+        node_layout,
     );
 }
 
@@ -8521,290 +16085,6 @@ impl DashboardMetric {
             tone,
         }
     }
-}
-
-fn add_dashboard_metric_cell(
-    document: &mut UiDocument,
-    parent: operad::UiNodeId,
-    index: usize,
-    metric: &DashboardMetric,
-    ui_scale: UiScale,
-) {
-    add_text(
-        document,
-        parent,
-        format!("fabricad.primary.metrics.{index}"),
-        compact_button_label(
-            &format!("{}: {} - {}", metric.label, metric.value, metric.detail),
-            54,
-        ),
-        text_style(
-            ui_scale.value(12.0),
-            FontWeight::BOLD,
-            overview_tone_color(metric.tone, 255),
-        ),
-        layout::with_padding_all(primary_cell_layout(1.0), ui_scale.value(7.0)),
-    );
-}
-
-fn overview_scene_primitives(rows: &[PrimaryRow], ui_scale: UiScale) -> Vec<ScenePrimitive> {
-    let mut primitives = Vec::with_capacity(rows.len() * 8 + 80);
-    let frame = UiRect::new(
-        ui_scale.value(30.0),
-        ui_scale.value(18.0),
-        ui_scale.value(900.0),
-        ui_scale.value(202.0),
-    );
-    primitives.push(ScenePrimitive::Rect(
-        operad::PaintRect::solid(frame, ColorRgba::new(14, 19, 24, 255)).stroke(StrokeStyle::new(
-            ColorRgba::new(70, 84, 98, 255),
-            ui_scale.value(1.0),
-        )),
-    ));
-    let row_bounds = UiRect::new(
-        frame.x + ui_scale.value(22.0),
-        frame.y + ui_scale.value(24.0),
-        ui_scale.value(430.0),
-        ui_scale.value(154.0),
-    );
-    let status_bounds = UiRect::new(
-        frame.x + ui_scale.value(492.0),
-        frame.y + ui_scale.value(28.0),
-        ui_scale.value(172.0),
-        ui_scale.value(154.0),
-    );
-    let matrix_bounds = UiRect::new(
-        frame.x + ui_scale.value(704.0),
-        frame.y + ui_scale.value(28.0),
-        ui_scale.value(174.0),
-        ui_scale.value(154.0),
-    );
-    add_overview_row_primitives(&mut primitives, row_bounds, rows, ui_scale);
-    add_overview_status_primitives(&mut primitives, status_bounds, rows, ui_scale);
-    add_overview_matrix_primitives(&mut primitives, matrix_bounds, rows, ui_scale);
-    primitives
-}
-
-fn add_overview_row_primitives(
-    primitives: &mut Vec<ScenePrimitive>,
-    bounds: UiRect,
-    rows: &[PrimaryRow],
-    ui_scale: UiScale,
-) {
-    primitives.push(ScenePrimitive::Rect(
-        operad::PaintRect::solid(bounds, ColorRgba::new(17, 23, 28, 255)).stroke(StrokeStyle::new(
-            ColorRgba::new(55, 68, 82, 255),
-            ui_scale.value(1.0),
-        )),
-    ));
-    if rows.is_empty() {
-        add_spc_empty_plot(primitives, bounds, ui_scale);
-        return;
-    }
-    let visible = rows.len().min(8);
-    let gap = ui_scale.value(5.0);
-    let row_height = (bounds.height - gap * visible.saturating_sub(1) as f32) / visible as f32;
-    for (index, row_data) in rows.iter().take(visible).enumerate() {
-        let y = bounds.y + index as f32 * (row_height + gap);
-        let row = UiRect::new(bounds.x, y, bounds.width, row_height);
-        let tone = overview_row_tone(row_data);
-        primitives.push(ScenePrimitive::Rect(
-            operad::PaintRect::solid(
-                row,
-                if row_data.selected {
-                    ColorRgba::new(72, 128, 188, 72)
-                } else {
-                    ColorRgba::new(25, 32, 39, 255)
-                },
-            )
-            .stroke(StrokeStyle::new(
-                if row_data.selected {
-                    ColorRgba::new(252, 253, 255, 210)
-                } else {
-                    ColorRgba::new(41, 52, 63, 180)
-                },
-                ui_scale.value(if row_data.selected { 1.2 } else { 0.7 }),
-            )),
-        ));
-        primitives.push(ScenePrimitive::Rect(operad::PaintRect::solid(
-            UiRect::new(
-                row.x,
-                row.y,
-                row.width * overview_row_ratio(row_data, index),
-                row.height,
-            ),
-            overview_tone_color(tone, 155),
-        )));
-        primitives.push(ScenePrimitive::Circle {
-            center: UiPoint::new(row.x + ui_scale.value(9.0), row.y + row.height * 0.5),
-            radius: ui_scale.value(3.6),
-            fill: overview_tone_color(tone, 245),
-            stroke: Some(StrokeStyle::new(
-                ColorRgba::new(15, 19, 23, 190),
-                ui_scale.value(0.8),
-            )),
-        });
-    }
-}
-
-fn add_overview_status_primitives(
-    primitives: &mut Vec<ScenePrimitive>,
-    bounds: UiRect,
-    rows: &[PrimaryRow],
-    ui_scale: UiScale,
-) {
-    primitives.push(ScenePrimitive::Rect(
-        operad::PaintRect::solid(bounds, ColorRgba::new(17, 23, 28, 255)).stroke(StrokeStyle::new(
-            ColorRgba::new(55, 68, 82, 255),
-            ui_scale.value(1.0),
-        )),
-    ));
-    if rows.is_empty() {
-        add_spc_empty_plot(primitives, bounds, ui_scale);
-        return;
-    }
-    let tones = [
-        OverviewTone::Danger,
-        OverviewTone::Warning,
-        OverviewTone::Success,
-        OverviewTone::Info,
-        OverviewTone::Neutral,
-    ];
-    let total = rows.len().max(1) as f32;
-    let gap = ui_scale.value(6.0);
-    let row_height =
-        (bounds.height - gap * tones.len().saturating_sub(1) as f32) / tones.len() as f32;
-    for (index, tone) in tones.iter().enumerate() {
-        let count = rows
-            .iter()
-            .filter(|row_data| overview_row_tone(row_data) == *tone)
-            .count();
-        let y = bounds.y + index as f32 * (row_height + gap);
-        primitives.push(ScenePrimitive::Rect(operad::PaintRect::solid(
-            UiRect::new(bounds.x, y, bounds.width, row_height),
-            ColorRgba::new(25, 32, 39, 255),
-        )));
-        primitives.push(ScenePrimitive::Rect(operad::PaintRect::solid(
-            UiRect::new(
-                bounds.x,
-                y,
-                (bounds.width * count as f32 / total).max(ui_scale.value(2.0)),
-                row_height,
-            ),
-            overview_tone_color(*tone, 210),
-        )));
-    }
-}
-
-fn add_overview_matrix_primitives(
-    primitives: &mut Vec<ScenePrimitive>,
-    bounds: UiRect,
-    rows: &[PrimaryRow],
-    ui_scale: UiScale,
-) {
-    primitives.push(ScenePrimitive::Rect(
-        operad::PaintRect::solid(bounds, ColorRgba::new(17, 23, 28, 255)).stroke(StrokeStyle::new(
-            ColorRgba::new(55, 68, 82, 255),
-            ui_scale.value(1.0),
-        )),
-    ));
-    if rows.is_empty() {
-        add_spc_empty_plot(primitives, bounds, ui_scale);
-        return;
-    }
-    let columns = 6usize;
-    let visible = rows.len().min(18);
-    let row_count = visible.div_ceil(columns).max(1);
-    let gap = ui_scale.value(4.0);
-    let cell_width = (bounds.width - gap * columns.saturating_sub(1) as f32) / columns as f32;
-    let cell_height = (bounds.height - gap * row_count.saturating_sub(1) as f32) / row_count as f32;
-    for (index, row_data) in rows.iter().take(visible).enumerate() {
-        let column = index % columns;
-        let row = index / columns;
-        let rect = UiRect::new(
-            bounds.x + column as f32 * (cell_width + gap),
-            bounds.y + row as f32 * (cell_height + gap),
-            cell_width,
-            cell_height,
-        );
-        primitives.push(ScenePrimitive::Rect(
-            operad::PaintRect::solid(rect, overview_tone_color(overview_row_tone(row_data), 215))
-                .stroke(StrokeStyle::new(
-                    if row_data.selected {
-                        ColorRgba::new(252, 253, 255, 230)
-                    } else {
-                        ColorRgba::new(16, 20, 24, 140)
-                    },
-                    ui_scale.value(if row_data.selected { 1.4 } else { 0.8 }),
-                )),
-        ));
-    }
-}
-
-fn overview_row_tone(row: &PrimaryRow) -> OverviewTone {
-    let text = format!("{} {} {}", row.title, row.value, row.detail).to_lowercase();
-    if text.contains("critical")
-        || text.contains("locked")
-        || text.contains("overdue")
-        || text.contains("error")
-        || text.contains("alarm")
-        || text.contains("fail")
-        || text.contains("blocked")
-        || text.contains("excursion")
-    {
-        OverviewTone::Danger
-    } else if text.contains("warning")
-        || text.contains("due")
-        || text.contains("risk")
-        || text.contains("hold")
-        || text.contains("maintenance")
-        || text.contains("changed")
-    {
-        OverviewTone::Warning
-    } else if text.contains("complete")
-        || text.contains("available")
-        || text.contains("online")
-        || text.contains("running")
-        || text.contains("pass")
-        || text.contains("nominal")
-        || text.contains("ready")
-    {
-        OverviewTone::Success
-    } else if text.contains("selected")
-        || text.contains("lineage")
-        || text.contains("recipe")
-        || text.contains("yield")
-        || text.contains("wafer")
-    {
-        OverviewTone::Info
-    } else {
-        OverviewTone::Neutral
-    }
-}
-
-fn overview_tone_color(tone: OverviewTone, alpha: u8) -> ColorRgba {
-    match tone {
-        OverviewTone::Danger => ColorRgba::new(236, 91, 88, alpha),
-        OverviewTone::Warning => ColorRgba::new(238, 181, 82, alpha),
-        OverviewTone::Success => ColorRgba::new(91, 190, 130, alpha),
-        OverviewTone::Info => ColorRgba::new(93, 168, 232, alpha),
-        OverviewTone::Neutral => ColorRgba::new(130, 145, 160, alpha),
-    }
-}
-
-fn overview_row_ratio(row: &PrimaryRow, index: usize) -> f32 {
-    if row.selected {
-        return 1.0;
-    }
-    let hash = row
-        .title
-        .bytes()
-        .chain(row.value.bytes())
-        .chain(row.detail.bytes())
-        .fold(index as u32 + 17, |acc, byte| {
-            acc.wrapping_mul(31).wrapping_add(byte as u32)
-        });
-    0.32 + (hash % 58) as f32 / 100.0
 }
 
 fn workflow_dashboard_metrics(app: &FabricadApp) -> Vec<DashboardMetric> {
@@ -8859,14 +16139,14 @@ fn workflow_dashboard_metrics(app: &FabricadApp) -> Vec<DashboardMetric> {
     ]
 }
 
-fn mask_dashboard_metrics(app: &FabricadApp) -> Vec<DashboardMetric> {
+fn mask_dashboard_metrics(app: &FabricadApp, compact_rows: bool) -> Vec<DashboardMetric> {
     let prep = reticle_prep_for_app(app);
     let report = mask_check_report(app);
     let filtered = mask_filtered_issue_count(app, &report);
     vec![
         DashboardMetric::new(
             "Reticle",
-            prep.reticle.id.to_string(),
+            display_reticle_identifier(prep.reticle.id.as_str()),
             format!("{} fields", report.field_count),
             OverviewTone::Info,
         ),
@@ -8903,7 +16183,16 @@ fn mask_dashboard_metrics(app: &FabricadApp) -> Vec<DashboardMetric> {
             report.exposure_block_count.to_string(),
             app.mask_source_lot
                 .as_ref()
-                .map(|lot| format!("linked {lot}"))
+                .map(|lot| {
+                    if compact_rows {
+                        "linked lot".to_string()
+                    } else {
+                        format!(
+                            "linked {}",
+                            workflow_lot_label(&app.workspace, lot.as_str(), 32)
+                        )
+                    }
+                })
                 .unwrap_or_else(|| "unlinked lot".to_string()),
             OverviewTone::Neutral,
         ),
@@ -8997,174 +16286,6 @@ fn fab_control_dashboard_metrics(app: &FabricadApp) -> Vec<DashboardMetric> {
                 .map(equipment_recipe_summary)
                 .unwrap_or_else(|| "n/a".to_string()),
             "loaded/draft recipe",
-            OverviewTone::Neutral,
-        ),
-    ]
-}
-
-fn maintenance_dashboard_metrics(app: &FabricadApp) -> Vec<DashboardMetric> {
-    let workspace = &app.workspace;
-    let today = maintenance_today(workspace);
-    let actionable = maintenance_filtered_work_count(workspace, MaintenanceWorkFilter::Actionable);
-    let overdue = workspace
-        .maintenance
-        .tools
-        .iter()
-        .flat_map(|tool| tool.schedules.iter().map(move |schedule| (tool, schedule)))
-        .filter(|(tool, schedule)| schedule.due_state(today, tool.run_count) == DueState::Overdue)
-        .count();
-    vec![
-        DashboardMetric::new(
-            "Queue",
-            actionable.to_string(),
-            format!("{overdue} overdue"),
-            if overdue > 0 {
-                OverviewTone::Danger
-            } else if actionable > 0 {
-                OverviewTone::Warning
-            } else {
-                OverviewTone::Success
-            },
-        ),
-        DashboardMetric::new(
-            "Tools",
-            workspace.maintenance.tools.len().to_string(),
-            format!("{} locked", maintenance_locked_count(workspace)),
-            if maintenance_locked_count(workspace) > 0 {
-                OverviewTone::Danger
-            } else {
-                OverviewTone::Success
-            },
-        ),
-        DashboardMetric::new(
-            "Calibration",
-            workspace.maintenance.calibration_records.len().to_string(),
-            format!(
-                "{} quals",
-                workspace.maintenance.qualification_results.len()
-            ),
-            OverviewTone::Info,
-        ),
-        DashboardMetric::new(
-            "Downtime",
-            workspace.maintenance.downtime.len().to_string(),
-            format!("audit date {today}"),
-            OverviewTone::Neutral,
-        ),
-        DashboardMetric::new(
-            "Selected",
-            selected_maintenance_tool(app)
-                .map(|tool| tool.tool_id.to_string())
-                .unwrap_or_else(|| "None".to_string()),
-            app.maintenance_work_filter.detail_label(),
-            OverviewTone::Info,
-        ),
-    ]
-}
-
-fn inventory_dashboard_metrics(app: &FabricadApp) -> Vec<DashboardMetric> {
-    let workspace = &app.workspace;
-    let alerts = workspace.inventory.alerts(INVENTORY_DEMO_TODAY);
-    vec![
-        DashboardMetric::new(
-            "Lots",
-            workspace.inventory.lots.len().to_string(),
-            format!(
-                "{} visible",
-                inventory_filter_count(workspace, app.inventory_filter)
-            ),
-            OverviewTone::Info,
-        ),
-        DashboardMetric::new(
-            "Alerts",
-            alerts.len().to_string(),
-            "stock and expiry",
-            if alerts.is_empty() {
-                OverviewTone::Success
-            } else {
-                OverviewTone::Warning
-            },
-        ),
-        DashboardMetric::new(
-            "Low Stock",
-            inventory_filter_count(workspace, InventoryQuickFilter::LowStock).to_string(),
-            "lots below reorder",
-            if inventory_filter_count(workspace, InventoryQuickFilter::LowStock) > 0 {
-                OverviewTone::Warning
-            } else {
-                OverviewTone::Success
-            },
-        ),
-        DashboardMetric::new(
-            "Hold",
-            inventory_filter_count(workspace, InventoryQuickFilter::ProductHold).to_string(),
-            format!("today {INVENTORY_DEMO_TODAY}"),
-            if inventory_filter_count(workspace, InventoryQuickFilter::ProductHold) > 0 {
-                OverviewTone::Danger
-            } else {
-                OverviewTone::Success
-            },
-        ),
-        DashboardMetric::new(
-            "Selected",
-            selected_inventory_lot(app)
-                .map(|lot| lot.id.to_string())
-                .unwrap_or_else(|| "None".to_string()),
-            app.inventory_filter.detail_label(),
-            OverviewTone::Info,
-        ),
-    ]
-}
-
-fn safety_dashboard_metrics(app: &FabricadApp) -> Vec<DashboardMetric> {
-    let summary = app.workspace.safety.summary();
-    vec![
-        DashboardMetric::new(
-            "State",
-            summary
-                .highest_severity
-                .map(SafetySeverity::label)
-                .unwrap_or("normal"),
-            format!("{} active conditions", summary.active_condition_count),
-            if summary.active_condition_count > 0 {
-                OverviewTone::Danger
-            } else {
-                OverviewTone::Success
-            },
-        ),
-        DashboardMetric::new(
-            "Lockouts",
-            summary.locked_out_tool_count.to_string(),
-            "tool interlocks",
-            if summary.locked_out_tool_count > 0 {
-                OverviewTone::Danger
-            } else {
-                OverviewTone::Success
-            },
-        ),
-        DashboardMetric::new(
-            "Incidents",
-            summary.open_incident_count.to_string(),
-            format!("{} total", app.workspace.safety.incidents.len()),
-            if summary.open_incident_count > 0 {
-                OverviewTone::Warning
-            } else {
-                OverviewTone::Success
-            },
-        ),
-        DashboardMetric::new(
-            "Sensors",
-            summary.sensor_count.to_string(),
-            format!("{} routes", app.workspace.safety.alarm_routes.len()),
-            OverviewTone::Info,
-        ),
-        DashboardMetric::new(
-            "Ack",
-            app.acknowledged_count().to_string(),
-            app.selected_safety_tool
-                .as_deref()
-                .unwrap_or("no selected tool")
-                .to_string(),
             OverviewTone::Neutral,
         ),
     ]
@@ -9538,20 +16659,23 @@ fn mask_reticle_rows(prep: &ReticlePrep) -> Vec<PrimaryRow> {
         PrimaryRow::new(
             "mask-design",
             "Mask design",
-            prep.mask_design_id.clone(),
+            display_mask_identifier(&prep.mask_design_id),
             format!(
                 "{}; route {}",
-                prep.layout_revision,
+                display_layout_revision_identifier(&prep.layout_revision),
                 prep.route_id
                     .as_ref()
-                    .map(ToString::to_string)
+                    .map(|route_id| display_route_identifier(route_id.as_str()))
                     .unwrap_or_else(|| "unlinked".to_string())
             ),
         ),
         PrimaryRow::new(
             "mask-reticle",
-            format!("Reticle {}", prep.reticle.id),
-            prep.reticle.name.clone(),
+            format!(
+                "Reticle {}",
+                display_reticle_identifier(prep.reticle.id.as_str())
+            ),
+            display_mask_identifier(&prep.reticle.name),
             format!(
                 "size {} x {}; printable {} x {}",
                 prep.reticle.size.width,
@@ -9564,8 +16688,8 @@ fn mask_reticle_rows(prep: &ReticlePrep) -> Vec<PrimaryRow> {
     rows.extend(prep.fields.iter().take(1).map(|field| {
         PrimaryRow::new(
             format!("mask-field-{}", field.id),
-            format!("Field {}", field.id),
             field.name.clone(),
+            display_reticle_field_identifier(field.id.as_str()),
             format!(
                 "cell {}; bounds {} x {}; stepping {} x {}",
                 field.source_cell.0,
@@ -9828,7 +16952,7 @@ fn fab_selected_tool_rows(tool: &EquipmentTool) -> Vec<PrimaryRow> {
         rows.push(PrimaryRow::new(
             format!("fab-recipe-{}", tool.id),
             "Selected recipe",
-            selection.recipe_id.to_string(),
+            display_recipe_identifier(selection.recipe_id.as_str()),
             format!("version {}", selection.recipe_version),
         ));
     } else {
@@ -9854,7 +16978,9 @@ fn fab_selected_tool_rows(tool: &EquipmentTool) -> Vec<PrimaryRow> {
             run.status.label(),
             format!(
                 "{} since t+{}s; {} samples",
-                run.recipe.recipe_id, run.started_at_s, run.sensor_count
+                display_recipe_identifier(run.recipe.recipe_id.as_str()),
+                run.started_at_s,
+                run.sensor_count
             ),
         ));
     }
@@ -9913,7 +17039,7 @@ fn inventory_primary_rows(app: &FabricadApp) -> Vec<PrimaryRow> {
 
     if let Some(lot) = selected_inventory_lot(app) {
         rows.extend(
-            inventory_selected_lot_rows(lot)
+            inventory_selected_lot_rows(app, lot)
                 .into_iter()
                 .take(10 - rows.len().min(10)),
         );
@@ -9949,7 +17075,7 @@ fn inventory_lot_primary_row<'a>(app: &'a FabricadApp) -> impl Fn(&'a MaterialLo
     }
 }
 
-fn inventory_selected_lot_rows(lot: &MaterialLot) -> Vec<PrimaryRow> {
+fn inventory_selected_lot_rows(app: &FabricadApp, lot: &MaterialLot) -> Vec<PrimaryRow> {
     let mut rows = vec![
         PrimaryRow::new(
             format!("inventory-detail-stock-{}", lot.id),
@@ -9980,7 +17106,7 @@ fn inventory_selected_lot_rows(lot: &MaterialLot) -> Vec<PrimaryRow> {
                 "lot {} received {} by {}",
                 lot.supplier.supplier_lot,
                 layout_model::inventory::format_date(lot.supplier.received_date),
-                lot.supplier.received_by
+                display_inventory_actor_identifier(&lot.supplier.received_by)
             ),
         ),
     ];
@@ -9992,7 +17118,7 @@ fn inventory_selected_lot_rows(lot: &MaterialLot) -> Vec<PrimaryRow> {
                 layout_model::inventory::format_date(usage.timestamp),
                 usage.quantity.format()
             ),
-            usage.actor.clone(),
+            display_inventory_actor_identifier(&usage.actor),
             format!(
                 "{}; {}",
                 usage
@@ -10031,6 +17157,17 @@ fn inventory_material_status_label(lot: &MaterialLot) -> &'static str {
     } else {
         "released"
     }
+}
+
+fn inventory_lot_button_label(lot: &MaterialLot, max_chars: usize) -> String {
+    compact_button_label(
+        &format!(
+            "{} {}",
+            lot.material_name,
+            inventory_material_status_label(lot)
+        ),
+        max_chars,
+    )
 }
 
 fn inventory_expiration_label(lot: &MaterialLot) -> String {
@@ -10395,7 +17532,7 @@ fn environment_primary_rows(app: &FabricadApp) -> Vec<PrimaryRow> {
             };
             PrimaryRow::new(
                 format!("sensor-{}", sensor.id),
-                format!("{} {}", sensor.id, sensor.name),
+                display_environment_sensor_label(sensor),
                 environment_sensor_status_for(&app.workspace, sensor),
                 format!("{}; {}; {}", sensor.zone, sensor.kind.label(), tags),
             )
@@ -10807,15 +17944,21 @@ fn environment_selected_sensor_label(
         .map(|reading| {
             let severity = sensor.thresholds.evaluate(reading.value);
             format!(
-                "{} {} {:.2} {} {}",
-                sensor.id,
+                "{} / {} / {:.2} {} / {}",
+                display_environment_sensor_label(sensor),
                 sensor.zone,
                 reading.value,
                 sensor.unit,
                 severity.map_or("Nominal", |severity| severity.label())
             )
         })
-        .unwrap_or_else(|| format!("{} {} no samples", sensor.id, sensor.zone))
+        .unwrap_or_else(|| {
+            format!(
+                "{} / {} / no samples",
+                display_environment_sensor_label(sensor),
+                sensor.zone
+            )
+        })
 }
 
 fn environment_selected_zone_label(
@@ -10879,45 +18022,73 @@ fn experiment_view_primitives(
     analysis: &ExperimentAnalysisSummary,
     missing_only: bool,
     ui_scale: UiScale,
+    compact_rows: bool,
+    body_width: f32,
 ) -> Vec<ScenePrimitive> {
     let mut primitives = Vec::with_capacity(plan.runs.len() * plan.factors.len() + 100);
-    let frame = UiRect::new(
-        ui_scale.value(30.0),
-        ui_scale.value(18.0),
-        ui_scale.value(900.0),
-        ui_scale.value(202.0),
-    );
+    let frame_x = ui_scale.value(if compact_rows { 10.0 } else { 30.0 });
+    let frame_y = ui_scale.value(if compact_rows { 10.0 } else { 18.0 });
+    let frame_width = (body_width - frame_x - ui_scale.value(30.0))
+        .max(ui_scale.value(220.0))
+        .min(ui_scale.value(900.0));
+    let frame_height = ui_scale.value(if compact_rows { 184.0 } else { 202.0 });
+    let frame = UiRect::new(frame_x, frame_y, frame_width, frame_height);
     primitives.push(ScenePrimitive::Rect(
         operad::PaintRect::solid(frame, ColorRgba::new(14, 19, 24, 255)).stroke(StrokeStyle::new(
             ColorRgba::new(70, 84, 98, 255),
             ui_scale.value(1.0),
         )),
     ));
-    let matrix_bounds = UiRect::new(
-        frame.x + ui_scale.value(22.0),
-        frame.y + ui_scale.value(20.0),
-        ui_scale.value(400.0),
-        ui_scale.value(162.0),
-    );
+    let compact_scene = compact_rows || frame.width < ui_scale.value(620.0);
+    let matrix_bounds = if compact_scene {
+        UiRect::new(
+            frame.x + ui_scale.value(18.0),
+            frame.y + ui_scale.value(20.0),
+            frame.width - ui_scale.value(36.0),
+            frame.height - ui_scale.value(40.0),
+        )
+    } else {
+        let inset = ui_scale.value(22.0);
+        let gap = ui_scale.value(40.0);
+        let side_width = (frame.width * 0.2)
+            .max(ui_scale.value(150.0))
+            .min(ui_scale.value(184.0));
+        let matrix_width =
+            (frame.width - inset * 2.0 - gap * 2.0 - side_width * 2.0).max(ui_scale.value(220.0));
+        UiRect::new(
+            frame.x + inset,
+            frame.y + ui_scale.value(20.0),
+            matrix_width,
+            ui_scale.value(162.0),
+        )
+    };
+    add_experiment_matrix_primitives(&mut primitives, matrix_bounds, plan, missing_only, ui_scale);
+    if compact_scene {
+        return primitives;
+    }
+
+    let gap = ui_scale.value(40.0);
+    let side_width = (frame.width * 0.2)
+        .max(ui_scale.value(150.0))
+        .min(ui_scale.value(184.0));
     let response_bounds = UiRect::new(
-        frame.x + ui_scale.value(462.0),
+        matrix_bounds.right() + gap,
         frame.y + ui_scale.value(28.0),
-        ui_scale.value(184.0),
+        side_width,
         ui_scale.value(70.0),
     );
     let effect_bounds = UiRect::new(
-        frame.x + ui_scale.value(462.0),
+        response_bounds.x,
         frame.y + ui_scale.value(126.0),
-        ui_scale.value(184.0),
+        side_width,
         ui_scale.value(56.0),
     );
     let status_bounds = UiRect::new(
-        frame.x + ui_scale.value(690.0),
+        response_bounds.right() + gap,
         frame.y + ui_scale.value(28.0),
-        ui_scale.value(184.0),
+        side_width,
         ui_scale.value(154.0),
     );
-    add_experiment_matrix_primitives(&mut primitives, matrix_bounds, plan, missing_only, ui_scale);
     add_experiment_response_primitives(&mut primitives, response_bounds, plan, analysis, ui_scale);
     add_experiment_effect_primitives(&mut primitives, effect_bounds, analysis, ui_scale);
     add_experiment_status_primitives(&mut primitives, status_bounds, plan, ui_scale);
@@ -11242,7 +18413,11 @@ fn experiment_readiness_label(
     }
 }
 
-fn process_control_view_primitives(app: &FabricadApp, ui_scale: UiScale) -> Vec<ScenePrimitive> {
+fn process_control_view_primitives(
+    app: &FabricadApp,
+    ui_scale: UiScale,
+    compact_rows: bool,
+) -> Vec<ScenePrimitive> {
     let Some(loop_definition) = selected_control_loop(app) else {
         return Vec::new();
     };
@@ -11258,24 +18433,53 @@ fn process_control_view_primitives(app: &FabricadApp, ui_scale: UiScale) -> Vec<
         .filter(|action| action.loop_id == loop_definition.id)
         .or_else(|| actions.first().copied());
     let mut primitives = Vec::with_capacity(trend.len() * 4 + actions.len() * 4 + 80);
-    let frame = UiRect::new(
-        ui_scale.value(30.0),
-        ui_scale.value(18.0),
-        ui_scale.value(900.0),
-        ui_scale.value(202.0),
-    );
+    let frame = if compact_rows {
+        UiRect::new(
+            ui_scale.value(30.0),
+            ui_scale.value(18.0),
+            ui_scale.value(250.0),
+            ui_scale.value(168.0),
+        )
+    } else {
+        UiRect::new(
+            ui_scale.value(30.0),
+            ui_scale.value(18.0),
+            ui_scale.value(900.0),
+            ui_scale.value(202.0),
+        )
+    };
     primitives.push(ScenePrimitive::Rect(
         operad::PaintRect::solid(frame, ColorRgba::new(14, 19, 24, 255)).stroke(StrokeStyle::new(
             ColorRgba::new(70, 84, 98, 255),
             ui_scale.value(1.0),
         )),
     ));
-    let trend_bounds = UiRect::new(
-        frame.x + ui_scale.value(22.0),
-        frame.y + ui_scale.value(24.0),
-        ui_scale.value(430.0),
-        ui_scale.value(154.0),
+    let trend_bounds = if compact_rows {
+        UiRect::new(
+            frame.x + ui_scale.value(16.0),
+            frame.y + ui_scale.value(20.0),
+            frame.width - ui_scale.value(32.0),
+            frame.height - ui_scale.value(36.0),
+        )
+    } else {
+        UiRect::new(
+            frame.x + ui_scale.value(22.0),
+            frame.y + ui_scale.value(24.0),
+            ui_scale.value(430.0),
+            ui_scale.value(154.0),
+        )
+    };
+    add_process_control_trend_primitives(
+        &mut primitives,
+        trend_bounds,
+        loop_definition,
+        trend,
+        ui_scale,
     );
+    if compact_rows {
+        return primitives;
+    }
+
     let action_bounds = UiRect::new(
         frame.x + ui_scale.value(492.0),
         frame.y + ui_scale.value(28.0),
@@ -11287,13 +18491,6 @@ fn process_control_view_primitives(app: &FabricadApp, ui_scale: UiScale) -> Vec<
         frame.y + ui_scale.value(28.0),
         ui_scale.value(174.0),
         ui_scale.value(154.0),
-    );
-    add_process_control_trend_primitives(
-        &mut primitives,
-        trend_bounds,
-        loop_definition,
-        trend,
-        ui_scale,
     );
     add_process_control_action_primitives(
         &mut primitives,
@@ -11611,7 +18808,14 @@ fn process_control_action_state_color(state: ControlActionState, alpha: u8) -> C
     }
 }
 
-fn process_control_action_label(action: &ControlAction) -> String {
+fn process_control_action_label(action: &ControlAction, compact_rows: bool) -> String {
+    if compact_rows {
+        return format!(
+            "{} {}",
+            process_control_action_short_label(action),
+            action.state.label()
+        );
+    }
     let adjustment_label = action
         .adjustments
         .first()
@@ -11623,7 +18827,7 @@ fn process_control_action_label(action: &ControlAction) -> String {
     compact_button_label(
         &format!(
             "{} {} error {:+.3}, confidence {:.0}%, {}",
-            short_control_action_label(&action.id),
+            process_control_action_short_label(action),
             action.state.label(),
             action.error,
             action.confidence.clamp(0.0, 1.0) * 100.0,
@@ -11633,7 +18837,11 @@ fn process_control_action_label(action: &ControlAction) -> String {
     )
 }
 
-fn process_control_yield_link_label(app: &FabricadApp, loop_definition: &ControlLoop) -> String {
+fn process_control_yield_link_label(
+    app: &FabricadApp,
+    loop_definition: &ControlLoop,
+    compact_rows: bool,
+) -> String {
     let Some(point) = app
         .workspace
         .process_control
@@ -11649,10 +18857,15 @@ fn process_control_yield_link_label(app: &FabricadApp, loop_definition: &Control
         .map(|summary| percent_label(summary.yield_fraction))
         .or_else(|| point.yield_fraction.map(percent_label))
         .unwrap_or_else(|| "yield n/a".to_string());
+    if compact_rows {
+        return format!("yield {yield_label}");
+    }
     compact_button_label(
         &format!(
-            "{yield_label} yield for {}/{} run {}",
-            point.source.lot_id, point.source.wafer_id, point.source.tool_run_id
+            "{yield_label} yield for {} / {} / {}",
+            workflow_lot_label(&app.workspace, &point.source.lot_id, 32),
+            yield_wafer_label(&point.source.wafer_id),
+            control_run_label(point.source.run_index)
         ),
         70,
     )
@@ -11664,12 +18877,14 @@ fn yield_view_primitives(
     wafer_id: &str,
     outcomes: &[DieOutcome],
     ui_scale: UiScale,
+    compact_rows: bool,
 ) -> Vec<ScenePrimitive> {
     let mut primitives = Vec::with_capacity(outcomes.len() * 2 + 90);
+    let frame_width = if compact_rows { 250.0 } else { 900.0 };
     let frame = UiRect::new(
         ui_scale.value(30.0),
         ui_scale.value(18.0),
-        ui_scale.value(900.0),
+        ui_scale.value(frame_width),
         ui_scale.value(202.0),
     );
     primitives.push(ScenePrimitive::Rect(
@@ -11678,6 +18893,17 @@ fn yield_view_primitives(
             ui_scale.value(1.0),
         )),
     ));
+    if compact_rows {
+        let wafer_size = ui_scale.value(178.0);
+        let wafer_bounds = UiRect::new(
+            frame.x + (frame.width - wafer_size) * 0.5,
+            frame.y + ui_scale.value(12.0),
+            wafer_size,
+            wafer_size,
+        );
+        add_yield_die_map_primitives(&mut primitives, wafer_bounds, outcomes, app, ui_scale);
+        return primitives;
+    }
     let wafer_bounds = UiRect::new(
         frame.x + ui_scale.value(22.0),
         frame.y + ui_scale.value(12.0),
@@ -12029,6 +19255,47 @@ fn yield_failure_label(summary: &YieldSummary) -> String {
         ),
         68,
     )
+}
+
+fn yield_failure_mode_short_label(failure: Option<FailureMode>) -> &'static str {
+    match failure {
+        Some(FailureMode::OpenCircuit) => "open",
+        Some(FailureMode::ShortCircuit) => "short",
+        Some(FailureMode::HighLeakage) => "leakage",
+        Some(FailureMode::LowFrequency) => "low-freq",
+        Some(FailureMode::ParametricDrift) => "drift",
+        Some(FailureMode::ContactResistance) => "contact R",
+        Some(FailureMode::EdgeDefect) => "edge defect",
+        None => "no fails",
+    }
+}
+
+fn yield_spatial_short_label(summary: &YieldSummary) -> &'static str {
+    match summary.spatial_pattern.label() {
+        "edge-heavy" => "edge",
+        "center-heavy" => "center",
+        "no failures" => "none",
+        other => other,
+    }
+}
+
+fn yield_failure_compact_label(summary: &YieldSummary) -> String {
+    format!(
+        "{}; {}",
+        yield_failure_mode_short_label(summary.dominant_failure),
+        yield_spatial_short_label(summary)
+    )
+}
+
+fn yield_root_cause_compact_label(summary: &YieldSummary) -> String {
+    match (
+        summary.spatial_pattern.label(),
+        summary.dominant_failure.map(|failure| failure.label()),
+    ) {
+        ("edge-heavy", Some("Low frequency")) => "Edge low-frequency issue".to_string(),
+        (_, Some(failure)) => format!("{failure} issue"),
+        _ => "No root-cause hint".to_string(),
+    }
 }
 
 fn metrology_view_primitives(app: &FabricadApp, ui_scale: UiScale) -> Vec<ScenePrimitive> {
@@ -12594,6 +19861,39 @@ fn metrology_summary_label(summary: MeasurementSummary) -> String {
     }
 }
 
+fn metrology_status_compact_label(summary: MeasurementSummary) -> String {
+    format!(
+        "{} fail / {} outlier",
+        summary.fail_count, summary.outlier_count
+    )
+}
+
+fn metrology_summary_compact_label(summary: MeasurementSummary) -> String {
+    let (Some(mean), Some(stddev)) = (summary.mean, summary.stddev) else {
+        return "No summary".to_string();
+    };
+    let mean = metrology_format_value(summary.kind, mean);
+    let stddev = metrology_format_value(summary.kind, stddev);
+    let unit = summary.kind.unit();
+    if unit.is_empty() {
+        return format!("{mean} +/- {stddev}");
+    }
+    let with_unit = format!("{mean} +/- {stddev} {unit}");
+    if with_unit.chars().count() <= 20 {
+        with_unit
+    } else {
+        format!("{mean} +/- {stddev}")
+    }
+}
+
+fn metrology_defects_compact_label(map: &WaferMap) -> String {
+    format!(
+        "{} defects; {} notes",
+        map.defects.len(),
+        map.annotations.len()
+    )
+}
+
 fn metrology_selected_die_label(map: &WaferMap, selected_die: Option<DieCoord>) -> String {
     let Some(die) = selected_die else {
         return "No selected die - use Next or attention buttons".to_string();
@@ -13122,7 +20422,7 @@ fn spc_severity_color(severity: MonitorSeverity, alpha: u8) -> ColorRgba {
     }
 }
 
-fn spc_chart_summary_label(chart: &ControlChart) -> String {
+fn spc_chart_summary_label(chart: &ControlChart, max_chars: usize) -> String {
     let latest = chart
         .latest_point()
         .map(|point| {
@@ -13137,15 +20437,19 @@ fn spc_chart_summary_label(chart: &ControlChart) -> String {
     compact_button_label(
         &format!(
             "{}: {latest}; {}; {} rules",
-            chart.metric.replace('_', " "),
+            display_measurement_identifier(&chart.metric),
             spc_chart_trend_label(chart),
             chart.violations.len()
         ),
-        78,
+        max_chars,
     )
 }
 
-fn spc_trace_summary_label(monitor: &SpcFdcMonitor, trace: &SensorTrace) -> String {
+fn spc_trace_summary_label(
+    monitor: &SpcFdcMonitor,
+    trace: &SensorTrace,
+    max_chars: usize,
+) -> String {
     let latest = trace
         .latest_point()
         .map(|point| {
@@ -13160,11 +20464,11 @@ fn spc_trace_summary_label(monitor: &SpcFdcMonitor, trace: &SensorTrace) -> Stri
     compact_button_label(
         &format!(
             "{}: {latest}; {}; {} alarms",
-            trace.display_name(),
+            display_spc_trace_name(trace),
             spc_trace_range_label(trace),
             same_tool_alarm_count(monitor, &trace.tool_id)
         ),
-        78,
+        max_chars,
     )
 }
 
@@ -13533,14 +20837,14 @@ fn safety_primary_rows(app: &FabricadApp) -> Vec<PrimaryRow> {
             .map(|lockout| {
                 PrimaryRow::new(
                     format!("lockout-{}", lockout.tool_id),
-                    format!("{} {}", lockout.tool_id, lockout.tool_name),
+                    safety_tool_label(&lockout.tool_id, &lockout.tool_name),
                     if lockout.locked_out {
                         "Locked out"
                     } else {
                         "Clear"
                     },
                     if lockout.reasons.is_empty() {
-                        "All simulated interlocks clear".to_string()
+                        "All interlocks clear".to_string()
                     } else {
                         lockout.reasons.join("; ")
                     },
@@ -13595,7 +20899,7 @@ fn safety_primary_rows(app: &FabricadApp) -> Vec<PrimaryRow> {
                     let incident_id = incident.id.to_string();
                     PrimaryRow::new(
                         format!("incident-{incident_id}"),
-                        incident_id.clone(),
+                        display_safety_incident_identifier(&incident.id),
                         format!("{} {}", incident.severity.label(), incident.status.label()),
                         format!("{}; {}", incident.domain.label(), incident.summary),
                     )
@@ -13639,7 +20943,7 @@ fn safety_selected_tool_rows(
                 "clear"
             },
             if lockout.reasons.is_empty() {
-                "All simulated interlocks clear".to_string()
+                "All interlocks clear".to_string()
             } else {
                 lockout.reasons.join("; ")
             },
@@ -13751,8 +21055,11 @@ fn trace_wafer_primary_row(app: &FabricadApp, wafer: WaferRef) -> PrimaryRow {
         .unwrap_or_else(|| "missing wafer".to_string());
     PrimaryRow::new(
         format!("trace-{}-{}", wafer.lot_id, wafer.wafer_id),
-        wafer.wafer_id.to_string(),
-        format!("{} {slot}", wafer.lot_id),
+        trace_wafer_label(&wafer),
+        format!(
+            "{} {slot}",
+            trace_lot_label(&app.workspace.genealogy, &wafer.lot_id, 24)
+        ),
         format!("lineage {lineage}; descendants {descendants}"),
     )
     .action(
@@ -13781,7 +21088,7 @@ fn trace_selected_wafer_rows(app: &FabricadApp) -> Vec<PrimaryRow> {
                     } else {
                         "Parent wafer".to_string()
                     },
-                    wafer.to_string(),
+                    trace_wafer_context_label(genealogy, &wafer),
                     trace_latest_step_label(app, &wafer),
                 )
                 .action(
@@ -13799,7 +21106,7 @@ fn trace_selected_wafer_rows(app: &FabricadApp) -> Vec<PrimaryRow> {
                 PrimaryRow::new(
                     format!("trace-child-{}-{}", wafer.lot_id, wafer.wafer_id),
                     "Child wafer",
-                    wafer.to_string(),
+                    trace_wafer_context_label(genealogy, &wafer),
                     trace_latest_step_label(app, &wafer),
                 )
                 .action(
@@ -13813,7 +21120,7 @@ fn trace_selected_wafer_rows(app: &FabricadApp) -> Vec<PrimaryRow> {
         rows.push(PrimaryRow::new(
             "trace-impact-summary",
             app.trace_impact_mode.label(),
-            query.label(),
+            trace_impact_query_label(genealogy, &query),
             format!(
                 "{} direct, {} impacted, {} evidence rows",
                 impact.direct_wafers.len(),
@@ -13828,14 +21135,14 @@ fn trace_selected_wafer_rows(app: &FabricadApp) -> Vec<PrimaryRow> {
                     impact.wafer.lot_id, impact.wafer.wafer_id
                 ),
                 "Impacted wafer",
-                impact.wafer.to_string(),
+                trace_wafer_context_label(genealogy, &impact.wafer),
                 format!(
                     "{}; latest {}",
                     impact.relationship.label(),
                     impact
                         .latest_step_id
                         .as_ref()
-                        .map(ToString::to_string)
+                        .map(|step_id| display_step_identifier(step_id.as_str()))
                         .unwrap_or_else(|| "n/a".to_string())
                 ),
             )
@@ -13854,11 +21161,13 @@ fn trace_selected_wafer_rows(app: &FabricadApp) -> Vec<PrimaryRow> {
             .map(|record| {
                 PrimaryRow::new(
                     format!("trace-process-{}", record.sequence),
-                    format!("#{} {}", record.sequence, record.step_id),
-                    record.tool_id.to_string(),
+                    record.step_name.clone(),
+                    equipment_tool_label_for_raw_id(&app.workspace, record.tool_id.as_str()),
                     format!(
-                        "{}; run {}; {}",
-                        record.step_name, record.tool_run_id, record.completed_at
+                        "{}; {}; {}",
+                        display_recipe_identifier(record.recipe_id.as_str()),
+                        display_tool_run_identifier(record.tool_run_id.as_str()),
+                        record.completed_at
                     ),
                 )
                 .action(
@@ -13874,16 +21183,15 @@ fn trace_selected_wafer_rows(app: &FabricadApp) -> Vec<PrimaryRow> {
             .rev()
             .take(2)
             .map(|record| {
+                let material_name = trace_material_lot_label(genealogy, &record.material_lot_id);
                 PrimaryRow::new(
                     format!("trace-material-{}", record.sequence),
-                    format!("#{} material", record.sequence),
-                    record.material_lot_id.to_string(),
+                    material_name,
+                    format!("{} {}", spc_compact_number(record.quantity), record.unit),
                     format!(
-                        "{} {} at step {}; run {}",
-                        spc_compact_number(record.quantity),
-                        record.unit,
-                        record.step_id,
-                        record.tool_run_id
+                        "{}; {}",
+                        display_step_identifier(record.step_id.as_str()),
+                        display_tool_run_identifier(record.tool_run_id.as_str())
                     ),
                 )
                 .action(
@@ -13900,10 +21208,10 @@ fn trace_selected_wafer_rows(app: &FabricadApp) -> Vec<PrimaryRow> {
             .rev()
             .take(2)
             .map(|event| {
-                let (title, detail) = trace_event_labels(&event.kind);
+                let (title, detail) = trace_event_labels(genealogy, &event.kind);
                 PrimaryRow::new(
                     format!("trace-event-{}", event.sequence),
-                    format!("#{} {title}", event.sequence),
+                    capitalize_ascii_first(title.to_string()),
                     "event",
                     detail,
                 )
@@ -13921,16 +21229,77 @@ fn trace_latest_step_label(app: &FabricadApp, wafer: &WaferRef) -> String {
         .genealogy
         .inherited_process_history_for_wafer(wafer)
         .last()
-        .map(|record| format!("latest {} on {}", record.step_id, record.tool_id))
+        .map(|record| {
+            format!(
+                "latest {} on {}",
+                record.step_name,
+                equipment_tool_label_for_raw_id(&app.workspace, record.tool_id.as_str())
+            )
+        })
         .unwrap_or_else(|| "no process history".to_string())
 }
 
+fn trace_wafer_label(wafer: &WaferRef) -> String {
+    let lot_prefix = format!("{}-", wafer.lot_id);
+    wafer
+        .wafer_id
+        .as_str()
+        .strip_prefix(&lot_prefix)
+        .unwrap_or_else(|| wafer.wafer_id.as_str())
+        .to_string()
+}
+
+fn trace_wafer_context_label(
+    genealogy: &layout_model::genealogy::LotGenealogy,
+    wafer: &WaferRef,
+) -> String {
+    format!(
+        "{} / {}",
+        trace_lot_label(genealogy, &wafer.lot_id, 32),
+        trace_wafer_label(wafer)
+    )
+}
+
+fn trace_material_lot_label(
+    genealogy: &layout_model::genealogy::LotGenealogy,
+    material_lot_id: &layout_model::genealogy::MaterialLotId,
+) -> String {
+    genealogy
+        .material_lots
+        .get(material_lot_id)
+        .map(|material| material.name.clone())
+        .unwrap_or_else(|| material_lot_id.to_string())
+}
+
+fn trace_process_button_label(record: &layout_model::genealogy::WaferProcessRecord) -> String {
+    compact_button_label(&record.step_name, 16)
+}
+
+fn trace_material_use_button_label(
+    genealogy: &layout_model::genealogy::LotGenealogy,
+    record: &layout_model::genealogy::MaterialUse,
+) -> String {
+    compact_button_label(
+        &trace_material_lot_label(genealogy, &record.material_lot_id),
+        16,
+    )
+}
+
+fn trace_event_button_label(event: &layout_model::genealogy::GenealogyEvent) -> &'static str {
+    match &event.kind {
+        layout_model::genealogy::GenealogyEventKind::LotStarted { .. } => "Lot started",
+        layout_model::genealogy::GenealogyEventKind::LotSplit { .. } => "Lot split",
+        layout_model::genealogy::GenealogyEventKind::LotMerge { .. } => "Lot merge",
+    }
+}
+
 fn trace_event_labels(
+    genealogy: &layout_model::genealogy::LotGenealogy,
     kind: &layout_model::genealogy::GenealogyEventKind,
 ) -> (&'static str, String) {
     match kind {
         layout_model::genealogy::GenealogyEventKind::LotStarted { lot_id } => {
-            ("lot started", lot_id.to_string())
+            ("lot started", trace_lot_label(genealogy, lot_id, 42))
         }
         layout_model::genealogy::GenealogyEventKind::LotSplit {
             source_lot_id,
@@ -13939,7 +21308,11 @@ fn trace_event_labels(
             reason,
         } => (
             "lot split",
-            format!("{source_lot_id} -> {target_lot_id}; {wafer_count} wafers; {reason}"),
+            format!(
+                "{} -> {}; {wafer_count} wafers; {reason}",
+                trace_lot_label(genealogy, source_lot_id, 24),
+                trace_lot_label(genealogy, target_lot_id, 24)
+            ),
         ),
         layout_model::genealogy::GenealogyEventKind::LotMerge {
             source_lot_ids,
@@ -13949,12 +21322,13 @@ fn trace_event_labels(
         } => (
             "lot merge",
             format!(
-                "{} -> {target_lot_id}; {wafer_count} wafers; {reason}",
+                "{} -> {}; {wafer_count} wafers; {reason}",
                 source_lot_ids
                     .iter()
-                    .map(ToString::to_string)
+                    .map(|lot_id| trace_lot_label(genealogy, lot_id, 24))
                     .collect::<Vec<_>>()
-                    .join(", ")
+                    .join(", "),
+                trace_lot_label(genealogy, target_lot_id, 24)
             ),
         ),
     }
@@ -13998,8 +21372,11 @@ fn trace_selected_detail_rows(app: &FabricadApp) -> Vec<(String, String)> {
                 })
                 .count();
             vec![
-                ("Selected node".to_string(), format!("Lot {lot_id}")),
-                ("Product".to_string(), lot.product.clone()),
+                (
+                    "Selection".to_string(),
+                    format!("Lot {}", trace_lot_label(genealogy, &lot_id, 42)),
+                ),
+                ("Product".to_string(), display_product_label(&lot.product)),
                 ("Route".to_string(), lot.route_id.to_string()),
                 ("Disposition".to_string(), trace_lot_disposition_label(lot)),
                 (
@@ -14015,25 +21392,31 @@ fn trace_selected_detail_rows(app: &FabricadApp) -> Vec<(String, String)> {
         TraceSelection::Wafer(wafer_ref) => {
             let Some(wafer) = genealogy.wafer(&wafer_ref) else {
                 return vec![(
-                    "Selected node".to_string(),
+                    "Selection".to_string(),
                     format!("Missing wafer {wafer_ref}"),
                 )];
             };
             let process_records = genealogy.inherited_process_history_for_wafer(&wafer_ref);
             let material_records = genealogy.material_ancestry_for_wafer(&wafer_ref);
             vec![
-                ("Selected node".to_string(), format!("Wafer {wafer_ref}")),
+                (
+                    "Selection".to_string(),
+                    format!("Wafer {}", trace_wafer_context_label(genealogy, &wafer_ref)),
+                ),
                 (
                     "Slot / substrate".to_string(),
                     format!("{} / {}", wafer.slot, wafer.substrate),
                 ),
-                ("State".to_string(), trace_wafer_state_label(wafer)),
+                (
+                    "State".to_string(),
+                    trace_wafer_state_label(genealogy, wafer),
+                ),
                 (
                     "Parent".to_string(),
                     wafer
                         .parent
                         .as_ref()
-                        .map(ToString::to_string)
+                        .map(|parent| trace_wafer_context_label(genealogy, parent))
                         .unwrap_or_else(|| "None".to_string()),
                 ),
                 (
@@ -14053,7 +21436,7 @@ fn trace_selected_detail_rows(app: &FabricadApp) -> Vec<(String, String)> {
         TraceSelection::Process(sequence) => {
             let Some(record) = trace_process_record(app, sequence) else {
                 return vec![(
-                    "Selected node".to_string(),
+                    "Selection".to_string(),
                     format!("Missing process #{sequence}"),
                 )];
             };
@@ -14065,37 +21448,48 @@ fn trace_selected_detail_rows(app: &FabricadApp) -> Vec<(String, String)> {
                 })
                 .count();
             vec![
-                ("Selected node".to_string(), format!("Process #{sequence}")),
-                ("Wafer".to_string(), record.wafer.to_string()),
+                ("Selection".to_string(), "Process step".to_string()),
                 (
-                    "Step".to_string(),
-                    format!("{} {}", record.step_id, record.step_name),
+                    "Wafer".to_string(),
+                    trace_wafer_context_label(genealogy, &record.wafer),
                 ),
+                ("Step".to_string(), record.step_name.clone()),
                 ("Layer".to_string(), trace_process_layer_label(record)),
                 (
                     "Recipe / tool".to_string(),
-                    format!("{} / {}", record.recipe_id, record.tool_id),
+                    format!(
+                        "{} / {}",
+                        display_recipe_identifier(record.recipe_id.as_str()),
+                        equipment_tool_label_for_raw_id(&app.workspace, record.tool_id.as_str())
+                    ),
                 ),
                 (
                     "Run / materials".to_string(),
-                    format!("{} / {}", record.tool_run_id, material_uses),
+                    format!(
+                        "{} / {}",
+                        display_tool_run_identifier(record.tool_run_id.as_str()),
+                        material_uses
+                    ),
                 ),
             ]
         }
         TraceSelection::MaterialUse(sequence) => {
             let Some(record) = trace_material_use(app, sequence) else {
                 return vec![(
-                    "Selected node".to_string(),
+                    "Selection".to_string(),
                     format!("Missing material #{sequence}"),
                 )];
             };
             let material = genealogy.material_lots.get(&record.material_lot_id);
             vec![
-                ("Selected node".to_string(), format!("Material #{sequence}")),
-                ("Wafer".to_string(), record.wafer.to_string()),
+                ("Selection".to_string(), "Material use".to_string()),
+                (
+                    "Wafer".to_string(),
+                    trace_wafer_context_label(genealogy, &record.wafer),
+                ),
                 (
                     "Material lot".to_string(),
-                    record.material_lot_id.to_string(),
+                    trace_material_lot_label(genealogy, &record.material_lot_id),
                 ),
                 (
                     "Material".to_string(),
@@ -14115,7 +21509,7 @@ fn trace_selected_detail_rows(app: &FabricadApp) -> Vec<(String, String)> {
                     "Step / qty".to_string(),
                     format!(
                         "{} / {} {}",
-                        record.step_id,
+                        display_step_identifier(record.step_id.as_str()),
                         spc_compact_number(record.quantity),
                         record.unit
                     ),
@@ -14125,15 +21519,21 @@ fn trace_selected_detail_rows(app: &FabricadApp) -> Vec<(String, String)> {
         TraceSelection::Event(sequence) => {
             let Some(event) = trace_event(app, sequence) else {
                 return vec![(
-                    "Selected node".to_string(),
+                    "Selection".to_string(),
                     format!("Missing event #{sequence}"),
                 )];
             };
-            let (title, detail) = trace_event_labels(&event.kind);
+            let (title, detail) = trace_event_labels(genealogy, &event.kind);
             vec![
-                ("Selected node".to_string(), format!("Event #{sequence}")),
+                (
+                    "Selection".to_string(),
+                    trace_event_button_label(event).to_string(),
+                ),
                 ("Operation".to_string(), title.to_string()),
-                ("Scope".to_string(), trace_event_scope(&event.kind)),
+                (
+                    "Scope".to_string(),
+                    trace_event_scope(genealogy, &event.kind),
+                ),
                 ("Reason".to_string(), trace_event_reason(&event.kind)),
                 ("Audit text".to_string(), detail),
             ]
@@ -14183,14 +21583,17 @@ fn trace_lot_disposition_label(lot: &layout_model::genealogy::GenealogyLot) -> S
     }
 }
 
-fn trace_wafer_state_label(wafer: &layout_model::genealogy::GenealogyWafer) -> String {
+fn trace_wafer_state_label(
+    genealogy: &layout_model::genealogy::LotGenealogy,
+    wafer: &layout_model::genealogy::GenealogyWafer,
+) -> String {
     match &wafer.state {
         layout_model::genealogy::WaferGenealogyState::Active => "active".to_string(),
         layout_model::genealogy::WaferGenealogyState::SplitTo { lot_id } => {
-            format!("split to {lot_id}")
+            format!("split to {}", trace_lot_label(genealogy, lot_id, 32))
         }
         layout_model::genealogy::WaferGenealogyState::MergedTo { lot_id } => {
-            format!("merged to {lot_id}")
+            format!("merged to {}", trace_lot_label(genealogy, lot_id, 32))
         }
         layout_model::genealogy::WaferGenealogyState::Scrapped { reason } => {
             format!("scrapped: {reason}")
@@ -14206,25 +21609,35 @@ fn trace_process_layer_label(record: &layout_model::genealogy::WaferProcessRecor
         .to_string()
 }
 
-fn trace_event_scope(kind: &layout_model::genealogy::GenealogyEventKind) -> String {
+fn trace_event_scope(
+    genealogy: &layout_model::genealogy::LotGenealogy,
+    kind: &layout_model::genealogy::GenealogyEventKind,
+) -> String {
     match kind {
-        layout_model::genealogy::GenealogyEventKind::LotStarted { lot_id } => lot_id.to_string(),
+        layout_model::genealogy::GenealogyEventKind::LotStarted { lot_id } => {
+            trace_lot_label(genealogy, lot_id, 42)
+        }
         layout_model::genealogy::GenealogyEventKind::LotSplit {
             source_lot_id,
             target_lot_id,
             ..
-        } => format!("{source_lot_id} -> {target_lot_id}"),
+        } => format!(
+            "{} -> {}",
+            trace_lot_label(genealogy, source_lot_id, 24),
+            trace_lot_label(genealogy, target_lot_id, 24)
+        ),
         layout_model::genealogy::GenealogyEventKind::LotMerge {
             source_lot_ids,
             target_lot_id,
             ..
         } => format!(
-            "{} -> {target_lot_id}",
+            "{} -> {}",
             source_lot_ids
                 .iter()
-                .map(ToString::to_string)
+                .map(|lot_id| trace_lot_label(genealogy, lot_id, 24))
                 .collect::<Vec<_>>()
-                .join(", ")
+                .join(", "),
+            trace_lot_label(genealogy, target_lot_id, 24)
         ),
     }
 }
@@ -14260,11 +21673,11 @@ fn process_flow_primary_rows(app: &FabricadApp) -> Vec<PrimaryRow> {
             let recipe = node
                 .recipe
                 .as_ref()
-                .map(ToString::to_string)
+                .map(|recipe| display_recipe_identifier(recipe.recipe_id.as_str()))
                 .unwrap_or_else(|| "no recipe".to_string());
             PrimaryRow::new(
                 format!("process-node-{}", node.id),
-                format!("{} {}", node.id, node.name),
+                display_process_flow_node_label(node),
                 format!("{} {}", node.kind.label(), node.area),
                 format!(
                     "{}; {} eligible tools; {}",
@@ -14292,7 +21705,7 @@ fn process_control_primary_rows(app: &FabricadApp) -> Vec<PrimaryRow> {
                 .map(|action| {
                     PrimaryRow::new(
                         format!("control-action-{}", action.id),
-                        short_control_action_label(&action.id),
+                        process_control_action_short_label(action),
                         format!(
                             "{} {:.0}% confidence",
                             action.state.label(),
@@ -14324,7 +21737,7 @@ fn process_control_primary_rows(app: &FabricadApp) -> Vec<PrimaryRow> {
                     PrimaryRow::new(
                         format!("control-loop-{}", loop_definition.id),
                         loop_definition.name.clone(),
-                        loop_definition.id.to_string(),
+                        equipment_tool_label_for_raw_id(&app.workspace, &loop_definition.tool_id),
                         format!(
                             "{} target {:.3} {}",
                             loop_definition.output.label,
@@ -14372,23 +21785,38 @@ fn spc_fdc_primary_rows(app: &FabricadApp) -> Vec<PrimaryRow> {
         .take(10)
         .map(|finding| {
             let context = [
-                finding.tool_id.as_ref().map(|id| format!("tool {id}")),
-                finding.lot_id.as_ref().map(|id| format!("lot {id}")),
-                finding.wafer_id.as_ref().map(|id| format!("wafer {id}")),
-                finding.recipe_id.as_ref().map(|id| format!("recipe {id}")),
+                finding.tool_id.as_ref().map(|id| {
+                    format!(
+                        "tool {}",
+                        equipment_tool_label_for_raw_id(&app.workspace, id)
+                    )
+                }),
+                finding
+                    .lot_id
+                    .as_ref()
+                    .map(|id| format!("lot {}", workflow_lot_label(&app.workspace, id, 28))),
+                finding
+                    .wafer_id
+                    .as_ref()
+                    .map(|id| display_wafer_identifier(id)),
+                finding
+                    .recipe_id
+                    .as_ref()
+                    .map(|id| format!("recipe {}", display_recipe_identifier(id))),
             ]
             .into_iter()
             .flatten()
             .collect::<Vec<_>>()
             .join(", ");
+            let detail = display_spc_finding_detail(&app.workspace, finding);
             PrimaryRow::new(
                 format!("spc-{}-{}", finding.source.label(), finding.title),
-                finding.title.clone(),
+                display_spc_finding_title(finding),
                 format!("{} {}", finding.severity.label(), finding.source.label()),
                 if context.is_empty() {
-                    finding.detail.clone()
+                    detail
                 } else {
-                    format!("{context}; {}", finding.detail)
+                    format!("{context}; {detail}")
                 },
             )
         })
@@ -14397,7 +21825,7 @@ fn spc_fdc_primary_rows(app: &FabricadApp) -> Vec<PrimaryRow> {
         rows.extend(monitor.charts.iter().take(10).map(|chart| {
             PrimaryRow::new(
                 format!("spc-chart-{}", chart.id),
-                chart.metric.clone(),
+                display_measurement_identifier(&chart.metric),
                 format!("{} violations", chart.violations.len()),
                 format!(
                     "center {:.2}; limits {:.2}..{:.2}",
@@ -14467,15 +21895,17 @@ fn metrology_primary_rows(app: &FabricadApp) -> Vec<PrimaryRow> {
         .map(|measurement| {
             PrimaryRow::new(
                 format!("measurement-{}", measurement.id),
-                measurement.id.clone(),
-                measurement.status.label(),
+                metrology_measurement_title(measurement),
                 format!(
-                    "{} {:.2} {}; {} / {}",
-                    die_coord_label(Some(measurement.die)),
-                    measurement.value,
-                    measurement.kind.unit(),
+                    "{} {}",
+                    metrology_measurement_value(measurement),
+                    measurement.status.label()
+                ),
+                format!(
+                    "lot {} / wafer {} / {}",
                     measurement.links.lot_id,
-                    measurement.links.wafer_id
+                    measurement.links.wafer_id,
+                    measurement.links.process_step_id
                 ),
             )
             .action(
@@ -14487,6 +21917,79 @@ fn metrology_primary_rows(app: &FabricadApp) -> Vec<PrimaryRow> {
             )
         })
         .collect()
+}
+
+fn metrology_measurement_title(measurement: &layout_model::metrology::Measurement) -> String {
+    format!(
+        "{} at {}",
+        measurement.kind.label(),
+        die_coord_label(Some(measurement.die))
+    )
+}
+
+fn metrology_map_display_name(workspace: &WorkspaceDataset, map: &WaferMap) -> String {
+    let lot_id = map.links.lot_id.trim();
+    let wafer_id = map.links.wafer_id.trim();
+    let mut name = map.name.trim().to_string();
+    for raw_prefix in [
+        (!lot_id.is_empty() && !wafer_id.is_empty()).then(|| format!("{lot_id} {wafer_id}")),
+        (!lot_id.is_empty()).then(|| lot_id.to_string()),
+        (!wafer_id.is_empty()).then(|| wafer_id.to_string()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(stripped) = name.strip_prefix(&raw_prefix) {
+            name = stripped
+                .trim_start_matches([' ', '-', '/', ':'])
+                .to_string();
+        }
+    }
+
+    let mut parts = Vec::new();
+    if !lot_id.is_empty() {
+        parts.push(workflow_lot_label(workspace, lot_id, 32));
+    }
+    if !wafer_id.is_empty() {
+        parts.push(yield_wafer_short_label(wafer_id));
+    }
+    if !name.is_empty() {
+        parts.push(capitalize_ascii_first(name));
+    }
+    if parts.is_empty() {
+        "Wafer map".to_string()
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn metrology_measurement_value(measurement: &layout_model::metrology::Measurement) -> String {
+    let value = metrology_format_value(measurement.kind, measurement.value);
+    let unit = measurement.kind.unit();
+    if unit.is_empty() {
+        value
+    } else {
+        format!("{value} {unit}")
+    }
+}
+
+fn metrology_attention_site_label(die: DieCoord, score: usize, compact: bool) -> String {
+    let level = if score >= 72 {
+        "critical"
+    } else if score >= 42 {
+        "review"
+    } else {
+        "watch"
+    };
+    if compact {
+        format!(
+            "{} {}",
+            die_coord_label(Some(die)),
+            &level[..level.len().min(4)]
+        )
+    } else {
+        format!("{} {level}", die_coord_label(Some(die)))
+    }
 }
 
 fn yield_primary_rows(app: &FabricadApp) -> Vec<PrimaryRow> {
@@ -14559,13 +22062,13 @@ fn experiment_primary_rows(app: &FabricadApp) -> Vec<PrimaryRow> {
                 .join(", ");
             PrimaryRow::new(
                 format!("experiment-run-{}", row.run_id),
-                row.run_id.clone(),
+                experiment_run_order_label(row.run_order),
                 row.status.clone(),
                 format!(
-                    "order {} / {} W{:02} / split {} / responses {} / primary {}",
+                    "order {} / {} {} / split {} / responses {} / primary {}",
                     row.run_order,
-                    row.wafer_id,
-                    row.slot,
+                    workflow_lot_label(&app.workspace, &row.lot_id, 28),
+                    yield_wafer_short_label(&row.wafer_id),
                     row.block,
                     row.capture_summary,
                     row.primary_value
@@ -14598,7 +22101,11 @@ fn notebook_primary_rows(app: &FabricadApp) -> Vec<PrimaryRow> {
             PrimaryRow::new(
                 format!("notebook-{}", entry.id),
                 entry.title.clone(),
-                format!("{} {}", entry.updated_at, entry.author),
+                format!(
+                    "{} {}",
+                    entry.updated_at,
+                    display_owner_identifier(&entry.author)
+                ),
                 format!("{} links; {tags}", entry.link_count()),
             )
         })
@@ -14630,6 +22137,55 @@ fn notebook_link_summary(entry: &layout_model::notebook::NotebookEntry) -> Strin
         links.metrology.len(),
         links.images.len()
     )
+}
+
+fn notebook_link_summary_compact(entry: &layout_model::notebook::NotebookEntry) -> String {
+    let links = &entry.links;
+    let link_types = [
+        links.lots.len(),
+        links.wafers.len(),
+        links.recipes.len(),
+        links.tool_runs.len(),
+        links.metrology.len(),
+        links.images.len(),
+    ]
+    .into_iter()
+    .filter(|count| *count > 0)
+    .count();
+    if link_types == 0 {
+        "No link types".to_string()
+    } else {
+        format!("{link_types} link types")
+    }
+}
+
+fn notebook_body_display_text(
+    entry: &layout_model::notebook::NotebookEntry,
+    preview_mode: bool,
+) -> String {
+    if !preview_mode {
+        return entry.body_markdown.replace('\n', " ");
+    }
+
+    entry
+        .body_markdown
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            let heading = trimmed
+                .strip_prefix('#')
+                .map(|value| value.trim_start_matches('#').trim())
+                .filter(|value| !value.is_empty());
+            Some(match heading {
+                Some(value) => format!("{value}:"),
+                None => trimmed.to_string(),
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn notebook_entry_link_focus_tokens(
@@ -14716,6 +22272,48 @@ fn notebook_entry_has_link(
     }
 }
 
+fn display_notebook_shared_link_label(value: &str) -> String {
+    if value.contains("-W") || value.starts_with('W') {
+        return display_wafer_identifier(value);
+    }
+    if value.starts_with("L-") {
+        return display_lot_identifier(value);
+    }
+    if value.starts_with("RUN-") || value.contains("-RUN-") {
+        return display_tool_run_identifier(value);
+    }
+    capitalize_ascii_first(humanize_identifier(value))
+}
+
+fn notebook_link_value_label(kind: NotebookLinkKind, value: &str) -> String {
+    match kind {
+        NotebookLinkKind::Lot => display_lot_identifier(value),
+        NotebookLinkKind::Wafer => display_wafer_identifier(value),
+        NotebookLinkKind::Recipe => display_recipe_identifier(value),
+        NotebookLinkKind::ToolRun => display_tool_run_identifier(value),
+        NotebookLinkKind::Metrology | NotebookLinkKind::Image => {
+            display_notebook_shared_link_label(value)
+        }
+    }
+}
+
+fn notebook_entry_button_label(entry: &layout_model::notebook::NotebookEntry) -> String {
+    match entry.title.as_str() {
+        "Reduce poly etch residue" => "Etch residue".to_string(),
+        "Photoresist coat uniformity check" => "PR coat check".to_string(),
+        "Night shift handoff" => "Shift handoff".to_string(),
+        _ => compact_button_label(&entry.title, 18),
+    }
+}
+
+fn notebook_shared_link_summary(shared_links: &[String]) -> String {
+    shared_links
+        .iter()
+        .map(|link| display_notebook_shared_link_label(link))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn add_notebook_tag_once(entry: &mut layout_model::notebook::NotebookEntry, tag: &str) {
     if !entry.tags.iter().any(|candidate| candidate == tag) {
         entry.tags.push(tag.to_string());
@@ -14778,12 +22376,15 @@ fn notebook_related_entries(
                 format!(
                     "shared tags {}; shared links {}",
                     shared_tags.join(", "),
-                    shared_links.join(", ")
+                    notebook_shared_link_summary(&shared_links)
                 )
             } else if !shared_tags.is_empty() {
                 format!("shared tags {}", shared_tags.join(", "))
             } else {
-                format!("shared links {}", shared_links.join(", "))
+                format!(
+                    "shared links {}",
+                    notebook_shared_link_summary(&shared_links)
+                )
             };
             Some((
                 score,
@@ -14844,6 +22445,25 @@ fn yield_summary_matches(
         && (!app.show_only_excursions || !summary.root_cause_hints.is_empty())
 }
 
+fn yield_filter_summary(app: &FabricadApp) -> String {
+    let mut parts = vec![match app.yield_map_filter {
+        YieldMapFilter::All => "All wafers".to_string(),
+        YieldMapFilter::Failing => "Failing wafers".to_string(),
+        YieldMapFilter::Passing => "Passing wafers".to_string(),
+    }];
+    if app.show_only_attention_wafers {
+        parts.push("attention only".to_string());
+    }
+    if app.show_only_excursions {
+        parts.push("excursions only".to_string());
+    }
+    parts.join(" / ")
+}
+
+fn enabled_state_label(enabled: bool) -> &'static str {
+    if enabled { "On" } else { "Off" }
+}
+
 fn yield_summary_detail(summary: &layout_model::yield_analysis::YieldSummary) -> String {
     let failure = summary
         .dominant_failure
@@ -14878,14 +22498,22 @@ fn process_flow_timeline_primitives(
     app: &FabricadApp,
     findings: &[layout_model::process_flow::ProcessFlowFinding],
     ui_scale: UiScale,
+    compact_rows: bool,
+    body_width: f32,
 ) -> Vec<ScenePrimitive> {
     let nodes = process_flow_visible_nodes(app, findings);
     let mut primitives =
         Vec::with_capacity(nodes.len() * 4 + app.workspace.process_flow.route.edges.len());
+    let track_x = ui_scale.value(if compact_rows { 18.0 } else { 42.0 });
+    let track_width = if compact_rows {
+        (body_width - ui_scale.value(76.0)).clamp(ui_scale.value(180.0), ui_scale.value(860.0))
+    } else {
+        ui_scale.value(860.0)
+    };
     let track = UiRect::new(
-        ui_scale.value(42.0),
+        track_x,
         ui_scale.value(26.0),
-        ui_scale.value(860.0),
+        track_width,
         ui_scale.value(178.0),
     );
     primitives.push(ScenePrimitive::Rect(
@@ -15146,6 +22774,9 @@ struct CrossSectionPreviewOptions {
     show_mask_overlay: bool,
     show_dimension_guides: bool,
     show_risk_cues: bool,
+    compact_layout: bool,
+    medium_layout: bool,
+    body_width: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -15163,12 +22794,27 @@ fn cross_section_preview_primitives(
     options: CrossSectionPreviewOptions,
     ui_scale: UiScale,
 ) -> Vec<ScenePrimitive> {
-    let bounds = UiRect::new(
-        ui_scale.value(54.0),
-        ui_scale.value(40.0),
-        ui_scale.value(850.0),
-        ui_scale.value(236.0),
-    );
+    let scene_width = (options.body_width - ui_scale.value(40.0)).max(ui_scale.value(260.0));
+    let bounds = if options.compact_layout {
+        UiRect::new(
+            ui_scale.value(24.0),
+            ui_scale.value(40.0),
+            ui_scale.value(236.0),
+            ui_scale.value(204.0),
+        )
+    } else if options.medium_layout {
+        let width = ui_scale
+            .value(520.0)
+            .min((scene_width - ui_scale.value(32.0)).max(ui_scale.value(260.0)));
+        let x = ((scene_width - width) * 0.5).max(ui_scale.value(18.0));
+        UiRect::new(x, ui_scale.value(36.0), width, ui_scale.value(110.0))
+    } else {
+        let width = ui_scale
+            .value(850.0)
+            .min((scene_width - ui_scale.value(40.0)).max(ui_scale.value(360.0)));
+        let x = ((scene_width - width) * 0.5).max(ui_scale.value(24.0));
+        UiRect::new(x, ui_scale.value(40.0), width, ui_scale.value(236.0))
+    };
     let surface = cross_section_surface_summary(process, snapshot);
     let max_y = surface.max_um.max(process.substrate_thickness_um).max(1.0);
     let mut primitives = Vec::with_capacity(snapshot.segments.len() + 32);
@@ -15248,7 +22894,13 @@ fn cross_section_preview_primitives(
         stroke: StrokeStyle::new(ColorRgba::new(188, 198, 208, 255), ui_scale.value(1.0)),
     });
 
-    let swatch_y = ui_scale.value(292.0);
+    let swatch_y = ui_scale.value(if options.compact_layout {
+        256.0
+    } else if options.medium_layout {
+        158.0
+    } else {
+        292.0
+    });
     let mut swatch_x = bounds.x;
     for material in process.materials.iter().take(8) {
         primitives.push(ScenePrimitive::Rect(
@@ -15728,7 +23380,7 @@ fn mask_prep_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
                 .map(|lot_id| {
                     ViewControlButton::new(
                         format!("fabricad.viewctl.mask.lot.{lot_id}"),
-                        lot_id.to_string(),
+                        workflow_lot_label(&app.workspace, lot_id.as_str(), 18),
                         app.mask_source_lot.as_ref() == Some(lot_id),
                     )
                 })
@@ -15783,11 +23435,12 @@ fn mask_prep_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
     rows
 }
 
-fn layout_diff_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
+fn layout_diff_control_rows(app: &FabricadApp, compact_rows: bool) -> Vec<Vec<ViewControlButton>> {
     let report = layout_diff_report(app);
     let page_count = layout_diff_page_count(app, &report);
     let mut rows: Vec<Vec<ViewControlButton>> = Vec::new();
-    for chunk in LayoutDiffSource::ALL.chunks(2) {
+    let chunk_size = if compact_rows { 2 } else { 4 };
+    for chunk in LayoutDiffSource::ALL.chunks(chunk_size) {
         rows.push(
             chunk
                 .iter()
@@ -15801,7 +23454,7 @@ fn layout_diff_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
                 .collect(),
         );
     }
-    for chunk in LayoutDiffSource::ALL.chunks(2) {
+    for chunk in LayoutDiffSource::ALL.chunks(chunk_size) {
         rows.push(
             chunk
                 .iter()
@@ -15823,7 +23476,7 @@ fn layout_diff_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
             app.layout_diff_changed_only,
         ),
     ]);
-    for chunk in LayoutChangeFilter::ALL.chunks(2) {
+    for chunk in LayoutChangeFilter::ALL.chunks(chunk_size) {
         rows.push(
             chunk
                 .iter()
@@ -15837,7 +23490,7 @@ fn layout_diff_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
                 .collect(),
         );
     }
-    for chunk in LAYOUT_DIFF_PAGE_SIZE_OPTIONS.chunks(2) {
+    for chunk in LAYOUT_DIFF_PAGE_SIZE_OPTIONS.chunks(chunk_size) {
         rows.push(
             chunk
                 .iter()
@@ -15867,7 +23520,7 @@ fn layout_diff_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
             app.layout_diff_change_page + 1 < page_count,
         ),
     ]);
-    for chunk in LayoutReviewDisposition::ALL.chunks(2) {
+    for chunk in LayoutReviewDisposition::ALL.chunks(chunk_size) {
         rows.push(
             chunk
                 .iter()
@@ -15902,15 +23555,16 @@ fn layout_diff_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
     rows
 }
 
-fn fab_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
+fn fab_control_rows(app: &FabricadApp, compact_rows: bool) -> Vec<Vec<ViewControlButton>> {
     let mut rows = Vec::new();
+    let chunk_size = if compact_rows { 2 } else { 4 };
     for chunk in app
         .workspace
         .equipment
         .tools()
         .take(6)
         .collect::<Vec<_>>()
-        .chunks(2)
+        .chunks(chunk_size)
     {
         rows.push(
             chunk
@@ -15931,7 +23585,7 @@ fn fab_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
             .values()
             .take(4)
             .collect::<Vec<_>>()
-            .chunks(2)
+            .chunks(chunk_size)
         {
             rows.push(
                 chunk
@@ -15944,14 +23598,14 @@ fn fab_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
                         }) == Some(&recipe.id);
                         ViewControlButton::new(
                             format!("fabricad.viewctl.fab.recipe.{}|{}", tool.id, recipe.id),
-                            recipe.id.to_string(),
+                            display_recipe_identifier(recipe.id.as_str()),
                             selected,
                         )
                     })
                     .collect(),
             );
         }
-        rows.push(vec![
+        let command_buttons = vec![
             ViewControlButton::new(
                 format!("fabricad.viewctl.fab.command.online|{}", tool.id),
                 "Online",
@@ -15962,8 +23616,6 @@ fn fab_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
                 "Load",
                 tool.state == EquipmentToolState::RecipeLoaded,
             ),
-        ]);
-        rows.push(vec![
             ViewControlButton::new(
                 format!("fabricad.viewctl.fab.command.start|{}", tool.id),
                 "Start",
@@ -15974,8 +23626,6 @@ fn fab_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
                 "Stop",
                 false,
             ),
-        ]);
-        rows.push(vec![
             ViewControlButton::new(
                 format!("fabricad.viewctl.fab.command.alarm|{}", tool.id),
                 "Alarm",
@@ -15986,8 +23636,6 @@ fn fab_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
                 "Clear",
                 false,
             ),
-        ]);
-        rows.push(vec![
             ViewControlButton::new(
                 format!("fabricad.viewctl.fab.command.reset|{}", tool.id),
                 "Reset",
@@ -15998,15 +23646,21 @@ fn fab_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
                 "Maint",
                 tool.state == EquipmentToolState::Maintenance,
             ),
-        ]);
+        ];
+        rows.extend(
+            command_buttons
+                .chunks(chunk_size)
+                .map(|chunk| chunk.to_vec()),
+        );
     }
     rows.retain(|row| !row.is_empty());
     rows
 }
 
-fn maintenance_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
+fn maintenance_control_rows(app: &FabricadApp, compact_rows: bool) -> Vec<Vec<ViewControlButton>> {
     let mut rows = Vec::new();
-    for chunk in MaintenanceWorkFilter::ALL.chunks(2) {
+    let chunk_size = if compact_rows { 2 } else { 3 };
+    for chunk in MaintenanceWorkFilter::ALL.chunks(chunk_size) {
         rows.push(
             chunk
                 .iter()
@@ -16043,7 +23697,7 @@ fn maintenance_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
         .iter()
         .take(6)
         .collect::<Vec<_>>()
-        .chunks(2)
+        .chunks(chunk_size)
     {
         rows.push(
             chunk
@@ -16059,7 +23713,7 @@ fn maintenance_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
         );
     }
     if let Some(tool) = selected_maintenance_tool(app) {
-        rows.push(vec![
+        let mut tool_actions = vec![
             ViewControlButton::new(
                 format!(
                     "fabricad.viewctl.maintenance.status.schedule|{}",
@@ -16076,19 +23730,27 @@ fn maintenance_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
                 "Calibrate",
                 false,
             ),
-        ]);
-        rows.push(vec![ViewControlButton::new(
-            format!(
-                "fabricad.viewctl.maintenance.status.release|{}",
-                tool.tool_id
+            ViewControlButton::new(
+                format!(
+                    "fabricad.viewctl.maintenance.status.release|{}",
+                    tool.tool_id
+                ),
+                "Release",
+                !app.workspace
+                    .maintenance
+                    .release_for_tool(&tool.tool_id, maintenance_today(&app.workspace))
+                    .state
+                    .released_to_production(),
             ),
-            "Release",
-            !app.workspace
-                .maintenance
-                .release_for_tool(&tool.tool_id, maintenance_today(&app.workspace))
-                .state
-                .released_to_production(),
-        )]);
+        ];
+        if compact_rows {
+            if let Some(release) = tool_actions.pop() {
+                rows.push(tool_actions);
+                rows.push(vec![release]);
+            }
+        } else {
+            rows.push(tool_actions);
+        }
     }
     rows.retain(|row| !row.is_empty());
     rows
@@ -16111,7 +23773,7 @@ fn environment_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
                 .map(|sensor| {
                     ViewControlButton::new(
                         format!("fabricad.viewctl.environment.sensor.{}", sensor.id),
-                        sensor.id.clone(),
+                        environment_sensor_button_label(sensor),
                         app.selected_environment_sensor.as_deref() == Some(sensor.id.as_str()),
                     )
                 })
@@ -16183,7 +23845,7 @@ fn inventory_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
                 .map(|lot| {
                     ViewControlButton::new(
                         format!("fabricad.viewctl.inventory.lot.{}", lot.id),
-                        lot.id.to_string(),
+                        inventory_lot_button_label(lot, 18),
                         app.selected_inventory_lot.as_ref() == Some(&lot.id),
                     )
                 })
@@ -16208,7 +23870,7 @@ fn scheduler_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
                     "fabricad.viewctl.scheduler.policy.{}",
                     dispatch_policy_slug(*policy)
                 ),
-                policy.label(),
+                display_dispatch_policy_label(*policy),
                 app.scheduler_policy == *policy,
             )
         })
@@ -16219,7 +23881,7 @@ fn scheduler_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
             "fabricad.viewctl.scheduler.policy.{}",
             dispatch_policy_slug(DispatchPolicy::Fifo)
         ),
-        DispatchPolicy::Fifo.label(),
+        display_dispatch_policy_label(DispatchPolicy::Fifo),
         app.scheduler_policy == DispatchPolicy::Fifo,
     )]);
     for chunk in [0_u8, 1, 2, 3, 4, 5].chunks(2) {
@@ -16279,17 +23941,26 @@ fn scheduler_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
     rows
 }
 
-fn safety_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
+fn safety_control_rows(app: &FabricadApp, compact_rows: bool) -> Vec<Vec<ViewControlButton>> {
     let mut rows: Vec<Vec<ViewControlButton>> = Vec::new();
+    let chunk_size = if compact_rows { 2 } else { 4 };
     let lockouts = app.workspace.safety.evaluate_lockouts();
-    for chunk in lockouts.iter().take(6).collect::<Vec<_>>().chunks(2) {
+    for chunk in lockouts
+        .iter()
+        .take(6)
+        .collect::<Vec<_>>()
+        .chunks(chunk_size)
+    {
         rows.push(
             chunk
                 .iter()
                 .map(|lockout| {
                     ViewControlButton::new(
                         format!("fabricad.viewctl.safety.tool.{}", lockout.tool_id),
-                        lockout.tool_id.clone(),
+                        compact_button_label(
+                            &safety_tool_label(&lockout.tool_id, &lockout.tool_name),
+                            if compact_rows { 16 } else { 18 },
+                        ),
                         app.selected_safety_tool.as_deref() == Some(lockout.tool_id.as_str()),
                     )
                 })
@@ -16303,7 +23974,7 @@ fn safety_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
         .into_iter()
         .take(4)
         .collect::<Vec<_>>()
-        .chunks(2)
+        .chunks(chunk_size)
     {
         rows.push(
             chunk
@@ -16312,7 +23983,7 @@ fn safety_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
                     let sensor_id = sensor.id.to_string();
                     ViewControlButton::new(
                         format!("fabricad.viewctl.safety.ack.condition.{sensor_id}"),
-                        format!("Ack {sensor_id}"),
+                        safety_ack_condition_label(sensor),
                         app.acknowledged_conditions.contains(&sensor_id),
                     )
                 })
@@ -16322,7 +23993,10 @@ fn safety_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
     if let Some(lockout) = selected_safety_lockout(app) {
         rows.push(vec![ViewControlButton::new(
             format!("fabricad.viewctl.safety.ack.lockout.{}", lockout.tool_id),
-            "Ack lockout",
+            format!(
+                "Ack {}",
+                compact_button_label(&safety_tool_label(&lockout.tool_id, &lockout.tool_name), 14)
+            ),
             app.acknowledged_lockouts.contains(&lockout.tool_id),
         )]);
     }
@@ -16333,7 +24007,7 @@ fn safety_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
         .iter()
         .take(4)
         .collect::<Vec<_>>()
-        .chunks(2)
+        .chunks(chunk_size)
     {
         rows.push(
             chunk
@@ -16342,7 +24016,7 @@ fn safety_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
                     let id = incident.id.to_string();
                     ViewControlButton::new(
                         format!("fabricad.viewctl.safety.ack.incident.{id}"),
-                        format!("Ack {id}"),
+                        safety_incident_action_label(incident),
                         app.acknowledged_incidents.contains(&id),
                     )
                 })
@@ -16353,8 +24027,9 @@ fn safety_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
     rows
 }
 
-fn traceability_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
+fn traceability_control_rows(app: &FabricadApp, compact_rows: bool) -> Vec<Vec<ViewControlButton>> {
     let mut rows: Vec<Vec<ViewControlButton>> = Vec::new();
+    let chunk_size = if compact_rows { 2 } else { 4 };
     let related_wafers = selected_trace_wafer_ref(app)
         .map(|wafer| {
             app.workspace
@@ -16372,7 +24047,7 @@ fn traceability_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
         .iter()
         .take(6)
         .collect::<Vec<_>>()
-        .chunks(2)
+        .chunks(chunk_size)
     {
         rows.push(
             chunk
@@ -16380,7 +24055,7 @@ fn traceability_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
                 .map(|lot_id| {
                     ViewControlButton::new(
                         format!("fabricad.viewctl.trace.lot.{lot_id}"),
-                        lot_id.to_string(),
+                        trace_lot_button_label(&app.workspace.genealogy, lot_id, compact_rows),
                         app.selected_trace_lot.as_ref() == Some(lot_id),
                     )
                 })
@@ -16400,7 +24075,7 @@ fn traceability_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
             })
             .take(6)
             .collect::<Vec<_>>()
-            .chunks(2)
+            .chunks(chunk_size)
         {
             rows.push(
                 chunk
@@ -16411,7 +24086,7 @@ fn traceability_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
                                 "fabricad.viewctl.trace.wafer.{}|{}",
                                 wafer.lot_id, wafer.wafer_id
                             ),
-                            wafer.wafer_id.to_string(),
+                            trace_wafer_label(wafer),
                             app.selected_trace_lot.as_ref() == Some(&wafer.lot_id)
                                 && app.selected_trace_wafer.as_ref() == Some(&wafer.wafer_id),
                         )
@@ -16425,18 +24100,19 @@ fn traceability_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
         "Related",
         app.trace_related_only,
     )]);
-    rows.push(
-        TraceImpactMode::ALL
-            .iter()
-            .map(|mode| {
-                ViewControlButton::new(
-                    format!("fabricad.viewctl.trace.impact.{}", mode.slug()),
-                    mode.label(),
-                    app.trace_impact_mode == *mode,
-                )
-            })
-            .collect(),
-    );
+    let impact_buttons = TraceImpactMode::ALL
+        .iter()
+        .map(|mode| {
+            ViewControlButton::new(
+                format!("fabricad.viewctl.trace.impact.{}", mode.slug()),
+                mode.label(),
+                app.trace_impact_mode == *mode,
+            )
+        })
+        .collect::<Vec<_>>();
+    for chunk in impact_buttons.chunks(chunk_size) {
+        rows.push(chunk.to_vec());
+    }
     if let Some(wafer) = selected_trace_wafer_ref(app) {
         let process_buttons = app
             .workspace
@@ -16448,12 +24124,12 @@ fn traceability_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
             .map(|record| {
                 ViewControlButton::new(
                     trace_detail_action(&TraceSelection::Process(record.sequence)),
-                    format!("P{}", record.sequence),
+                    trace_process_button_label(record),
                     app.selected_trace_detail == Some(TraceSelection::Process(record.sequence)),
                 )
             })
             .collect::<Vec<_>>();
-        for chunk in process_buttons.chunks(2) {
+        for chunk in process_buttons.chunks(chunk_size) {
             rows.push(chunk.to_vec());
         }
 
@@ -16467,12 +24143,12 @@ fn traceability_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
             .map(|record| {
                 ViewControlButton::new(
                     trace_detail_action(&TraceSelection::MaterialUse(record.sequence)),
-                    format!("M{}", record.sequence),
+                    trace_material_use_button_label(&app.workspace.genealogy, record),
                     app.selected_trace_detail == Some(TraceSelection::MaterialUse(record.sequence)),
                 )
             })
             .collect::<Vec<_>>();
-        for chunk in material_buttons.chunks(2) {
+        for chunk in material_buttons.chunks(chunk_size) {
             rows.push(chunk.to_vec());
         }
     }
@@ -16486,12 +24162,12 @@ fn traceability_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
         .map(|event| {
             ViewControlButton::new(
                 trace_detail_action(&TraceSelection::Event(event.sequence)),
-                format!("E{}", event.sequence),
+                trace_event_button_label(event),
                 app.selected_trace_detail == Some(TraceSelection::Event(event.sequence)),
             )
         })
         .collect::<Vec<_>>();
-    for chunk in event_buttons.chunks(2) {
+    for chunk in event_buttons.chunks(chunk_size) {
         rows.push(chunk.to_vec());
     }
     rows.retain(|row| !row.is_empty());
@@ -16548,7 +24224,7 @@ fn process_flow_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
                 .map(|node| {
                     ViewControlButton::new(
                         format!("fabricad.viewctl.process_flow.node.{}", node.id),
-                        node.id.to_string(),
+                        process_flow_node_button_label(node),
                         app.selected_process_node.as_ref() == Some(&node.id),
                     )
                 })
@@ -16579,7 +24255,7 @@ fn process_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
                             "fabricad.viewctl.process_control.loop.{}",
                             loop_definition.id
                         ),
-                        compact_button_label(&loop_definition.name, 16),
+                        process_control_loop_button_label(&loop_definition.name),
                         app.selected_control_loop.as_ref() == Some(&loop_definition.id),
                     )
                 })
@@ -16599,11 +24275,7 @@ fn process_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
                     .map(|action| {
                         ViewControlButton::new(
                             format!("fabricad.viewctl.process_control.action.{}", action.id),
-                            format!(
-                                "{} {}",
-                                short_control_action_label(&action.id),
-                                action.state.label()
-                            ),
+                            process_control_action_button_label(action),
                             app.selected_control_action.as_ref() == Some(&action.id),
                         )
                     })
@@ -16636,7 +24308,7 @@ fn process_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
     rows
 }
 
-fn spc_fdc_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
+fn spc_fdc_control_rows(app: &FabricadApp, compact_rows: bool) -> Vec<Vec<ViewControlButton>> {
     let monitor = spc_fdc_monitor(&app.workspace);
     let selected_chart = selected_spc_chart(app, &monitor)
         .map(|chart| chart.id.as_str().to_string())
@@ -16644,6 +24316,7 @@ fn spc_fdc_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
     let selected_trace = selected_fdc_trace(app, &monitor)
         .map(|trace| trace.id.clone())
         .or_else(|| app.selected_fdc_trace.clone());
+    let chunk_size = if compact_rows { 2 } else { 4 };
     let mut rows = Vec::new();
 
     rows.push(
@@ -16671,7 +24344,13 @@ fn spc_fdc_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
             .collect(),
     );
 
-    for chunk in monitor.charts.iter().take(6).collect::<Vec<_>>().chunks(2) {
+    for chunk in monitor
+        .charts
+        .iter()
+        .take(6)
+        .collect::<Vec<_>>()
+        .chunks(chunk_size)
+    {
         rows.push(
             chunk
                 .iter()
@@ -16681,7 +24360,10 @@ fn spc_fdc_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
                         format!("fabricad.viewctl.spc.chart.{id}"),
                         format!(
                             "{} ({})",
-                            compact_button_label(&chart.metric, 10),
+                            compact_button_label(
+                                &display_measurement_identifier(&chart.metric),
+                                18
+                            ),
                             chart.violations.len()
                         ),
                         selected_chart.as_deref() == Some(id),
@@ -16691,7 +24373,13 @@ fn spc_fdc_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
         );
     }
 
-    for chunk in monitor.traces.iter().take(6).collect::<Vec<_>>().chunks(2) {
+    for chunk in monitor
+        .traces
+        .iter()
+        .take(6)
+        .collect::<Vec<_>>()
+        .chunks(chunk_size)
+    {
         rows.push(
             chunk
                 .iter()
@@ -16700,7 +24388,10 @@ fn spc_fdc_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
                         format!("fabricad.viewctl.spc.trace.{}", trace.id),
                         format!(
                             "{} ({})",
-                            compact_button_label(&trace.sensor_name, 10),
+                            compact_button_label(
+                                &display_measurement_identifier(&trace.sensor_name),
+                                18
+                            ),
                             trace.violations.len()
                         ),
                         selected_trace.as_deref() == Some(trace.id.as_str()),
@@ -16787,9 +24478,10 @@ fn cross_section_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> 
     rows
 }
 
-fn metrology_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
+fn metrology_control_rows(app: &FabricadApp, compact_rows: bool) -> Vec<Vec<ViewControlButton>> {
     let mut rows = Vec::new();
-    for chunk in MetrologyMapMode::ALL.chunks(2) {
+    let chunk_size = if compact_rows { 2 } else { 3 };
+    for chunk in MetrologyMapMode::ALL.chunks(chunk_size) {
         rows.push(
             chunk
                 .iter()
@@ -16803,7 +24495,7 @@ fn metrology_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
                 .collect(),
         );
     }
-    for chunk in MeasurementKind::ALL.chunks(2) {
+    for chunk in MeasurementKind::ALL.chunks(chunk_size) {
         rows.push(
             chunk
                 .iter()
@@ -16820,7 +24512,7 @@ fn metrology_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
                 .collect(),
         );
     }
-    rows.push(vec![
+    let utility_buttons = vec![
         ViewControlButton::new(
             "fabricad.viewctl.metrology.failed_only",
             "Failed",
@@ -16831,18 +24523,20 @@ fn metrology_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
             "Next",
             app.selected_die.is_some(),
         ),
-    ]);
-    rows.push(vec![ViewControlButton::new(
-        "fabricad.viewctl.metrology.clear_die",
-        "Clear",
-        false,
-    )]);
+        ViewControlButton::new("fabricad.viewctl.metrology.clear_die", "Clear", false),
+    ];
+    rows.extend(
+        utility_buttons
+            .chunks(chunk_size)
+            .map(|chunk| chunk.to_vec()),
+    );
     rows
 }
 
-fn yield_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
+fn yield_control_rows(app: &FabricadApp, compact_rows: bool) -> Vec<Vec<ViewControlButton>> {
     let mut rows = Vec::new();
-    for chunk in YieldMapFilter::ALL.chunks(2) {
+    let chunk_size = if compact_rows { 2 } else { 4 };
+    for chunk in YieldMapFilter::ALL.chunks(chunk_size) {
         rows.push(
             chunk
                 .iter()
@@ -16856,7 +24550,7 @@ fn yield_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
                 .collect(),
         );
     }
-    rows.push(vec![
+    let focus_buttons = vec![
         ViewControlButton::new(
             "fabricad.viewctl.yield.attention",
             "Attention",
@@ -16867,7 +24561,8 @@ fn yield_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
             "Excursions",
             app.show_only_excursions,
         ),
-    ]);
+    ];
+    rows.extend(focus_buttons.chunks(chunk_size).map(|chunk| chunk.to_vec()));
     for chunk in app
         .workspace
         .yield_analysis
@@ -16875,7 +24570,7 @@ fn yield_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
         .iter()
         .take(4)
         .collect::<Vec<_>>()
-        .chunks(2)
+        .chunks(chunk_size)
     {
         rows.push(
             chunk
@@ -16892,7 +24587,7 @@ fn yield_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
     }
     if let Some(lot_id) = app.selected_yield_lot.as_deref() {
         let wafers = app.workspace.yield_analysis.wafer_ids_for_lot(lot_id);
-        for chunk in wafers.iter().take(4).collect::<Vec<_>>().chunks(2) {
+        for chunk in wafers.iter().take(4).collect::<Vec<_>>().chunks(chunk_size) {
             rows.push(
                 chunk
                     .iter()
@@ -16911,10 +24606,11 @@ fn yield_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
     rows
 }
 
-fn notebook_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
+fn notebook_control_rows(app: &FabricadApp, compact_rows: bool) -> Vec<Vec<ViewControlButton>> {
     let filtered_entries = notebook_filtered_entries(app);
+    let chunk_size = if compact_rows { 2 } else { 4 };
     let mut rows: Vec<Vec<ViewControlButton>> = Vec::new();
-    rows.push(vec![
+    let primary_actions = vec![
         ViewControlButton::new(
             "fabricad.viewctl.notebook.preview",
             "Preview",
@@ -16925,23 +24621,34 @@ fn notebook_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
             "Edit",
             !app.notebook_preview_mode,
         ),
-    ]);
-    rows.push(vec![
         ViewControlButton::new(
             "fabricad.viewctl.notebook.toggle_followups",
-            format!("Follow-ups ({})", filtered_entries.len()),
+            if compact_rows {
+                "Follow-ups".to_string()
+            } else {
+                format!("Follow-ups ({})", filtered_entries.len())
+            },
             app.notebook_followups_only,
         ),
         ViewControlButton::new("fabricad.viewctl.notebook.clear_filters", "Clear", false),
-    ]);
-    for chunk in NotebookEntryAction::ALL.chunks(2) {
+    ];
+    rows.extend(
+        primary_actions
+            .chunks(chunk_size)
+            .map(|chunk| chunk.to_vec()),
+    );
+    for chunk in NotebookEntryAction::ALL.chunks(chunk_size) {
         rows.push(
             chunk
                 .iter()
                 .map(|action| {
                     ViewControlButton::new(
                         format!("fabricad.viewctl.notebook.entry_action.{}", action.slug()),
-                        action.label(),
+                        if compact_rows {
+                            compact_button_label(action.label(), 14)
+                        } else {
+                            action.label().to_string()
+                        },
                         false,
                     )
                 })
@@ -16960,7 +24667,7 @@ fn notebook_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
         .iter()
         .take(6)
         .collect::<Vec<_>>()
-        .chunks(2)
+        .chunks(chunk_size)
     {
         rows.push(
             chunk
@@ -16980,21 +24687,26 @@ fn notebook_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
         "Any link",
         app.notebook_link_kind_filter.is_none(),
     )]);
-    for chunk in NotebookLinkKind::ALL.chunks(2) {
+    for chunk in NotebookLinkKind::ALL.chunks(chunk_size) {
         rows.push(
             chunk
                 .iter()
                 .map(|kind| {
+                    let label = format!(
+                        "{} ({})",
+                        kind.label(),
+                        notebook_link_count_for_kind(app, *kind)
+                    );
                     ViewControlButton::new(
                         format!(
                             "fabricad.viewctl.notebook.link.{}",
                             notebook_link_kind_slug(*kind)
                         ),
-                        format!(
-                            "{} ({})",
-                            kind.label(),
-                            notebook_link_count_for_kind(app, *kind)
-                        ),
+                        if compact_rows {
+                            compact_button_label(&label, 18)
+                        } else {
+                            label
+                        },
                         app.notebook_link_kind_filter == Some(*kind),
                     )
                 })
@@ -17006,7 +24718,7 @@ fn notebook_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
             .iter()
             .take(4)
             .collect::<Vec<_>>()
-            .chunks(2)
+            .chunks(chunk_size)
         {
             rows.push(
                 chunk
@@ -17018,7 +24730,7 @@ fn notebook_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
                                 notebook_link_kind_slug(*kind),
                                 value
                             ),
-                            compact_button_label(value, 14),
+                            compact_button_label(&notebook_link_value_label(*kind, value), 14),
                             app.notebook_link_kind_filter == Some(*kind),
                         )
                     })
@@ -17030,7 +24742,7 @@ fn notebook_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
         .iter()
         .take(6)
         .collect::<Vec<_>>()
-        .chunks(2)
+        .chunks(chunk_size)
     {
         rows.push(
             chunk
@@ -17038,7 +24750,7 @@ fn notebook_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
                 .map(|entry| {
                     ViewControlButton::new(
                         format!("fabricad.viewctl.notebook.entry.{}", entry.id),
-                        compact_button_label(&entry.title, 14),
+                        compact_button_label(&entry.title, if compact_rows { 11 } else { 14 }),
                         app.selected_notebook_entry.as_ref() == Some(&entry.id),
                     )
                 })
@@ -17049,40 +24761,44 @@ fn notebook_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
     rows
 }
 
-fn experiment_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
-    let mut rows = vec![
-        vec![
-            ViewControlButton::new(
-                "fabricad.viewctl.experiment.pending_only",
-                "Pending",
-                app.experiment_show_missing_only,
-            ),
-            ViewControlButton::new("fabricad.viewctl.experiment.next_pending", "Next", false),
-        ],
-        vec![
-            ViewControlButton::new("fabricad.viewctl.experiment.capture", "Capture", false),
-            ViewControlButton::new(
-                "fabricad.viewctl.experiment.capture_advance",
-                "Advance",
-                false,
-            ),
-        ],
-        vec![
-            ViewControlButton::new("fabricad.viewctl.experiment.use_demo", "Demo", false),
-            ViewControlButton::new("fabricad.viewctl.experiment.use_target", "Target", false),
-        ],
-        vec![ViewControlButton::new(
-            "fabricad.viewctl.experiment.capture_next_demo",
-            "Next demo",
+fn experiment_control_rows(app: &FabricadApp, compact_rows: bool) -> Vec<Vec<ViewControlButton>> {
+    let chunk_size = if compact_rows { 2 } else { 4 };
+    let mut rows = Vec::new();
+    let primary_actions = vec![
+        ViewControlButton::new(
+            "fabricad.viewctl.experiment.pending_only",
+            "Pending",
+            app.experiment_show_missing_only,
+        ),
+        ViewControlButton::new("fabricad.viewctl.experiment.next_pending", "Next", false),
+        ViewControlButton::new("fabricad.viewctl.experiment.capture", "Capture", false),
+        ViewControlButton::new(
+            "fabricad.viewctl.experiment.capture_advance",
+            "Advance",
             false,
-        )],
+        ),
+        ViewControlButton::new("fabricad.viewctl.experiment.use_demo", "Sample", false),
+        ViewControlButton::new("fabricad.viewctl.experiment.use_target", "Target", false),
+        ViewControlButton::new(
+            "fabricad.viewctl.experiment.capture_next_demo",
+            "Next sample",
+            false,
+        ),
+        ViewControlButton::new(
+            "fabricad.viewctl.experiment.clear_filters",
+            if compact_rows {
+                "Clear"
+            } else {
+                "Clear filters"
+            },
+            false,
+        ),
     ];
-
-    rows.push(vec![ViewControlButton::new(
-        "fabricad.viewctl.experiment.clear_filters",
-        "Clear filters",
-        false,
-    )]);
+    rows.extend(
+        primary_actions
+            .chunks(chunk_size)
+            .map(|chunk| chunk.to_vec()),
+    );
 
     for chunk in app
         .workspace
@@ -17091,7 +24807,7 @@ fn experiment_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
         .iter()
         .take(6)
         .collect::<Vec<_>>()
-        .chunks(2)
+        .chunks(chunk_size)
     {
         rows.push(
             chunk
@@ -17107,14 +24823,19 @@ fn experiment_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
         );
     }
 
-    for chunk in ExperimentRunFilter::ALL.chunks(2) {
+    for chunk in ExperimentRunFilter::ALL.chunks(chunk_size) {
         rows.push(
             chunk
                 .iter()
                 .map(|filter| {
+                    let label = if compact_rows {
+                        compact_button_label(filter.short_label(), 11)
+                    } else {
+                        filter.short_label().to_string()
+                    };
                     ViewControlButton::new(
                         format!("fabricad.viewctl.experiment.filter.{}", filter.slug()),
-                        filter.short_label(),
+                        label,
                         app.experiment_run_filter == *filter,
                     )
                 })
@@ -17127,7 +24848,7 @@ fn experiment_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
         .iter()
         .take(4)
         .collect::<Vec<_>>()
-        .chunks(2)
+        .chunks(chunk_size)
     {
         rows.push(
             chunk
@@ -17135,7 +24856,11 @@ fn experiment_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
                 .map(|lot_id| {
                     ViewControlButton::new(
                         format!("fabricad.viewctl.experiment.lot.{lot_id}"),
-                        lot_id.to_string(),
+                        workflow_lot_label(
+                            &app.workspace,
+                            lot_id,
+                            if compact_rows { 11 } else { 14 },
+                        ),
                         app.experiment_lot_filter.as_deref() == Some(lot_id.as_str()),
                     )
                 })
@@ -17148,7 +24873,7 @@ fn experiment_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
         .iter()
         .take(4)
         .collect::<Vec<_>>()
-        .chunks(2)
+        .chunks(chunk_size)
     {
         rows.push(
             chunk
@@ -17156,7 +24881,7 @@ fn experiment_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
                 .map(|row| {
                     ViewControlButton::new(
                         format!("fabricad.viewctl.experiment.run.{}", row.run_id),
-                        row.run_id.clone(),
+                        experiment_run_order_label(row.run_order),
                         row.selected,
                     )
                 })
@@ -17174,6 +24899,18 @@ fn add_control_panel(
     name: &str,
     title: &str,
     rows: Vec<Vec<ViewControlButton>>,
+    ui_scale: UiScale,
+) {
+    add_control_panel_with_button_width(document, parent, name, title, rows, 132.0, ui_scale);
+}
+
+fn add_control_panel_with_button_width(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    name: &str,
+    title: &str,
+    rows: Vec<Vec<ViewControlButton>>,
+    button_width: f32,
     ui_scale: UiScale,
 ) {
     let row_height = ui_scale.value(30.0);
@@ -17194,12 +24931,9 @@ fn add_control_panel(
             ),
         )
         .with_visual(UiVisual::panel(
-            ColorRgba::new(23, 30, 36, 255),
-            Some(StrokeStyle::new(
-                ColorRgba::new(56, 70, 84, 255),
-                ui_scale.value(1.0),
-            )),
-            ui_scale.value(4.0),
+            COLOR_PANEL_BG,
+            Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
+            ui_scale.value(2.0),
         )),
     );
     add_text(
@@ -17207,11 +24941,7 @@ fn add_control_panel(
         panel,
         format!("{name}.title"),
         title,
-        text_style(
-            ui_scale.value(15.0),
-            FontWeight::BOLD,
-            ColorRgba::new(238, 243, 247, 255),
-        ),
+        text_style(ui_scale.value(15.0), FontWeight::BOLD, COLOR_TEXT),
         layout::size(layout::percent(1.0), layout::px(ui_scale.value(24.0))),
     );
 
@@ -17234,7 +24964,7 @@ fn add_control_panel(
                 button.label.clone(),
                 button.selected,
                 layout::size(
-                    layout::px(ui_scale.value(132.0)),
+                    layout::px(ui_scale.value(button_width)),
                     layout::px(ui_scale.value(28.0)),
                 ),
                 ui_scale,
@@ -17243,12 +24973,59 @@ fn add_control_panel(
     }
 }
 
+fn add_menu_drawer_toggles(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    app: &FabricadApp,
+    viewport_width: f32,
+    ui_scale: UiScale,
+) {
+    let compact = viewport_width < ui_scale.value(760.0);
+    if app.has_inspector_panel() {
+        add_button(
+            document,
+            parent,
+            "fabricad.drawer.inspector",
+            if compact { "Info" } else { "Details" },
+            app.show_inspector,
+            layout::size(
+                layout::px(ui_scale.value(if compact { 58.0 } else { 112.0 })),
+                layout::px(ui_scale.value(22.0)),
+            ),
+            ui_scale,
+        );
+    }
+    if app.has_secondary_panel() {
+        add_button(
+            document,
+            parent,
+            "fabricad.drawer.layers",
+            if compact {
+                "Side"
+            } else {
+                app.secondary_panel_label()
+            },
+            app.show_layers,
+            layout::size(
+                layout::px(ui_scale.value(if compact { 58.0 } else { 108.0 })),
+                layout::px(ui_scale.value(22.0)),
+            ),
+            ui_scale,
+        );
+    }
+}
+
 fn add_tool_strip(
     document: &mut UiDocument,
     parent: operad::UiNodeId,
     app: &FabricadApp,
+    viewport_width: f32,
     ui_scale: UiScale,
 ) {
+    let drawer_mode = viewport_width < ui_scale.value(980.0);
+    let compact_editing_tools =
+        viewport_width < ui_scale.value(760.0) && app.active_view == StartupView::Layout2d;
+    let strip_height = tool_strip_height(app.active_view, viewport_width, ui_scale);
     let strip = document.add_child(
         parent,
         UiNode::container(
@@ -17256,24 +25033,52 @@ fn add_tool_strip(
             layout::with_padding_all(
                 layout::with_gap_all(
                     layout::with_size(
-                        layout::row(),
+                        layout::column(),
                         layout::percent(1.0),
-                        layout::px(ui_scale.value(42.0)),
+                        layout::px(strip_height),
                     ),
-                    ui_scale.value(6.0),
+                    ui_scale.value(4.0),
                 ),
-                ui_scale.value(8.0),
+                ui_scale.value(4.0),
             ),
         )
         .with_visual(UiVisual::panel(
-            ColorRgba::new(20, 25, 30, 255),
-            Some(StrokeStyle::new(
-                ColorRgba::new(46, 57, 68, 255),
-                ui_scale.value(1.0),
-            )),
+            COLOR_CHROME_BG,
+            Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
             0.0,
         )),
     );
+
+    let first_row = document.add_child(
+        strip,
+        UiNode::container(
+            "fabricad.tool_strip.row.0",
+            layout::with_gap_all(
+                layout::with_size(
+                    layout::row(),
+                    layout::percent(1.0),
+                    layout::px(ui_scale.value(26.0)),
+                ),
+                ui_scale.value(4.0),
+            ),
+        ),
+    );
+    let second_row = compact_editing_tools.then(|| {
+        document.add_child(
+            strip,
+            UiNode::container(
+                "fabricad.tool_strip.row.1",
+                layout::with_gap_all(
+                    layout::with_size(
+                        layout::row(),
+                        layout::percent(1.0),
+                        layout::px(ui_scale.value(26.0)),
+                    ),
+                    ui_scale.value(4.0),
+                ),
+            ),
+        )
+    });
 
     if matches!(
         app.active_view,
@@ -17281,8 +25086,8 @@ fn add_tool_strip(
     ) {
         add_button(
             document,
-            strip,
-            "fabricad.menu.item.view.layout2d",
+            first_row,
+            "fabricad.toolbar.view.layout2d",
             "2D",
             app.active_view == StartupView::Layout2d,
             layout::size(
@@ -17293,8 +25098,8 @@ fn add_tool_strip(
         );
         add_button(
             document,
-            strip,
-            "fabricad.menu.item.view.layout3d",
+            first_row,
+            "fabricad.toolbar.view.layout3d",
             "3D",
             app.active_view == StartupView::Layout3d,
             layout::size(
@@ -17306,37 +25111,97 @@ fn add_tool_strip(
     }
 
     if app.active_view == StartupView::Layout2d {
-        for tool in ToolMode::ALL {
+        if compact_editing_tools {
+            for tool in [ToolMode::Select, ToolMode::Rect, ToolMode::Polygon] {
+                add_button(
+                    document,
+                    first_row,
+                    format!("fabricad.tool.{}", tool.slug()),
+                    tool.label(),
+                    app.active_tool == tool,
+                    layout::size(
+                        layout::px(ui_scale.value(72.0)),
+                        layout::px(ui_scale.value(26.0)),
+                    ),
+                    ui_scale,
+                );
+            }
+            let second_row = second_row.expect("compact layout editor should create a second row");
+            for tool in [
+                ToolMode::Path,
+                ToolMode::Via,
+                ToolMode::Measure,
+                ToolMode::Route,
+            ] {
+                let width = if tool == ToolMode::Measure {
+                    82.0
+                } else {
+                    72.0
+                };
+                add_button(
+                    document,
+                    second_row,
+                    format!("fabricad.tool.{}", tool.slug()),
+                    tool.label(),
+                    app.active_tool == tool,
+                    layout::size(
+                        layout::px(ui_scale.value(width)),
+                        layout::px(ui_scale.value(26.0)),
+                    ),
+                    ui_scale,
+                );
+            }
             add_button(
                 document,
-                strip,
-                format!("fabricad.tool.{}", tool.slug()),
-                tool.label(),
-                app.active_tool == tool,
+                second_row,
+                "fabricad.toolbar.edit.delete",
+                "Delete",
+                false,
                 layout::size(
                     layout::px(ui_scale.value(82.0)),
                     layout::px(ui_scale.value(26.0)),
                 ),
                 ui_scale,
             );
+            if app.active_menu != Some(AppMenu::Edit) {
+                add_node_marker(document, second_row, "fabricad.menu.item.edit.delete");
+            }
+        } else {
+            for tool in ToolMode::ALL {
+                add_button(
+                    document,
+                    first_row,
+                    format!("fabricad.tool.{}", tool.slug()),
+                    tool.label(),
+                    app.active_tool == tool,
+                    layout::size(
+                        layout::px(ui_scale.value(82.0)),
+                        layout::px(ui_scale.value(26.0)),
+                    ),
+                    ui_scale,
+                );
+            }
+            add_button(
+                document,
+                first_row,
+                "fabricad.toolbar.edit.delete",
+                "Delete",
+                false,
+                layout::size(
+                    layout::px(ui_scale.value(82.0)),
+                    layout::px(ui_scale.value(26.0)),
+                ),
+                ui_scale,
+            );
+            if app.active_menu != Some(AppMenu::Edit) {
+                add_node_marker(document, first_row, "fabricad.menu.item.edit.delete");
+            }
         }
-        add_button(
-            document,
-            strip,
-            "fabricad.menu.item.edit.delete",
-            "Delete",
-            false,
-            layout::size(
-                layout::px(ui_scale.value(82.0)),
-                layout::px(ui_scale.value(26.0)),
-            ),
-            ui_scale,
-        );
     } else if app.active_view == StartupView::Layout3d {
         add_button(
             document,
-            strip,
-            "fabricad.menu.item.tools.reset3d",
+            first_row,
+            "fabricad.toolbar.tools.reset3d",
             "Reset 3D",
             false,
             layout::size(
@@ -17347,8 +25212,8 @@ fn add_tool_strip(
         );
         add_button(
             document,
-            strip,
-            "fabricad.menu.item.tools.fullscreen",
+            first_row,
+            "fabricad.toolbar.tools.fullscreen",
             "Fullscreen",
             false,
             layout::size(
@@ -17357,26 +25222,29 @@ fn add_tool_strip(
             ),
             ui_scale,
         );
+        if app.active_menu != Some(AppMenu::Tools) {
+            add_node_marker(document, first_row, "fabricad.menu.item.tools.fullscreen");
+        }
     }
 
-    if app.has_inspector_panel() {
+    if drawer_mode && app.has_inspector_panel() {
         add_button(
             document,
-            strip,
+            first_row,
             "fabricad.drawer.inspector",
-            "Inspector",
+            "Details",
             app.show_inspector,
             layout::size(
-                layout::px(ui_scale.value(112.0)),
+                layout::px(ui_scale.value(92.0)),
                 layout::px(ui_scale.value(26.0)),
             ),
             ui_scale,
         );
     }
-    if app.has_secondary_panel() {
+    if drawer_mode && app.has_secondary_panel() {
         add_button(
             document,
-            strip,
+            first_row,
             "fabricad.drawer.layers",
             app.secondary_panel_label(),
             app.show_layers,
@@ -17386,6 +25254,39 @@ fn add_tool_strip(
             ),
             ui_scale,
         );
+    }
+}
+
+fn add_tool_strip_spacer(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    viewport_width: f32,
+    ui_scale: UiScale,
+) -> operad::UiNodeId {
+    let height = if viewport_width < ui_scale.value(760.0) {
+        ui_scale.value(64.0)
+    } else {
+        ui_scale.value(34.0)
+    };
+    document.add_child(
+        parent,
+        UiNode::container(
+            "fabricad.tool_strip_spacer",
+            layout::size(layout::percent(1.0), layout::px(height)),
+        )
+        .with_visual(UiVisual::panel(
+            COLOR_CHROME_BG,
+            Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
+            0.0,
+        )),
+    )
+}
+
+fn tool_strip_height(active_view: StartupView, viewport_width: f32, ui_scale: UiScale) -> f32 {
+    if viewport_width < ui_scale.value(760.0) && active_view == StartupView::Layout2d {
+        ui_scale.value(64.0)
+    } else {
+        ui_scale.value(34.0)
     }
 }
 
@@ -17452,13 +25353,244 @@ fn layout_editor_detail_rows(app: &FabricadApp) -> Vec<(String, String)> {
     ]
 }
 
+fn layout_editor_inspector_sections(app: &FabricadApp) -> Vec<DetailSection> {
+    let document = &app.workspace.document;
+    let technology = layout_model::default_technology();
+    let active_layer = document
+        .layers
+        .get(&app.active_layer)
+        .map(|layer| format!("L{} {}", layer.id.0, layer.name))
+        .unwrap_or_else(|| format!("L{} missing", app.active_layer.0));
+
+    vec![
+        DetailSection::new(
+            "Document",
+            vec![
+                (
+                    "Technology".to_string(),
+                    display_technology_name(&technology.name),
+                ),
+                ("Name".to_string(), display_document_name(&document.name)),
+                (
+                    "Grid".to_string(),
+                    app.format_layout_length(document.grid as f64),
+                ),
+                (
+                    "Shapes".to_string(),
+                    document.flattened_shape_count_estimate().to_string(),
+                ),
+                ("Layers".to_string(), document.layers.len().to_string()),
+                ("Cells".to_string(), document.cells.len().to_string()),
+            ],
+        ),
+        DetailSection::new("Cells", layout_cell_hierarchy_rows(app)),
+        DetailSection::new("Connectivity", layout_connectivity_rows(app)),
+        DetailSection::new("DRC Markers", layout_drc_marker_rows(app)),
+        DetailSection::new(
+            "Diagnostics",
+            vec![
+                ("Tool".to_string(), app.active_tool.label().to_string()),
+                ("Active layer".to_string(), active_layer),
+                (
+                    "Selection".to_string(),
+                    app.selected_layout_occurrence
+                        .as_ref()
+                        .map(layout_occurrence_label)
+                        .unwrap_or_else(|| "None".to_string()),
+                ),
+                (
+                    "Selection bounds".to_string(),
+                    app.selected_layout_shape_ref()
+                        .map(|shape| rect_summary(shape.kind.bounds()))
+                        .unwrap_or_else(|| "None".to_string()),
+                ),
+                (
+                    "Display".to_string(),
+                    format!(
+                        "grid={}, snap={}, drc={}",
+                        app.show_grid, app.snap_enabled, app.show_drc_overlay
+                    ),
+                ),
+                (
+                    "Frame".to_string(),
+                    format_fps_label(app.layout_frame_ms.get()),
+                ),
+            ],
+        ),
+    ]
+}
+
+fn layout_cell_hierarchy_rows(app: &FabricadApp) -> Vec<(String, String)> {
+    let document = &app.workspace.document;
+    let mut rows = Vec::new();
+    rows.push((
+        "Top cell".to_string(),
+        document
+            .cell(document.top_cell)
+            .map(|cell| cell.name.clone())
+            .unwrap_or_else(|| format!("cell {}", document.top_cell.0)),
+    ));
+    rows.push((
+        "Placed instances".to_string(),
+        document
+            .cells
+            .values()
+            .map(|cell| cell.instances.len())
+            .sum::<usize>()
+            .to_string(),
+    ));
+    for cell in document.cells.values().take(4) {
+        let suffix = if cell.id == document.top_cell {
+            " top"
+        } else {
+            ""
+        };
+        rows.push((
+            cell.name.clone(),
+            format!(
+                "{} shapes / {} child instances{}",
+                cell.shapes.len(),
+                cell.instances.len(),
+                suffix
+            ),
+        ));
+    }
+    if let Some(occurrence) = &app.selected_layout_occurrence
+        && let Some((parent, instance_id)) =
+            document.instance_parent_for_path(&occurrence.instance_path)
+        && let Some(instance) = document.instance(parent, instance_id)
+    {
+        rows.push((
+            "Selected instance".to_string(),
+            format!("inst #{} -> cell #{}", instance.id.0, instance.cell.0),
+        ));
+        rows.push((
+            "Instance origin".to_string(),
+            format!(
+                "{},{}",
+                instance.transform.translation.dx, instance.transform.translation.dy
+            ),
+        ));
+    } else if let Some(shape) = app.selected_top_level_layout_shape() {
+        rows.push((
+            "Selected shape".to_string(),
+            format!("#{} {}", shape.id.0, shape_kind_label(&shape.kind)),
+        ));
+    }
+    rows
+}
+
+fn layout_connectivity_rows(app: &FabricadApp) -> Vec<(String, String)> {
+    let document = &app.workspace.document;
+    if document.flattened_shape_count_estimate() > MAX_CONNECTIVITY_OVERLAY_SHAPES {
+        return vec![(
+            "Status".to_string(),
+            format!(
+                "Skipped over {} shapes",
+                document.flattened_shape_count_estimate()
+            ),
+        )];
+    }
+    match app.connectivity_report() {
+        Ok(report) => {
+            let summary = report.summary(8);
+            vec![
+                (
+                    "Health".to_string(),
+                    summary
+                        .skipped
+                        .clone()
+                        .unwrap_or_else(|| summary.health.label().to_string()),
+                ),
+                (
+                    "Components".to_string(),
+                    summary.component_count.to_string(),
+                ),
+                (
+                    "Labeled nets".to_string(),
+                    summary.labeled_component_count.to_string(),
+                ),
+                ("Shorts".to_string(), summary.short_count.to_string()),
+                ("Opens".to_string(), summary.open_count.to_string()),
+                (
+                    "Largest net".to_string(),
+                    format!("{} shapes", summary.largest_component_shape_count),
+                ),
+                (
+                    "Saved states".to_string(),
+                    document.connectivity_issue_states.len().to_string(),
+                ),
+            ]
+        }
+        Err(error) => vec![("Status".to_string(), format!("Failed: {error}"))],
+    }
+}
+
+fn layout_drc_marker_rows(app: &FabricadApp) -> Vec<(String, String)> {
+    let document = &app.workspace.document;
+    let shape_count = document.flattened_shape_count_estimate();
+    if shape_count > MAX_DRC_INSPECTOR_SHAPES {
+        return vec![(
+            "Status".to_string(),
+            format!("Skipped over {shape_count} shapes"),
+        )];
+    }
+    let report = app.drc_report();
+    if !report.findings.is_empty() {
+        return vec![(
+            "Rule deck".to_string(),
+            format!("{} issue(s)", report.findings.len()),
+        )];
+    }
+
+    let active = report
+        .violations
+        .iter()
+        .filter(|violation| drc_violation_is_active(document, violation))
+        .count();
+    let rule_count = report
+        .violations
+        .iter()
+        .map(|violation| violation.rule.as_str())
+        .collect::<BTreeSet<_>>()
+        .len();
+    vec![
+        ("Active".to_string(), active.to_string()),
+        ("Total".to_string(), report.violations.len().to_string()),
+        ("Rule families".to_string(), rule_count.to_string()),
+        (
+            "Saved states".to_string(),
+            document.marker_states.len().to_string(),
+        ),
+        (
+            "Overlay".to_string(),
+            if app.show_drc_overlay {
+                "shown"
+            } else {
+                "hidden"
+            }
+            .to_string(),
+        ),
+    ]
+}
+
 fn view_detail_sections(app: &FabricadApp) -> Vec<DetailSection> {
+    if matches!(
+        app.active_view,
+        StartupView::Layout2d | StartupView::Layout3d
+    ) {
+        return layout_editor_inspector_sections(app);
+    }
+
     let workspace = &app.workspace;
     let document = &workspace.document;
     let overview = DetailSection::new(
         "Workspace Overview",
         vec![
-            ("Document".to_string(), document.name.clone()),
+            (
+                "Document".to_string(),
+                display_document_name(&document.name),
+            ),
             (
                 "Shapes".to_string(),
                 document.flattened_shape_count_estimate().to_string(),
@@ -17520,10 +25652,13 @@ fn view_detail_sections(app: &FabricadApp) -> Vec<DetailSection> {
                         "Lot".to_string(),
                         app.mask_source_lot
                             .as_ref()
-                            .map(ToString::to_string)
+                            .map(|lot_id| workflow_lot_label(workspace, lot_id.as_str(), 32))
                             .unwrap_or_else(|| "Unlinked".to_string()),
                     ),
-                    ("Reticle".to_string(), prep.reticle.id.to_string()),
+                    (
+                        "Reticle".to_string(),
+                        display_reticle_identifier(prep.reticle.id.as_str()),
+                    ),
                     (
                         "Severity".to_string(),
                         app.mask_issue_severity_filter.detail_label().to_string(),
@@ -17733,7 +25868,7 @@ fn view_detail_sections(app: &FabricadApp) -> Vec<DetailSection> {
             vec![
                 (
                     "Policy".to_string(),
-                    app.scheduler_policy.label().to_string(),
+                    display_dispatch_policy_label(app.scheduler_policy).to_string(),
                 ),
                 (
                     "Shift minute".to_string(),
@@ -17780,12 +25915,7 @@ fn view_detail_sections(app: &FabricadApp) -> Vec<DetailSection> {
                     workspace.safety.sensors.len().to_string(),
                 ),
                 ("State".to_string(), safety_highest_label(app).to_string()),
-                (
-                    "Selected tool".to_string(),
-                    app.selected_safety_tool
-                        .clone()
-                        .unwrap_or_else(|| "None".to_string()),
-                ),
+                ("Selected tool".to_string(), safety_selected_tool_label(app)),
                 (
                     "Acknowledged".to_string(),
                     app.acknowledged_count().to_string(),
@@ -17853,7 +25983,7 @@ fn view_detail_sections(app: &FabricadApp) -> Vec<DetailSection> {
                 ),
                 (
                     "Failed only".to_string(),
-                    app.metrology_failed_only.to_string(),
+                    enabled_state_label(app.metrology_failed_only).to_string(),
                 ),
                 (
                     "Selected die".to_string(),
@@ -17892,17 +26022,14 @@ fn view_detail_sections(app: &FabricadApp) -> Vec<DetailSection> {
                         .clone()
                         .unwrap_or_else(|| "None".to_string()),
                 ),
-                (
-                    "Filter".to_string(),
-                    app.yield_map_filter.label().to_string(),
-                ),
+                ("Filter".to_string(), yield_filter_summary(app)),
                 (
                     "Attention only".to_string(),
-                    app.show_only_attention_wafers.to_string(),
+                    enabled_state_label(app.show_only_attention_wafers).to_string(),
                 ),
                 (
                     "Excursions only".to_string(),
-                    app.show_only_excursions.to_string(),
+                    enabled_state_label(app.show_only_excursions).to_string(),
                 ),
                 (
                     "Lots".to_string(),
@@ -17932,13 +26059,13 @@ fn view_detail_sections(app: &FabricadApp) -> Vec<DetailSection> {
                     (
                         "Selected chart".to_string(),
                         selected_chart
-                            .map(|chart| chart.id.as_str().to_string())
+                            .map(display_spc_chart_label)
                             .unwrap_or_else(|| "None".to_string()),
                     ),
                     (
                         "Selected trace".to_string(),
                         selected_trace
-                            .map(|trace| trace.id.clone())
+                            .map(display_spc_trace_name)
                             .unwrap_or_else(|| "None".to_string()),
                     ),
                     (
@@ -17969,7 +26096,7 @@ fn view_detail_sections(app: &FabricadApp) -> Vec<DetailSection> {
             vec![
                 (
                     "Route".to_string(),
-                    workspace.process_flow.route.name.clone(),
+                    display_process_flow_route_name(&workspace.process_flow.route.name),
                 ),
                 (
                     "Selected node".to_string(),
@@ -18012,19 +26139,19 @@ fn view_detail_sections(app: &FabricadApp) -> Vec<DetailSection> {
                     (
                         "Selected loop".to_string(),
                         selected_loop
-                            .map(|loop_definition| loop_definition.id.to_string())
+                            .map(|loop_definition| loop_definition.name.clone())
                             .unwrap_or_else(|| "None".to_string()),
                     ),
                     (
                         "Selected action".to_string(),
                         selected_action
-                            .map(|action| action.id.to_string())
+                            .map(process_control_action_button_label)
                             .unwrap_or_else(|| "None".to_string()),
                     ),
                     (
                         "Action state".to_string(),
                         selected_action
-                            .map(|action| action.state.label().to_string())
+                            .map(|action| capitalize_ascii_first(action.state.label().to_string()))
                             .unwrap_or_else(|| "None".to_string()),
                     ),
                     (
@@ -18127,7 +26254,8 @@ fn view_detail_sections(app: &FabricadApp) -> Vec<DetailSection> {
                 (
                     "Lot filter".to_string(),
                     app.experiment_lot_filter
-                        .clone()
+                        .as_deref()
+                        .map(|lot_id| workflow_lot_label(workspace, lot_id, 32))
                         .unwrap_or_else(|| "All lots".to_string()),
                 ),
                 (
@@ -18206,99 +26334,15 @@ fn view_detail_sections(app: &FabricadApp) -> Vec<DetailSection> {
                 "Menu".to_string(),
                 app.active_menu.map_or("Closed", AppMenu::label).to_string(),
             ),
-            ("Inspector".to_string(), app.show_inspector.to_string()),
+            ("Details".to_string(), app.show_inspector.to_string()),
             (
                 app.secondary_panel_label().to_string(),
                 app.show_layers.to_string(),
-            ),
-            (
-                "Theme".to_string(),
-                if app.dark_theme { "Dark" } else { "Light" }.to_string(),
             ),
         ],
     );
 
     vec![overview, specific, selection]
-}
-
-fn add_detail_sections(
-    document: &mut UiDocument,
-    parent: operad::UiNodeId,
-    app: &FabricadApp,
-    ui_scale: UiScale,
-) {
-    let sections = view_detail_sections(app);
-    let total_rows = sections
-        .iter()
-        .map(|section| section.rows.len().min(6))
-        .sum::<usize>();
-    let height = ui_scale.value(52.0 + total_rows as f32 * 28.0 + sections.len() as f32 * 24.0);
-    let root = document.add_child(
-        parent,
-        UiNode::container(
-            "fabricad.view.detail",
-            layout::with_gap_all(
-                layout::with_size(layout::column(), layout::percent(1.0), layout::px(height)),
-                ui_scale.value(10.0),
-            ),
-        ),
-    );
-
-    for (section_index, section) in sections.iter().enumerate() {
-        let row_count = section.rows.len().min(6);
-        let section_height = ui_scale.value(38.0 + row_count as f32 * 28.0);
-        let card = document.add_child(
-            root,
-            UiNode::container(
-                format!("fabricad.view.detail.section.{section_index}"),
-                layout::with_padding_all(
-                    layout::with_gap_all(
-                        layout::with_size(
-                            layout::column(),
-                            layout::percent(1.0),
-                            layout::px(section_height),
-                        ),
-                        ui_scale.value(6.0),
-                    ),
-                    ui_scale.value(10.0),
-                ),
-            )
-            .with_visual(UiVisual::panel(
-                ColorRgba::new(24, 31, 38, 255),
-                Some(StrokeStyle::new(
-                    ColorRgba::new(55, 68, 82, 255),
-                    ui_scale.value(1.0),
-                )),
-                ui_scale.value(4.0),
-            )),
-        );
-        add_text(
-            document,
-            card,
-            format!("fabricad.view.detail.section.{section_index}.title"),
-            section.title.clone(),
-            text_style(
-                ui_scale.value(15.0),
-                FontWeight::BOLD,
-                ColorRgba::new(236, 242, 246, 255),
-            ),
-            layout::size(layout::percent(1.0), layout::px(ui_scale.value(24.0))),
-        );
-        for (row_index, (label, value)) in section.rows.iter().take(6).enumerate() {
-            add_text(
-                document,
-                card,
-                format!("fabricad.view.detail.section.{section_index}.row.{row_index}"),
-                format!("{label}: {value}"),
-                text_style(
-                    ui_scale.value(13.0),
-                    FontWeight::NORMAL,
-                    ColorRgba::new(177, 187, 197, 255),
-                ),
-                layout::size(layout::percent(1.0), layout::px(ui_scale.value(22.0))),
-            );
-        }
-    }
 }
 
 fn add_inspector_panel(
@@ -18307,84 +26351,189 @@ fn add_inspector_panel(
     app: &FabricadApp,
     ui_scale: UiScale,
 ) {
-    let mut rows = vec![
-        ("View".to_string(), app.active_view.label().to_string()),
-        ("Tool".to_string(), app.active_tool.label().to_string()),
-        (
-            "Active layer".to_string(),
-            app.workspace
-                .document
-                .layers
-                .get(&app.active_layer)
-                .map(|layer| format!("L{} {}", layer.id.0, layer.name))
-                .unwrap_or_else(|| format!("L{} missing", app.active_layer.0)),
-        ),
-        ("Status".to_string(), app.status_message.clone()),
-        (
-            "Workspace".to_string(),
-            format!(
-                "{} shapes, {} lots",
-                app.workspace.document.flattened_shape_count_estimate(),
-                app.workspace.mes.lots.len()
-            ),
-        ),
-    ];
-    if let Some(shape) = app.selected_layout_shape_ref() {
-        rows.push((
-            format!("Selected #{}", shape.id.0),
-            format!(
-                "{} {}",
-                shape_kind_label(&shape.kind),
-                rect_summary(shape.kind.bounds())
-            ),
-        ));
-    }
-    rows.extend(app.workspace.document.shapes.values().take(5).map(|shape| {
-        (
-            format!("Shape {}", shape.id.0),
-            format!("{} on L{}", shape_kind_label(&shape.kind), shape.layer.0),
-        )
-    }));
-    add_side_panel(
+    let sections = view_detail_sections(app)
+        .into_iter()
+        .filter(|section| section.title != "Current Controls")
+        .collect::<Vec<_>>();
+    let title = if matches!(
+        app.active_view,
+        StartupView::Layout2d | StartupView::Layout3d
+    ) {
+        ""
+    } else {
+        app.active_view.label()
+    };
+    add_sectioned_side_panel(
         document,
         parent,
         "fabricad.inspector",
-        "Inspector",
-        rows,
+        title,
+        app,
+        sections,
         ui_scale.value(280.0),
         ui_scale,
     );
 }
 
-fn layout_layer_panel_rows(app: &FabricadApp) -> Vec<(String, String)> {
+fn add_layout_layers_panel(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    app: &FabricadApp,
+    ui_scale: UiScale,
+) {
+    let width = ui_scale.value(244.0);
+    let panel = document.add_child(
+        parent,
+        UiNode::container(
+            "fabricad.secondary",
+            UiNodeStyle {
+                layout: layout::with_min_size(
+                    layout::with_padding_all(
+                        layout::with_gap_all(
+                            layout::with_size(
+                                layout::column(),
+                                layout::px(width),
+                                layout::percent(1.0),
+                            ),
+                            ui_scale.value(8.0),
+                        ),
+                        ui_scale.value(10.0),
+                    ),
+                    layout::px(0.0),
+                    layout::px(0.0),
+                )
+                .as_taffy_style()
+                .clone(),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            COLOR_CHROME_BG,
+            Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
+            0.0,
+        ))
+        .with_scroll(ScrollAxes::VERTICAL),
+    );
+    add_text(
+        document,
+        panel,
+        "fabricad.secondary.title",
+        "Layers",
+        text_style(ui_scale.value(16.0), FontWeight::BOLD, COLOR_TEXT),
+        layout::size(layout::percent(1.0), layout::px(ui_scale.value(26.0))),
+    );
+    add_button(
+        document,
+        panel,
+        "fabricad.viewctl.layout.add_layer",
+        "Add layer",
+        false,
+        layout::size(
+            layout::px(ui_scale.value(88.0)),
+            layout::px(ui_scale.value(28.0)),
+        ),
+        ui_scale,
+    );
+
     let mut layers = app.workspace.document.layers.values().collect::<Vec<_>>();
     layers.sort_by_key(|layer| (layer.display_order, layer.id));
-    layers
+    for layer in layers.into_iter().take(10) {
+        let row = document.add_child(
+            panel,
+            UiNode::container(
+                format!("fabricad.layers.row.{}", layer.id.0),
+                layout::with_gap_all(
+                    layout::with_size(
+                        layout::row(),
+                        layout::percent(1.0),
+                        layout::px(ui_scale.value(28.0)),
+                    ),
+                    ui_scale.value(6.0),
+                ),
+            ),
+        );
+        document.add_child(
+            row,
+            UiNode::container(
+                format!("fabricad.layers.swatch.{}", layer.id.0),
+                layout::size(
+                    layout::px(ui_scale.value(14.0)),
+                    layout::px(ui_scale.value(14.0)),
+                ),
+            )
+            .with_visual(UiVisual::panel(
+                layer_color(layer.color, 255),
+                None,
+                ui_scale.value(2.0),
+            )),
+        );
+        add_button(
+            document,
+            row,
+            format!("fabricad.viewctl.layout.layer.{}", layer.id.0),
+            layer.name.clone(),
+            app.active_layer == layer.id,
+            layout::size(
+                layout::px(ui_scale.value(124.0)),
+                layout::px(ui_scale.value(26.0)),
+            ),
+            ui_scale,
+        );
+        add_button(
+            document,
+            row,
+            format!("fabricad.viewctl.layout.toggle_layer.{}", layer.id.0),
+            if layer.visible { "v" } else { "-" },
+            layer.visible,
+            layout::size(
+                layout::px(ui_scale.value(28.0)),
+                layout::px(ui_scale.value(26.0)),
+            ),
+            ui_scale,
+        );
+        add_button(
+            document,
+            row,
+            format!("fabricad.layers.delete.{}", layer.id.0),
+            "x",
+            false,
+            layout::size(
+                layout::px(ui_scale.value(28.0)),
+                layout::px(ui_scale.value(26.0)),
+            ),
+            ui_scale,
+        );
+    }
+
+    if let Some(layer) = app.workspace.document.layers.get(&app.active_layer) {
+        add_text(
+            document,
+            panel,
+            "fabricad.layers.properties.title",
+            "Layer Properties",
+            text_style(ui_scale.value(13.0), FontWeight::BOLD, COLOR_TEXT_MUTED),
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(24.0))),
+        );
+        for (index, (label, value)) in [
+            ("Layer ID", layer.id.0.to_string()),
+            ("Process", format!("{:?}", layer.process)),
+            ("Purpose", layer.name.clone()),
+            ("Display order", layer.display_order.to_string()),
+        ]
         .into_iter()
-        .take(12)
-        .map(|layer| {
-            let shape_count = app
-                .workspace
-                .document
-                .shapes
-                .values()
-                .filter(|shape| shape.layer == layer.id)
-                .count();
-            let label = if app.active_layer == layer.id {
-                format!("* L{} {}", layer.id.0, layer.name)
-            } else {
-                format!("L{} {}", layer.id.0, layer.name)
-            };
-            let state = format!(
-                "{}{}; {} shape{}",
-                if layer.visible { "visible" } else { "hidden" },
-                if layer.locked { ", locked" } else { "" },
-                shape_count,
-                if shape_count == 1 { "" } else { "s" }
+        .enumerate()
+        {
+            add_text(
+                document,
+                panel,
+                format!("fabricad.layers.properties.row.{index}"),
+                format!("{label}: {value}"),
+                text_style(ui_scale.value(12.0), FontWeight::NORMAL, COLOR_TEXT_MUTED),
+                layout::size(layout::percent(1.0), layout::px(ui_scale.value(22.0))),
             );
-            (label, state)
-        })
-        .collect()
+        }
+    }
 }
 
 fn add_secondary_panel(
@@ -18393,6 +26542,14 @@ fn add_secondary_panel(
     app: &FabricadApp,
     ui_scale: UiScale,
 ) {
+    if matches!(
+        app.active_view,
+        StartupView::Layout2d | StartupView::Layout3d
+    ) {
+        add_layout_layers_panel(document, parent, app, ui_scale);
+        return;
+    }
+
     let rows = match app.active_view {
         StartupView::Metrology => vec![
             (
@@ -18445,7 +26602,6 @@ fn add_secondary_panel(
                     .unwrap_or_else(|| "No entries".to_string()),
             ),
         ],
-        StartupView::Layout2d | StartupView::Layout3d => layout_layer_panel_rows(app),
         _ => app
             .workspace
             .document
@@ -18512,11 +26668,8 @@ fn add_side_panel(
             },
         )
         .with_visual(UiVisual::panel(
-            ColorRgba::new(22, 28, 34, 255),
-            Some(StrokeStyle::new(
-                ColorRgba::new(52, 64, 76, 255),
-                ui_scale.value(1.0),
-            )),
+            COLOR_CHROME_BG,
+            Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
             0.0,
         ))
         .with_scroll(ScrollAxes::VERTICAL),
@@ -18526,11 +26679,7 @@ fn add_side_panel(
         panel,
         format!("{name}.title"),
         title,
-        text_style(
-            ui_scale.value(16.0),
-            FontWeight::BOLD,
-            ColorRgba::new(238, 243, 247, 255),
-        ),
+        text_style(ui_scale.value(16.0), FontWeight::BOLD, COLOR_TEXT),
         layout::size(layout::percent(1.0), layout::px(ui_scale.value(28.0))),
     );
     for (index, (label, value)) in rows.iter().take(12).enumerate() {
@@ -18539,13 +26688,368 @@ fn add_side_panel(
             panel,
             format!("{name}.row.{index}"),
             format!("{label}: {value}"),
-            text_style(
-                ui_scale.value(12.0),
-                FontWeight::NORMAL,
-                ColorRgba::new(172, 183, 194, 255),
-            ),
+            text_style(ui_scale.value(12.0), FontWeight::NORMAL, COLOR_TEXT_MUTED),
             layout::size(layout::percent(1.0), layout::px(ui_scale.value(30.0))),
         );
+    }
+}
+
+fn add_layout_inspector_rail(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    app: &FabricadApp,
+    width: f32,
+    height: f32,
+    ui_scale: UiScale,
+) -> operad::UiNodeId {
+    let rail = document.add_child(
+        parent,
+        UiNode::container(
+            "fabricad.layout.inspector_rail",
+            UiNodeStyle {
+                layout: fixed_row_child_layout(
+                    layout::with_padding_all(
+                        layout::with_gap_all(
+                            layout::with_size(
+                                layout::column(),
+                                layout::px(width),
+                                layout::px(height),
+                            ),
+                            ui_scale.value(4.0),
+                        ),
+                        ui_scale.value(6.0),
+                    ),
+                    width,
+                    height,
+                )
+                .as_taffy_style()
+                .clone(),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            COLOR_CHROME_BG,
+            Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
+            0.0,
+        ))
+        .with_scroll(ScrollAxes::VERTICAL),
+    );
+    add_collapsible_detail_sections(
+        document,
+        rail,
+        "fabricad.layout.inspector",
+        app,
+        &layout_editor_inspector_sections(app),
+        8,
+        8,
+        ui_scale,
+    );
+    rail
+}
+
+fn add_sectioned_side_panel(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    name: &str,
+    title: &str,
+    app: &FabricadApp,
+    sections: Vec<DetailSection>,
+    width: f32,
+    ui_scale: UiScale,
+) {
+    let panel = document.add_child(
+        parent,
+        UiNode::container(
+            name,
+            UiNodeStyle {
+                layout: layout::with_min_size(
+                    layout::with_padding_all(
+                        layout::with_gap_all(
+                            layout::with_size(
+                                layout::column(),
+                                layout::px(width),
+                                layout::percent(1.0),
+                            ),
+                            ui_scale.value(8.0),
+                        ),
+                        ui_scale.value(12.0),
+                    ),
+                    layout::px(0.0),
+                    layout::px(0.0),
+                )
+                .as_taffy_style()
+                .clone(),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_visual(UiVisual::panel(
+            COLOR_CHROME_BG,
+            Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
+            0.0,
+        ))
+        .with_scroll(ScrollAxes::VERTICAL),
+    );
+    if !title.is_empty() {
+        add_text(
+            document,
+            panel,
+            format!("{name}.title"),
+            title,
+            text_style(ui_scale.value(15.0), FontWeight::BOLD, COLOR_TEXT),
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(24.0))),
+        );
+    }
+    add_collapsible_detail_sections(document, panel, name, app, &sections, 6, 6, ui_scale);
+}
+
+fn add_collapsible_detail_sections(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    base_name: &str,
+    app: &FabricadApp,
+    sections: &[DetailSection],
+    max_sections: usize,
+    max_rows: usize,
+    ui_scale: UiScale,
+) {
+    for (section_index, section) in sections.iter().take(max_sections).enumerate() {
+        let key = detail_section_key(app.active_view, section_index, &section.title);
+        let expanded = !app.collapsed_detail_sections.contains(&key);
+        let mut options = CollapsingHeaderOptions::default()
+            .expanded(expanded)
+            .with_toggle_action(format!("fabricad.inspector.section.toggle.{key}"));
+        options.layout = LayoutStyle::column().with_width_percent(1.0);
+        options.header_layout = layout::with_padding_all(
+            layout::with_gap_all(
+                layout::with_size(
+                    layout::row(),
+                    layout::percent(1.0),
+                    layout::px(ui_scale.value(24.0)),
+                ),
+                ui_scale.value(4.0),
+            ),
+            ui_scale.value(3.0),
+        );
+        options.body_layout = layout::with_gap_all(
+            layout::with_padding_all(layout::column(), ui_scale.value(4.0)),
+            ui_scale.value(2.0),
+        );
+        options.header_visual = UiVisual::panel(
+            COLOR_PANEL_BG,
+            Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
+            ui_scale.value(2.0),
+        );
+        options.hovered_visual = UiVisual::panel(
+            COLOR_PANEL_ALT,
+            Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
+            ui_scale.value(2.0),
+        );
+        options.pressed_visual = UiVisual::panel(
+            COLOR_BUTTON_SELECTED,
+            Some(StrokeStyle::new(
+                COLOR_BUTTON_STROKE_SELECTED,
+                ui_scale.value(1.0),
+            )),
+            ui_scale.value(2.0),
+        );
+        options.body_visual = UiVisual::panel(COLOR_APP_BG, None, 0.0);
+        options.text_style = text_style(ui_scale.value(12.0), FontWeight::BOLD, COLOR_TEXT);
+        options.indicator_text_style =
+            text_style(ui_scale.value(11.0), FontWeight::BOLD, COLOR_TEXT_MUTED);
+        options.accessibility_label = Some(section.title.clone());
+
+        let nodes = collapsing_header(
+            document,
+            parent,
+            format!("{base_name}.section.{section_index}"),
+            section.title.clone(),
+            options,
+        );
+        if let Some(body) = nodes.body {
+            for (row_index, (label, value)) in section.rows.iter().take(max_rows).enumerate() {
+                add_text(
+                    document,
+                    body,
+                    format!("{base_name}.section.{section_index}.row.{row_index}"),
+                    format!("{label}: {value}"),
+                    text_style(ui_scale.value(11.0), FontWeight::NORMAL, COLOR_TEXT_MUTED),
+                    layout::size(layout::percent(1.0), layout::px(ui_scale.value(18.0))),
+                );
+            }
+        }
+    }
+}
+
+fn detail_section_key(view: StartupView, section_index: usize, title: &str) -> String {
+    let slug = title
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    let slug = if slug.is_empty() {
+        "section".to_string()
+    } else {
+        slug
+    };
+    format!("{}.{}.{}", view.slug(), section_index, slug)
+}
+
+fn add_detail_sections(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    app: &FabricadApp,
+    ui_scale: UiScale,
+) {
+    let sections = view_detail_sections(app);
+    if sections.is_empty() {
+        return;
+    }
+    let panel = document.add_child(
+        parent,
+        UiNode::container(
+            "fabricad.details",
+            layout::with_padding_all(
+                layout::with_gap_all(
+                    layout::with_size(
+                        layout::column(),
+                        layout::percent(1.0),
+                        layout::px(ui_scale.value(220.0)),
+                    ),
+                    ui_scale.value(6.0),
+                ),
+                ui_scale.value(8.0),
+            ),
+        )
+        .with_visual(UiVisual::panel(
+            COLOR_PANEL_BG,
+            Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
+            ui_scale.value(2.0),
+        )),
+    );
+    for (section_index, section) in sections.iter().take(4).enumerate() {
+        add_text(
+            document,
+            panel,
+            format!("fabricad.details.{section_index}.title"),
+            section.title.clone(),
+            text_style(ui_scale.value(13.0), FontWeight::BOLD, COLOR_TEXT),
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(22.0))),
+        );
+        for (row_index, (label, value)) in section.rows.iter().take(5).enumerate() {
+            add_text(
+                document,
+                panel,
+                format!("fabricad.details.{section_index}.row.{row_index}"),
+                format!("{label}: {value}"),
+                text_style(ui_scale.value(12.0), FontWeight::NORMAL, COLOR_TEXT_MUTED),
+                layout::size(layout::percent(1.0), layout::px(ui_scale.value(20.0))),
+            );
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum MenuPanelItem {
+    Action {
+        action: String,
+        label: String,
+        selected: bool,
+        checkable: bool,
+        enabled: bool,
+    },
+    Label(String),
+    Separator,
+}
+
+impl MenuPanelItem {
+    fn action(action: impl Into<String>, label: impl Into<String>) -> Self {
+        Self::Action {
+            action: action.into(),
+            label: label.into(),
+            selected: false,
+            checkable: false,
+            enabled: true,
+        }
+    }
+
+    fn selected(action: impl Into<String>, label: impl Into<String>, selected: bool) -> Self {
+        Self::Action {
+            action: action.into(),
+            label: label.into(),
+            selected,
+            checkable: true,
+            enabled: true,
+        }
+    }
+
+    fn disabled(action: impl Into<String>, label: impl Into<String>) -> Self {
+        Self::Action {
+            action: action.into(),
+            label: label.into(),
+            selected: false,
+            checkable: false,
+            enabled: false,
+        }
+    }
+
+    fn height(&self, ui_scale: UiScale) -> f32 {
+        match self {
+            Self::Action { .. } => ui_scale.value(28.0),
+            Self::Label(_) => ui_scale.value(22.0),
+            Self::Separator => ui_scale.value(1.0),
+        }
+    }
+
+    fn is_checkable(&self) -> bool {
+        matches!(
+            self,
+            Self::Action {
+                checkable: true,
+                ..
+            }
+        )
+    }
+
+    fn to_operad_menu_item(&self, fallback_id: impl Into<String>) -> OperadMenuItem {
+        match self {
+            Self::Action {
+                action,
+                label,
+                selected,
+                checkable,
+                enabled,
+            } => {
+                let item = if *checkable {
+                    OperadMenuItem::check(action.clone(), label.clone(), *selected)
+                } else {
+                    OperadMenuItem::command(action.clone(), label.clone())
+                };
+                if *enabled { item } else { item.disabled() }
+            }
+            Self::Label(label) => OperadMenuItem::command(fallback_id, label.clone()).disabled(),
+            Self::Separator => OperadMenuItem::separator(),
+        }
+    }
+}
+
+fn menu_action_enabled(
+    action: impl Into<String>,
+    label: impl Into<String>,
+    enabled: bool,
+) -> MenuPanelItem {
+    if enabled {
+        MenuPanelItem::action(action, label)
+    } else {
+        MenuPanelItem::disabled(action, label)
     }
 }
 
@@ -18558,167 +27062,163 @@ fn add_menu_panel(
     viewport_width: f32,
     ui_scale: UiScale,
 ) {
-    let item_width = ui_scale.value(160.0);
-    let item_height = ui_scale.value(if menu == AppMenu::View { 40.0 } else { 34.0 });
-    let gap = ui_scale.value(8.0);
+    if menu == AppMenu::View {
+        add_view_menu_panel(document, parent, active_view, app, viewport_width, ui_scale);
+        return;
+    }
 
-    let items: Vec<(String, String)> = match menu {
+    let editing_mode = active_view == StartupView::Layout2d;
+    let can_delete = editing_mode && app.selected_layout_shape.is_some();
+    let items: Vec<MenuPanelItem> = match menu {
         AppMenu::File => vec![
-            (
-                "file.new_blank".to_string(),
-                "New Blank Workspace".to_string(),
-            ),
-            (
-                "file.load_demo".to_string(),
-                "Load Demo Workspace".to_string(),
-            ),
-            ("file.save".to_string(), "Save Workspace".to_string()),
-            ("file.load".to_string(), "Load Workspace".to_string()),
-            (
-                "file.save_layout".to_string(),
-                "Save Layout JSON".to_string(),
-            ),
-            (
-                "file.load_layout".to_string(),
-                "Load Layout JSON".to_string(),
-            ),
-            ("file.export_gds".to_string(), "Export GDS".to_string()),
-            ("file.import_gds".to_string(), "Import GDS".to_string()),
-            (
-                "file.collaboration".to_string(),
-                "Connect Collaboration".to_string(),
-            ),
+            MenuPanelItem::action("file.new_blank", "New Blank Workspace"),
+            MenuPanelItem::action("file.load_demo", "Load Sample Workspace"),
+            MenuPanelItem::Separator,
+            MenuPanelItem::disabled("file.save", "Save Workspace"),
+            MenuPanelItem::disabled("file.load", "Load Workspace"),
+            MenuPanelItem::Separator,
+            MenuPanelItem::Label("Layout".to_string()),
+            MenuPanelItem::disabled("file.save_layout", "Save Layout JSON"),
+            MenuPanelItem::disabled("file.load_layout", "Load Layout JSON"),
+            MenuPanelItem::disabled("file.export_gds", "Export GDS"),
+            MenuPanelItem::disabled("file.import_gds", "Import GDS"),
+            MenuPanelItem::Separator,
+            MenuPanelItem::disabled("file.collaboration", "Connect Collaboration"),
         ],
         AppMenu::Edit => vec![
-            ("edit.undo".to_string(), "Undo".to_string()),
-            ("edit.redo".to_string(), "Redo".to_string()),
-            ("edit.copy".to_string(), "Copy".to_string()),
-            ("edit.paste".to_string(), "Paste".to_string()),
-            ("edit.duplicate".to_string(), "Duplicate".to_string()),
-            ("edit.delete".to_string(), "Delete".to_string()),
-            ("edit.make_cell".to_string(), "Make Cell".to_string()),
-            ("edit.rotate90".to_string(), "Rotate 90".to_string()),
-            ("edit.mirror_x".to_string(), "Mirror X".to_string()),
-            ("edit.mirror_y".to_string(), "Mirror Y".to_string()),
+            menu_action_enabled("edit.undo", "Undo", editing_mode),
+            menu_action_enabled("edit.redo", "Redo", editing_mode),
+            MenuPanelItem::Separator,
+            menu_action_enabled("edit.copy", "Copy", editing_mode),
+            menu_action_enabled("edit.paste", "Paste", editing_mode),
+            menu_action_enabled("edit.duplicate", "Duplicate", editing_mode),
+            menu_action_enabled("edit.delete", "Delete", can_delete),
+            MenuPanelItem::Separator,
+            menu_action_enabled("edit.make_cell", "Make Cell", editing_mode),
+            menu_action_enabled("edit.rotate90", "Rotate 90", editing_mode),
+            menu_action_enabled("edit.mirror_x", "Mirror X", editing_mode),
+            menu_action_enabled("edit.mirror_y", "Mirror Y", editing_mode),
         ],
-        AppMenu::View => StartupView::ALL
-            .iter()
-            .map(|view| (format!("view.{}", view.slug()), view.label().to_string()))
-            .collect(),
+        AppMenu::View => unreachable!("view menu is handled by add_view_menu_panel"),
         AppMenu::Bookmarks => vec![
-            ("bookmarks.origin".to_string(), "Origin".to_string()),
-            ("bookmarks.bounds".to_string(), "Layout Bounds".to_string()),
+            MenuPanelItem::disabled("bookmarks.origin", "Origin"),
+            MenuPanelItem::disabled("bookmarks.bounds", "Layout Bounds"),
         ],
         AppMenu::Display => vec![
-            (
-                "display.grid2d".to_string(),
-                (if app.show_grid {
-                    "Hide 2D Grid"
-                } else {
-                    "Show 2D Grid"
-                })
-                .to_string(),
+            MenuPanelItem::selected("display.grid2d", "2D grid", app.show_grid),
+            MenuPanelItem::selected("display.grid3d", "3D grid", app.show_3d_grid),
+            MenuPanelItem::selected("display.origin", "Origin crosshair", app.show_origin_marker),
+            MenuPanelItem::selected("display.drc", "DRC overlay", app.show_drc_overlay),
+            MenuPanelItem::selected("display.inspector", "Details panel", app.show_inspector),
+            MenuPanelItem::selected(
+                "display.secondary_panel",
+                app.secondary_panel_label(),
+                app.show_layers,
             ),
-            (
-                "display.grid3d".to_string(),
-                (if app.show_3d_grid {
-                    "Hide 3D Grid"
-                } else {
-                    "Show 3D Grid"
-                })
-                .to_string(),
+            MenuPanelItem::Separator,
+            MenuPanelItem::Label("Theme".to_string()),
+            MenuPanelItem::selected("display.theme.dark", "Dark", app.dark_theme),
+            MenuPanelItem::selected("display.theme.light", "Light", !app.dark_theme),
+            MenuPanelItem::Separator,
+            MenuPanelItem::Label("Units".to_string()),
+            MenuPanelItem::selected(
+                "display.units.auto",
+                UnitDisplay::Auto.label(),
+                app.unit_display == UnitDisplay::Auto,
             ),
-            (
-                "display.origin".to_string(),
-                (if app.show_origin_marker {
-                    "Hide Origin"
-                } else {
-                    "Show Origin"
-                })
-                .to_string(),
+            MenuPanelItem::selected(
+                "display.units.nanometers",
+                UnitDisplay::Nanometers.label(),
+                app.unit_display == UnitDisplay::Nanometers,
             ),
-            (
-                "display.drc".to_string(),
-                (if app.show_drc_overlay {
-                    "Hide DRC Overlay"
-                } else {
-                    "Show DRC Overlay"
-                })
-                .to_string(),
+            MenuPanelItem::selected(
+                "display.units.microns",
+                UnitDisplay::Microns.label(),
+                app.unit_display == UnitDisplay::Microns,
             ),
-            (
-                "display.theme".to_string(),
-                (if app.dark_theme {
-                    "Light Theme"
-                } else {
-                    "Dark Theme"
-                })
-                .to_string(),
+            MenuPanelItem::selected(
+                "display.units.dbu",
+                UnitDisplay::Dbu.label(),
+                app.unit_display == UnitDisplay::Dbu,
             ),
-            ("display.units".to_string(), "Units".to_string()),
+            MenuPanelItem::Separator,
+            MenuPanelItem::action("display.options", "Options..."),
         ],
         AppMenu::Options => vec![
-            (
-                "options.grid".to_string(),
-                (if app.show_grid {
-                    "Hide Grid"
-                } else {
-                    "Show Grid"
-                })
-                .to_string(),
-            ),
-            (
-                "options.snap".to_string(),
-                if app.snap_enabled {
-                    "Disable Snap"
-                } else {
-                    "Enable Snap"
-                }
-                .to_string(),
-            ),
-            (
-                "options.theme".to_string(),
-                if app.dark_theme {
-                    "Light Theme"
-                } else {
-                    "Dark Theme"
-                }
-                .to_string(),
-            ),
+            MenuPanelItem::selected("options.snap", "Snap", app.snap_enabled),
+            MenuPanelItem::action("display.options", "Options..."),
         ],
         AppMenu::Tools => {
             let mut items = vec![
-                ("tools.palette".to_string(), "Command Palette".to_string()),
-                ("tools.rundrc".to_string(), "Run DRC".to_string()),
-                ("tools.diagnostics".to_string(), "Diagnostics".to_string()),
+                MenuPanelItem::action("tools.palette", "Command Palette..."),
+                MenuPanelItem::Separator,
             ];
-            for tool in ToolMode::ALL {
-                items.push((format!("tool.{}", tool.slug()), tool.label().to_string()));
+            if editing_mode {
+                items.push(MenuPanelItem::Label("Layout Tools".to_string()));
+                for tool in ToolMode::ALL {
+                    items.push(MenuPanelItem::selected(
+                        format!("tool.{}", tool.slug()),
+                        tool.label(),
+                        app.active_tool == tool,
+                    ));
+                }
+                items.push(MenuPanelItem::Separator);
+            }
+            items.push(MenuPanelItem::Label("Technology".to_string()));
+            for (index, technology) in layout_model::builtin_technologies().into_iter().enumerate()
+            {
+                items.push(MenuPanelItem::selected(
+                    format!("tools.technology.{index}"),
+                    display_technology_name(&technology.name),
+                    index == 0,
+                ));
+            }
+            items.push(MenuPanelItem::Separator);
+            items.push(MenuPanelItem::action("tools.rundrc", "Run DRC"));
+            items.push(MenuPanelItem::action("tools.diagnostics", "Diagnostics"));
+            if let Some(lot_id) = app.workflow_focus_lot.as_deref() {
+                items.push(MenuPanelItem::Separator);
+                items.push(MenuPanelItem::action(
+                    format!("tools.focus_note.{lot_id}"),
+                    "Add Focus Note",
+                ));
             }
             items
         }
         AppMenu::Macros => vec![
-            ("macros.demo".to_string(), "Load Full Demo".to_string()),
-            ("macros.stress10k".to_string(), "10k Stress".to_string()),
-            ("macros.stress100k".to_string(), "100k Stress".to_string()),
-            ("macros.stress1m".to_string(), "1M Stress".to_string()),
-            ("macros.hierarchy".to_string(), "Hierarchy".to_string()),
-            ("macros.validate".to_string(), "Validate".to_string()),
-            ("macros.drc".to_string(), "Run DRC".to_string()),
-            ("macros.snapshot".to_string(), "Snapshot".to_string()),
+            MenuPanelItem::action("macros.demo", "Load Full Sample Workspace"),
+            MenuPanelItem::Separator,
+            MenuPanelItem::Label("Layout Test Scenes".to_string()),
+            MenuPanelItem::action("macros.stress10k", "10k Stress"),
+            MenuPanelItem::action("macros.stress100k", "100k Stress"),
+            MenuPanelItem::action("macros.stress1m", "1M Stress"),
+            MenuPanelItem::action("macros.hierarchy", "Hierarchy"),
         ],
-        AppMenu::Help => vec![
-            ("help.shortcuts".to_string(), "Shortcuts".to_string()),
-            ("help.about".to_string(), "About".to_string()),
+        AppMenu::Help => vec![MenuPanelItem::disabled("help.about", "About")],
+        AppMenu::More => vec![
+            MenuPanelItem::action("more.bookmarks", "Bookmarks"),
+            MenuPanelItem::action("more.display", "Display"),
+            MenuPanelItem::action("more.options", "Options"),
+            MenuPanelItem::action("more.tools", "Tools"),
+            MenuPanelItem::action("more.macros", "Macros"),
+            MenuPanelItem::action("more.help", "Help"),
         ],
     };
-    let available_width = (viewport_width - 16.0).max(item_width);
-    let columns = (((available_width + gap) / (item_width + gap)).floor() as usize)
-        .max(1)
-        .min(items.len().max(1));
-    let row_count = (items.len() + columns - 1) / columns;
-    let panel_height =
-        row_count as f32 * item_height + row_count.saturating_sub(1) as f32 * gap + 16.0;
+
+    let item_width = ui_scale.value(match menu {
+        AppMenu::File => 220.0,
+        AppMenu::Display | AppMenu::Tools => 220.0,
+        AppMenu::Macros => 210.0,
+        AppMenu::View | AppMenu::Options | AppMenu::More => 190.0,
+        _ => 180.0,
+    });
+    let item_height = ui_scale.value(28.0);
+    let gap = ui_scale.value(2.0);
+    let panel_width = item_width + ui_scale.value(12.0);
+    let panel_height = items.iter().map(|item| item.height(ui_scale)).sum::<f32>()
+        + items.len().saturating_sub(1) as f32 * gap
+        + ui_scale.value(12.0);
+    let left = menu_popup_left(menu, panel_width, viewport_width, ui_scale);
 
     let panel = document.add_child(
         parent,
@@ -18726,56 +27226,1040 @@ fn add_menu_panel(
             format!("fabricad.menu_panel.{}", menu.slug()),
             layout::with_padding_all(
                 layout::with_gap_all(
-                    layout::with_size(
-                        layout::column(),
-                        layout::percent(1.0),
-                        layout::px(panel_height),
+                    layout::with_absolute_position(
+                        layout::with_size(
+                            layout::column(),
+                            layout::px(panel_width),
+                            layout::px(panel_height),
+                        ),
+                        left,
+                        ui_scale.value(30.0),
                     ),
                     gap,
                 ),
-                ui_scale.value(8.0),
+                ui_scale.value(6.0),
             ),
         )
         .with_visual(UiVisual::panel(
-            ColorRgba::new(22, 28, 34, 255),
-            Some(StrokeStyle::new(
-                ColorRgba::new(58, 72, 86, 255),
-                ui_scale.value(1.0),
-            )),
+            COLOR_CHROME_BG,
+            Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
             0.0,
         )),
     );
+    document.node_mut(panel).style.z_index = 80;
 
-    for (row_index, row_items) in items.chunks(columns).enumerate() {
-        let row = document.add_child(
-            panel,
-            UiNode::container(
-                format!("fabricad.menu_row.{}.{}", menu.slug(), row_index),
-                layout::with_gap_all(
-                    layout::with_size(layout::row(), layout::percent(1.0), layout::px(item_height)),
-                    gap,
-                ),
-            ),
-        );
-
-        for (action, label) in row_items {
-            let selected = action
-                .strip_prefix("view.")
-                .and_then(StartupView::from_slug)
-                == Some(active_view)
-                || action.strip_prefix("tool.").and_then(ToolMode::from_slug)
-                    == Some(app.active_tool);
-            add_button(
-                document,
-                row,
-                format!("fabricad.menu.item.{action}"),
+    for (index, item) in items.iter().enumerate() {
+        match item {
+            MenuPanelItem::Action {
+                action,
                 label,
                 selected,
-                layout::size(layout::px(item_width), layout::px(item_height)),
+                enabled,
+                ..
+            } => {
+                add_menu_item_button(
+                    document,
+                    panel,
+                    format!("fabricad.menu.item.{action}"),
+                    label,
+                    *selected,
+                    *enabled,
+                    layout::size(layout::px(item_width), layout::px(item_height)),
+                    ui_scale,
+                );
+            }
+            MenuPanelItem::Label(label) => {
+                add_text(
+                    document,
+                    panel,
+                    format!("fabricad.menu.label.{}.{}", menu.slug(), index),
+                    label,
+                    text_style(ui_scale.value(12.0), FontWeight::BOLD, COLOR_TEXT_MUTED),
+                    layout::size(layout::px(item_width), layout::px(ui_scale.value(22.0))),
+                );
+            }
+            MenuPanelItem::Separator => {
+                document.add_child(
+                    panel,
+                    UiNode::container(
+                        format!("fabricad.menu.separator.{}.{}", menu.slug(), index),
+                        layout::size(layout::px(item_width), layout::px(ui_scale.value(1.0))),
+                    )
+                    .with_visual(UiVisual::panel(
+                        COLOR_PANEL_STROKE,
+                        None,
+                        0.0,
+                    )),
+                );
+            }
+        }
+    }
+}
+
+fn add_operad_menu_list_panel(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    name: impl Into<String>,
+    items: &[MenuPanelItem],
+    panel_width: f32,
+    left: f32,
+    viewport: UiSize,
+    ui_scale: UiScale,
+    z_index: i16,
+) {
+    let name = name.into();
+    let operad_items = items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| item.to_operad_menu_item(format!("__label_{index}")))
+        .collect::<Vec<_>>();
+    let nodes = menu_list_popup(
+        document,
+        parent,
+        name,
+        AnchoredPopup::new(
+            UiRect::new(left, ui_scale.value(26.0), 0.0, 0.0),
+            UiRect::new(0.0, 0.0, viewport.width, viewport.height),
+            PopupPlacement::new(PopupSide::Bottom, PopupAlign::Start)
+                .with_offset(ui_scale.value(4.0))
+                .with_viewport_margin(ui_scale.value(4.0)),
+        ),
+        &operad_items,
+        None,
+        MenuListOptions {
+            width: panel_width,
+            row_height: ui_scale.value(28.0),
+            separator_height: ui_scale.value(8.0),
+            max_visible_rows: operad_items.len().max(1),
+            menu_visual: UiVisual::panel(
+                COLOR_CHROME_BG,
+                Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
+                0.0,
+            ),
+            item_visual: UiVisual::panel(
+                COLOR_BUTTON_BG,
+                Some(button_stroke(false, ui_scale)),
+                0.0,
+            ),
+            active_visual: UiVisual::panel(
+                COLOR_BUTTON_SELECTED,
+                Some(button_stroke(true, ui_scale)),
+                0.0,
+            ),
+            disabled_visual: UiVisual::panel(
+                COLOR_BUTTON_BG,
+                Some(button_stroke(false, ui_scale)),
+                0.0,
+            ),
+            text_style: text_style(ui_scale.value(13.0), FontWeight::NORMAL, COLOR_TEXT),
+            disabled_text_style: text_style(
+                ui_scale.value(12.0),
+                FontWeight::NORMAL,
+                COLOR_TEXT_MUTED,
+            ),
+            shortcut_text_style: text_style(
+                ui_scale.value(12.0),
+                FontWeight::NORMAL,
+                COLOR_TEXT_MUTED,
+            ),
+            destructive_text_style: text_style(
+                ui_scale.value(13.0),
+                FontWeight::NORMAL,
+                ColorRgba::new(238, 116, 106, 255),
+            ),
+            image_size: UiSize::new(ui_scale.value(18.0), ui_scale.value(18.0)),
+            z_index,
+            action_prefix: Some("fabricad.menu.item".to_string()),
+            ..Default::default()
+        },
+    );
+
+    for (row, item) in nodes.rows.iter().zip(items) {
+        if let MenuPanelItem::Action { action, .. } = item {
+            let row_node = document.node_mut(*row);
+            row_node.name = format!("fabricad.menu.item.{action}");
+            if let Some(accessibility) = row_node.accessibility.take() {
+                row_node.accessibility =
+                    Some(accessibility.action(AccessibilityAction::new("activate", "Activate")));
+            }
+        }
+    }
+}
+
+fn add_view_menu_panel(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    active_view: StartupView,
+    app: &FabricadApp,
+    viewport_width: f32,
+    ui_scale: UiScale,
+) {
+    let item_width = ui_scale.value(220.0);
+    let item_height = ui_scale.value(28.0);
+    let gap = ui_scale.value(2.0);
+    let items = [
+        (
+            "view.command_palette".to_string(),
+            "Command Palette...".to_string(),
+        ),
+        (
+            "view.sidebar_modules".to_string(),
+            "Sidebar Modules...".to_string(),
+        ),
+        (
+            format!("view.group.{}", ModuleGroup::Design.slug()),
+            ModuleGroup::Design.label().to_string(),
+        ),
+        (
+            format!("view.group.{}", ModuleGroup::Operations.slug()),
+            ModuleGroup::Operations.label().to_string(),
+        ),
+        (
+            format!("view.group.{}", ModuleGroup::Analysis.slug()),
+            ModuleGroup::Analysis.label().to_string(),
+        ),
+        (
+            format!("view.group.{}", ModuleGroup::Engineering.slug()),
+            ModuleGroup::Engineering.label().to_string(),
+        ),
+    ];
+    let panel_width = item_width + ui_scale.value(12.0);
+    let panel_height =
+        items.len() as f32 * item_height + items.len() as f32 * gap + ui_scale.value(13.0);
+    let left = menu_popup_left(AppMenu::View, panel_width, viewport_width, ui_scale);
+
+    let panel = document.add_child(
+        parent,
+        UiNode::container(
+            "fabricad.menu_panel.view",
+            layout::with_padding_all(
+                layout::with_gap_all(
+                    layout::with_absolute_position(
+                        layout::with_size(
+                            layout::column(),
+                            layout::px(panel_width),
+                            layout::px(panel_height),
+                        ),
+                        left,
+                        ui_scale.value(30.0),
+                    ),
+                    gap,
+                ),
+                ui_scale.value(6.0),
+            ),
+        )
+        .with_visual(UiVisual::panel(
+            COLOR_CHROME_BG,
+            Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
+            0.0,
+        )),
+    );
+    document.node_mut(panel).style.z_index = 80;
+
+    for (index, (action, label)) in items.iter().enumerate() {
+        let selected = action
+            .strip_prefix("view.group.")
+            .and_then(ModuleGroup::from_slug)
+            .is_some_and(|group| app.active_view_group == Some(group));
+        add_button(
+            document,
+            panel,
+            format!("fabricad.menu.item.{action}"),
+            label,
+            selected,
+            layout::size(layout::px(item_width), layout::px(item_height)),
+            ui_scale,
+        );
+
+        if index == 1 {
+            document.add_child(
+                panel,
+                UiNode::container(
+                    "fabricad.menu.view.separator",
+                    layout::size(layout::percent(1.0), layout::px(ui_scale.value(1.0))),
+                )
+                .with_visual(UiVisual::panel(COLOR_PANEL_STROKE, None, 0.0)),
+            );
+        }
+    }
+
+    let Some(group) = app.active_view_group else {
+        return;
+    };
+    let group_views = StartupView::ALL
+        .into_iter()
+        .filter(|view| view.group() == group)
+        .collect::<Vec<_>>();
+    let sub_item_width = ui_scale.value(190.0);
+    let sub_panel_width = sub_item_width + ui_scale.value(12.0);
+    let sub_panel_height = group_views.len() as f32 * item_height
+        + group_views.len().saturating_sub(1) as f32 * gap
+        + ui_scale.value(12.0);
+    let group_index = ModuleGroup::ALL
+        .into_iter()
+        .position(|candidate| candidate == group)
+        .unwrap_or(0);
+    let sub_left = (left + panel_width + ui_scale.value(4.0))
+        .min((viewport_width - sub_panel_width - ui_scale.value(4.0)).max(ui_scale.value(4.0)));
+    let sub_top = ui_scale.value(30.0 + 6.0) + (2 + group_index) as f32 * (item_height + gap);
+    let sub_panel = document.add_child(
+        parent,
+        UiNode::container(
+            format!("fabricad.menu_subpanel.view.{}", group.slug()),
+            layout::with_padding_all(
+                layout::with_gap_all(
+                    layout::with_absolute_position(
+                        layout::with_size(
+                            layout::column(),
+                            layout::px(sub_panel_width),
+                            layout::px(sub_panel_height),
+                        ),
+                        sub_left,
+                        sub_top,
+                    ),
+                    gap,
+                ),
+                ui_scale.value(6.0),
+            ),
+        )
+        .with_visual(UiVisual::panel(
+            COLOR_CHROME_BG,
+            Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
+            0.0,
+        )),
+    );
+    document.node_mut(sub_panel).style.z_index = 81;
+
+    for view in group_views {
+        add_button(
+            document,
+            sub_panel,
+            format!("fabricad.menu.item.view.{}", view.slug()),
+            view.nav_label(),
+            active_view == view,
+            layout::size(layout::px(sub_item_width), layout::px(item_height)),
+            ui_scale,
+        );
+    }
+}
+
+fn add_menu_button(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    menu: AppMenu,
+    selected: bool,
+    ui_scale: UiScale,
+) -> operad::UiNodeId {
+    let label = menu.label();
+    let width = menu_button_width(menu, ui_scale);
+    let height = ui_scale.value(22.0);
+    let text_rect = UiRect::new(
+        ui_scale.value(4.0),
+        ui_scale.value(2.0),
+        width - ui_scale.value(8.0),
+        height - ui_scale.value(4.0),
+    );
+    let underline_y = ui_scale.value(18.0);
+    document.add_child(
+        parent,
+        UiNode::scene(
+            format!("fabricad.menu.{}", menu.slug()),
+            vec![
+                ScenePrimitive::Text(
+                    PaintText::new(
+                        label,
+                        text_rect,
+                        text_style(
+                            ui_scale.value(13.0),
+                            FontWeight::NORMAL,
+                            if selected {
+                                COLOR_TEXT
+                            } else {
+                                COLOR_TEXT_MUTED
+                            },
+                        ),
+                    )
+                    .multiline(false),
+                ),
+                ScenePrimitive::Line {
+                    from: UiPoint::new(ui_scale.value(4.0), underline_y),
+                    to: UiPoint::new(ui_scale.value(11.0), underline_y),
+                    stroke: StrokeStyle::new(
+                        if selected {
+                            COLOR_TEXT
+                        } else {
+                            COLOR_TEXT_MUTED
+                        },
+                        ui_scale.value(1.0),
+                    ),
+                },
+            ],
+            layout::size(layout::px(width), layout::px(height)),
+        )
+        .with_input(InputBehavior::BUTTON)
+        .with_accessibility(button_accessibility(label))
+        .with_visual(UiVisual::panel(
+            if selected {
+                COLOR_PANEL_ALT
+            } else {
+                COLOR_CHROME_BG
+            },
+            None,
+            0.0,
+        )),
+    )
+}
+
+fn menu_button_width(menu: AppMenu, ui_scale: UiScale) -> f32 {
+    ui_scale.value((menu.label().len() as f32 * 9.8 + 20.0).max(44.0))
+}
+
+fn menu_popup_left(menu: AppMenu, panel_width: f32, viewport_width: f32, ui_scale: UiScale) -> f32 {
+    let compact_preceding = [AppMenu::File, AppMenu::Edit, AppMenu::View];
+    let (preceding_width, index) = if menu == AppMenu::More {
+        (
+            compact_preceding
+                .into_iter()
+                .map(|candidate| menu_button_width(candidate, ui_scale))
+                .sum::<f32>(),
+            compact_preceding.len(),
+        )
+    } else {
+        let index = AppMenu::ALL
+            .iter()
+            .position(|candidate| *candidate == menu)
+            .unwrap_or(0);
+        (
+            AppMenu::ALL
+                .iter()
+                .take(index)
+                .map(|candidate| menu_button_width(*candidate, ui_scale))
+                .sum::<f32>(),
+            index,
+        )
+    };
+    let gaps = ui_scale.value(4.0) * index as f32;
+    let left = ui_scale.value(4.0) + preceding_width + gaps;
+    left.min((viewport_width - panel_width - ui_scale.value(4.0)).max(ui_scale.value(4.0)))
+}
+
+fn add_scrollbar_rail(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    name: &str,
+    ui_scale: UiScale,
+) -> operad::UiNodeId {
+    let rail = document.add_child(
+        parent,
+        UiNode::container(
+            name,
+            layout::with_padding_all(
+                layout::with_size(
+                    layout::column(),
+                    layout::px(ui_scale.value(8.0)),
+                    layout::percent(1.0),
+                ),
+                ui_scale.value(2.0),
+            ),
+        )
+        .with_visual(UiVisual::panel(
+            ColorRgba::new(10, 14, 17, 255),
+            Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
+            0.0,
+        )),
+    );
+    document.add_child(
+        rail,
+        UiNode::container(
+            format!("{name}.thumb"),
+            layout::size(
+                layout::px(ui_scale.value(4.0)),
+                layout::px(ui_scale.value(130.0)),
+            ),
+        )
+        .with_visual(UiVisual::panel(
+            ColorRgba::new(82, 96, 109, 255),
+            None,
+            ui_scale.value(2.0),
+        )),
+    );
+    rail
+}
+
+fn add_command_palette_panel(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    app: &FabricadApp,
+    viewport: UiSize,
+    ui_scale: UiScale,
+) {
+    let width = (viewport.width - ui_scale.value(48.0))
+        .min(ui_scale.value(520.0))
+        .max(ui_scale.value(320.0));
+    let height = (viewport.height - ui_scale.value(96.0))
+        .min(ui_scale.value(520.0))
+        .max(ui_scale.value(280.0));
+    let left = ((viewport.width - width) * 0.5).max(ui_scale.value(12.0));
+    let top = ui_scale.value(64.0);
+    let panel = document.add_child(
+        parent,
+        UiNode::container(
+            "fabricad.command_palette",
+            layout::with_padding_all(
+                layout::with_gap_all(
+                    layout::with_absolute_position(
+                        layout::with_size(layout::column(), layout::px(width), layout::px(height)),
+                        left,
+                        top,
+                    ),
+                    ui_scale.value(8.0),
+                ),
+                ui_scale.value(10.0),
+            ),
+        )
+        .with_visual(UiVisual::panel(
+            COLOR_PANEL_BG,
+            Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
+            ui_scale.value(2.0),
+        )),
+    );
+    document.node_mut(panel).style.z_index = 100;
+
+    let header = document.add_child(
+        panel,
+        UiNode::container(
+            "fabricad.command.header",
+            layout::with_gap_all(
+                layout::with_size(
+                    layout::row(),
+                    layout::percent(1.0),
+                    layout::px(ui_scale.value(30.0)),
+                ),
+                ui_scale.value(8.0),
+            ),
+        ),
+    );
+    add_text(
+        document,
+        header,
+        "fabricad.command.title",
+        "Command Palette",
+        text_style(ui_scale.value(16.0), FontWeight::NORMAL, COLOR_TEXT),
+        layout::with_flex(layout::row(), 1.0, 1.0, layout::px(0.0)),
+    );
+    add_button(
+        document,
+        header,
+        "fabricad.command.close",
+        "Close",
+        false,
+        layout::size(
+            layout::px(ui_scale.value(72.0)),
+            layout::px(ui_scale.value(26.0)),
+        ),
+        ui_scale,
+    );
+
+    let list_height = height - ui_scale.value(58.0);
+    let list = document.add_child(
+        panel,
+        UiNode::container(
+            "fabricad.command.list",
+            layout::with_gap_all(
+                layout::with_size(
+                    layout::column(),
+                    layout::percent(1.0),
+                    layout::px(list_height),
+                ),
+                ui_scale.value(4.0),
+            ),
+        )
+        .with_scroll(ScrollAxes::VERTICAL),
+    );
+
+    let command_views = StartupView::ALL;
+    let button_height = ui_scale.value(28.0);
+    let row_gap = ui_scale.value(4.0);
+    let rows_fit = ((list_height + row_gap) / (button_height + row_gap))
+        .floor()
+        .max(1.0) as usize;
+    let column_count = if command_views.len() > rows_fit && width >= ui_scale.value(420.0) {
+        command_views.len().div_ceil(rows_fit).clamp(1, 2)
+    } else {
+        1
+    };
+
+    if column_count == 1 {
+        for view in command_views {
+            add_button(
+                document,
+                list,
+                format!("fabricad.command.view.{}", view.slug()),
+                format!("Go to {}", view.label()),
+                app.active_view == view,
+                layout::size(layout::percent(1.0), layout::px(button_height)),
+                ui_scale,
+            );
+        }
+    } else {
+        let rows = command_views.len().div_ceil(column_count);
+        for row_index in 0..rows {
+            let row = document.add_child(
+                list,
+                UiNode::container(
+                    format!("fabricad.command.row.{row_index}"),
+                    layout::with_gap_all(
+                        layout::with_size(
+                            layout::row(),
+                            layout::percent(1.0),
+                            layout::px(button_height),
+                        ),
+                        ui_scale.value(6.0),
+                    ),
+                ),
+            );
+            for column_index in 0..column_count {
+                let view_index = column_index * rows + row_index;
+                let Some(view) = command_views.get(view_index).copied() else {
+                    continue;
+                };
+                add_button(
+                    document,
+                    row,
+                    format!("fabricad.command.view.{}", view.slug()),
+                    format!("Go to {}", view.nav_label()),
+                    app.active_view == view,
+                    layout::with_flex(layout::row(), 1.0, 1.0, layout::px(0.0)),
+                    ui_scale,
+                );
+            }
+        }
+    }
+}
+
+fn add_sidebar_modules_panel(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    app: &FabricadApp,
+    viewport: UiSize,
+    ui_scale: UiScale,
+) {
+    let width = (viewport.width - ui_scale.value(48.0))
+        .min(ui_scale.value(380.0))
+        .max(ui_scale.value(300.0));
+    let height = (viewport.height - ui_scale.value(96.0))
+        .min(ui_scale.value(760.0))
+        .max(ui_scale.value(360.0));
+    let left = ((viewport.width - width) * 0.5).max(ui_scale.value(12.0));
+    let top = ui_scale.value(64.0);
+    let panel = document.add_child(
+        parent,
+        UiNode::container(
+            "fabricad.sidebar_modules",
+            layout::with_padding_all(
+                layout::with_gap_all(
+                    layout::with_absolute_position(
+                        layout::with_size(layout::column(), layout::px(width), layout::px(height)),
+                        left,
+                        top,
+                    ),
+                    ui_scale.value(8.0),
+                ),
+                ui_scale.value(10.0),
+            ),
+        )
+        .with_visual(UiVisual::panel(
+            COLOR_PANEL_BG,
+            Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
+            ui_scale.value(2.0),
+        )),
+    );
+    document.node_mut(panel).style.z_index = 100;
+
+    let header = document.add_child(
+        panel,
+        UiNode::container(
+            "fabricad.sidebar.header",
+            layout::with_gap_all(
+                layout::with_size(
+                    layout::row(),
+                    layout::percent(1.0),
+                    layout::px(ui_scale.value(30.0)),
+                ),
+                ui_scale.value(8.0),
+            ),
+        ),
+    );
+    add_text(
+        document,
+        header,
+        "fabricad.sidebar.title",
+        "Sidebar Modules",
+        text_style(ui_scale.value(16.0), FontWeight::NORMAL, COLOR_TEXT),
+        layout::with_flex(layout::row(), 1.0, 1.0, layout::px(0.0)),
+    );
+    add_button(
+        document,
+        header,
+        "fabricad.sidebar.close",
+        "Close",
+        false,
+        layout::size(
+            layout::px(ui_scale.value(72.0)),
+            layout::px(ui_scale.value(26.0)),
+        ),
+        ui_scale,
+    );
+
+    let controls = document.add_child(
+        panel,
+        UiNode::container(
+            "fabricad.sidebar.controls",
+            layout::with_gap_all(
+                layout::with_size(
+                    layout::row(),
+                    layout::percent(1.0),
+                    layout::px(ui_scale.value(30.0)),
+                ),
+                ui_scale.value(6.0),
+            ),
+        ),
+    );
+    for (name, label) in [
+        ("fabricad.sidebar.default", "Default"),
+        ("fabricad.sidebar.all", "All"),
+        ("fabricad.sidebar.none", "None"),
+    ] {
+        add_button(
+            document,
+            controls,
+            name,
+            label,
+            false,
+            layout::size(
+                layout::px(ui_scale.value(92.0)),
+                layout::px(ui_scale.value(26.0)),
+            ),
+            ui_scale,
+        );
+    }
+
+    let list_height = height - ui_scale.value(96.0);
+    let list = document.add_child(
+        panel,
+        UiNode::container(
+            "fabricad.sidebar.list",
+            layout::with_gap_all(
+                layout::with_size(
+                    layout::column(),
+                    layout::percent(1.0),
+                    layout::px(list_height.max(ui_scale.value(180.0))),
+                ),
+                ui_scale.value(2.0),
+            ),
+        )
+        .with_scroll(ScrollAxes::VERTICAL),
+    );
+    for group in ModuleGroup::ALL {
+        add_text(
+            document,
+            list,
+            format!("fabricad.sidebar.group.{}", group.slug()),
+            group.label(),
+            text_style(ui_scale.value(12.0), FontWeight::BOLD, COLOR_TEXT_MUTED),
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(16.0))),
+        );
+        for view in StartupView::ALL
+            .into_iter()
+            .filter(|view| view.group() == group)
+        {
+            add_button(
+                document,
+                list,
+                format!("fabricad.sidebar.view.{}", view.slug()),
+                view.nav_label(),
+                app.nav_rail_views.contains(&view),
+                layout::size(layout::percent(1.0), layout::px(ui_scale.value(20.0))),
                 ui_scale,
             );
         }
     }
+}
+
+fn add_options_panel(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    app: &FabricadApp,
+    viewport: UiSize,
+    ui_scale: UiScale,
+) {
+    let width = (viewport.width - ui_scale.value(48.0))
+        .min(ui_scale.value(380.0))
+        .max(ui_scale.value(300.0));
+    let height = ui_scale.value(360.0);
+    let left = ((viewport.width - width) * 0.5).max(ui_scale.value(12.0));
+    let top = ui_scale.value(64.0);
+    let panel = document.add_child(
+        parent,
+        UiNode::container(
+            "fabricad.options_panel",
+            layout::with_padding_all(
+                layout::with_gap_all(
+                    layout::with_absolute_position(
+                        layout::with_size(layout::column(), layout::px(width), layout::px(height)),
+                        left,
+                        top,
+                    ),
+                    ui_scale.value(8.0),
+                ),
+                ui_scale.value(10.0),
+            ),
+        )
+        .with_visual(UiVisual::panel(
+            COLOR_PANEL_BG,
+            Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
+            ui_scale.value(2.0),
+        )),
+    );
+    document.node_mut(panel).style.z_index = 100;
+    add_overlay_title_row(
+        document,
+        panel,
+        "fabricad.options",
+        "Options",
+        "fabricad.options.close",
+        width,
+        ui_scale,
+    );
+    add_text(
+        document,
+        panel,
+        "fabricad.options.label.theme",
+        "Theme",
+        text_style(ui_scale.value(12.0), FontWeight::BOLD, COLOR_TEXT_MUTED),
+        layout::size(layout::percent(1.0), layout::px(ui_scale.value(22.0))),
+    );
+    add_menu_item_button(
+        document,
+        panel,
+        "fabricad.menu.item.display.theme.dark",
+        "Dark",
+        app.dark_theme,
+        true,
+        layout::size(layout::percent(1.0), layout::px(ui_scale.value(28.0))),
+        ui_scale,
+    );
+    add_menu_item_button(
+        document,
+        panel,
+        "fabricad.menu.item.display.theme.light",
+        "Light",
+        !app.dark_theme,
+        true,
+        layout::size(layout::percent(1.0), layout::px(ui_scale.value(28.0))),
+        ui_scale,
+    );
+    add_text(
+        document,
+        panel,
+        "fabricad.options.label.units",
+        "Units",
+        text_style(ui_scale.value(12.0), FontWeight::BOLD, COLOR_TEXT_MUTED),
+        layout::size(layout::percent(1.0), layout::px(ui_scale.value(22.0))),
+    );
+    for unit in UnitDisplay::ALL {
+        add_menu_item_button(
+            document,
+            panel,
+            format!("fabricad.menu.item.display.units.{}", unit.slug()),
+            unit.label(),
+            app.unit_display == unit,
+            true,
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(28.0))),
+            ui_scale,
+        );
+    }
+    add_menu_item_button(
+        document,
+        panel,
+        "fabricad.menu.item.options.snap",
+        "Snap",
+        app.snap_enabled,
+        true,
+        layout::size(layout::percent(1.0), layout::px(ui_scale.value(28.0))),
+        ui_scale,
+    );
+}
+
+fn add_diagnostics_panel(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    app: &FabricadApp,
+    viewport: UiSize,
+    ui_scale: UiScale,
+) {
+    let width = (viewport.width - ui_scale.value(48.0))
+        .min(ui_scale.value(380.0))
+        .max(ui_scale.value(300.0));
+    let height = ui_scale.value(300.0);
+    let left = ((viewport.width - width) * 0.5).max(ui_scale.value(12.0));
+    let top = ui_scale.value(64.0);
+    let panel = document.add_child(
+        parent,
+        UiNode::container(
+            "fabricad.diagnostics_panel",
+            layout::with_padding_all(
+                layout::with_gap_all(
+                    layout::with_absolute_position(
+                        layout::with_size(layout::column(), layout::px(width), layout::px(height)),
+                        left,
+                        top,
+                    ),
+                    ui_scale.value(8.0),
+                ),
+                ui_scale.value(10.0),
+            ),
+        )
+        .with_visual(UiVisual::panel(
+            COLOR_PANEL_BG,
+            Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
+            ui_scale.value(2.0),
+        )),
+    );
+    document.node_mut(panel).style.z_index = 100;
+    add_overlay_title_row(
+        document,
+        panel,
+        "fabricad.diagnostics",
+        "Diagnostics",
+        "fabricad.diagnostics.close",
+        width,
+        ui_scale,
+    );
+    for (index, (label, value)) in [
+        ("View", app.active_view.nav_label().to_string()),
+        (
+            "Layout shapes",
+            app.workspace
+                .document
+                .flattened_shape_count_estimate()
+                .to_string(),
+        ),
+        ("Lots", app.workspace.mes.lots.len().to_string()),
+        (
+            "Equipment tools",
+            app.workspace.equipment.tools().count().to_string(),
+        ),
+        ("Active tool", app.active_tool.label().to_string()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        add_text(
+            document,
+            panel,
+            format!("fabricad.diagnostics.row.{index}"),
+            format!("{label}: {value}"),
+            text_style(ui_scale.value(12.0), FontWeight::NORMAL, COLOR_TEXT_MUTED),
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(28.0))),
+        );
+    }
+}
+
+fn add_overlay_title_row(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    name: &str,
+    title: &str,
+    close_name: &str,
+    width: f32,
+    ui_scale: UiScale,
+) {
+    let header = document.add_child(
+        parent,
+        UiNode::container(
+            format!("{name}.header"),
+            layout::with_gap_all(
+                layout::with_size(
+                    layout::row(),
+                    layout::px(width - ui_scale.value(20.0)),
+                    layout::px(ui_scale.value(30.0)),
+                ),
+                ui_scale.value(8.0),
+            ),
+        ),
+    );
+    add_text(
+        document,
+        header,
+        format!("{name}.title"),
+        title,
+        text_style(ui_scale.value(16.0), FontWeight::NORMAL, COLOR_TEXT),
+        layout::with_flex(layout::row(), 1.0, 1.0, layout::px(0.0)),
+    );
+    add_button(
+        document,
+        header,
+        close_name,
+        "Close",
+        false,
+        layout::size(
+            layout::px(ui_scale.value(72.0)),
+            layout::px(ui_scale.value(26.0)),
+        ),
+        ui_scale,
+    );
+}
+
+fn add_menu_item_button(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    name: impl Into<String>,
+    label: impl Into<String>,
+    selected: bool,
+    enabled: bool,
+    node_layout: impl Into<operad::LayoutStyle>,
+    ui_scale: UiScale,
+) -> operad::UiNodeId {
+    let name = name.into();
+    let label = label.into();
+    let text_color = if enabled {
+        COLOR_TEXT
+    } else {
+        COLOR_TEXT_MUTED
+    };
+    let mut primitives = Vec::new();
+    if selected {
+        let check_stroke =
+            StrokeStyle::new(ColorRgba::new(102, 190, 236, 255), ui_scale.value(1.6));
+        primitives.push(ScenePrimitive::Line {
+            from: UiPoint::new(ui_scale.value(8.0), ui_scale.value(14.0)),
+            to: UiPoint::new(ui_scale.value(12.0), ui_scale.value(18.0)),
+            stroke: check_stroke,
+        });
+        primitives.push(ScenePrimitive::Line {
+            from: UiPoint::new(ui_scale.value(12.0), ui_scale.value(18.0)),
+            to: UiPoint::new(ui_scale.value(19.0), ui_scale.value(9.0)),
+            stroke: check_stroke,
+        });
+    }
+    primitives.push(ScenePrimitive::Text(PaintText::new(
+        label.clone(),
+        UiRect::new(
+            ui_scale.value(28.0),
+            ui_scale.value(6.0),
+            ui_scale.value(720.0),
+            ui_scale.value(18.0),
+        ),
+        text_style(ui_scale.value(13.0), FontWeight::NORMAL, text_color),
+    )));
+    let mut node = UiNode::scene(name, primitives, node_layout)
+        .with_accessibility(button_accessibility(&label))
+        .with_visual(UiVisual::panel(COLOR_BUTTON_BG, None, 0.0));
+    if enabled {
+        node = node.with_input(InputBehavior::BUTTON);
+    }
+    document.add_child(parent, node)
 }
 
 fn add_button(
@@ -18787,39 +28271,75 @@ fn add_button(
     node_layout: impl Into<operad::LayoutStyle>,
     ui_scale: UiScale,
 ) -> operad::UiNodeId {
+    let name = name.into();
     let label = label.into();
     let fill = if selected {
-        ColorRgba::new(45, 78, 103, 255)
+        COLOR_BUTTON_SELECTED
     } else {
-        ColorRgba::new(31, 39, 47, 255)
+        COLOR_BUTTON_BG
     };
+    let stroke = Some(StrokeStyle::new(
+        if selected {
+            ColorRgba::new(60, 134, 190, 255)
+        } else {
+            COLOR_PANEL_STROKE
+        },
+        ui_scale.value(1.0),
+    ));
+    let text_style = text_style(
+        ui_scale.value(13.0),
+        if selected {
+            FontWeight::BOLD
+        } else {
+            FontWeight::NORMAL
+        },
+        COLOR_TEXT,
+    );
+    let button_id = button(
+        document,
+        parent,
+        name.clone(),
+        label.clone(),
+        ButtonOptions::new(node_layout)
+            .with_visual(UiVisual::panel(fill, stroke, ui_scale.value(2.0)))
+            .with_text_style(text_style)
+            .with_action(WidgetActionBinding::action(name))
+            .with_accessibility_label(label),
+    );
+    document.node_mut(button_id).layout_constraint = None;
+    button_id
+}
+
+fn add_node_marker(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    name: impl Into<String>,
+) -> operad::UiNodeId {
     document.add_child(
         parent,
-        UiNode::text(
+        UiNode::container(
             name,
-            label.clone(),
-            text_style(
-                ui_scale.value(13.0),
-                if selected {
-                    FontWeight::BOLD
-                } else {
-                    FontWeight::NORMAL
-                },
-                ColorRgba::new(229, 235, 240, 255),
+            layout::with_absolute_position(
+                layout::size(layout::px(0.0), layout::px(0.0)),
+                0.0,
+                0.0,
             ),
-            layout::with_padding_all(node_layout.into(), ui_scale.value(7.0)),
-        )
-        .with_input(InputBehavior::BUTTON)
-        .with_accessibility(button_accessibility(&label))
-        .with_visual(UiVisual::panel(
-            fill,
-            Some(StrokeStyle::new(
-                ColorRgba::new(68, 82, 96, 255),
-                ui_scale.value(1.0),
-            )),
-            ui_scale.value(4.0),
-        )),
+        ),
     )
+}
+
+fn attach_default_pointer_actions(document: &mut UiDocument) {
+    for index in 0..document.node_count() {
+        let id = operad::UiNodeId(index);
+        let action = {
+            let node = document.node(id);
+            let is_canvas = matches!(node.content, UiContent::Canvas(_));
+            (node.action.is_none() && node.input.pointer && !is_canvas).then(|| node.name.clone())
+        };
+        if let Some(action) = action {
+            document.node_mut(id).action = Some(WidgetActionBinding::action(action));
+        }
+    }
 }
 
 fn button_accessibility(label: &str) -> AccessibilityMeta {
@@ -18840,61 +28360,6 @@ fn add_text(
     document.add_child(parent, UiNode::text(name, text, style, node_layout));
 }
 
-fn add_metric(
-    document: &mut UiDocument,
-    parent: operad::UiNodeId,
-    key: &str,
-    value: String,
-    label: &str,
-    ui_scale: UiScale,
-) {
-    let tile = document.add_child(
-        parent,
-        UiNode::container(
-            format!("fabricad.metric.{key}"),
-            layout::with_padding_all(
-                layout::with_gap_all(
-                    layout::with_flex(layout::column(), 1.0, 1.0, layout::percent(0.0)),
-                    ui_scale.value(4.0),
-                ),
-                ui_scale.value(12.0),
-            ),
-        )
-        .with_visual(UiVisual::panel(
-            ColorRgba::new(27, 34, 42, 255),
-            Some(StrokeStyle::new(
-                ColorRgba::new(56, 70, 84, 255),
-                ui_scale.value(1.0),
-            )),
-            ui_scale.value(4.0),
-        )),
-    );
-    add_text(
-        document,
-        tile,
-        format!("fabricad.metric.{key}.value"),
-        value,
-        text_style(
-            ui_scale.value(24.0),
-            FontWeight::BOLD,
-            ColorRgba::new(242, 247, 250, 255),
-        ),
-        layout::size(layout::percent(1.0), layout::px(ui_scale.value(34.0))),
-    );
-    add_text(
-        document,
-        tile,
-        format!("fabricad.metric.{key}.label"),
-        label,
-        text_style(
-            ui_scale.value(12.0),
-            FontWeight::NORMAL,
-            ColorRgba::new(154, 165, 176, 255),
-        ),
-        layout::size(layout::percent(1.0), layout::px(ui_scale.value(22.0))),
-    );
-}
-
 fn text_style(font_size: f32, weight: FontWeight, color: ColorRgba) -> TextStyle {
     TextStyle {
         font_size,
@@ -18906,22 +28371,53 @@ fn text_style(font_size: f32, weight: FontWeight, color: ColorRgba) -> TextStyle
     }
 }
 
+fn visible_layout_preview_shapes(document: &Document) -> Vec<(ShapeId, Shape)> {
+    document
+        .visible_flattened_shapes()
+        .into_iter()
+        .take(320)
+        .map(|shape| (shape.source_shape_id(), shape.transformed_shape()))
+        .collect()
+}
+
+fn add_layout_preview_grid(primitives: &mut Vec<ScenePrimitive>, ui_scale: UiScale) {
+    let left = ui_scale.value(20.0);
+    let right = ui_scale.value(940.0);
+    let top = ui_scale.value(20.0);
+    let bottom = ui_scale.value(532.0);
+    let minor = StrokeStyle::new(ColorRgba::new(54, 66, 77, 150), ui_scale.value(1.0));
+    let major = StrokeStyle::new(ColorRgba::new(72, 86, 98, 190), ui_scale.value(1.0));
+    for index in 0..=32 {
+        let x = left + index as f32 * ui_scale.value(28.0);
+        if x > right {
+            break;
+        }
+        primitives.push(ScenePrimitive::Line {
+            from: UiPoint::new(x, top),
+            to: UiPoint::new(x, bottom),
+            stroke: if index % 4 == 0 { major } else { minor },
+        });
+    }
+    for index in 0..=20 {
+        let y = top + index as f32 * ui_scale.value(28.0);
+        if y > bottom {
+            break;
+        }
+        primitives.push(ScenePrimitive::Line {
+            from: UiPoint::new(left, y),
+            to: UiPoint::new(right, y),
+            stroke: if index % 4 == 0 { major } else { minor },
+        });
+    }
+}
+
 fn layout_preview_primitives(
     document: &Document,
     selected_shape: Option<ShapeId>,
+    show_grid: bool,
     ui_scale: UiScale,
 ) -> Vec<ScenePrimitive> {
-    let shapes = document
-        .shapes
-        .values()
-        .filter(|shape| {
-            document
-                .layers
-                .get(&shape.layer)
-                .is_none_or(|layer| layer.visible)
-        })
-        .take(320)
-        .collect::<Vec<_>>();
+    let shapes = visible_layout_preview_shapes(document);
     if shapes.is_empty() {
         return vec![ScenePrimitive::Line {
             from: UiPoint::new(ui_scale.value(24.0), ui_scale.value(180.0)),
@@ -18931,7 +28427,7 @@ fn layout_preview_primitives(
     }
 
     let mut bounds: Option<Rect> = None;
-    for shape in &shapes {
+    for (_, shape) in &shapes {
         if let Some(shape_bounds) = shape_bounds(&shape.kind) {
             bounds = Some(match bounds {
                 Some(current) => current.union(shape_bounds),
@@ -18948,16 +28444,14 @@ fn layout_preview_primitives(
         ui_scale.value(30.0) - bounds.min.y as f32 * scale,
     );
 
-    let mut primitives = Vec::with_capacity(shapes.len() + 2);
-    primitives.push(ScenePrimitive::Line {
-        from: UiPoint::new(ui_scale.value(24.0), ui_scale.value(328.0)),
-        to: UiPoint::new(ui_scale.value(936.0), ui_scale.value(328.0)),
-        stroke: StrokeStyle::new(ColorRgba::new(44, 57, 70, 255), ui_scale.value(1.0)),
-    });
+    let mut primitives = Vec::with_capacity(shapes.len() + 80);
+    if show_grid {
+        add_layout_preview_grid(&mut primitives, ui_scale);
+    }
 
-    for shape in shapes {
+    for (source_shape_id, shape) in shapes {
         let layer = document.layers.get(&shape.layer);
-        let selected = selected_shape == Some(shape.id);
+        let selected = selected_shape == Some(source_shape_id);
         let fill_alpha = if selected { 210 } else { 150 };
         let stroke_width = if selected {
             ui_scale.value(2.5)
@@ -19048,6 +28542,320 @@ fn layout_preview_primitives(
     primitives
 }
 
+fn layout_overlay_primitives(
+    app: &FabricadApp,
+    size: UiSize,
+    ui_scale: UiScale,
+) -> Vec<ScenePrimitive> {
+    let mut primitives = Vec::new();
+    if app.show_grid {
+        add_layout_grid_overlay_primitives(&mut primitives, app, size, ui_scale);
+    }
+
+    let highlight = StrokeStyle::new(ColorRgba::new(112, 236, 214, 240), ui_scale.value(2.0));
+    if let Some(selected) = app.selected_layout_occurrence.as_ref() {
+        let mut highlighted = BTreeSet::new();
+        if let Ok(report) = app.connectivity_report()
+            && let Some(component_id) = report.component_for_occurrence(selected)
+            && let Some(component) = report.component(component_id)
+        {
+            for occurrence in &component.shapes {
+                highlighted.insert(occurrence.source_shape_id());
+            }
+        }
+        if highlighted.is_empty() {
+            highlighted.insert(selected.source_shape_id());
+        }
+        for shape_id in highlighted {
+            if let Some(shape) = app.workspace.document.shapes.get(&shape_id) {
+                add_overlay_rect_outline(
+                    &mut primitives,
+                    app,
+                    size,
+                    shape.kind.bounds(),
+                    highlight,
+                );
+            }
+        }
+    }
+
+    if matches!(app.active_tool, ToolMode::Route) {
+        let fill = ColorRgba::new(250, 210, 80, 255);
+        for point in &app.route_points {
+            primitives.push(ScenePrimitive::Circle {
+                center: app.layout_world_to_canvas(*point, size),
+                radius: ui_scale.value(5.0),
+                fill,
+                stroke: Some(StrokeStyle::new(
+                    ColorRgba::new(18, 22, 28, 255),
+                    ui_scale.value(1.0),
+                )),
+            });
+        }
+    }
+
+    if app.show_drc_overlay {
+        let active = app
+            .drc_report()
+            .violations
+            .iter()
+            .filter(|violation| drc_violation_is_active(&app.workspace.document, violation))
+            .count();
+        if active > 0 {
+            primitives.push(ScenePrimitive::Text(PaintText::new(
+                format!("DRC overlay: {active} active"),
+                UiRect::new(
+                    ui_scale.value(10.0),
+                    ui_scale.value(10.0),
+                    ui_scale.value(240.0),
+                    ui_scale.value(20.0),
+                ),
+                text_style(
+                    ui_scale.value(12.0),
+                    FontWeight::BOLD,
+                    ColorRgba::new(238, 181, 82, 255),
+                ),
+            )));
+        }
+    }
+
+    primitives
+}
+
+fn add_layout_grid_overlay_primitives(
+    primitives: &mut Vec<ScenePrimitive>,
+    app: &FabricadApp,
+    size: UiSize,
+    ui_scale: UiScale,
+) {
+    let grid = app.layout_grid_step_for_zoom().max(1);
+    let viewport = app.layout_viewport_for_size(size);
+    let min_x = viewport.min.x.div_euclid(grid) * grid;
+    let max_x = viewport.max.x.div_euclid(grid) * grid + grid;
+    let min_y = viewport.min.y.div_euclid(grid) * grid;
+    let max_y = viewport.max.y.div_euclid(grid) * grid + grid;
+    let minor = StrokeStyle::new(ColorRgba::new(82, 94, 98, 46), ui_scale.value(1.0));
+    let major = StrokeStyle::new(ColorRgba::new(116, 132, 138, 82), ui_scale.value(1.0));
+    let major_step = grid.saturating_mul(5).max(grid);
+
+    for x in (min_x..=max_x).step_by(grid as usize) {
+        let stroke = if x == 0 || x.rem_euclid(major_step) == 0 {
+            major
+        } else {
+            minor
+        };
+        primitives.push(ScenePrimitive::Line {
+            from: app.layout_world_to_canvas(Point::new(x, min_y), size),
+            to: app.layout_world_to_canvas(Point::new(x, max_y), size),
+            stroke,
+        });
+    }
+    for y in (min_y..=max_y).step_by(grid as usize) {
+        let stroke = if y == 0 || y.rem_euclid(major_step) == 0 {
+            major
+        } else {
+            minor
+        };
+        primitives.push(ScenePrimitive::Line {
+            from: app.layout_world_to_canvas(Point::new(min_x, y), size),
+            to: app.layout_world_to_canvas(Point::new(max_x, y), size),
+            stroke,
+        });
+    }
+}
+
+fn add_overlay_rect_outline(
+    primitives: &mut Vec<ScenePrimitive>,
+    app: &FabricadApp,
+    size: UiSize,
+    bounds: Rect,
+    stroke: StrokeStyle,
+) {
+    let min = app.layout_world_to_canvas(bounds.min, size);
+    let max = app.layout_world_to_canvas(bounds.max, size);
+    let a = UiPoint::new(min.x, min.y);
+    let b = UiPoint::new(max.x, min.y);
+    let c = UiPoint::new(max.x, max.y);
+    let d = UiPoint::new(min.x, max.y);
+    primitives.push(ScenePrimitive::Line {
+        from: a,
+        to: b,
+        stroke,
+    });
+    primitives.push(ScenePrimitive::Line {
+        from: b,
+        to: c,
+        stroke,
+    });
+    primitives.push(ScenePrimitive::Line {
+        from: c,
+        to: d,
+        stroke,
+    });
+    primitives.push(ScenePrimitive::Line {
+        from: d,
+        to: a,
+        stroke,
+    });
+}
+
+fn layout_3d_preview_primitives(
+    document: &Document,
+    selected_shape: Option<ShapeId>,
+    ui_scale: UiScale,
+) -> Vec<ScenePrimitive> {
+    let mut shapes = visible_layout_preview_shapes(document);
+    if shapes.is_empty() {
+        return vec![ScenePrimitive::Line {
+            from: UiPoint::new(ui_scale.value(36.0), ui_scale.value(360.0)),
+            to: UiPoint::new(ui_scale.value(940.0), ui_scale.value(360.0)),
+            stroke: StrokeStyle::new(ColorRgba::new(76, 92, 108, 255), ui_scale.value(1.0)),
+        }];
+    }
+    shapes.sort_by_key(|(_, shape)| shape.layer.0);
+
+    let mut bounds: Option<Rect> = None;
+    for (_, shape) in &shapes {
+        if let Some(shape_bounds) = shape_bounds(&shape.kind) {
+            bounds = Some(match bounds {
+                Some(current) => current.union(shape_bounds),
+                None => shape_bounds,
+            });
+        }
+    }
+    let bounds = bounds.unwrap_or_else(|| Rect::from_min_size(Point::ZERO, 1, 1));
+    let scale_x = ui_scale.value(820.0) / bounds.width().max(1) as f32;
+    let scale_y = ui_scale.value(360.0) / bounds.height().max(1) as f32;
+    let scale = scale_x.min(scale_y).max(0.0001);
+    let max_layer = shapes
+        .iter()
+        .map(|(_, shape)| shape.layer.0)
+        .max()
+        .unwrap_or(1) as f32;
+    let origin = UiPoint::new(
+        ui_scale.value(42.0),
+        ui_scale.value(96.0) + max_layer * ui_scale.value(5.0),
+    );
+    let slab_offset = UiPoint::new(ui_scale.value(10.0), ui_scale.value(14.0));
+
+    let mut primitives = Vec::with_capacity(shapes.len() * 3 + 16);
+    for step in 0..=6 {
+        let t = step as f32 / 6.0;
+        let x = bounds.min.x + ((bounds.width() as f32) * t).round() as Coord;
+        let y = bounds.min.y + ((bounds.height() as f32) * t).round() as Coord;
+        primitives.push(ScenePrimitive::Line {
+            from: map_point_3d(Point::new(x, bounds.min.y), bounds, scale, origin, 0.0),
+            to: map_point_3d(Point::new(x, bounds.max.y), bounds, scale, origin, 0.0),
+            stroke: StrokeStyle::new(ColorRgba::new(28, 42, 52, 180), ui_scale.value(1.0)),
+        });
+        primitives.push(ScenePrimitive::Line {
+            from: map_point_3d(Point::new(bounds.min.x, y), bounds, scale, origin, 0.0),
+            to: map_point_3d(Point::new(bounds.max.x, y), bounds, scale, origin, 0.0),
+            stroke: StrokeStyle::new(ColorRgba::new(28, 42, 52, 180), ui_scale.value(1.0)),
+        });
+    }
+
+    for (source_shape_id, shape) in shapes {
+        let layer = document.layers.get(&shape.layer);
+        let selected = selected_shape == Some(source_shape_id);
+        let alpha = if selected { 225 } else { 176 };
+        let top_fill = layer
+            .map(|layer| layer_color(layer.color, alpha))
+            .unwrap_or_else(|| ColorRgba::new(92, 160, 220, alpha));
+        let side_fill = shade_color(top_fill, 0.58);
+        let stroke_color = if selected {
+            ColorRgba::new(250, 219, 112, 255)
+        } else {
+            shade_color(top_fill, 1.25)
+        };
+        let stroke = Some(StrokeStyle::new(
+            stroke_color,
+            if selected {
+                ui_scale.value(2.0)
+            } else {
+                ui_scale.value(1.0)
+            },
+        ));
+        let z = shape.layer.0 as f32 * ui_scale.value(10.0);
+        match &shape.kind {
+            ShapeKind::Rectangle(rect) => {
+                let top = [
+                    map_point_3d(rect.min, bounds, scale, origin, z),
+                    map_point_3d(Point::new(rect.max.x, rect.min.y), bounds, scale, origin, z),
+                    map_point_3d(rect.max, bounds, scale, origin, z),
+                    map_point_3d(Point::new(rect.min.x, rect.max.y), bounds, scale, origin, z),
+                ];
+                let bottom = top.map(|point| offset_ui_point(point, slab_offset.x, slab_offset.y));
+                primitives.push(ScenePrimitive::Polygon {
+                    points: vec![top[1], top[2], bottom[2], bottom[1]],
+                    fill: shade_color(side_fill, 0.82),
+                    stroke,
+                });
+                primitives.push(ScenePrimitive::Polygon {
+                    points: vec![top[3], top[2], bottom[2], bottom[3]],
+                    fill: side_fill,
+                    stroke,
+                });
+                primitives.push(ScenePrimitive::Polygon {
+                    points: top.to_vec(),
+                    fill: top_fill,
+                    stroke,
+                });
+            }
+            ShapeKind::Polygon(polygon) => {
+                let points = polygon
+                    .points
+                    .iter()
+                    .map(|point| map_point_3d(*point, bounds, scale, origin, z))
+                    .collect::<Vec<_>>();
+                primitives.push(ScenePrimitive::Polygon {
+                    points,
+                    fill: top_fill,
+                    stroke,
+                });
+            }
+            ShapeKind::Path { points, .. } => {
+                for pair in points.windows(2) {
+                    primitives.push(ScenePrimitive::Line {
+                        from: map_point_3d(pair[0], bounds, scale, origin, z),
+                        to: map_point_3d(pair[1], bounds, scale, origin, z),
+                        stroke: StrokeStyle::new(top_fill, ui_scale.value(3.0)),
+                    });
+                }
+            }
+            ShapeKind::Via { center, size, .. } => {
+                primitives.push(ScenePrimitive::Circle {
+                    center: map_point_3d(*center, bounds, scale, origin, z + ui_scale.value(5.0)),
+                    radius: ((*size as f32 * scale) * 0.5)
+                        .clamp(ui_scale.value(4.0), ui_scale.value(18.0)),
+                    fill: top_fill,
+                    stroke,
+                });
+            }
+            ShapeKind::Label { position, .. } => {
+                primitives.push(ScenePrimitive::Circle {
+                    center: map_point_3d(*position, bounds, scale, origin, z),
+                    radius: ui_scale.value(4.0),
+                    fill: ColorRgba::new(234, 218, 132, 230),
+                    stroke: None,
+                });
+            }
+            ShapeKind::Measurement { a, b, .. } => {
+                primitives.push(ScenePrimitive::Line {
+                    from: map_point_3d(*a, bounds, scale, origin, z),
+                    to: map_point_3d(*b, bounds, scale, origin, z),
+                    stroke: StrokeStyle::new(
+                        ColorRgba::new(238, 188, 116, 230),
+                        ui_scale.value(1.5),
+                    ),
+                });
+            }
+        }
+    }
+
+    primitives
+}
+
 fn shape_bounds(kind: &ShapeKind) -> Option<Rect> {
     Rect::from_points(&kind.key_points())
 }
@@ -19098,12 +28906,32 @@ fn map_point(point: Point, scale: f32, offset: UiPoint) -> UiPoint {
     )
 }
 
+fn map_point_3d(point: Point, bounds: Rect, scale: f32, origin: UiPoint, z: f32) -> UiPoint {
+    UiPoint::new(
+        origin.x + (point.x - bounds.min.x) as f32 * scale + z * 0.58,
+        origin.y + (point.y - bounds.min.y) as f32 * scale * 0.62 - z * 0.42,
+    )
+}
+
+fn offset_ui_point(point: UiPoint, dx: f32, dy: f32) -> UiPoint {
+    UiPoint::new(point.x + dx, point.y + dy)
+}
+
 fn layer_color(color: [f32; 4], alpha: u8) -> ColorRgba {
     ColorRgba::new(
         (color[0].clamp(0.0, 1.0) * 255.0).round() as u8,
         (color[1].clamp(0.0, 1.0) * 255.0).round() as u8,
         (color[2].clamp(0.0, 1.0) * 255.0).round() as u8,
         alpha,
+    )
+}
+
+fn shade_color(color: ColorRgba, factor: f32) -> ColorRgba {
+    ColorRgba::new(
+        ((color.r as f32 * factor).round().clamp(0.0, 255.0)) as u8,
+        ((color.g as f32 * factor).round().clamp(0.0, 255.0)) as u8,
+        ((color.b as f32 * factor).round().clamp(0.0, 255.0)) as u8,
+        color.a,
     )
 }
 
@@ -19526,9 +29354,425 @@ fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     result
 }
 
+fn layout_drag_world(start: Point, target: Point, modifiers: operad::KeyModifiers) -> Point {
+    if modifiers.shift {
+        axis_constrained_point(start, target)
+    } else {
+        target
+    }
+}
+
+fn rect_size(rect: UiRect) -> UiSize {
+    UiSize::new(rect.width, rect.height)
+}
+
+fn local_canvas_point(point: UiPoint, rect: UiRect) -> UiPoint {
+    UiPoint::new(point.x - rect.x, point.y - rect.y)
+}
+
+fn fixed_height_layout(style: LayoutStyle, height: f32) -> LayoutStyle {
+    layout::with_min_size(
+        layout::with_flex(style, 0.0, 0.0, layout::px(height)),
+        layout::px(0.0),
+        layout::px(height),
+    )
+}
+
+fn fixed_row_child_layout(style: LayoutStyle, width: f32, height: f32) -> LayoutStyle {
+    layout::with_min_size(
+        layout::with_flex(style, 0.0, 0.0, layout::px(width)),
+        layout::px(width),
+        layout::px(height),
+    )
+}
+
+fn layout_occurrence_label(occurrence: &ShapeOccurrenceId) -> String {
+    if occurrence.is_top_level() {
+        format!("shape #{}", occurrence.source_shape_id().0)
+    } else {
+        format!("shape #{} instance", occurrence.source_shape_id().0)
+    }
+}
+
+fn format_physical_length_with_options(
+    length_dbu: f64,
+    dbu_per_micron: Coord,
+    unit_display: UnitDisplay,
+    precision: usize,
+) -> String {
+    let dbu_per_micron = dbu_per_micron.max(1) as f64;
+    match unit_display {
+        UnitDisplay::Dbu => format!("{length_dbu:.0} dbu"),
+        UnitDisplay::Nanometers => {
+            let nm = length_dbu / dbu_per_micron * 1000.0;
+            format!("{nm:.precision$} nm")
+        }
+        UnitDisplay::Microns => {
+            let um = length_dbu / dbu_per_micron;
+            format!("{um:.precision$} um")
+        }
+        UnitDisplay::Auto => {
+            let nm = length_dbu / dbu_per_micron * 1000.0;
+            if nm.abs() >= 1000.0 {
+                let um = nm / 1000.0;
+                format!("{um:.precision$} um")
+            } else {
+                format!("{nm:.precision$} nm")
+            }
+        }
+    }
+}
+
+fn layout_rect_end(start: Point, target: Point, modifiers: operad::KeyModifiers) -> Point {
+    if modifiers.shift {
+        square_constrained_point(start, target)
+    } else {
+        target
+    }
+}
+
+fn layout_vertex_drag_position(
+    original_position: Point,
+    start: Point,
+    target: Point,
+    modifiers: operad::KeyModifiers,
+) -> Point {
+    let constrained = layout_drag_world(start, target, modifiers);
+    original_position.translated(Vector::new(
+        constrained.x - start.x,
+        constrained.y - start.y,
+    ))
+}
+
+fn axis_constrained_point(start: Point, target: Point) -> Point {
+    let dx = target.x - start.x;
+    let dy = target.y - start.y;
+    if dx.abs() >= dy.abs() {
+        Point::new(target.x, start.y)
+    } else {
+        Point::new(start.x, target.y)
+    }
+}
+
+fn square_constrained_point(start: Point, target: Point) -> Point {
+    let dx = target.x - start.x;
+    let dy = target.y - start.y;
+    let side = dx.abs().max(dy.abs());
+    Point::new(
+        start.x + if dx < 0 { -side } else { side },
+        start.y + if dy < 0 { -side } else { side },
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShapeTransform {
+    RotateCw90,
+    MirrorX,
+    MirrorY,
+}
+
+fn transform_shape_kind(kind: &ShapeKind, center: Point, transform: ShapeTransform) -> ShapeKind {
+    let mut transformed = kind.clone();
+    match &mut transformed {
+        ShapeKind::Rectangle(rect) => {
+            let points = rect
+                .corners()
+                .into_iter()
+                .map(|point| transform_point(point, center, transform))
+                .collect::<Vec<_>>();
+            *rect = Rect::from_points(&points).unwrap_or(*rect);
+        }
+        ShapeKind::Polygon(poly) => {
+            for point in &mut poly.points {
+                *point = transform_point(*point, center, transform);
+            }
+        }
+        ShapeKind::Path { points, .. } => {
+            for point in points {
+                *point = transform_point(*point, center, transform);
+            }
+        }
+        ShapeKind::Via {
+            center: via_center, ..
+        }
+        | ShapeKind::Label {
+            position: via_center,
+            ..
+        } => {
+            *via_center = transform_point(*via_center, center, transform);
+        }
+        ShapeKind::Measurement { a, b, .. } => {
+            *a = transform_point(*a, center, transform);
+            *b = transform_point(*b, center, transform);
+        }
+    }
+    transformed
+}
+
+fn transform_point(point: Point, center: Point, transform: ShapeTransform) -> Point {
+    let dx = point.x - center.x;
+    let dy = point.y - center.y;
+    match transform {
+        ShapeTransform::RotateCw90 => Point::new(center.x + dy, center.y - dx),
+        ShapeTransform::MirrorX => Point::new(point.x, center.y - dy),
+        ShapeTransform::MirrorY => Point::new(center.x - dx, point.y),
+    }
+}
+
+fn editable_vertex_points(kind: &ShapeKind) -> Vec<Point> {
+    kind.key_points()
+}
+
+fn editable_edges(kind: &ShapeKind) -> Vec<(Point, Point)> {
+    let points = editable_vertex_points(kind);
+    match kind {
+        ShapeKind::Rectangle(_) | ShapeKind::Polygon(_) if !points.is_empty() => points
+            .iter()
+            .enumerate()
+            .map(|(index, point)| (*point, points[(index + 1) % points.len()]))
+            .collect(),
+        ShapeKind::Path { .. } | ShapeKind::Measurement { .. } => {
+            points.windows(2).map(|pair| (pair[0], pair[1])).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn shape_edge_is_draggable(kind: &ShapeKind, edge: usize) -> bool {
+    edge < editable_edges(kind).len()
+}
+
+fn shape_with_moved_vertex(shape: &Shape, vertex: usize, position: Point) -> Option<Shape> {
+    let mut shape = shape.clone();
+    match &mut shape.kind {
+        ShapeKind::Rectangle(rect) => {
+            let mut corners = rect.corners();
+            *corners.get_mut(vertex)? = position;
+            *rect = Rect::from_points(&corners)?;
+        }
+        ShapeKind::Polygon(poly) => *poly.points.get_mut(vertex)? = position,
+        ShapeKind::Path { points, .. } => *points.get_mut(vertex)? = position,
+        ShapeKind::Via { center, .. }
+        | ShapeKind::Label {
+            position: center, ..
+        } => {
+            if vertex != 0 {
+                return None;
+            }
+            *center = position;
+        }
+        ShapeKind::Measurement { a, b, .. } => match vertex {
+            0 => *a = position,
+            1 => *b = position,
+            _ => return None,
+        },
+    }
+    Some(shape)
+}
+
+fn shape_with_inserted_vertex(shape: &Shape, edge: usize, position: Point) -> Option<Shape> {
+    let mut shape = shape.clone();
+    match &mut shape.kind {
+        ShapeKind::Rectangle(rect) => {
+            let mut points = rect.corners().to_vec();
+            if edge >= points.len() {
+                return None;
+            }
+            points.insert(edge + 1, position);
+            shape.kind = ShapeKind::Polygon(geometry_core::Polygon::new(points));
+        }
+        ShapeKind::Polygon(poly) => {
+            if edge >= poly.points.len() {
+                return None;
+            }
+            poly.points.insert(edge + 1, position);
+        }
+        ShapeKind::Path { points, .. } => {
+            if edge + 1 > points.len() {
+                return None;
+            }
+            points.insert(edge + 1, position);
+        }
+        _ => return None,
+    }
+    Some(shape)
+}
+
+fn shape_with_deleted_vertex(shape: &Shape, vertex: usize) -> Option<Shape> {
+    let mut shape = shape.clone();
+    match &mut shape.kind {
+        ShapeKind::Polygon(poly) if poly.points.len() > 3 => {
+            poly.points.remove(vertex);
+        }
+        ShapeKind::Path { points, .. } if points.len() > 2 => {
+            points.remove(vertex);
+        }
+        _ => return None,
+    }
+    Some(shape)
+}
+
+fn shape_with_moved_edge(shape: &Shape, edge: usize, delta: Vector) -> Option<Shape> {
+    let mut shape = shape.clone();
+    match &mut shape.kind {
+        ShapeKind::Rectangle(rect) => {
+            let mut corners = rect.corners();
+            let len = corners.len();
+            corners[edge % len] = corners[edge % len].translated(delta);
+            corners[(edge + 1) % len] = corners[(edge + 1) % len].translated(delta);
+            *rect = Rect::from_points(&corners)?;
+        }
+        ShapeKind::Polygon(poly) => {
+            let len = poly.points.len();
+            if edge >= len {
+                return None;
+            }
+            poly.points[edge] = poly.points[edge].translated(delta);
+            poly.points[(edge + 1) % len] = poly.points[(edge + 1) % len].translated(delta);
+        }
+        ShapeKind::Path { points, .. } => {
+            if edge + 1 >= points.len() {
+                return None;
+            }
+            points[edge] = points[edge].translated(delta);
+            points[edge + 1] = points[edge + 1].translated(delta);
+        }
+        ShapeKind::Measurement { a, b, .. } => {
+            if edge != 0 {
+                return None;
+            }
+            *a = a.translated(delta);
+            *b = b.translated(delta);
+        }
+        ShapeKind::Via { .. } | ShapeKind::Label { .. } => return None,
+    }
+    Some(shape)
+}
+
+fn display_document_name(name: &str) -> String {
+    name.strip_prefix("Fabricad demo ")
+        .map(|suffix| format!("Sample {suffix}"))
+        .unwrap_or_else(|| name.to_string())
+}
+
+fn format_fps_label(frame_ms: Option<f64>) -> String {
+    frame_ms
+        .filter(|value| *value > 0.0)
+        .map(|value| format!("FPS: {:.1}", 1000.0 / value))
+        .unwrap_or_else(|| "FPS: --".to_string())
+}
+
+fn workflow_lot_label<T: ToString>(
+    _workspace: &WorkspaceDataset,
+    lot_id: T,
+    max_chars: usize,
+) -> String {
+    compact_button_label(&lot_id.to_string(), max_chars)
+}
+
+fn trace_lot_label<T: ToString>(
+    _genealogy: &layout_model::genealogy::LotGenealogy,
+    lot_id: T,
+    max_chars: usize,
+) -> String {
+    compact_button_label(&lot_id.to_string(), max_chars)
+}
+
+fn trace_lot_button_label<T: ToString>(
+    genealogy: &layout_model::genealogy::LotGenealogy,
+    lot_id: T,
+    compact: bool,
+) -> String {
+    trace_lot_label(genealogy, lot_id, if compact { 11 } else { 18 })
+}
+
+fn yield_wafer_short_label<T: ToString>(wafer_id: T) -> String {
+    compact_button_label(&wafer_id.to_string(), 12)
+}
+
+fn yield_wafer_label<T: ToString>(wafer_id: T) -> String {
+    wafer_id.to_string()
+}
+
+fn inventory_usage_link_label(value: &layout_model::inventory::FabObjectLink) -> String {
+    compact_button_label(&value.label(), 18)
+}
+
+fn display_product_label<T: ToString>(value: T) -> String {
+    value.to_string()
+}
+
+fn equipment_tool_label_for_raw_id(workspace: &WorkspaceDataset, id: &str) -> String {
+    workspace
+        .equipment
+        .tools()
+        .find(|tool| tool.id.as_str() == id)
+        .map(|tool| compact_button_label(&tool.name, 18))
+        .unwrap_or_else(|| compact_button_label(id, 18))
+}
+
+fn display_spc_finding_detail(
+    _workspace: &WorkspaceDataset,
+    finding: &layout_model::spc_fdc::MonitorFinding,
+) -> String {
+    finding.detail.clone()
+}
+
+fn drc_violation_is_active(document: &Document, violation: &DrcViolation) -> bool {
+    document
+        .marker_states
+        .get(&violation.stable_key())
+        .is_none_or(|state| !state.hidden && !state.waived)
+}
+
+fn button_stroke(selected: bool, ui_scale: UiScale) -> StrokeStyle {
+    StrokeStyle::new(
+        if selected {
+            COLOR_BUTTON_STROKE_SELECTED
+        } else {
+            COLOR_BUTTON_STROKE
+        },
+        ui_scale.value(1.0),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn document_visible_text(document: &UiDocument) -> String {
+        let mut text = Vec::new();
+        for node in document.nodes() {
+            match &node.content {
+                UiContent::Text(content) => text.push(content.text.as_str()),
+                UiContent::Scene(primitives) => {
+                    for primitive in primitives {
+                        if let ScenePrimitive::Text(content) = primitive {
+                            text.push(content.text.as_str());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        text.join("\n")
+    }
+
+    fn scene_primitive_max_x(primitives: &[ScenePrimitive]) -> f32 {
+        primitives
+            .iter()
+            .filter_map(|primitive| match primitive {
+                ScenePrimitive::Line { from, to, .. } => Some(from.x.max(to.x)),
+                ScenePrimitive::Circle { center, radius, .. } => Some(center.x + radius),
+                ScenePrimitive::Polygon { points, .. } => {
+                    points.iter().map(|point| point.x).reduce(f32::max)
+                }
+                ScenePrimitive::Image { rect, .. } => Some(rect.x + rect.width),
+                ScenePrimitive::Rect(rect) => Some(rect.rect.x + rect.rect.width),
+                _ => None,
+            })
+            .fold(0.0, f32::max)
+    }
 
     #[test]
     fn startup_view_slugs_cover_known_routes() {
@@ -19544,25 +29788,363 @@ mod tests {
     }
 
     #[test]
-    fn operad_document_builds_without_layout_warnings() {
+    fn app_menu_contract_matches_d43277f_shell() {
+        let labels = AppMenu::ALL.map(AppMenu::label);
+        assert_eq!(
+            labels,
+            [
+                "File",
+                "Edit",
+                "View",
+                "Bookmarks",
+                "Display",
+                "Options",
+                "Tools",
+                "Macros",
+                "Help"
+            ]
+        );
+
+        let mut compact_app = FabricadApp::new_with_options(StartupOptions::default());
+        let compact_document = compact_app
+            .build_operad_document(UiSize::new(640.0, 720.0))
+            .expect("compact menu bar should build");
+        assert!(
+            compact_document
+                .nodes()
+                .iter()
+                .any(|node| node.name == "fabricad.menu.more")
+        );
+        assert!(
+            !compact_document
+                .nodes()
+                .iter()
+                .any(|node| node.name == "fabricad.menu.bookmarks")
+        );
+        assert!(compact_app.apply_clicked_node_name("fabricad.menu.more"));
+        let compact_document = compact_app
+            .build_operad_document(UiSize::new(640.0, 720.0))
+            .expect("compact More menu should build");
+        assert!(
+            compact_document
+                .nodes()
+                .iter()
+                .any(|node| node.name == "fabricad.menu.item.more.display")
+        );
+        assert!(
+            compact_document
+                .nodes()
+                .iter()
+                .any(|node| node.name == "fabricad.menu.item.more.options")
+        );
+        assert!(compact_app.apply_clicked_node_name("fabricad.menu.item.more.display"));
+        assert_eq!(compact_app.active_menu(), Some(AppMenu::Display));
+        assert!(compact_app.apply_clicked_node_name("fabricad.menu.more"));
+        assert!(compact_app.apply_clicked_node_name("fabricad.menu.item.more.options"));
+        assert_eq!(compact_app.active_menu(), Some(AppMenu::Options));
+
+        let app = FabricadApp::new_with_options(StartupOptions::default());
+        let document = app
+            .build_operad_document(UiSize::new(1024.0, 720.0))
+            .expect("standard menu bar should build");
+        assert!(
+            document
+                .nodes()
+                .iter()
+                .any(|node| node.name == "fabricad.menu.options")
+        );
+
+        let mut app = FabricadApp::new_with_options(StartupOptions::default());
+        assert!(app.apply_clicked_node_name("fabricad.menu.display"));
+        let document = app
+            .build_operad_document(UiSize::new(1024.0, 720.0))
+            .expect("display menu should build");
+        for node_name in [
+            "fabricad.menu.item.display.grid2d",
+            "fabricad.menu.item.display.grid3d",
+            "fabricad.menu.item.display.origin",
+            "fabricad.menu.item.display.drc",
+            "fabricad.menu.item.display.inspector",
+            "fabricad.menu.item.display.units.auto",
+            "fabricad.menu.item.display.units.nanometers",
+            "fabricad.menu.item.display.units.microns",
+            "fabricad.menu.item.display.units.dbu",
+            "fabricad.menu.item.display.options",
+        ] {
+            assert!(
+                document.nodes().iter().any(|node| node.name == node_name),
+                "{node_name} should be in Display menu"
+            );
+        }
+        let selected_grid = document
+            .nodes()
+            .iter()
+            .find(|node| node.name == "fabricad.menu.item.display.grid2d")
+            .expect("selected display item should exist");
+        let UiContent::Scene(primitives) = &selected_grid.content else {
+            panic!("selected menu items should use scene primitives");
+        };
+        assert!(
+            primitives
+                .iter()
+                .any(|primitive| matches!(primitive, ScenePrimitive::Line { .. })),
+            "selected menu item should draw a check indicator instead of a full selected button"
+        );
+        assert!(app.apply_clicked_node_name("fabricad.menu.item.display.inspector"));
+        assert!(app.show_inspector);
+        assert!(app.apply_clicked_node_name("fabricad.menu.item.display.options"));
+        assert!(app.show_options_panel);
+        let document = app
+            .build_operad_document(UiSize::new(1024.0, 720.0))
+            .expect("options panel should build");
+        assert_eq!(document.audit_layout(), Vec::new());
+        assert!(
+            document
+                .nodes()
+                .iter()
+                .any(|node| node.name == "fabricad.options_panel")
+        );
+        assert!(app.apply_clicked_node_name("fabricad.options.close"));
+        assert!(!app.show_options_panel);
+
+        let mut panel_app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            ..Default::default()
+        });
+        assert!(panel_app.apply_clicked_node_name("fabricad.menu.display"));
+        let document = panel_app
+            .build_operad_document(UiSize::new(1024.0, 720.0))
+            .expect("display panel menu should build");
+        assert!(
+            document
+                .nodes()
+                .iter()
+                .any(|node| node.name == "fabricad.menu.item.display.secondary_panel")
+        );
+        assert!(panel_app.apply_clicked_node_name("fabricad.menu.item.display.secondary_panel"));
+        assert!(panel_app.show_layers);
+
+        assert!(app.apply_clicked_node_name("fabricad.menu.options"));
+        let document = app
+            .build_operad_document(UiSize::new(1024.0, 720.0))
+            .expect("options menu should build");
+        assert_eq!(document.audit_layout(), Vec::new());
+        for node_name in [
+            "fabricad.menu.item.options.snap",
+            "fabricad.menu.item.display.options",
+        ] {
+            assert!(
+                document.nodes().iter().any(|node| node.name == node_name),
+                "{node_name} should be in Options menu"
+            );
+        }
+
+        let mut app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            ..Default::default()
+        });
+        assert!(app.apply_clicked_node_name("fabricad.menu.tools"));
+        let document = app
+            .build_operad_document(UiSize::new(1024.0, 720.0))
+            .expect("tools menu should build");
+        for node_name in [
+            "fabricad.menu.item.tools.palette",
+            "fabricad.menu.item.tool.select",
+            "fabricad.menu.item.tool.rect",
+            "fabricad.menu.item.tool.polygon",
+            "fabricad.menu.item.tool.path",
+            "fabricad.menu.item.tool.via",
+            "fabricad.menu.item.tool.measure",
+            "fabricad.menu.item.tool.route",
+            "fabricad.menu.item.tools.rundrc",
+            "fabricad.menu.item.tools.diagnostics",
+        ] {
+            assert!(
+                document.nodes().iter().any(|node| node.name == node_name),
+                "{node_name} should be in Tools menu"
+            );
+        }
+        assert!(app.apply_clicked_node_name("fabricad.menu.item.tools.diagnostics"));
+        assert!(app.show_diagnostics_panel);
+        let document = app
+            .build_operad_document(UiSize::new(1024.0, 720.0))
+            .expect("diagnostics panel should build");
+        assert_eq!(document.audit_layout(), Vec::new());
+        assert!(
+            document
+                .nodes()
+                .iter()
+                .any(|node| node.name == "fabricad.diagnostics_panel")
+        );
+    }
+
+    #[test]
+    fn ui_document_builds_without_layout_warnings() {
         let app = FabricadApp::new_with_options(StartupOptions::default());
         let report = app
             .audit_operad_document(UiSize::new(1024.0, 720.0))
-            .expect("Operad document should build");
+            .expect("UI document should build");
         assert!(report.paint_items > 0);
         let document = app
             .build_operad_document(UiSize::new(1024.0, 720.0))
-            .expect("Operad document should build");
+            .expect("UI document should build");
         assert_eq!(document.audit_layout(), Vec::new());
+        assert!(
+            document
+                .nodes()
+                .iter()
+                .any(|node| node.name == "fabricad.user_id")
+        );
+        assert!(
+            !document
+                .nodes()
+                .iter()
+                .any(|node| node.name == "fabricad.status")
+        );
+        assert!(
+            !document
+                .nodes()
+                .iter()
+                .any(|node| node.name == "fabricad.validation")
+        );
 
+        let closed_shell_y = node_rect(&document, "fabricad.shell").y;
         for menu in AppMenu::ALL {
             let mut app = FabricadApp::new_with_options(StartupOptions::default());
             assert!(app.apply_clicked_node_name(&format!("fabricad.menu.{}", menu.slug())));
             let document = app
                 .build_operad_document(UiSize::new(1024.0, 720.0))
-                .expect("Operad document with open menu should build");
+                .expect("UI document with open menu should build");
             assert_eq!(document.audit_layout(), Vec::new());
+            let panel = document
+                .nodes()
+                .iter()
+                .find(|node| node.name == format!("fabricad.menu_panel.{}", menu.slug()))
+                .expect("open menu should render a popup panel");
+            assert!(panel.layout.rect.width <= 430.0, "{:?}", panel.layout.rect);
+            let shell = document
+                .nodes()
+                .iter()
+                .find(|node| node.name == "fabricad.shell")
+                .expect("shell should exist");
+            assert!(
+                (shell.layout.rect.y - closed_shell_y).abs() < 0.5,
+                "menu popup should not push shell down: {:?}",
+                shell.layout.rect
+            );
         }
+    }
+
+    #[test]
+    fn visible_ui_surfaces_do_not_include_stale_chrome_copy() {
+        assert_eq!(
+            display_technology_name("Fabricad demo process"),
+            "Sample process"
+        );
+        assert_eq!(
+            display_technology_name("Fabricad high-density process"),
+            "High-density process"
+        );
+        assert_eq!(
+            display_document_name("Fabricad demo inverter"),
+            "Sample inverter"
+        );
+
+        fn assert_no_stale_copy(surface: &str, document: &UiDocument) {
+            let visible_text = document_visible_text(document);
+            for stale_copy in [
+                "Fabricad",
+                "Inspector",
+                "Operad v4 shell",
+                "Semiconductor Layout Workspace",
+                "Switched to",
+            ] {
+                assert!(
+                    !visible_text.contains(stale_copy),
+                    "{surface} should not include stale chrome copy {stale_copy:?}\n{visible_text}"
+                );
+            }
+        }
+
+        for view in StartupView::ALL {
+            let app = FabricadApp::new_with_options(StartupOptions {
+                view_mode: Some(view),
+                ..Default::default()
+            });
+            let document = app
+                .build_operad_document(UiSize::new(1024.0, 720.0))
+                .unwrap_or_else(|error| panic!("{view:?} document should build: {error}"));
+            assert_no_stale_copy(&format!("{view:?} view"), &document);
+        }
+
+        for menu in AppMenu::ALL.into_iter().chain([AppMenu::More]) {
+            let mut app = FabricadApp::new_with_options(StartupOptions::default());
+            assert!(app.apply_clicked_node_name(&format!("fabricad.menu.{}", menu.slug())));
+            let document = app
+                .build_operad_document(UiSize::new(1024.0, 720.0))
+                .unwrap_or_else(|error| panic!("{menu:?} menu document should build: {error}"));
+            assert_no_stale_copy(&format!("{menu:?} menu"), &document);
+        }
+
+        for (surface, startup_actions) in [
+            (
+                "command palette",
+                vec![
+                    "fabricad.menu.view".to_string(),
+                    "fabricad.menu.item.view.command_palette".to_string(),
+                ],
+            ),
+            (
+                "sidebar modules",
+                vec![
+                    "fabricad.menu.view".to_string(),
+                    "fabricad.menu.item.view.sidebar_modules".to_string(),
+                ],
+            ),
+            (
+                "options panel",
+                vec![
+                    "fabricad.menu.options".to_string(),
+                    "fabricad.menu.item.display.options".to_string(),
+                ],
+            ),
+            (
+                "details panel",
+                vec![
+                    "fabricad.menu.display".to_string(),
+                    "fabricad.menu.item.display.inspector".to_string(),
+                ],
+            ),
+            (
+                "view engineering menu",
+                vec![
+                    "fabricad.menu.view".to_string(),
+                    "fabricad.menu.item.view.group.engineering".to_string(),
+                ],
+            ),
+        ] {
+            let app = FabricadApp::new_with_options(StartupOptions {
+                startup_actions,
+                ..Default::default()
+            });
+            let document = app
+                .build_operad_document(UiSize::new(1024.0, 720.0))
+                .unwrap_or_else(|error| panic!("{surface} document should build: {error}"));
+            assert_no_stale_copy(surface, &document);
+        }
+
+        let app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            startup_actions: vec![
+                "fabricad.menu.display".to_string(),
+                "fabricad.menu.item.display.secondary_panel".to_string(),
+            ],
+            ..Default::default()
+        });
+        let document = app
+            .build_operad_document(UiSize::new(1024.0, 720.0))
+            .expect("secondary panel document should build");
+        assert_no_stale_copy("secondary panel", &document);
     }
 
     #[test]
@@ -19585,12 +30167,153 @@ mod tests {
 
         assert!(app.apply_clicked_node_name("fabricad.menu.view"));
         assert_eq!(app.active_menu(), Some(AppMenu::View));
+        let document = app
+            .build_operad_document(UiSize::new(1024.0, 720.0))
+            .expect("view menu should build");
+        assert_eq!(document.audit_layout(), Vec::new());
+        assert!(
+            document
+                .nodes()
+                .iter()
+                .any(|node| node.name == "fabricad.menu.item.view.command_palette")
+        );
+        assert!(
+            document
+                .nodes()
+                .iter()
+                .any(|node| node.name == "fabricad.menu.item.view.sidebar_modules")
+        );
+        for group in ModuleGroup::ALL {
+            assert!(
+                document
+                    .nodes()
+                    .iter()
+                    .any(|node| node.name
+                        == format!("fabricad.menu.item.view.group.{}", group.slug())),
+                "{} group should be in View menu",
+                group.label()
+            );
+        }
+        assert!(app.apply_clicked_node_name("fabricad.menu.item.view.group.engineering"));
+        assert_eq!(app.active_view_group, Some(ModuleGroup::Engineering));
+        let document = app
+            .build_operad_document(UiSize::new(1024.0, 720.0))
+            .expect("view submenu should build");
+        assert_eq!(document.audit_layout(), Vec::new());
+        assert!(
+            document
+                .nodes()
+                .iter()
+                .any(|node| node.name == "fabricad.menu_subpanel.view.engineering")
+        );
         assert!(app.apply_clicked_node_name("fabricad.menu.item.view.process-flow"));
         assert_eq!(app.active_view(), StartupView::ProcessFlow);
+
+        assert!(app.apply_clicked_node_name("fabricad.menu.view"));
+        assert!(app.apply_clicked_node_name("fabricad.menu.item.view.command_palette"));
+        assert!(app.show_command_palette);
+        let document = app
+            .build_operad_document(UiSize::new(1024.0, 720.0))
+            .expect("command palette should build");
+        assert_eq!(document.audit_layout(), Vec::new());
+        assert!(
+            document
+                .nodes()
+                .iter()
+                .any(|node| node.name == "fabricad.command_palette")
+        );
+        for view in StartupView::ALL {
+            assert!(
+                document
+                    .nodes()
+                    .iter()
+                    .any(|node| node.name == format!("fabricad.command.view.{}", view.slug())),
+                "command palette should include {:?}",
+                view
+            );
+        }
+        assert!(app.apply_clicked_node_name("fabricad.command.close"));
+        assert!(!app.show_command_palette);
+
+        assert!(app.apply_clicked_node_name("fabricad.menu.view"));
+        assert!(app.apply_clicked_node_name("fabricad.menu.item.view.sidebar_modules"));
+        assert!(app.show_sidebar_modules);
+        assert!(app.nav_rail_views.contains(&StartupView::Metrology));
+        assert!(app.apply_clicked_node_name("fabricad.sidebar.view.metrology"));
+        assert!(!app.nav_rail_views.contains(&StartupView::Metrology));
+        assert!(app.apply_clicked_node_name("fabricad.sidebar.default"));
+        assert!(app.nav_rail_views.contains(&StartupView::Metrology));
     }
 
     #[test]
-    fn restored_shell_actions_cover_tools_and_drawers() {
+    fn command_palette_commands_stay_visible_at_hidpi() {
+        let app = FabricadApp::new_with_options(StartupOptions {
+            startup_actions: vec![
+                "fabricad.menu.view".to_string(),
+                "fabricad.menu.item.view.command_palette".to_string(),
+            ],
+            ..Default::default()
+        });
+        let document = app
+            .build_operad_document_scaled(UiSize::new(2048.0, 1440.0), UiScale::new(2.0))
+            .expect("HiDPI command palette should build");
+        assert_eq!(document.audit_layout(), Vec::new());
+        let list = document
+            .nodes()
+            .iter()
+            .find(|node| node.name == "fabricad.command.list")
+            .expect("command list should exist");
+        for view in StartupView::ALL {
+            let command = document
+                .nodes()
+                .iter()
+                .find(|node| node.name == format!("fabricad.command.view.{}", view.slug()))
+                .unwrap_or_else(|| panic!("missing command for {view:?}"));
+            assert!(
+                command.layout.rect.x + command.layout.rect.width
+                    <= list.layout.rect.x + list.layout.rect.width + 0.5
+                    && command.layout.rect.y + command.layout.rect.height
+                        <= list.layout.rect.y + list.layout.rect.height + 0.5,
+                "command {:?} should fit visible command list: command {:?}, list {:?}",
+                view,
+                command.layout.rect,
+                list.layout.rect
+            );
+        }
+    }
+
+    #[test]
+    fn startup_actions_can_render_open_menu_states() {
+        let app = FabricadApp::new_with_options(StartupOptions {
+            startup_actions: vec![
+                "fabricad.menu.view".to_string(),
+                "fabricad.menu.item.view.group.engineering".to_string(),
+            ],
+            ..Default::default()
+        });
+        assert_eq!(app.active_menu(), Some(AppMenu::View));
+        assert_eq!(app.active_view_group, Some(ModuleGroup::Engineering));
+
+        let document = app
+            .build_operad_document(UiSize::new(1024.0, 720.0))
+            .expect("open View menu state should build");
+        assert_eq!(document.audit_layout(), Vec::new());
+        assert!(
+            document
+                .nodes()
+                .iter()
+                .any(|node| node.name == "fabricad.menu_panel.view")
+        );
+        assert!(
+            document
+                .nodes()
+                .iter()
+                .any(|node| node.name == "fabricad.menu_subpanel.view.engineering")
+        );
+    }
+
+    #[test]
+    fn restored_shell_actions_cover_tools_and_panels() {
         let mut app = FabricadApp::new_with_options(StartupOptions {
             view_mode: Some(StartupView::Layout2d),
             ..Default::default()
@@ -19604,13 +30327,496 @@ mod tests {
         assert!(app.apply_clicked_node_name("fabricad.menu.item.tool.route"));
         assert_eq!(app.active_tool(), ToolMode::Route);
 
-        assert!(app.show_inspector());
-        assert!(app.apply_clicked_node_name("fabricad.drawer.inspector"));
         assert!(!app.show_inspector());
+        assert!(app.apply_clicked_node_name("fabricad.menu.item.display.inspector"));
+        assert!(app.show_inspector());
 
-        assert!(app.show_layers());
-        assert!(app.apply_clicked_node_name("fabricad.drawer.layers"));
         assert!(!app.show_layers());
+        assert!(app.apply_clicked_node_name("fabricad.menu.item.display.secondary_panel"));
+        assert!(app.show_layers());
+
+        let desktop = app
+            .build_operad_document(UiSize::new(1440.0, 920.0))
+            .expect("desktop shell should build");
+        assert!(
+            desktop
+                .nodes()
+                .iter()
+                .any(|node| node.name == "fabricad.inspector")
+        );
+        assert!(
+            desktop
+                .nodes()
+                .iter()
+                .any(|node| node.name == "fabricad.secondary")
+        );
+
+        let mut compact_app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            ..Default::default()
+        });
+        let compact = compact_app
+            .build_operad_document(UiSize::new(820.0, 620.0))
+            .expect("compact shell should build");
+        assert!(
+            !compact
+                .nodes()
+                .iter()
+                .any(|node| node.name == "fabricad.inspector")
+        );
+        assert!(
+            !compact
+                .nodes()
+                .iter()
+                .any(|node| node.name == "fabricad.secondary")
+        );
+        assert!(compact_app.apply_clicked_node_name("fabricad.menu.item.display.secondary_panel"));
+        let compact = compact_app
+            .build_operad_document(UiSize::new(820.0, 620.0))
+            .expect("compact drawer shell should build");
+        assert!(
+            compact
+                .nodes()
+                .iter()
+                .any(|node| node.name == "fabricad.secondary")
+        );
+    }
+
+    #[test]
+    fn unwired_menu_items_are_visible_but_disabled() {
+        fn input_state(input: InputBehavior) -> (bool, bool, bool) {
+            (input.pointer, input.focusable, input.keyboard)
+        }
+
+        let mut file_app = FabricadApp::new_with_options(StartupOptions::default());
+        assert!(file_app.apply_clicked_node_name("fabricad.menu.file"));
+        let file_document = file_app
+            .build_operad_document(UiSize::new(1024.0, 720.0))
+            .expect("File menu should build");
+        for node_name in [
+            "fabricad.menu.item.file.save",
+            "fabricad.menu.item.file.load",
+            "fabricad.menu.item.file.save_layout",
+            "fabricad.menu.item.file.load_layout",
+            "fabricad.menu.item.file.export_gds",
+            "fabricad.menu.item.file.import_gds",
+            "fabricad.menu.item.file.collaboration",
+        ] {
+            let node = file_document
+                .nodes()
+                .iter()
+                .find(|node| node.name == node_name)
+                .unwrap_or_else(|| panic!("{node_name} should stay visible in the File menu"));
+            assert_eq!(
+                input_state(node.input),
+                input_state(InputBehavior::NONE),
+                "{node_name} should be disabled until its UI action is wired"
+            );
+        }
+        for node_name in [
+            "fabricad.menu.item.file.new_blank",
+            "fabricad.menu.item.file.load_demo",
+        ] {
+            let node = file_document
+                .nodes()
+                .iter()
+                .find(|node| node.name == node_name)
+                .unwrap_or_else(|| panic!("{node_name} should stay visible in the File menu"));
+            assert_eq!(input_state(node.input), input_state(InputBehavior::BUTTON));
+        }
+
+        let mut edit_app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            ..Default::default()
+        });
+        assert!(edit_app.apply_clicked_node_name("fabricad.menu.edit"));
+        let edit_document = edit_app
+            .build_operad_document(UiSize::new(1024.0, 720.0))
+            .expect("Edit menu should build");
+        for node_name in [
+            "fabricad.menu.item.edit.undo",
+            "fabricad.menu.item.edit.redo",
+            "fabricad.menu.item.edit.copy",
+            "fabricad.menu.item.edit.paste",
+            "fabricad.menu.item.edit.duplicate",
+            "fabricad.menu.item.edit.make_cell",
+            "fabricad.menu.item.edit.rotate90",
+            "fabricad.menu.item.edit.mirror_x",
+            "fabricad.menu.item.edit.mirror_y",
+        ] {
+            let node = edit_document
+                .nodes()
+                .iter()
+                .find(|node| node.name == node_name)
+                .unwrap_or_else(|| panic!("{node_name} should stay visible in the Edit menu"));
+            assert_eq!(input_state(node.input), input_state(InputBehavior::BUTTON));
+        }
+
+        for (menu, disabled_node) in [
+            (AppMenu::Bookmarks, "fabricad.menu.item.bookmarks.origin"),
+            (AppMenu::Help, "fabricad.menu.item.help.about"),
+        ] {
+            let mut app = FabricadApp::new_with_options(StartupOptions::default());
+            assert!(app.apply_clicked_node_name(&format!("fabricad.menu.{}", menu.slug())));
+            let document = app
+                .build_operad_document(UiSize::new(1024.0, 720.0))
+                .expect("menu with disabled item should build");
+            let node = document
+                .nodes()
+                .iter()
+                .find(|node| node.name == disabled_node)
+                .unwrap_or_else(|| panic!("{disabled_node} should stay visible"));
+            assert_eq!(
+                input_state(node.input),
+                input_state(InputBehavior::NONE),
+                "{disabled_node} should be disabled until its UI action is wired"
+            );
+            if menu == AppMenu::Help {
+                let visible_text = document_visible_text(&document);
+                assert!(visible_text.contains("About"));
+                assert!(
+                    !visible_text.contains("Fabricad"),
+                    "Help menu should avoid redundant product copy\n{visible_text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compact_layout_edit_menu_has_no_layout_warnings() {
+        let app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            startup_actions: vec!["fabricad.menu.edit".to_string()],
+            ..Default::default()
+        });
+        let document = app
+            .build_operad_document(UiSize::new(480.0, 900.0))
+            .expect("compact Layout Editor edit menu should build");
+        assert_eq!(document.audit_layout(), Vec::new());
+    }
+
+    #[test]
+    fn compact_editor_tool_strip_keeps_actions_visible() {
+        let layout_app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            ..Default::default()
+        });
+        let layout_doc = layout_app
+            .build_operad_document(UiSize::new(480.0, 900.0))
+            .expect("narrow layout editor should build");
+        assert_eq!(layout_doc.audit_layout(), Vec::new());
+        let select = layout_doc
+            .nodes()
+            .iter()
+            .find(|node| node.name == "fabricad.tool.select")
+            .expect("select tool should exist");
+        let route = layout_doc
+            .nodes()
+            .iter()
+            .find(|node| node.name == "fabricad.tool.route")
+            .expect("route tool should exist");
+        let delete = layout_doc
+            .nodes()
+            .iter()
+            .find(|node| node.name == "fabricad.menu.item.edit.delete")
+            .expect("delete action should exist");
+        let canvas = layout_doc
+            .nodes()
+            .iter()
+            .find(|node| {
+                matches!(
+                    &node.content,
+                    UiContent::Canvas(canvas) if canvas.key == "fabricad.layout.viewport.2d"
+                )
+            })
+            .expect("2D canvas should exist");
+        assert!(
+            route.layout.rect.y > select.layout.rect.y,
+            "narrow editor actions should use a second toolbar row instead of a clipped single row"
+        );
+        for node in [select, route, delete] {
+            assert!(
+                node.layout.rect.right() <= 480.0,
+                "{} should stay inside the narrow viewport: {:?}",
+                node.name,
+                node.layout.rect
+            );
+        }
+        assert!(
+            delete.layout.rect.bottom() <= canvas.layout.rect.y,
+            "compact toolbar should finish before the 2D canvas starts: delete {:?}, canvas {:?}",
+            delete.layout.rect,
+            canvas.layout.rect
+        );
+
+        let viewport_app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Layout3d),
+            ..Default::default()
+        });
+        let viewport_doc = viewport_app
+            .build_operad_document(UiSize::new(480.0, 900.0))
+            .expect("narrow 3D viewport should build");
+        assert_eq!(viewport_doc.audit_layout(), Vec::new());
+        let fullscreen = viewport_doc
+            .nodes()
+            .iter()
+            .find(|node| node.name == "fabricad.menu.item.tools.fullscreen")
+            .expect("fullscreen action should exist");
+        assert!(
+            fullscreen.layout.rect.right() <= 480.0,
+            "3D compact toolbar actions should stay inside the viewport: {:?}",
+            fullscreen.layout.rect
+        );
+    }
+
+    #[test]
+    fn hidpi_editor_tool_strip_centers_button_labels() {
+        let app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            ..Default::default()
+        });
+        let document = app
+            .build_operad_document_scaled(UiSize::new(1815.0, 900.0), UiScale::new(2.0))
+            .expect("HiDPI layout editor should build");
+        assert_eq!(document.audit_layout(), Vec::new());
+        let strip = node_rect(&document, "fabricad.tool_strip");
+
+        for name in [
+            "fabricad.toolbar.view.layout2d",
+            "fabricad.toolbar.view.layout3d",
+            "fabricad.tool.select",
+            "fabricad.tool.rect",
+            "fabricad.toolbar.edit.delete",
+        ] {
+            let button = node_rect(&document, name);
+            let label = node_rect(&document, &format!("{name}.label"));
+            assert!(
+                label.x >= button.x
+                    && label.right() <= button.right()
+                    && label.y >= button.y
+                    && label.bottom() <= button.bottom(),
+                "{name} label should stay inside its toolbar button: button {button:?}, label {label:?}"
+            );
+            let button_center_y = button.y + button.height / 2.0;
+            let label_center_y = label.y + label.height / 2.0;
+            assert!(
+                (button_center_y - label_center_y).abs() <= 2.0,
+                "{name} label should be vertically centered: button {button:?}, label {label:?}"
+            );
+            let top_margin = button.y - strip.y;
+            let bottom_margin = strip.bottom() - button.bottom();
+            assert!(
+                top_margin >= 6.0 && bottom_margin >= 6.0,
+                "{name} should keep top and bottom toolbar padding: strip {strip:?}, button {button:?}"
+            );
+            assert!(
+                (top_margin - bottom_margin).abs() <= 2.0,
+                "{name} toolbar padding should be balanced: strip {strip:?}, button {button:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_layout_views_reserve_editor_tool_strip_slot() {
+        for viewport in [UiSize::new(1440.0, 920.0), UiSize::new(480.0, 900.0)] {
+            let layout_app = FabricadApp::new_with_options(StartupOptions {
+                view_mode: Some(StartupView::Layout2d),
+                ..Default::default()
+            });
+            let layout_document = layout_app
+                .build_operad_document(viewport)
+                .expect("layout editor document should build");
+            let mask_app = FabricadApp::new_with_options(StartupOptions {
+                view_mode: Some(StartupView::MaskPrep),
+                ..Default::default()
+            });
+            let mask_document = mask_app
+                .build_operad_document(viewport)
+                .expect("mask prep document should build");
+
+            let layout_shell = node_rect(&layout_document, "fabricad.shell");
+            let mask_shell = node_rect(&mask_document, "fabricad.shell");
+            assert!(
+                (layout_shell.y - mask_shell.y).abs() < 0.5,
+                "non-layout views should reserve the editor tool-strip height at {viewport:?}: layout shell {:?}, mask shell {:?}",
+                layout_shell,
+                mask_shell
+            );
+            assert!(
+                mask_document
+                    .nodes()
+                    .iter()
+                    .any(|node| node.name == "fabricad.tool_strip_spacer"),
+                "mask prep should reserve an inert tool-strip spacer"
+            );
+            assert!(
+                !mask_document
+                    .nodes()
+                    .iter()
+                    .any(|node| node.name == "fabricad.tool.rect"),
+                "reserved non-layout strip should not expose editor tool buttons"
+            );
+        }
+    }
+
+    #[test]
+    fn layout_3d_canvas_input_updates_camera() {
+        let mut app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Layout3d),
+            ..Default::default()
+        });
+        let canvas = UiRect::new(10.0, 20.0, 900.0, 560.0);
+        let start = UiPoint::new(450.0, 300.0);
+        let moved = UiPoint::new(510.0, 265.0);
+        let before = app.camera_3d;
+
+        assert!(
+            app.handle_layout_3d_canvas_input(&operad::UiInputEvent::PointerDown(start), canvas)
+        );
+        assert!(app.flycam_captured());
+        assert!(
+            app.handle_layout_3d_canvas_input(&operad::UiInputEvent::PointerMove(moved), canvas)
+        );
+        assert_ne!(
+            app.camera_3d, before,
+            "dragging the 3D canvas should update flycam look direction"
+        );
+        assert_eq!(
+            app.camera_3d.position, before.position,
+            "mouse look should not orbit or translate the camera position"
+        );
+
+        let before_scroll = app.camera_3d;
+        assert!(app.handle_layout_3d_canvas_input(
+            &operad::UiInputEvent::wheel(moved, UiPoint::new(0.0, -120.0)),
+            canvas
+        ));
+        assert!(
+            app.camera_3d.position != before_scroll.position,
+            "wheel-up should move the flycam along its view direction"
+        );
+        assert!(app.handle_layout_3d_canvas_input(&operad::UiInputEvent::PointerUp(moved), canvas));
+    }
+
+    #[test]
+    fn layout_3d_toolbar_and_keyboard_controls_are_wired() {
+        let mut app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Layout3d),
+            ..Default::default()
+        });
+        assert!(app.apply_layout_3d_mouse_delta(UiPoint::new(70.0, -30.0), false));
+        assert_ne!(app.camera_3d, Camera3d::default());
+
+        let moved_camera = app.camera_3d;
+        assert!(app.apply_clicked_node_name("fabricad.toolbar.tools.reset3d"));
+        assert_ne!(app.camera_3d, moved_camera);
+
+        let before_move = app.camera_3d;
+        assert!(
+            app.handle_layout_3d_key(operad::KeyCode::Character('w'), operad::KeyModifiers::NONE)
+        );
+        assert_ne!(app.camera_3d, before_move, "W should move the 3D camera");
+
+        assert!(!app.viewport_fullscreen);
+        assert!(app.apply_clicked_node_name("fabricad.toolbar.tools.fullscreen"));
+        assert!(app.viewport_fullscreen);
+        assert!(app.handle_layout_3d_key(operad::KeyCode::Escape, operad::KeyModifiers::NONE));
+        assert!(!app.viewport_fullscreen);
+    }
+
+    #[test]
+    fn layout_3d_view_exposes_stack_panel_hud_and_fullscreen_viewport() {
+        let mut app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Layout3d),
+            ..Default::default()
+        });
+        let document = app
+            .build_operad_document(UiSize::new(1800.0, 980.0))
+            .expect("wide 3D layout should build");
+        assert_eq!(document.audit_layout(), Vec::new());
+        let inspector = node_rect(&document, "fabricad.layout.inspector_rail");
+        let preview = node_rect(&document, "fabricad.layout.preview");
+        assert!(
+            inspector.x < preview.x,
+            "layout inspector should sit to the left of the canvas; inspector={inspector:?} preview={preview:?}"
+        );
+        assert!(
+            !document
+                .nodes()
+                .iter()
+                .any(|node| node.name == "fabricad.details"),
+            "3D layout should not render the generic below-canvas detail panel"
+        );
+        let visible_text = document_visible_text(&document);
+        assert!(visible_text.contains("3D Stack"), "{visible_text}");
+        assert!(visible_text.contains("flycam"), "{visible_text}");
+        assert!(visible_text.contains("mouse look"), "{visible_text}");
+        assert!(
+            document
+                .nodes()
+                .iter()
+                .any(|node| node.name == "fabricad.layout.3d.overlay"),
+            "3D viewport should publish a HUD overlay"
+        );
+        assert!(
+            document.nodes().iter().any(|node| {
+                matches!(
+                    &node.content,
+                    UiContent::Canvas(canvas) if canvas.key == "fabricad.layout.viewport.3d"
+                )
+            }),
+            "3D viewport should keep using the WGPU canvas"
+        );
+
+        assert!(app.apply_clicked_node_name("fabricad.toolbar.tools.fullscreen"));
+        let fullscreen = app
+            .build_operad_document(UiSize::new(1440.0, 920.0))
+            .expect("fullscreen 3D layout should build");
+        assert_eq!(fullscreen.audit_layout(), Vec::new());
+        assert!(
+            fullscreen
+                .nodes()
+                .iter()
+                .any(|node| node.name == "fabricad.fullscreen.viewport_stack")
+        );
+        assert!(
+            !fullscreen
+                .nodes()
+                .iter()
+                .any(|node| node.name == "fabricad.nav"),
+            "viewport fullscreen should hide the workspace side chrome"
+        );
+        assert!(document_visible_text(&fullscreen).contains("Exit fullscreen"));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn layout_3d_grid_option_adds_ground_guides() {
+        let document = Document::demo();
+        let basic = build_layout_3d_batch(&document);
+        let with_grid = build_layout_3d_batch_with_options(&document, true);
+        let basic_validation = basic
+            .validate_geometry()
+            .expect("basic 3D batch should validate");
+        let grid_validation = with_grid
+            .validate_geometry()
+            .expect("3D grid batch should validate");
+
+        assert_eq!(basic_validation.guide_segments, 2);
+        assert!(
+            grid_validation.guide_segments > basic_validation.guide_segments,
+            "3D grid should add ground guide segments"
+        );
+        let max_rect_extent = with_grid
+            .rect_slabs
+            .iter()
+            .flat_map(|slab| slab.rect)
+            .map(f32::abs)
+            .fold(0.0, f32::max);
+        assert!(
+            max_rect_extent > 100.0,
+            "3D slab coordinates should stay in layout world space so the flycam and renderer share units"
+        );
     }
 
     #[test]
@@ -19685,35 +30891,1418 @@ mod tests {
 
         let mut document = app
             .build_operad_document(UiSize::new(1440.0, 920.0))
-            .expect("layout editor controls should build");
-        assert_clicked_node(
-            &mut document,
-            &format!("fabricad.viewctl.layout.layer.{}", layer_id.0),
+            .expect("layout editor shell should build");
+        assert_clicked_node(&mut document, "fabricad.tool.rect");
+    }
+
+    #[test]
+    fn layout_layer_delete_removes_layer_and_undo_restores_shapes() {
+        let mut app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            ..Default::default()
+        });
+        let shape = app
+            .workspace()
+            .document
+            .shapes
+            .values()
+            .next()
+            .expect("demo document should have shapes");
+        let layer_id = shape.layer;
+        let shape_id = shape.id;
+        let layer_count = app.workspace().document.layers.len();
+        let shape_count = app.workspace().document.shapes.len();
+
+        assert!(app.apply_clicked_node_name(&format!("fabricad.layers.delete.{}", layer_id.0)));
+        assert!(app.workspace().document.layers.get(&layer_id).is_none());
+        assert!(app.workspace().document.shapes.get(&shape_id).is_none());
+        assert!(app.workspace().document.shapes.len() < shape_count);
+
+        assert!(app.apply_clicked_node_name("fabricad.menu.item.edit.undo"));
+        assert!(app.workspace().document.layers.get(&layer_id).is_some());
+        assert!(app.workspace().document.shapes.get(&shape_id).is_some());
+        assert_eq!(app.workspace().document.layers.len(), layer_count);
+    }
+
+    #[test]
+    fn layout_canvas_uses_editor_zoom_and_pan() {
+        let app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            zoom: Some(0.1),
+            pan: Some([25.0, -10.0]),
+            ..Default::default()
+        });
+        let size = UiSize::new(1000.0, 500.0);
+
+        assert_eq!(app.layout_zoom(), 0.1);
+        assert_eq!(app.layout_pan(), [25.0, -10.0]);
+        assert_eq!(
+            app.layout_world_to_canvas(Point::ZERO, size),
+            UiPoint::new(525.0, 240.0)
+        );
+        let viewport = app.layout_viewport_for_size(size);
+        assert_eq!(viewport.width(), 10_000);
+        assert_eq!(viewport.height(), 5_000);
+        assert_eq!(
+            app.layout_canvas_to_world_local(app.layout_world_to_canvas(Point::ZERO, size), size),
+            Point::ZERO
         );
     }
 
     #[test]
-    fn operad_document_nodes_are_clickable() {
+    fn layout_overlay_grid_tracks_zoom_and_pan() {
+        fn vertical_grid_lines(primitives: &[ScenePrimitive]) -> Vec<i32> {
+            primitives
+                .iter()
+                .filter_map(|primitive| match primitive {
+                    ScenePrimitive::Line { from, to, .. } if (from.x - to.x).abs() < 0.5 => {
+                        Some(from.x.round() as i32)
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+
+        let size = UiSize::new(900.0, 700.0);
+        let mut far = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            zoom: Some(0.1),
+            ..Default::default()
+        });
+        far.workspace.document.grid = 100;
+        let mut near = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            zoom: Some(1.0),
+            ..Default::default()
+        });
+        near.workspace.document.grid = 100;
+
+        let far_lines =
+            vertical_grid_lines(&layout_overlay_primitives(&far, size, UiScale::new(1.0)));
+        let near_lines =
+            vertical_grid_lines(&layout_overlay_primitives(&near, size, UiScale::new(1.0)));
+        assert!(
+            far_lines.len() > near_lines.len(),
+            "zoomed-out view should draw more world-grid lines: far={far_lines:?} near={near_lines:?}"
+        );
+
+        far.layout_pan = [20.0, 0.0];
+        let panned_lines =
+            vertical_grid_lines(&layout_overlay_primitives(&far, size, UiScale::new(1.0)));
+        assert_ne!(
+            far_lines, panned_lines,
+            "panning should move the world-aligned grid instead of leaving a fixed screen grid"
+        );
+    }
+
+    #[test]
+    fn layout_canvas_rect_tool_creates_rectangle() {
+        let mut app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            zoom: Some(0.1),
+            ..Default::default()
+        });
+        let rect = UiRect::new(0.0, 0.0, 800.0, 600.0);
+        let shape_count = app.workspace().document.shapes.len();
+        assert!(app.apply_clicked_node_name("fabricad.tool.rect"));
+
+        let start = app.layout_world_to_canvas(Point::new(0, 0), rect_size(rect));
+        let end = app.layout_world_to_canvas(Point::new(1_000, 700), rect_size(rect));
+        assert!(app.handle_layout_canvas_input(&operad::UiInputEvent::PointerDown(start), rect));
+        assert!(app.handle_layout_canvas_input(&operad::UiInputEvent::PointerMove(end), rect));
+        assert!(app.handle_layout_canvas_input(&operad::UiInputEvent::PointerUp(end), rect));
+
+        assert_eq!(app.workspace().document.shapes.len(), shape_count + 1);
+        let shape = app
+            .selected_layout_shape()
+            .and_then(|id| app.workspace().document.shapes.get(&id))
+            .expect("rectangle tool should select the shape it created");
+        assert_eq!(
+            shape.kind,
+            ShapeKind::Rectangle(Rect::new(Point::new(0, 0), Point::new(1_000, 700)))
+        );
+    }
+
+    #[test]
+    fn layout_canvas_zoom_and_pan_controls_update_viewport() {
+        let mut app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            zoom: Some(0.1),
+            ..Default::default()
+        });
+        let rect = UiRect::new(0.0, 0.0, 800.0, 600.0);
+        let center = UiPoint::new(400.0, 300.0);
+
+        assert!(app.handle_layout_canvas_input(
+            &operad::UiInputEvent::wheel(center, UiPoint::new(0.0, -120.0)),
+            rect
+        ));
+        assert!(
+            app.layout_zoom() > 0.1,
+            "wheel-up over the canvas should zoom in"
+        );
+
+        let origin_before = app.layout_world_to_canvas(Point::ZERO, rect_size(rect));
+        assert!(app.pan_layout_canvas_by(UiPoint::new(40.0, -20.0)));
+        let origin_after = app.layout_world_to_canvas(Point::ZERO, rect_size(rect));
+        assert_eq!(
+            origin_after,
+            UiPoint::new(origin_before.x + 40.0, origin_before.y - 20.0)
+        );
+    }
+
+    #[test]
+    fn layout_canvas_select_tool_moves_top_level_shape() {
+        let mut app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            zoom: Some(0.1),
+            ..Default::default()
+        });
+        let rect = UiRect::new(0.0, 0.0, 900.0, 700.0);
+        let shape_id = app
+            .workspace()
+            .document
+            .shapes
+            .keys()
+            .next()
+            .copied()
+            .expect("demo document should have a shape");
+        let original = app
+            .workspace()
+            .document
+            .shapes
+            .get(&shape_id)
+            .expect("shape should exist")
+            .clone();
+        let center = original.kind.bounds().center();
+        app.layout_pan = [
+            -(center.x as f32) * app.layout_zoom,
+            center.y as f32 * app.layout_zoom,
+        ];
+        let revision_before_drag = app.layout_revision;
+
+        let start = app.layout_world_to_canvas(center, rect_size(rect));
+        let end_world = Point::new(center.x + 100, center.y + 50);
+        let end = app.layout_world_to_canvas(end_world, rect_size(rect));
+        assert!(app.handle_layout_canvas_input(&operad::UiInputEvent::PointerDown(start), rect));
+        assert!(app.handle_layout_canvas_input(&operad::UiInputEvent::PointerMove(end), rect));
+        assert!(app.handle_layout_canvas_input(&operad::UiInputEvent::PointerUp(end), rect));
+
+        assert_eq!(app.selected_layout_shape(), Some(shape_id));
+        let moved = app
+            .workspace()
+            .document
+            .shapes
+            .get(&shape_id)
+            .expect("shape should still exist");
+        assert_eq!(
+            moved.kind.bounds(),
+            original.kind.bounds().translated(Vector::new(100, 50))
+        );
+        assert!(
+            app.layout_revision > revision_before_drag,
+            "dragging a shape should invalidate cached 2D canvas batches"
+        );
+    }
+
+    #[test]
+    fn layout_canvas_shape_drag_commits_one_undo_entry() {
+        let mut app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            zoom: Some(0.1),
+            ..Default::default()
+        });
+        let canvas = UiRect::new(0.0, 0.0, 900.0, 700.0);
+        let original_bounds = Rect::new(Point::new(140_000, 100_000), Point::new(141_000, 101_000));
+        let shape_id = app
+            .add_layout_shape(app.active_layer(), ShapeKind::Rectangle(original_bounds))
+            .expect("test shape should be added");
+        let center = original_bounds.center();
+        app.layout_pan = [
+            -(center.x as f32) * app.layout_zoom,
+            center.y as f32 * app.layout_zoom,
+        ];
+        let undo_len = app.layout_undo.len();
+
+        let start = app.layout_world_to_canvas(center, rect_size(canvas));
+        let mid =
+            app.layout_world_to_canvas(Point::new(center.x + 60, center.y + 30), rect_size(canvas));
+        let end = app
+            .layout_world_to_canvas(Point::new(center.x + 100, center.y + 50), rect_size(canvas));
+        assert!(app.handle_layout_canvas_input(&operad::UiInputEvent::PointerDown(start), canvas));
+        assert!(app.handle_layout_canvas_input(&operad::UiInputEvent::PointerMove(mid), canvas));
+        assert!(app.handle_layout_canvas_input(&operad::UiInputEvent::PointerMove(end), canvas));
+        assert_eq!(
+            app.layout_undo.len(),
+            undo_len,
+            "live drag frames should not add per-frame undo entries"
+        );
+        assert!(app.handle_layout_canvas_input(&operad::UiInputEvent::PointerUp(end), canvas));
+        assert_eq!(app.layout_undo.len(), undo_len + 1);
+
+        assert_eq!(
+            app.workspace()
+                .document
+                .shapes
+                .get(&shape_id)
+                .expect("shape should still exist")
+                .kind
+                .bounds(),
+            original_bounds.translated(Vector::new(100, 50))
+        );
+        assert!(app.apply_clicked_node_name("fabricad.menu.item.edit.undo"));
+        assert_eq!(
+            app.workspace()
+                .document
+                .shapes
+                .get(&shape_id)
+                .expect("shape should still exist after undo")
+                .kind
+                .bounds(),
+            original_bounds
+        );
+        assert!(app.apply_clicked_node_name("fabricad.menu.item.edit.redo"));
+        assert_eq!(
+            app.workspace()
+                .document
+                .shapes
+                .get(&shape_id)
+                .expect("shape should still exist after redo")
+                .kind
+                .bounds(),
+            original_bounds.translated(Vector::new(100, 50))
+        );
+    }
+
+    #[test]
+    fn layout_canvas_vertex_drag_commits_one_undo_entry() {
+        let mut app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            zoom: Some(0.1),
+            ..Default::default()
+        });
+        let canvas = UiRect::new(0.0, 0.0, 900.0, 700.0);
+        let original_bounds = Rect::new(Point::new(160_000, 100_000), Point::new(161_000, 101_000));
+        let shape_id = app
+            .add_layout_shape(app.active_layer(), ShapeKind::Rectangle(original_bounds))
+            .expect("test shape should be added");
+        app.layout_pan = [
+            -(original_bounds.max.x as f32) * app.layout_zoom,
+            original_bounds.max.y as f32 * app.layout_zoom,
+        ];
+        let undo_len = app.layout_undo.len();
+
+        let start = app.layout_world_to_canvas(original_bounds.max, rect_size(canvas));
+        let mid = app.layout_world_to_canvas(Point::new(161_150, 101_100), rect_size(canvas));
+        let end = app.layout_world_to_canvas(Point::new(161_300, 101_200), rect_size(canvas));
+        assert!(app.handle_layout_canvas_input(&operad::UiInputEvent::PointerDown(start), canvas));
+        assert!(app.handle_layout_canvas_input(&operad::UiInputEvent::PointerMove(mid), canvas));
+        assert!(app.handle_layout_canvas_input(&operad::UiInputEvent::PointerMove(end), canvas));
+        assert_eq!(
+            app.layout_undo.len(),
+            undo_len,
+            "live vertex drags should not add per-frame undo entries"
+        );
+        assert!(app.handle_layout_canvas_input(&operad::UiInputEvent::PointerUp(end), canvas));
+        assert_eq!(app.layout_undo.len(), undo_len + 1);
+
+        assert_eq!(
+            app.workspace()
+                .document
+                .shapes
+                .get(&shape_id)
+                .expect("shape should still exist")
+                .kind
+                .bounds(),
+            Rect::new(original_bounds.min, Point::new(161_300, 101_200))
+        );
+        assert!(app.apply_clicked_node_name("fabricad.menu.item.edit.undo"));
+        assert_eq!(
+            app.workspace()
+                .document
+                .shapes
+                .get(&shape_id)
+                .expect("shape should still exist after undo")
+                .kind
+                .bounds(),
+            original_bounds
+        );
+    }
+
+    #[test]
+    fn layout_canvas_shift_constrains_shape_drag_to_axis() {
+        let mut app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            zoom: Some(0.1),
+            ..Default::default()
+        });
+        let canvas = UiRect::new(0.0, 0.0, 900.0, 700.0);
+        let original_bounds = Rect::new(Point::new(100_000, 100_000), Point::new(101_000, 101_000));
+        let shape_id = app
+            .add_layout_shape(app.active_layer(), ShapeKind::Rectangle(original_bounds))
+            .expect("test shape should be added");
+        let center = original_bounds.center();
+        app.layout_pan = [
+            -(center.x as f32) * app.layout_zoom,
+            center.y as f32 * app.layout_zoom,
+        ];
+        let shift = operad::KeyModifiers {
+            shift: true,
+            ..operad::KeyModifiers::NONE
+        };
+
+        let start = app.layout_world_to_canvas(center, rect_size(canvas));
+        let end = app
+            .layout_world_to_canvas(Point::new(center.x + 100, center.y + 50), rect_size(canvas));
+        assert!(app.handle_layout_canvas_input_with_modifiers(
+            &operad::UiInputEvent::PointerDown(start),
+            canvas,
+            shift
+        ));
+        assert!(app.handle_layout_canvas_input_with_modifiers(
+            &operad::UiInputEvent::PointerMove(end),
+            canvas,
+            shift
+        ));
+        assert!(app.handle_layout_canvas_input_with_modifiers(
+            &operad::UiInputEvent::PointerUp(end),
+            canvas,
+            shift
+        ));
+
+        let moved = app
+            .workspace()
+            .document
+            .shapes
+            .get(&shape_id)
+            .expect("shape should still exist");
+        assert_eq!(
+            moved.kind.bounds(),
+            original_bounds.translated(Vector::new(100, 0))
+        );
+    }
+
+    #[test]
+    fn layout_canvas_alt_drag_duplicates_top_level_shape() {
+        let mut app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            zoom: Some(0.1),
+            ..Default::default()
+        });
+        let canvas = UiRect::new(0.0, 0.0, 900.0, 700.0);
+        let original_bounds = Rect::new(Point::new(120_000, 100_000), Point::new(121_000, 101_000));
+        let shape_id = app
+            .add_layout_shape(app.active_layer(), ShapeKind::Rectangle(original_bounds))
+            .expect("test shape should be added");
+        let shape_count = app.workspace().document.shapes.len();
+        let center = original_bounds.center();
+        app.layout_pan = [
+            -(center.x as f32) * app.layout_zoom,
+            center.y as f32 * app.layout_zoom,
+        ];
+        let alt = operad::KeyModifiers {
+            alt: true,
+            ..operad::KeyModifiers::NONE
+        };
+
+        let start = app.layout_world_to_canvas(center, rect_size(canvas));
+        let end = app
+            .layout_world_to_canvas(Point::new(center.x + 100, center.y + 50), rect_size(canvas));
+        assert!(app.handle_layout_canvas_input_with_modifiers(
+            &operad::UiInputEvent::PointerDown(start),
+            canvas,
+            alt
+        ));
+        assert!(app.handle_layout_canvas_input_with_modifiers(
+            &operad::UiInputEvent::PointerMove(end),
+            canvas,
+            alt
+        ));
+        assert!(app.handle_layout_canvas_input_with_modifiers(
+            &operad::UiInputEvent::PointerUp(end),
+            canvas,
+            alt
+        ));
+
+        assert_eq!(app.workspace().document.shapes.len(), shape_count + 1);
+        assert_eq!(
+            app.workspace()
+                .document
+                .shapes
+                .get(&shape_id)
+                .expect("original shape should remain")
+                .kind
+                .bounds(),
+            original_bounds
+        );
+        let duplicate_id = app
+            .selected_layout_shape()
+            .expect("alt-drag should select the duplicate");
+        assert_ne!(duplicate_id, shape_id);
+        assert_eq!(
+            app.workspace()
+                .document
+                .shapes
+                .get(&duplicate_id)
+                .expect("duplicate shape should exist")
+                .kind
+                .bounds(),
+            original_bounds.translated(Vector::new(100, 50))
+        );
+    }
+
+    #[test]
+    fn layout_canvas_ctrl_temporarily_disables_snap_for_drawing() {
+        let mut app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            zoom: Some(1.0),
+            ..Default::default()
+        });
+        app.workspace.document.grid = 100;
+        let canvas = UiRect::new(0.0, 0.0, 900.0, 700.0);
+        assert!(app.apply_clicked_node_name("fabricad.tool.rect"));
+        let ctrl = operad::KeyModifiers {
+            ctrl: true,
+            ..operad::KeyModifiers::NONE
+        };
+        let start_world = Point::new(13, 17);
+        let end_world = Point::new(257, 189);
+        let start = app.layout_world_to_canvas(start_world, rect_size(canvas));
+        let end = app.layout_world_to_canvas(end_world, rect_size(canvas));
+
+        assert!(app.handle_layout_canvas_input_with_modifiers(
+            &operad::UiInputEvent::PointerDown(start),
+            canvas,
+            ctrl
+        ));
+        assert!(app.handle_layout_canvas_input_with_modifiers(
+            &operad::UiInputEvent::PointerMove(end),
+            canvas,
+            ctrl
+        ));
+        assert!(app.handle_layout_canvas_input_with_modifiers(
+            &operad::UiInputEvent::PointerUp(end),
+            canvas,
+            ctrl
+        ));
+
+        let shape = app
+            .selected_layout_shape()
+            .and_then(|id| app.workspace().document.shapes.get(&id))
+            .expect("rectangle should be created");
+        assert_eq!(
+            shape.kind,
+            ShapeKind::Rectangle(Rect::new(start_world, end_world))
+        );
+    }
+
+    #[test]
+    fn layout_canvas_shift_constrains_rect_tool_to_square() {
+        let mut app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            zoom: Some(0.1),
+            ..Default::default()
+        });
+        let canvas = UiRect::new(0.0, 0.0, 800.0, 600.0);
+        assert!(app.apply_clicked_node_name("fabricad.tool.rect"));
+        let shift = operad::KeyModifiers {
+            shift: true,
+            ..operad::KeyModifiers::NONE
+        };
+        let start = app.layout_world_to_canvas(Point::new(0, 0), rect_size(canvas));
+        let end = app.layout_world_to_canvas(Point::new(1_000, 700), rect_size(canvas));
+
+        assert!(app.handle_layout_canvas_input_with_modifiers(
+            &operad::UiInputEvent::PointerDown(start),
+            canvas,
+            shift
+        ));
+        assert!(app.handle_layout_canvas_input_with_modifiers(
+            &operad::UiInputEvent::PointerMove(end),
+            canvas,
+            shift
+        ));
+        assert!(app.handle_layout_canvas_input_with_modifiers(
+            &operad::UiInputEvent::PointerUp(end),
+            canvas,
+            shift
+        ));
+
+        let shape = app
+            .selected_layout_shape()
+            .and_then(|id| app.workspace().document.shapes.get(&id))
+            .expect("rectangle should be created");
+        assert_eq!(
+            shape.kind,
+            ShapeKind::Rectangle(Rect::new(Point::new(0, 0), Point::new(1_000, 1_000)))
+        );
+    }
+
+    #[test]
+    fn layout_canvas_select_tool_moves_hierarchy_instance() {
+        let mut app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            hierarchy_demo: true,
+            zoom: Some(0.1),
+            ..Default::default()
+        });
+        let canvas = UiRect::new(0.0, 0.0, 900.0, 700.0);
+        let index = LayoutIndex::rebuild_hierarchical(&app.workspace.document);
+        let flattened = app
+            .workspace
+            .document
+            .visible_flattened_shapes()
+            .into_iter()
+            .find(|flattened| {
+                !flattened.id.is_top_level()
+                    && index.hit_test_occurrence(flattened.bounds.center(), 1)
+                        == Some(flattened.id.clone())
+            })
+            .expect("hierarchy demo should expose a directly pickable instance occurrence");
+        let (parent, instance_id) = app
+            .workspace
+            .document
+            .instance_parent_for_path(&flattened.id.instance_path)
+            .expect("picked occurrence should have an instance parent");
+        let before = app
+            .workspace
+            .document
+            .instance(parent, instance_id)
+            .expect("instance should exist before drag")
+            .transform
+            .translation;
+        let center = flattened.bounds.center();
+        app.layout_pan = [
+            -(center.x as f32) * app.layout_zoom,
+            center.y as f32 * app.layout_zoom,
+        ];
+
+        let start = app.layout_world_to_canvas(center, rect_size(canvas));
+        let end_world = Point::new(center.x + 240, center.y - 160);
+        let end = app.layout_world_to_canvas(end_world, rect_size(canvas));
+        assert!(app.handle_layout_canvas_input(&operad::UiInputEvent::PointerDown(start), canvas));
+        assert!(app.handle_layout_canvas_input(&operad::UiInputEvent::PointerMove(end), canvas));
+        assert!(app.handle_layout_canvas_input(&operad::UiInputEvent::PointerUp(end), canvas));
+
+        let after = app
+            .workspace
+            .document
+            .instance(parent, instance_id)
+            .expect("instance should exist after drag")
+            .transform
+            .translation;
+        assert_eq!(after, Vector::new(before.dx + 240, before.dy - 160));
+        assert_eq!(app.selected_layout_occurrence, Some(flattened.id));
+    }
+
+    #[test]
+    fn layout_canvas_select_tool_resizes_vertices_and_edges() {
+        let mut app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            zoom: Some(0.1),
+            ..Default::default()
+        });
+        let canvas = UiRect::new(0.0, 0.0, 800.0, 600.0);
+        let shape_id = app
+            .add_layout_shape(
+                app.active_layer(),
+                ShapeKind::Rectangle(Rect::new(Point::new(0, 0), Point::new(1_000, 1_000))),
+            )
+            .expect("test rectangle should be added");
+
+        let corner_start = app.layout_world_to_canvas(Point::new(1_000, 1_000), rect_size(canvas));
+        let corner_end = app.layout_world_to_canvas(Point::new(1_200, 1_300), rect_size(canvas));
+        assert!(
+            app.handle_layout_canvas_input(
+                &operad::UiInputEvent::PointerDown(corner_start),
+                canvas
+            )
+        );
+        assert!(
+            app.handle_layout_canvas_input(&operad::UiInputEvent::PointerMove(corner_end), canvas)
+        );
+        assert!(
+            app.handle_layout_canvas_input(&operad::UiInputEvent::PointerUp(corner_end), canvas)
+        );
+
+        let resized = app
+            .workspace()
+            .document
+            .shapes
+            .get(&shape_id)
+            .expect("resized shape should exist");
+        assert_eq!(
+            resized.kind.bounds(),
+            Rect::new(Point::new(0, 0), Point::new(1_200, 1_300))
+        );
+
+        let edge_start = app.layout_world_to_canvas(Point::new(1_200, 600), rect_size(canvas));
+        let edge_end = app.layout_world_to_canvas(Point::new(1_500, 600), rect_size(canvas));
+        assert!(
+            app.handle_layout_canvas_input(&operad::UiInputEvent::PointerDown(edge_start), canvas)
+        );
+        assert!(
+            app.handle_layout_canvas_input(&operad::UiInputEvent::PointerMove(edge_end), canvas)
+        );
+        assert!(app.handle_layout_canvas_input(&operad::UiInputEvent::PointerUp(edge_end), canvas));
+
+        let resized = app
+            .workspace()
+            .document
+            .shapes
+            .get(&shape_id)
+            .expect("edge-resized shape should exist");
+        assert_eq!(
+            resized.kind.bounds(),
+            Rect::new(Point::new(0, 0), Point::new(1_500, 1_300))
+        );
+    }
+
+    #[test]
+    fn layout_canvas_double_click_inserts_selected_edge_vertex() {
+        let mut app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            zoom: Some(0.1),
+            ..Default::default()
+        });
+        let canvas = UiRect::new(0.0, 0.0, 800.0, 600.0);
+        let shape_id = app
+            .add_layout_shape(
+                app.active_layer(),
+                ShapeKind::Rectangle(Rect::new(Point::new(0, 0), Point::new(1_000, 1_000))),
+            )
+            .expect("test rectangle should be added");
+        let edge_midpoint = Point::new(500, 1_000);
+        let click = app.layout_world_to_canvas(edge_midpoint, rect_size(canvas));
+
+        assert!(app.handle_layout_canvas_double_click(click, canvas));
+        let shape = app
+            .workspace()
+            .document
+            .shapes
+            .get(&shape_id)
+            .expect("edited shape should exist");
+        let ShapeKind::Polygon(poly) = shape.kind else {
+            panic!("inserting a vertex into a rectangle edge should convert it to a polygon");
+        };
+        assert_eq!(poly.points.len(), 5);
+        assert!(poly.points.contains(&edge_midpoint));
+    }
+
+    #[test]
+    fn layout_canvas_delete_key_removes_hovered_selected_vertex() {
+        let mut app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            zoom: Some(0.1),
+            ..Default::default()
+        });
+        let canvas = UiRect::new(0.0, 0.0, 800.0, 600.0);
+        let shape_id = app
+            .add_layout_shape(
+                app.active_layer(),
+                ShapeKind::Path {
+                    points: vec![Point::new(0, 0), Point::new(500, 0), Point::new(1_000, 0)],
+                    width: 180,
+                },
+            )
+            .expect("test path should be added");
+        let middle = app.layout_world_to_canvas(Point::new(500, 0), rect_size(canvas));
+        assert!(app.handle_layout_canvas_input(&operad::UiInputEvent::PointerMove(middle), canvas));
+
+        assert!(app.handle_layout_editor_key(operad::KeyCode::Delete, operad::KeyModifiers::NONE));
+        let shape = app
+            .workspace()
+            .document
+            .shapes
+            .get(&shape_id)
+            .expect("path should still exist after deleting one vertex");
+        let ShapeKind::Path { points, .. } = shape.kind else {
+            panic!("shape should remain a path");
+        };
+        assert_eq!(points, vec![Point::new(0, 0), Point::new(1_000, 0)]);
+    }
+
+    #[test]
+    fn layout_canvas_secondary_click_finishes_polyline() {
+        let mut app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            zoom: Some(0.1),
+            ..Default::default()
+        });
+        let canvas = UiRect::new(0.0, 0.0, 800.0, 600.0);
+        let shape_count = app.workspace().document.shapes.len();
+        assert!(app.apply_clicked_node_name("fabricad.tool.poly"));
+        for point in [
+            Point::new(0, 0),
+            Point::new(1_000, 0),
+            Point::new(1_000, 1_000),
+        ] {
+            let canvas_point = app.layout_world_to_canvas(point, rect_size(canvas));
+            assert!(app.handle_layout_canvas_input(
+                &operad::UiInputEvent::PointerDown(canvas_point),
+                canvas
+            ));
+            assert!(app.handle_layout_canvas_input(
+                &operad::UiInputEvent::PointerUp(canvas_point),
+                canvas
+            ));
+        }
+        let click = app.layout_world_to_canvas(Point::new(1_000, 1_000), rect_size(canvas));
+
+        assert!(app.handle_layout_canvas_secondary_click(click, canvas));
+        assert_eq!(app.workspace().document.shapes.len(), shape_count + 1);
+        let shape = app
+            .selected_layout_shape()
+            .and_then(|id| app.workspace().document.shapes.get(&id))
+            .expect("finished polygon should become selected");
+        assert!(matches!(shape.kind, ShapeKind::Polygon(_)));
+    }
+
+    #[test]
+    fn layout_transform_actions_rotate_and_mirror_selection() {
+        let mut app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            ..Default::default()
+        });
+        let shape_id = app
+            .add_layout_shape(
+                app.active_layer(),
+                ShapeKind::Rectangle(Rect::new(Point::new(0, 0), Point::new(1_000, 500))),
+            )
+            .expect("test rectangle should be added");
+
+        assert!(app.apply_clicked_node_name("fabricad.menu.item.edit.rotate90"));
+        let rotated = app
+            .workspace()
+            .document
+            .shapes
+            .get(&shape_id)
+            .expect("rotated shape should exist");
+        assert_eq!(
+            rotated.kind,
+            ShapeKind::Rectangle(Rect::new(Point::new(250, -250), Point::new(750, 750)))
+        );
+
+        assert!(app.apply_clicked_node_name("fabricad.menu.item.edit.mirror_x"));
+        let mirrored = app
+            .workspace()
+            .document
+            .shapes
+            .get(&shape_id)
+            .expect("mirrored shape should exist");
+        assert_eq!(mirrored.kind.bounds(), rotated.kind.bounds());
+        assert!(app.status_message().contains("Mirrored X"));
+    }
+
+    #[test]
+    fn layout_canvas_route_tool_uses_router_output() {
+        let mut app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            zoom: Some(0.05),
+            ..Default::default()
+        });
+        let canvas = UiRect::new(0.0, 0.0, 900.0, 700.0);
+        let shape_count = app.workspace().document.shapes.len();
+        assert!(app.apply_clicked_node_name("fabricad.tool.route"));
+
+        let start_world = Point::new(-12_000, -10_000);
+        let goal_world = Point::new(-10_000, -8_000);
+        app.layout_pan = [
+            -(start_world.x as f32) * app.layout_zoom,
+            start_world.y as f32 * app.layout_zoom,
+        ];
+        let start = app.layout_world_to_canvas(start_world, rect_size(canvas));
+        let goal = app.layout_world_to_canvas(goal_world, rect_size(canvas));
+
+        assert!(app.handle_layout_canvas_input(&operad::UiInputEvent::PointerDown(start), canvas));
+        assert!(app.handle_layout_canvas_input(&operad::UiInputEvent::PointerUp(start), canvas));
+        assert!(app.handle_layout_canvas_input(&operad::UiInputEvent::PointerDown(goal), canvas));
+        assert!(app.handle_layout_canvas_input(&operad::UiInputEvent::PointerUp(goal), canvas));
+
+        assert_eq!(app.workspace().document.shapes.len(), shape_count + 1);
+        let route_shape = app
+            .selected_layout_shape()
+            .and_then(|id| app.workspace().document.shapes.get(&id))
+            .expect("route tool should select the routed path");
+        let ShapeKind::Path { points, width } = route_shape.kind else {
+            panic!("route tool should create a path shape");
+        };
+        assert_eq!(width, 180);
+        assert!(points.len() >= 2, "router should produce route points");
+        assert!(app.status_message().contains("Route placed"));
+    }
+
+    #[test]
+    fn layout_canvas_route_inherits_endpoint_net_metadata() {
+        let mut app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            ..Default::default()
+        });
+        let metal1 = app
+            .workspace
+            .document
+            .layer_by_process(ProcessLayer::Metal1)
+            .expect("demo document should have metal1");
+        let metal2 = app
+            .workspace
+            .document
+            .layer_by_process(ProcessLayer::Metal2)
+            .expect("demo document should have metal2");
+        app.workspace.document.shapes.clear();
+        app.workspace.document.cells.clear();
+        app.add_layout_shape_with_metadata(
+            metal1,
+            ShapeKind::Rectangle(Rect::new(Point::new(-200, -200), Point::new(200, 200))),
+            Some(NetId(42)),
+            None,
+        )
+        .expect("source net shape should be added");
+
+        app.active_layer = metal2;
+        app.route_points = vec![Point::new(0, 0), Point::new(2_000, 0)];
+        app.route_layout_between_points();
+
+        let route_shape = app
+            .selected_layout_shape()
+            .and_then(|id| app.workspace().document.shapes.get(&id))
+            .expect("route tool should select the routed path");
+        let ShapeKind::Path { .. } = route_shape.kind else {
+            panic!("route tool should create a path shape");
+        };
+        assert_eq!(route_shape.layer, metal2);
+        assert_eq!(route_shape.net, Some(NetId(42)));
+        assert_eq!(route_shape.name.as_deref(), Some("NET42"));
+        assert!(app.status_message().contains("NET42"));
+    }
+
+    #[test]
+    fn layout_overlay_contains_editor_affordances() {
+        let app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            select_first_shape: true,
+            ..Default::default()
+        });
+        let document = app
+            .build_operad_document(UiSize::new(1280.0, 720.0))
+            .expect("layout editor should build");
+        assert_eq!(document.audit_layout(), Vec::new());
+        let overlay = document
+            .nodes()
+            .iter()
+            .find(|node| node.name == "fabricad.layout.overlay")
+            .expect("2D editor overlay should exist");
+        let UiContent::Scene(primitives) = &overlay.content else {
+            panic!("2D editor overlay should be a scene");
+        };
+        let preview = document
+            .nodes()
+            .iter()
+            .find(|node| node.name == "fabricad.layout.preview")
+            .expect("2D editor canvas should exist");
+        let inspector = document
+            .nodes()
+            .iter()
+            .find(|node| node.name == "fabricad.layout.inspector_rail")
+            .expect("2D editor should keep detail sections in a left inspector rail");
+        assert!(
+            inspector.layout.rect.x < preview.layout.rect.x,
+            "layout inspector should sit to the left of the canvas; inspector={:?} preview={:?}",
+            inspector.layout.rect,
+            preview.layout.rect
+        );
+        assert!(
+            document
+                .nodes()
+                .iter()
+                .any(|node| node.name == "fabricad.layout.inspector.section.0.header"),
+            "layout inspector should expose collapsible detail headers"
+        );
+        assert!(
+            document
+                .nodes()
+                .iter()
+                .any(|node| node.name == "fabricad.layout.inspector.section.0.body"),
+            "layout inspector detail section should start expanded"
+        );
+        assert!(
+            !document
+                .nodes()
+                .iter()
+                .any(|node| node.name == "fabricad.details"),
+            "2D layout should not render the generic below-canvas detail panel"
+        );
+
+        assert!(
+            overlay.layout.rect.height >= 300.0,
+            "overlay should cover the canvas instead of collapsing to zero height: {:?}",
+            overlay.layout.rect
+        );
+        assert!(
+            (overlay.layout.rect.x - preview.layout.rect.x).abs() < 0.5
+                && (overlay.layout.rect.y - preview.layout.rect.y).abs() < 0.5
+                && (overlay.layout.rect.width - preview.layout.rect.width).abs() < 0.5
+                && (overlay.layout.rect.height - preview.layout.rect.height).abs() < 0.5,
+            "overlay and canvas should be stacked on the same viewport rect; overlay={:?} preview={:?}",
+            overlay.layout.rect,
+            preview.layout.rect
+        );
+
+        assert!(
+            primitives
+                .iter()
+                .any(|primitive| matches!(primitive, ScenePrimitive::Line { .. })),
+            "grid/selection/scale affordances should draw line primitives"
+        );
+        assert!(
+            document.nodes().iter().any(|node| {
+                node.name == "fabricad.layout.fps"
+                    && matches!(&node.content, UiContent::Text(text) if text.text.starts_with("FPS:"))
+            }),
+            "2D editor should expose an FPS label"
+        );
+    }
+
+    #[test]
+    fn layout_detail_sections_collapse_in_inline_inspector() {
+        let mut app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            ..Default::default()
+        });
+        let expanded = app
+            .build_operad_document(UiSize::new(1280.0, 720.0))
+            .expect("layout editor should build");
+        assert!(
+            expanded
+                .nodes()
+                .iter()
+                .any(|node| node.name == "fabricad.layout.inspector.section.0.body"),
+            "layout inspector detail section should start expanded"
+        );
+
+        assert!(
+            app.apply_clicked_node_name("fabricad.inspector.section.toggle.layout2d.0.document")
+        );
+        let collapsed = app
+            .build_operad_document(UiSize::new(1280.0, 720.0))
+            .expect("layout editor should rebuild with collapsed inspector");
+        assert!(
+            collapsed
+                .nodes()
+                .iter()
+                .any(|node| node.name == "fabricad.layout.inspector.section.0.header"),
+            "collapsed layout inspector should keep the header"
+        );
+        assert!(
+            !collapsed
+                .nodes()
+                .iter()
+                .any(|node| node.name == "fabricad.layout.inspector.section.0.body"),
+            "collapsed layout inspector should omit the section body"
+        );
+    }
+
+    #[test]
+    fn layout_overlay_highlights_selected_net_component() {
+        let mut app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            zoom: Some(0.2),
+            ..Default::default()
+        });
+        let metal1 = app
+            .workspace
+            .document
+            .layer_by_process(ProcessLayer::Metal1)
+            .expect("demo document should have metal1");
+        app.workspace.document.shapes.clear();
+        app.workspace.document.cells.clear();
+        app.active_layer = metal1;
+
+        let first = app
+            .add_layout_shape(
+                metal1,
+                ShapeKind::Rectangle(Rect::new(Point::new(-1_000, -200), Point::new(200, 200))),
+            )
+            .expect("first connected shape should be added");
+        app.add_layout_shape(
+            metal1,
+            ShapeKind::Rectangle(Rect::new(Point::new(100, -200), Point::new(1_300, 200))),
+        )
+        .expect("second connected shape should be added");
+        app.selected_layout_shape = Some(first);
+
+        let report =
+            extract_connectivity(&app.workspace.document, &layout_model::default_technology())
+                .expect("test shapes should have connectivity");
+        let component_id = report
+            .component_for_occurrence(&ShapeOccurrenceId::top_level(first))
+            .expect("selected shape should be in a component");
+        assert_eq!(
+            report
+                .component(component_id)
+                .expect("component should exist")
+                .shapes
+                .len(),
+            2
+        );
+
+        let primitives =
+            layout_overlay_primitives(&app, UiSize::new(900.0, 700.0), UiScale::new(1.0));
+        let highlight_color = ColorRgba::new(112, 236, 214, 240);
+        let highlight_lines = primitives
+            .iter()
+            .filter(|primitive| {
+                matches!(primitive, ScenePrimitive::Line { stroke, .. } if stroke.color == highlight_color)
+            })
+            .count();
+
+        assert!(
+            highlight_lines >= 8,
+            "selected net component should outline both connected rectangles"
+        );
+    }
+
+    #[test]
+    fn layout_overlay_draws_pending_route_point_markers() {
+        let mut app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            zoom: Some(0.2),
+            ..Default::default()
+        });
+        app.active_tool = ToolMode::Route;
+        app.route_points.push(Point::new(0, 0));
+
+        let primitives =
+            layout_overlay_primitives(&app, UiSize::new(900.0, 700.0), UiScale::new(1.0));
+        let marker_color = ColorRgba::new(250, 210, 80, 255);
+
+        assert!(
+            primitives.iter().any(|primitive| {
+                matches!(
+                    primitive,
+                    ScenePrimitive::Circle { fill, radius, .. }
+                        if *fill == marker_color && (radius - 5.0).abs() < f32::EPSILON
+                )
+            }),
+            "route placement should show pending point markers"
+        );
+    }
+
+    #[test]
+    fn layout_overlay_draws_drc_markers_when_violations_exist() {
+        let mut app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            zoom: Some(0.1),
+            ..Default::default()
+        });
+        let layer = app.active_layer();
+        app.add_layout_shape(
+            layer,
+            ShapeKind::Rectangle(Rect::new(Point::new(-20, -20), Point::new(20, 20))),
+        )
+        .expect("tiny shape should be added");
+        let rules = RuleDeck::demo(&app.workspace().document);
+        assert!(
+            !run_drc(&app.workspace().document, &rules).is_empty(),
+            "fixture should create a visible DRC violation"
+        );
+
+        let document = app
+            .build_operad_document(UiSize::new(1280.0, 720.0))
+            .expect("layout editor should build");
+        let overlay = document
+            .nodes()
+            .iter()
+            .find(|node| node.name == "fabricad.layout.overlay")
+            .expect("2D editor overlay should exist");
+        let UiContent::Scene(primitives) = &overlay.content else {
+            panic!("2D editor overlay should be a scene");
+        };
+
+        assert!(
+            primitives.iter().any(|primitive| {
+                matches!(primitive, ScenePrimitive::Text(text) if text.text.contains("DRC overlay"))
+            }),
+            "DRC overlay should report active violations"
+        );
+    }
+
+    #[test]
+    fn layout_overlay_skips_hidden_or_waived_drc_markers() {
+        let mut app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            zoom: Some(0.1),
+            ..Default::default()
+        });
+        let layer = app.active_layer();
+        app.add_layout_shape(
+            layer,
+            ShapeKind::Rectangle(Rect::new(Point::new(-20, -20), Point::new(20, 20))),
+        )
+        .expect("tiny shape should be added");
+        let rules = RuleDeck::demo(&app.workspace().document);
+        let violations = run_drc(&app.workspace().document, &rules);
+        assert!(
+            !violations.is_empty(),
+            "fixture should create visible DRC violations"
+        );
+        for violation in violations {
+            app.workspace.document.marker_states.insert(
+                violation.stable_key(),
+                MarkerState {
+                    hidden: true,
+                    waived: false,
+                    note: None,
+                },
+            );
+        }
+
+        let primitives =
+            layout_overlay_primitives(&app, UiSize::new(1280.0, 720.0), UiScale::new(1.0));
+
+        assert!(
+            !primitives.iter().any(|primitive| {
+                matches!(primitive, ScenePrimitive::Text(text) if text.text.contains("DRC overlay"))
+            }),
+            "hidden DRC markers should not appear in the overlay legend"
+        );
+    }
+
+    #[test]
+    fn ui_document_nodes_are_clickable() {
         let app = FabricadApp::new_with_options(StartupOptions::default());
         let mut document = app
             .build_operad_document(UiSize::new(1024.0, 720.0))
-            .expect("Operad document should build");
+            .expect("UI document should build");
 
         assert_clicked_node(&mut document, "fabricad.menu.file");
         assert_clicked_node(&mut document, "fabricad.nav.action.metrology");
     }
 
     #[test]
+    fn nav_rail_buttons_center_single_line_text() {
+        let app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Safety),
+            ..Default::default()
+        });
+        let document = app
+            .build_operad_document(UiSize::new(1024.0, 720.0))
+            .expect("UI document should build");
+        let nav_button = document
+            .nodes()
+            .iter()
+            .find(|node| node.name == "fabricad.nav.action.safety")
+            .expect("safety nav button should exist");
+        assert!(nav_button.input.pointer);
+        assert_eq!(
+            nav_button
+                .action
+                .as_ref()
+                .and_then(|action| action.action_id()),
+            Some(&operad::WidgetActionId::new("fabricad.nav.action.safety"))
+        );
+        let accessibility = nav_button
+            .accessibility
+            .as_ref()
+            .expect("nav button should expose accessibility metadata");
+        assert_eq!(accessibility.role, AccessibilityRole::Button);
+        assert_eq!(
+            accessibility.label.as_deref(),
+            Some("Safety and Interlock Dashboard")
+        );
+        let nav_label = document
+            .nodes()
+            .iter()
+            .find(|node| node.name == "fabricad.nav.action.safety.label")
+            .expect("safety nav button should use the Operad button label node");
+        let UiContent::Text(text) = &nav_label.content else {
+            panic!("nav button label should be text");
+        };
+        assert_eq!(text.style.wrap, TextWrap::None);
+        assert!(
+            nav_label.layout.rect.y >= nav_button.layout.rect.y
+                && nav_label.layout.rect.bottom() <= nav_button.layout.rect.bottom(),
+            "label should fit vertically inside button: label {:?}, button {:?}",
+            nav_label.layout.rect,
+            nav_button.layout.rect
+        );
+    }
+
+    #[test]
+    fn all_view_pointer_controls_have_handlers() {
+        for view in StartupView::ALL {
+            let app = FabricadApp::new_with_options(StartupOptions {
+                view_mode: Some(view),
+                ..Default::default()
+            });
+            let document = app
+                .build_operad_document(UiSize::new(1280.0, 720.0))
+                .unwrap_or_else(|error| panic!("{view:?} document should build: {error}"));
+            let control_names = document
+                .nodes()
+                .iter()
+                .filter(|node| node.input.pointer)
+                .filter(|node| !matches!(node.content, UiContent::Canvas(_)))
+                .map(|node| node.name.clone())
+                .filter(|name| name.starts_with("fabricad."))
+                .collect::<Vec<_>>();
+            assert!(
+                !control_names.is_empty(),
+                "{view:?} should expose pointer controls"
+            );
+
+            for name in control_names {
+                let mut app = FabricadApp::new_with_options(StartupOptions {
+                    view_mode: Some(view),
+                    ..Default::default()
+                });
+                assert!(
+                    app.apply_clicked_node_name(&name),
+                    "{view:?} pointer control has no handler: {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn open_menu_pointer_items_have_handlers() {
+        fn enabled_menu_item_names(document: &UiDocument) -> Vec<String> {
+            document
+                .nodes()
+                .iter()
+                .filter(|node| node.input.pointer)
+                .map(|node| node.name.clone())
+                .filter(|name| name.starts_with("fabricad.menu.item."))
+                .collect()
+        }
+
+        fn expensive_menu_item(name: &str) -> bool {
+            matches!(
+                name.strip_prefix("fabricad.menu.item."),
+                Some("macros.stress10k" | "macros.stress100k" | "macros.stress1m")
+            )
+        }
+
+        for view in [
+            StartupView::Workflow,
+            StartupView::Layout2d,
+            StartupView::Layout3d,
+            StartupView::Metrology,
+        ] {
+            for menu in AppMenu::ALL {
+                let mut app = FabricadApp::new_with_options(StartupOptions {
+                    view_mode: Some(view),
+                    ..Default::default()
+                });
+                assert!(
+                    app.apply_clicked_node_name(&format!("fabricad.menu.{}", menu.slug())),
+                    "{view:?} should open {menu:?} menu"
+                );
+                let document = app
+                    .build_operad_document(UiSize::new(1280.0, 720.0))
+                    .unwrap_or_else(|error| panic!("{view:?} {menu:?} menu should build: {error}"));
+                for name in enabled_menu_item_names(&document) {
+                    if expensive_menu_item(&name) {
+                        continue;
+                    }
+                    let mut app = FabricadApp::new_with_options(StartupOptions {
+                        view_mode: Some(view),
+                        ..Default::default()
+                    });
+                    assert!(
+                        app.apply_clicked_node_name(&name),
+                        "{view:?} {menu:?} menu item has no handler: {name}"
+                    );
+                }
+            }
+        }
+
+        for group in ModuleGroup::ALL {
+            let mut app = FabricadApp::new_with_options(StartupOptions::default());
+            assert!(app.apply_clicked_node_name("fabricad.menu.view"));
+            assert!(app.apply_clicked_node_name(&format!(
+                "fabricad.menu.item.view.group.{}",
+                group.slug()
+            )));
+            let document = app
+                .build_operad_document(UiSize::new(1280.0, 720.0))
+                .unwrap_or_else(|error| panic!("View {group:?} submenu should build: {error}"));
+            for name in enabled_menu_item_names(&document) {
+                let mut app = FabricadApp::new_with_options(StartupOptions::default());
+                assert!(
+                    app.apply_clicked_node_name(&name),
+                    "View {group:?} submenu item has no handler: {name}"
+                );
+            }
+        }
+
+        let mut app = FabricadApp::new_with_options(StartupOptions::default());
+        assert!(app.apply_clicked_node_name("fabricad.menu.more"));
+        let document = app
+            .build_operad_document(UiSize::new(640.0, 720.0))
+            .expect("compact More menu should build");
+        for name in enabled_menu_item_names(&document) {
+            let mut app = FabricadApp::new_with_options(StartupOptions::default());
+            assert!(
+                app.apply_clicked_node_name(&name),
+                "compact More menu item has no handler: {name}"
+            );
+        }
+    }
+
+    #[test]
     fn primary_view_panels_show_domain_rows() {
-        for (view, scene_name) in [
-            (StartupView::Workflow, "fabricad.workflow.dashboard"),
-            (StartupView::MaskPrep, "fabricad.mask.overview"),
-            (StartupView::LayoutDiff, "fabricad.layout_diff.overview"),
-            (StartupView::FabControl, "fabricad.fab_control.overview"),
-            (StartupView::Maintenance, "fabricad.maintenance.overview"),
-            (StartupView::Inventory, "fabricad.inventory.overview"),
-            (StartupView::Safety, "fabricad.safety.overview"),
-            (StartupView::Traceability, "fabricad.traceability.overview"),
+        for (view, required_nodes) in [
+            (
+                StartupView::Workflow,
+                &[
+                    "fabricad.workflow.dashboard",
+                    "fabricad.workflow.actions",
+                    "fabricad.workflow.lots",
+                    "fabricad.workflow.focus",
+                    "fabricad.workflow.spine",
+                    "fabricad.workflow.cross_links",
+                    "fabricad.workflow.actions.row.0",
+                ][..],
+            ),
+            (
+                StartupView::MaskPrep,
+                &[
+                    "fabricad.mask.overview",
+                    "fabricad.mask.reticle",
+                    "fabricad.mask.fields",
+                    "fabricad.mask.layers",
+                    "fabricad.mask.checks",
+                    "fabricad.mask.reticle.row.0",
+                ][..],
+            ),
+            (
+                StartupView::LayoutDiff,
+                &[
+                    "fabricad.layout_diff.overview",
+                    "fabricad.layout_diff.layers",
+                    "fabricad.layout_diff.changes",
+                    "fabricad.layout_diff.layers.row.0",
+                ][..],
+            ),
+            (
+                StartupView::FabControl,
+                &[
+                    "fabricad.fab_control.overview",
+                    "fabricad.fab_control.tools",
+                    "fabricad.fab_control.detail",
+                    "fabricad.fab_control.tools.row.0",
+                ][..],
+            ),
+            (
+                StartupView::Traceability,
+                &[
+                    "fabricad.traceability.overview",
+                    "fabricad.traceability.lots",
+                    "fabricad.traceability.wafers",
+                    "fabricad.traceability.detail",
+                    "fabricad.traceability.lots.row.0",
+                ][..],
+            ),
         ] {
             let app = FabricadApp::new_with_options(StartupOptions {
                 view_mode: Some(view),
@@ -19729,23 +32318,116 @@ mod tests {
                     .any(|node| node.name == "fabricad.primary"),
                 "view {view:?} should include a primary panel"
             );
+            for node_name in required_nodes {
+                assert!(
+                    document.nodes().iter().any(|node| node.name == *node_name),
+                    "view {view:?} should include {node_name}"
+                );
+            }
+        }
+
+        for (view, duplicate_control_section) in [
+            (StartupView::MaskPrep, "fabricad.mask.controls"),
+            (StartupView::LayoutDiff, "fabricad.layout_diff.controls"),
+            (StartupView::FabControl, "fabricad.fab_control.commands"),
+            (StartupView::Traceability, "fabricad.traceability.controls"),
+        ] {
+            let document = FabricadApp::new_with_options(StartupOptions {
+                view_mode: Some(view),
+                ..Default::default()
+            })
+            .build_operad_document(UiSize::new(1440.0, 920.0))
+            .expect("domain primary panel should build");
             assert!(
-                document
+                !document
                     .nodes()
                     .iter()
-                    .any(|node| node.name == "fabricad.primary.row.0"),
-                "view {view:?} should include primary rows"
+                    .any(|node| node.name == duplicate_control_section),
+                "view {view:?} should not duplicate top controls in {duplicate_control_section}"
             );
+        }
+
+        let maintenance_app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Maintenance),
+            ..Default::default()
+        });
+        let maintenance_document = maintenance_app
+            .build_operad_document(UiSize::new(1440.0, 920.0))
+            .expect("maintenance primary panel should build");
+        for node_name in [
+            "fabricad.maintenance.overview",
+            "fabricad.maintenance.summary",
+            "fabricad.maintenance.queue",
+            "fabricad.maintenance.detail",
+            "fabricad.maintenance.audit",
+        ] {
             assert!(
-                document.nodes().iter().any(|node| node.name == scene_name),
-                "view {view:?} should include overview scene {scene_name}"
-            );
-            assert!(
-                document
+                maintenance_document
                     .nodes()
                     .iter()
-                    .any(|node| node.name == "fabricad.primary.metrics.0"),
-                "view {view:?} should include dashboard metrics"
+                    .any(|node| node.name == node_name),
+                "maintenance should include {node_name}"
+            );
+        }
+        assert!(
+            !maintenance_document
+                .nodes()
+                .iter()
+                .any(|node| node.name == "fabricad.maintenance.filters"),
+            "maintenance should not duplicate top filter controls inside the body"
+        );
+
+        let inventory_app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Inventory),
+            ..Default::default()
+        });
+        let inventory_document = inventory_app
+            .build_operad_document(UiSize::new(1440.0, 920.0))
+            .expect("inventory primary panel should build");
+        for node_name in [
+            "fabricad.inventory.overview",
+            "fabricad.inventory.summary",
+            "fabricad.inventory.alerts",
+            "fabricad.inventory.lots",
+            "fabricad.inventory.detail",
+        ] {
+            assert!(
+                inventory_document
+                    .nodes()
+                    .iter()
+                    .any(|node| node.name == node_name),
+                "inventory should include {node_name}"
+            );
+        }
+        assert!(
+            !inventory_document
+                .nodes()
+                .iter()
+                .any(|node| node.name == "fabricad.inventory.filters"),
+            "inventory should not duplicate top filter controls inside the body"
+        );
+
+        let safety_app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Safety),
+            ..Default::default()
+        });
+        let safety_document = safety_app
+            .build_operad_document(UiSize::new(1440.0, 920.0))
+            .expect("safety primary panel should build");
+        for node_name in [
+            "fabricad.safety.overview",
+            "fabricad.safety.summary",
+            "fabricad.safety.interlocks",
+            "fabricad.safety.sensors",
+            "fabricad.safety.tools",
+            "fabricad.safety.incidents",
+        ] {
+            assert!(
+                safety_document
+                    .nodes()
+                    .iter()
+                    .any(|node| node.name == node_name),
+                "safety should include {node_name}"
             );
         }
 
@@ -19762,6 +32444,72 @@ mod tests {
                 .iter()
                 .any(|node| node.name == "fabricad.layout.preview")
         );
+        let layout_preview = layout_document
+            .nodes()
+            .iter()
+            .find(|node| node.name == "fabricad.layout.preview")
+            .expect("layout preview should exist");
+        match &layout_preview.content {
+            UiContent::Canvas(canvas) => {
+                assert_eq!(canvas.key, "fabricad.layout.viewport.2d");
+                assert_eq!(canvas.render_mode, operad::CanvasRenderMode::Callback);
+                assert_eq!(canvas.interaction, CanvasInteractionPolicy::EDITOR);
+            }
+            other => panic!("layout preview should be a canvas, got {other:?}"),
+        }
+        assert!(
+            layout_preview.layout.rect.height >= 300.0,
+            "{:?}",
+            layout_preview.layout.rect
+        );
+        let layout_canvas_requests = RenderFrameRequest::new(
+            RenderTarget::window("test", UiSize::new(1440.0, 920.0)),
+            UiSize::new(1440.0, 920.0),
+            layout_document.paint_list(),
+        )
+        .canvas_requests();
+        assert!(
+            layout_canvas_requests
+                .iter()
+                .any(|request| request.canvas.key == "fabricad.layout.viewport.2d"),
+            "layout editor should publish a canvas render request"
+        );
+        assert!(
+            !layout_document
+                .nodes()
+                .iter()
+                .any(|node| node.name == "fabricad.viewctl.layout"),
+            "layout controls belong in the tool strip and side panels, not below the canvas"
+        );
+
+        let layout_3d_app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Layout3d),
+            ..Default::default()
+        });
+        let layout_3d_document = layout_3d_app
+            .build_operad_document(UiSize::new(1440.0, 920.0))
+            .expect("3D layout primary canvas should build");
+        let layout_3d_requests = RenderFrameRequest::new(
+            RenderTarget::window("test", UiSize::new(1440.0, 920.0)),
+            UiSize::new(1440.0, 920.0),
+            layout_3d_document.paint_list(),
+        )
+        .canvas_requests();
+        assert!(
+            layout_3d_requests
+                .iter()
+                .any(|request| request.canvas.key == "fabricad.layout.viewport.3d"),
+            "3D layout editor should publish a canvas render request"
+        );
+        let layout_3d_canvas = layout_3d_requests
+            .iter()
+            .find(|request| request.canvas.key == "fabricad.layout.viewport.3d")
+            .expect("3D layout canvas request should exist");
+        assert_eq!(
+            layout_3d_canvas.canvas.render_mode,
+            operad::CanvasRenderMode::AttachedContext
+        );
+        assert!(layout_3d_canvas.canvas.context.kind.is_gpu_backed());
 
         let cross_section_app = FabricadApp::new_with_options(StartupOptions {
             view_mode: Some(StartupView::CrossSection),
@@ -19905,11 +32653,11 @@ mod tests {
     }
 
     #[test]
-    fn operad_document_scales_for_hidpi_windows() {
+    fn ui_document_scales_for_hidpi_windows() {
         let app = FabricadApp::new_with_options(StartupOptions::default());
         let document = app
             .build_operad_document_scaled(UiSize::new(2048.0, 1440.0), UiScale::new(2.0))
-            .expect("scaled Operad document should build");
+            .expect("scaled UI document should build");
 
         assert_eq!(document.audit_layout(), Vec::new());
         let menu = document
@@ -19917,13 +32665,58 @@ mod tests {
             .iter()
             .find(|node| node.name == "fabricad.menu.file")
             .expect("file menu should exist");
-        assert!(menu.layout.rect.height >= 50.0, "{:?}", menu.layout.rect);
+        assert!(menu.layout.rect.height >= 40.0, "{:?}", menu.layout.rect);
         let nav = document
             .nodes()
             .iter()
             .find(|node| node.name == "fabricad.nav")
             .expect("nav should exist");
         assert!(nav.layout.rect.width >= 400.0, "{:?}", nav.layout.rect);
+    }
+
+    #[test]
+    fn narrow_ui_preserves_body_width() {
+        let app = FabricadApp::new_with_options(StartupOptions::default());
+        let document = app
+            .build_operad_document(UiSize::new(480.0, 900.0))
+            .expect("narrow UI document should build");
+
+        assert_eq!(document.audit_layout(), Vec::new());
+        let nav = document
+            .nodes()
+            .iter()
+            .find(|node| node.name == "fabricad.nav")
+            .expect("nav should exist");
+        assert!(nav.layout.rect.width <= 170.0, "{:?}", nav.layout.rect);
+        let body_frame = document
+            .nodes()
+            .iter()
+            .find(|node| node.name == "fabricad.body_frame")
+            .expect("body frame should exist");
+        assert!(
+            body_frame.layout.rect.width >= 300.0,
+            "{:?}",
+            body_frame.layout.rect
+        );
+
+        let layout_app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            ..Default::default()
+        });
+        let layout_document = layout_app
+            .build_operad_document(UiSize::new(480.0, 900.0))
+            .expect("narrow layout editor should build");
+        assert_eq!(layout_document.audit_layout(), Vec::new());
+        let preview = layout_document
+            .nodes()
+            .iter()
+            .find(|node| node.name == "fabricad.layout.preview")
+            .expect("layout preview should exist");
+        assert!(
+            preview.layout.rect.width >= 280.0,
+            "{:?}",
+            preview.layout.rect
+        );
     }
 
     #[test]
@@ -20766,6 +33559,52 @@ mod tests {
         }
     }
 
+    #[test]
+    fn all_views_are_warning_free_at_audit_sizes() {
+        for viewport in [
+            UiSize::new(480.0, 900.0),
+            UiSize::new(768.0, 1024.0),
+            UiSize::new(1280.0, 720.0),
+            UiSize::new(1440.0, 920.0),
+            UiSize::new(1920.0, 1080.0),
+        ] {
+            for view in StartupView::ALL {
+                let app = FabricadApp::new_with_options(StartupOptions {
+                    view_mode: Some(view),
+                    ..Default::default()
+                });
+                let document = app
+                    .build_operad_document(viewport)
+                    .expect("audit-sized view document should build");
+                let warnings = document.audit_layout();
+                assert!(
+                    warnings.is_empty(),
+                    "view {view:?} viewport {viewport:?} warnings: {warnings:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn all_views_are_warning_free_at_hidpi_scale() {
+        let viewport = UiSize::new(2048.0, 1440.0);
+        let ui_scale = UiScale::new(2.0);
+        for view in StartupView::ALL {
+            let app = FabricadApp::new_with_options(StartupOptions {
+                view_mode: Some(view),
+                ..Default::default()
+            });
+            let document = app
+                .build_operad_document_scaled(viewport, ui_scale)
+                .expect("HiDPI audit-sized view document should build");
+            let warnings = document.audit_layout();
+            assert!(
+                warnings.is_empty(),
+                "view {view:?} viewport {viewport:?} scale {ui_scale:?} warnings: {warnings:?}"
+            );
+        }
+    }
+
     fn assert_clicked_node(document: &mut UiDocument, name: &str) {
         let (node_id, point) = document
             .nodes()
@@ -20787,5 +33626,14 @@ mod tests {
         assert_eq!(down.pressed, Some(node_id));
         let up = document.handle_input(operad::UiInputEvent::PointerUp(point));
         assert_eq!(up.clicked, Some(node_id));
+    }
+
+    fn node_rect(document: &UiDocument, name: &str) -> UiRect {
+        document
+            .nodes()
+            .iter()
+            .find(|node| node.name == name)
+            .map(|node| node.layout.rect)
+            .unwrap_or_else(|| panic!("expected node {name} to exist"))
     }
 }

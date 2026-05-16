@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import html
+import re
 import shutil
 import subprocess
 import sys
@@ -27,30 +28,12 @@ class ViewportSize:
     name: str
     width: int
     height: int
+    scale: float = 1.0
 
+    def label(self) -> str:
+        suffix = "" if self.scale == 1.0 else f" @{self.scale:g}x"
+        return f"{self.width}x{self.height}{suffix}"
 
-VIEWS = [
-    ViewCase("workflow", "Workflow"),
-    ViewCase("layout", "Mask layout"),
-    ViewCase("3d", "3D viewport"),
-    ViewCase("reticle", "Reticle prep"),
-    ViewCase("diff", "Layout diff"),
-    ViewCase("fab", "Equipment"),
-    ViewCase("inventory", "Inventory"),
-    ViewCase("maintenance", "Maintenance"),
-    ViewCase("environment", "Environment"),
-    ViewCase("dispatch", "Dispatch"),
-    ViewCase("safety", "Safety"),
-    ViewCase("traceability", "Traceability"),
-    ViewCase("metrology", "Metrology"),
-    ViewCase("yield", "Yield"),
-    ViewCase("spc", "SPC / FDC"),
-    ViewCase("process-flow", "Process flow"),
-    ViewCase("r2r", "R2R control"),
-    ViewCase("cross-section", "Cross-section"),
-    ViewCase("doe", "DOE"),
-    ViewCase("notebook", "Notebook"),
-]
 
 SIZES = [
     ViewportSize("narrow", 480, 900),
@@ -58,10 +41,86 @@ SIZES = [
     ViewportSize("laptop", 1280, 720),
     ViewportSize("desktop", 1440, 920),
     ViewportSize("wide", 1920, 1080),
+    ViewportSize("hidpi", 2048, 1440, 2.0),
 ]
 
-QUICK_VIEWS = {"workflow", "layout", "3d", "reticle", "diff", "maintenance", "environment"}
 QUICK_SIZES = {"narrow", "laptop", "wide"}
+SUMMARY_COUNT_PATTERN = re.compile(r"\b(paint_items|layout_warnings)=(\d+)\b")
+PRESET_CLICKS = {
+    "bookmarks-menu": [
+        "fabricad.menu.bookmarks",
+    ],
+    "canvas-2d": [],
+    "canvas-3d": [],
+    "command-palette": [
+        "fabricad.menu.view",
+        "fabricad.menu.item.view.command_palette",
+    ],
+    "file-menu": [
+        "fabricad.menu.file",
+    ],
+    "help-menu": [
+        "fabricad.menu.help",
+    ],
+    "edit-menu": [
+        "fabricad.menu.edit",
+    ],
+    "display-menu": [
+        "fabricad.menu.display",
+    ],
+    "details-panel": [
+        "fabricad.menu.display",
+        "fabricad.menu.item.display.inspector",
+    ],
+    "macros-menu": [
+        "fabricad.menu.macros",
+    ],
+    "more-menu": [
+        "fabricad.menu.more",
+    ],
+    "options-panel": [
+        "fabricad.menu.options",
+        "fabricad.menu.item.display.options",
+    ],
+    "secondary-panel": [
+        "fabricad.menu.display",
+        "fabricad.menu.item.display.secondary_panel",
+    ],
+    "sidebar-modules": [
+        "fabricad.menu.view",
+        "fabricad.menu.item.view.sidebar_modules",
+    ],
+    "tools-menu": [
+        "fabricad.menu.tools",
+    ],
+    "view-analysis": [
+        "fabricad.menu.view",
+        "fabricad.menu.item.view.group.analysis",
+    ],
+    "view-design": [
+        "fabricad.menu.view",
+        "fabricad.menu.item.view.group.design",
+    ],
+    "view-engineering": [
+        "fabricad.menu.view",
+        "fabricad.menu.item.view.group.engineering",
+    ],
+    "view-operations": [
+        "fabricad.menu.view",
+        "fabricad.menu.item.view.group.operations",
+    ],
+}
+PRESET_DEFAULT_VIEWS = {
+    "canvas-2d": ["layout2d"],
+    "canvas-3d": ["layout3d"],
+    "edit-menu": ["layout2d"],
+    "secondary-panel": ["layout2d"],
+    "tools-menu": ["layout2d"],
+}
+
+
+def preset_default_views(name: str) -> list[str]:
+    return PRESET_DEFAULT_VIEWS.get(name, ["workflow"])
 
 
 def native_binary() -> Path:
@@ -76,16 +135,67 @@ def native_binary() -> Path:
     return binary
 
 
-def capture_snapshot(binary: Path, view: ViewCase, size: ViewportSize, out_dir: Path) -> Path:
-    raw_path = out_dir / "raw" / size.name / f"{view.slug}.rgba"
-    png_path = out_dir / "screenshots" / size.name / f"{view.slug}.png"
-    summary_path = out_dir / "summaries" / size.name / f"{view.slug}.txt"
+def load_views(binary: Path) -> list[ViewCase]:
+    result = subprocess.run(
+        [str(binary), "--list-views"],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"view list command failed: {result.stderr.strip()}")
+    views = []
+    for line in result.stdout.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t", 1)
+        if len(parts) != 2:
+            raise RuntimeError(f"malformed view list line: {line!r}")
+        views.append(ViewCase(parts[0], parts[1]))
+    if not views:
+        raise RuntimeError("view list command returned no views")
+    return views
+
+
+def parse_summary_counts(summary_path: Path) -> dict[str, int]:
+    text = summary_path.read_text(encoding="utf-8")
+    counts = {key: int(value) for key, value in SUMMARY_COUNT_PATTERN.findall(text)}
+    for key in ["paint_items", "layout_warnings"]:
+        if key not in counts:
+            raise RuntimeError(f"snapshot summary missing {key}: {summary_path}")
+    return counts
+
+
+def click_suffix(clicks: list[str]) -> str:
+    if not clicks:
+        return ""
+    parts = []
+    for click in clicks:
+        part = re.sub(r"[^A-Za-z0-9]+", "-", click).strip("-").lower()
+        part = re.sub(r"^(fabricad-)?menu-item-", "", part)
+        part = re.sub(r"^(fabricad-)?menu-", "menu-", part)
+        parts.append(part[:48] or "click")
+    return "__" + "__".join(parts)[:120]
+
+
+def capture_snapshot(
+    binary: Path,
+    view: ViewCase,
+    size: ViewportSize,
+    out_dir: Path,
+    clicks: list[str],
+) -> Path:
+    stem = f"{view.slug}{click_suffix(clicks)}"
+    raw_path = out_dir / "raw" / size.name / f"{stem}.rgba"
+    png_path = out_dir / "screenshots" / size.name / f"{stem}.png"
+    summary_path = out_dir / "summaries" / size.name / f"{stem}.txt"
     raw_path.parent.mkdir(parents=True, exist_ok=True)
     png_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     command = [
         str(binary),
-        "--operad-snapshot",
+        "--snapshot",
         "--workspace=demo",
         "--view",
         view.slug,
@@ -96,6 +206,10 @@ def capture_snapshot(binary: Path, view: ViewCase, size: ViewportSize, out_dir: 
         "--snapshot-rgba",
         str(raw_path),
     ]
+    if size.scale != 1.0:
+        command.extend(["--ui-scale", f"{size.scale:g}"])
+    for click in clicks:
+        command.extend(["--click", click])
     result = subprocess.run(
         command,
         cwd=ROOT,
@@ -107,6 +221,13 @@ def capture_snapshot(binary: Path, view: ViewCase, size: ViewportSize, out_dir: 
     if result.returncode != 0:
         raise RuntimeError(
             f"snapshot failed for {size.name}/{view.slug} with {result.returncode}; see {summary_path}"
+        )
+    counts = parse_summary_counts(summary_path)
+    if counts["paint_items"] <= 0:
+        raise RuntimeError(f"snapshot painted no UI items for {size.name}/{view.slug}; see {summary_path}")
+    if counts["layout_warnings"] > 0:
+        raise RuntimeError(
+            f"snapshot reported {counts['layout_warnings']} layout warning(s) for {size.name}/{view.slug}; see {summary_path}"
         )
     raw = raw_path.read_bytes()
     expected = size.width * size.height * 4
@@ -153,7 +274,7 @@ def make_contact_sheet(
         )
         draw.text(
             (x, y + 7),
-            f"{view.label}  {size.width}x{size.height}",
+            f"{view.label}  {size.label()}",
             fill=(235, 235, 235),
             font=font,
         )
@@ -183,7 +304,7 @@ def write_review_html(
                 f"<figcaption>{html.escape(view.label)}</figcaption></figure>"
             )
         rows.append(
-            f"<section><h2>{html.escape(size.name)} {size.width}x{size.height}</h2>"
+            f"<section><h2>{html.escape(size.name)} {html.escape(size.label())}</h2>"
             f'<div class="grid">{"".join(cells)}</div></section>'
         )
 
@@ -194,7 +315,7 @@ def write_review_html(
     )
     html_text = f"""<!doctype html>
 <meta charset="utf-8">
-<title>Fabricad UI Layout Audit</title>
+<title>UI Layout Audit</title>
 <style>
 body {{
   background: #151718;
@@ -225,8 +346,8 @@ figcaption {{
   margin-top: 6px;
 }}
 </style>
-<h1>Fabricad UI Layout Audit</h1>
-<p>Review each Operad snapshot for clipped labels, bad wrapping, crowded margins, and content that disappears at narrow or wide aspect ratios.</p>
+<h1>UI Layout Audit</h1>
+<p>Review each snapshot for clipped labels, bad wrapping, crowded margins, and content that disappears at narrow or wide aspect ratios.</p>
 <h2>Contact sheets</h2>
 <ul>{sheet_links}</ul>
 {"".join(rows)}
@@ -236,16 +357,44 @@ figcaption {{
     return path
 
 
-def selected_views(values: list[str], quick: bool) -> list[ViewCase]:
+def write_preset_index(preset_reviews: dict[str, Path], out_dir: Path) -> Path:
+    links = "".join(
+        f'<li><a href="{html.escape(str(path.relative_to(out_dir)))}">'
+        f"{html.escape(name)}</a></li>"
+        for name, path in sorted(preset_reviews.items())
+    )
+    html_text = f"""<!doctype html>
+<meta charset="utf-8">
+<title>UI Preset Layout Audit</title>
+<style>
+body {{
+  background: #151718;
+  color: #e6e6e6;
+  font: 14px system-ui, sans-serif;
+  margin: 24px;
+}}
+a {{ color: #8cc8ff; }}
+h1 {{ font-weight: 600; }}
+</style>
+<h1>UI Preset Layout Audit</h1>
+<p>Named interactive states captured with startup click sequences.</p>
+<ul>{links}</ul>
+"""
+    path = out_dir / "index.html"
+    path.write_text(html_text, encoding="utf-8")
+    return path
+
+
+def selected_views(values: list[str], quick: bool, views: list[ViewCase]) -> list[ViewCase]:
     if values:
         wanted = set(values)
-        unknown = wanted - {view.slug for view in VIEWS}
+        unknown = wanted - {view.slug for view in views}
         if unknown:
             raise ValueError(f"unknown view slug(s): {', '.join(sorted(unknown))}")
-        return [view for view in VIEWS if view.slug in wanted]
+        return [view for view in views if view.slug in wanted]
     if quick:
-        return [view for view in VIEWS if view.slug in QUICK_VIEWS]
-    return VIEWS
+        return views
+    return views
 
 
 def selected_sizes(values: list[str], quick: bool) -> list[ViewportSize]:
@@ -260,16 +409,23 @@ def selected_sizes(values: list[str], quick: bool) -> list[ViewportSize]:
     return SIZES
 
 
-def run_audit(views: list[ViewCase], sizes: list[ViewportSize], out_dir: Path) -> None:
+def run_audit(
+    views: list[ViewCase],
+    sizes: list[ViewportSize],
+    out_dir: Path,
+    binary: Path,
+    clicks: list[str],
+) -> None:
     if out_dir.exists():
         shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    binary = native_binary()
     screenshots: dict[tuple[str, str], Path] = {}
 
     for size in sizes:
         for view in views:
-            screenshots[(size.name, view.slug)] = capture_snapshot(binary, view, size, out_dir)
+            screenshots[(size.name, view.slug)] = capture_snapshot(
+                binary, view, size, out_dir, clicks
+            )
             print(f"captured {size.name}/{view.slug}")
 
     contact_sheets = [make_contact_sheet(size, views, screenshots, out_dir) for size in sizes]
@@ -279,7 +435,7 @@ def run_audit(views: list[ViewCase], sizes: list[ViewportSize], out_dir: Path) -
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Capture Fabricad Operad UI snapshots across views and aspect ratios."
+        description="Capture UI snapshots across views and aspect ratios."
     )
     parser.add_argument("--quick", action="store_true", help="capture a smaller smoke matrix")
     parser.add_argument(
@@ -300,12 +456,62 @@ def main() -> int:
         default=OUT_DIR,
         help=f"artifact directory (default: {OUT_DIR})",
     )
+    parser.add_argument(
+        "--click",
+        action="append",
+        default=[],
+        help="node name to click before each snapshot; may be repeated",
+    )
+    parser.add_argument(
+        "--preset",
+        choices=sorted(PRESET_CLICKS),
+        help="named interactive state to capture; adds its click sequence",
+    )
+    parser.add_argument(
+        "--all-presets",
+        action="store_true",
+        help="capture every named interactive preset into subdirectories under --out",
+    )
     args = parser.parse_args()
 
     try:
-        views = selected_views(args.view, args.quick)
+        if args.all_presets and args.preset:
+            raise ValueError("--all-presets cannot be combined with --preset")
+        binary = native_binary()
+        available_views = load_views(binary)
+        base_clicks = list(args.click)
+        view_args = list(args.view)
         sizes = selected_sizes(args.size, args.quick)
-        run_audit(views, sizes, args.out)
+        if args.all_presets:
+            if args.out.exists():
+                shutil.rmtree(args.out)
+            args.out.mkdir(parents=True, exist_ok=True)
+            preset_reviews = {}
+            for preset_name in sorted(PRESET_CLICKS):
+                preset_views = selected_views(
+                    view_args or preset_default_views(preset_name),
+                    args.quick,
+                    available_views,
+                )
+                preset_out = args.out / preset_name
+                run_audit(
+                    preset_views,
+                    sizes,
+                    preset_out,
+                    binary,
+                    PRESET_CLICKS[preset_name] + base_clicks,
+                )
+                preset_reviews[preset_name] = preset_out / "index.html"
+            review = write_preset_index(preset_reviews, args.out)
+            print(f"preset review: {review}")
+        else:
+            if args.preset and not view_args:
+                view_args = preset_default_views(args.preset)
+            views = selected_views(view_args, args.quick, available_views)
+            clicks = base_clicks
+            if args.preset:
+                clicks = PRESET_CLICKS[args.preset] + clicks
+            run_audit(views, sizes, args.out, binary, clicks)
     except Exception as error:
         print(f"ui layout audit failed: {error}", file=sys.stderr)
         return 1

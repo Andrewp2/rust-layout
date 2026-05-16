@@ -1,257 +1,1105 @@
-use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use fabricad_app::{FabricadApp, StartupOptions, UiScale};
+#[cfg(test)]
+use fabricad_app::build_layout_3d_batch_with_options;
+use fabricad_app::{
+    FabricadApp, LayoutCanvasResources, StartupOptions, StartupView, ToolMode,
+    Viewport3dCanvasResources, render_layout_2d_canvas_with_size, render_layout_3d_canvas,
+};
+#[cfg(test)]
+use geometry_core::{Point, Rect};
+#[cfg(test)]
+use layout_model::Document;
 use operad::{
-    ColorRgba, RenderFrameRequest, RenderOptions, RenderTarget, RendererAdapter, UiDocument,
-    UiInputEvent, UiPoint, UiSize, WgpuSurfaceRenderer,
+    CanvasRenderOutput, CursorGrabMode, CursorRequest, KeyCode, KeyModifiers, NativeCanvasInput,
+    NativeKeyboardInput, NativeRawMouseMotion, NativeWgpuCanvasRenderContext,
+    NativeWgpuCanvasRenderRegistry, NativeWindowHooks, NativeWindowMetrics, NativeWindowOptions,
+    PlatformRequest, PointerButton, PointerEventKind, RawInputEvent, RenderError, UiContent,
+    UiDocument, UiInputEvent, UiNodeId, UiPoint, UiRect, UiSize, WidgetAction, WidgetActionBinding,
+    WidgetActionKind,
 };
-use operad_wgpu as wgpu;
-use winit::{
-    application::ApplicationHandler,
-    dpi::{LogicalSize, PhysicalPosition},
-    event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
-    event_loop::{ActiveEventLoop, EventLoop},
-    window::{Window, WindowAttributes, WindowId},
-};
+#[cfg(test)]
+use operad::{RawPointerEvent, platform::PixelSize};
 
 const DEFAULT_WIDTH: u32 = 1440;
 const DEFAULT_HEIGHT: u32 = 920;
+const DOUBLE_CLICK_MAX_INTERVAL: Duration = Duration::from_millis(400);
+const DOUBLE_CLICK_MAX_DISTANCE: f32 = 5.0;
+const CANVAS_LINE_SCROLL_POINTS: f32 = 36.0;
 
 pub fn run(options: StartupOptions) -> Result<(), Box<dyn std::error::Error>> {
-    let event_loop = EventLoop::new()?;
-    let mut app = NativeWindowApp::new(options);
-    event_loop.run_app(&mut app)?;
+    let state = FabricadNativeState::new(options);
+    let native_options = NativeWindowOptions::new("Fabricad")
+        .with_size(DEFAULT_WIDTH as f32, DEFAULT_HEIGHT as f32)
+        .with_min_size(720.0, 480.0);
+    let mut canvas_renderers = NativeWgpuCanvasRenderRegistry::new();
+    canvas_renderers.register(
+        "fabricad.layout.viewport.2d",
+        render_native_layout_2d_canvas,
+    );
+    canvas_renderers.register(
+        "fabricad.layout.viewport.3d",
+        render_native_layout_3d_canvas,
+    );
+
+    operad::run_app_with_canvas_renderers_and_hooks(
+        native_options,
+        state,
+        update_native_state,
+        view_native_state,
+        canvas_renderers,
+        native_hooks(),
+    )?;
     Ok(())
 }
 
-struct NativeWindowApp {
+struct FabricadNativeState {
     app: FabricadApp,
-    window: Option<Arc<Window>>,
-    renderer: Option<WgpuSurfaceRenderer<'static>>,
-    document: Option<UiDocument>,
-    cursor_position: Option<UiPoint>,
+    layout_canvas: LayoutCanvasResources,
+    viewport_3d_canvas: Viewport3dCanvasResources,
+    layout_pan_drag: Option<UiPoint>,
+    last_left_click: Option<(UiPoint, Instant)>,
+    modifiers: KeyModifiers,
+    flycam_keys: FlycamKeyState,
+    last_flycam_tick: Instant,
+    native_flycam_captured: bool,
 }
 
-impl NativeWindowApp {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct FlycamKeyState {
+    forward: bool,
+    backward: bool,
+    left: bool,
+    right: bool,
+    up: bool,
+    down: bool,
+}
+
+impl FlycamKeyState {
+    fn set_key(&mut self, key: KeyCode, pressed: bool) -> bool {
+        let slot = match key {
+            KeyCode::ArrowUp | KeyCode::Character('w' | 'W') => &mut self.forward,
+            KeyCode::ArrowDown | KeyCode::Character('s' | 'S') => &mut self.backward,
+            KeyCode::ArrowLeft | KeyCode::Character('a' | 'A') => &mut self.left,
+            KeyCode::ArrowRight | KeyCode::Character('d' | 'D') => &mut self.right,
+            KeyCode::Character('e' | 'E' | ' ') => &mut self.up,
+            KeyCode::Character('q' | 'Q') => &mut self.down,
+            _ => return false,
+        };
+        if *slot == pressed {
+            return false;
+        }
+        *slot = pressed;
+        true
+    }
+
+    fn any(self) -> bool {
+        self.forward || self.backward || self.left || self.right || self.up || self.down
+    }
+}
+
+impl FabricadNativeState {
     fn new(options: StartupOptions) -> Self {
         Self {
             app: FabricadApp::new_with_options(options),
-            window: None,
-            renderer: None,
-            document: None,
-            cursor_position: None,
+            layout_canvas: LayoutCanvasResources::default(),
+            viewport_3d_canvas: Viewport3dCanvasResources::default(),
+            layout_pan_drag: None,
+            last_left_click: None,
+            modifiers: KeyModifiers::NONE,
+            flycam_keys: FlycamKeyState::default(),
+            last_flycam_tick: Instant::now(),
+            native_flycam_captured: false,
         }
     }
 
-    fn create_window(&mut self, event_loop: &ActiveEventLoop) -> Result<(), String> {
-        if self.window.is_some() {
-            return Ok(());
-        }
-
-        let attributes = WindowAttributes::default()
-            .with_title("Fabricad")
-            .with_inner_size(LogicalSize::new(
-                DEFAULT_WIDTH as f64,
-                DEFAULT_HEIGHT as f64,
-            ))
-            .with_min_inner_size(LogicalSize::new(720.0, 480.0));
-        let window = Arc::new(
-            event_loop
-                .create_window(attributes)
-                .map_err(|err| format!("create Fabricad window: {err}"))?,
-        );
-        self.renderer = Some(pollster::block_on(create_renderer(&window))?);
-        window.request_redraw();
-        self.window = Some(window);
-        Ok(())
+    fn build_document(&self, viewport: UiSize) -> UiDocument {
+        let mut document = self
+            .app
+            .build_operad_document(viewport)
+            .expect("Fabricad document should build for native window");
+        attach_default_pointer_actions(&mut document);
+        document
     }
 
-    fn render(&mut self) -> Result<(), String> {
-        let (Some(window), Some(renderer)) = (&self.window, &mut self.renderer) else {
-            return Ok(());
-        };
-        let size = window.inner_size();
-        if size.width == 0 || size.height == 0 {
-            return Ok(());
+    fn handle_widget_action(&mut self, action: WidgetAction) -> bool {
+        if !matches!(action.kind, WidgetActionKind::Activate(_)) {
+            return false;
         }
-
-        let viewport = UiSize::new(size.width as f32, size.height as f32);
-        let ui_scale = window_ui_scale(window);
-        let document = self.app.build_operad_document_scaled(viewport, ui_scale)?;
-        let request = RenderFrameRequest::new(
-            RenderTarget::window("fabricad.main", viewport),
-            viewport,
-            document.paint_list(),
-        )
-        .options(RenderOptions {
-            clear_color: ColorRgba::new(14, 18, 22, 255),
-            ..Default::default()
-        });
-        renderer
-            .render_frame(request, &operad::EmptyResourceResolver)
-            .map_err(|err| format!("render Fabricad window: {err}"))?;
-        self.document = Some(document);
-        Ok(())
-    }
-
-    fn handle_ui_input(&mut self, event: UiInputEvent) -> bool {
-        let Some(document) = self.document.as_mut() else {
+        let Some(action_id) = action.binding.action_id() else {
             return false;
         };
-        let result = document.handle_input(event);
-        if let Some(clicked) = result.clicked {
-            let name = document.node(clicked).name.clone();
-            return self.app.apply_clicked_node_name(&name);
+        let previous_view = self.app.active_view();
+        let handled = self.app.apply_clicked_node_name(action_id.as_str());
+        if handled && self.app.active_view() != previous_view {
+            self.layout_pan_drag = None;
+            self.flycam_keys = FlycamKeyState::default();
         }
-        result.hovered.is_some() || result.scrolled.is_some()
+        handled
     }
 
-    fn handle_error(event_loop: &ActiveEventLoop, error: String) {
-        eprintln!("ERROR {error}");
-        event_loop.exit();
-    }
-}
-
-impl ApplicationHandler for NativeWindowApp {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if let Err(error) = self.create_window(event_loop) {
-            Self::handle_error(event_loop, error);
+    fn handle_canvas_input(&mut self, input: NativeCanvasInput) -> bool {
+        match input.key.as_str() {
+            "fabricad.layout.viewport.2d" => self.handle_layout_2d_canvas_input(&input),
+            "fabricad.layout.viewport.3d" => self.handle_layout_3d_canvas_input(&input),
+            _ => false,
         }
     }
 
-    fn window_event(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        window_id: WindowId,
-        event: WindowEvent,
-    ) {
-        if self
-            .window
-            .as_ref()
-            .is_some_and(|window| window.id() != window_id)
+    fn handle_layout_2d_canvas_input(&mut self, input: &NativeCanvasInput) -> bool {
+        if self.app.active_view() != StartupView::Layout2d {
+            return false;
+        }
+
+        if let RawInputEvent::Pointer(pointer) = &input.input {
+            match pointer.kind {
+                PointerEventKind::Move if self.update_layout_pan_drag(pointer.position) => {
+                    return true;
+                }
+                PointerEventKind::Down(PointerButton::Secondary) => {
+                    return self.handle_layout_secondary_click(pointer.position, input.rect)
+                        || self.begin_layout_pan_drag(pointer.position, input.rect);
+                }
+                PointerEventKind::Down(PointerButton::Auxiliary) => {
+                    return self.begin_layout_pan_drag(pointer.position, input.rect);
+                }
+                PointerEventKind::Up(PointerButton::Secondary | PointerButton::Auxiliary)
+                | PointerEventKind::Cancel => return self.end_layout_pan_drag(),
+                PointerEventKind::Down(PointerButton::Primary)
+                | PointerEventKind::Up(PointerButton::Primary)
+                | PointerEventKind::Move => {}
+                PointerEventKind::Down(_) | PointerEventKind::Up(_) => return false,
+            }
+        }
+
+        let Some(event) = native_canvas_ui_event(input) else {
+            return false;
+        };
+        let mut handled =
+            self.app
+                .handle_layout_canvas_input_with_modifiers(&event, input.rect, self.modifiers);
+        if let RawInputEvent::Pointer(pointer) = &input.input
+            && matches!(pointer.kind, PointerEventKind::Up(PointerButton::Primary))
+            && self.consume_left_double_click(pointer.position)
         {
+            handled |= self
+                .app
+                .handle_layout_canvas_double_click(pointer.position, input.rect);
+        }
+        handled
+    }
+
+    fn handle_layout_3d_canvas_input(&mut self, input: &NativeCanvasInput) -> bool {
+        if self.app.active_view() != StartupView::Layout3d {
+            return false;
+        }
+        if let RawInputEvent::Pointer(pointer) = &input.input {
+            match pointer.kind {
+                PointerEventKind::Down(PointerButton::Secondary) if self.app.flycam_captured() => {
+                    self.set_native_flycam_capture(false);
+                    return true;
+                }
+                PointerEventKind::Down(PointerButton::Auxiliary)
+                | PointerEventKind::Up(PointerButton::Auxiliary)
+                | PointerEventKind::Down(PointerButton::Secondary)
+                | PointerEventKind::Up(PointerButton::Secondary) => return false,
+                PointerEventKind::Cancel => {
+                    self.set_native_flycam_capture(false);
+                    return true;
+                }
+                _ => {}
+            }
+        }
+
+        let Some(event) = native_canvas_ui_event(input) else {
+            return false;
+        };
+        let handled = self.app.handle_layout_3d_canvas_input(&event, input.rect);
+        if handled && self.app.flycam_captured() {
+            self.native_flycam_captured = false;
+        }
+        handled
+    }
+
+    fn handle_keyboard_input(&mut self, input: NativeKeyboardInput) -> bool {
+        self.modifiers = key_modifiers(input.modifiers);
+        let Some(key) = input.key_code else {
+            return false;
+        };
+
+        if self.app.flycam_captured() {
+            let key_state_changed = self.update_flycam_key_state(key, input.pressed);
+            if input.pressed && key == KeyCode::Escape && !has_command_modifier(self.modifiers) {
+                self.set_native_flycam_capture(false);
+                return true;
+            }
+            if input.pressed && self.app.handle_layout_3d_key(key, self.modifiers) {
+                return true;
+            }
+            return key_state_changed || self.app.active_view() == StartupView::Layout3d;
+        }
+
+        if input.pressed {
+            self.handle_keyboard_shortcut(key, self.modifiers)
+        } else {
+            false
+        }
+    }
+
+    fn handle_keyboard_shortcut(&mut self, key: KeyCode, modifiers: KeyModifiers) -> bool {
+        if key == KeyCode::Escape && !has_command_modifier(modifiers) {
+            return self.app.dismiss_transient_ui();
+        }
+
+        if primary_shortcut(modifiers)
+            && (matches_shortcut_char(key, 'k') || matches_shortcut_char(key, 'p'))
+        {
+            return self
+                .app
+                .apply_clicked_node_name("fabricad.menu.item.tools.palette");
+        }
+
+        if self.handle_view_cycle_shortcut(key, modifiers) {
+            return true;
+        }
+
+        if self.handle_editor_shortcut(key, modifiers) {
+            return true;
+        }
+
+        if modifiers.alt
+            && !modifiers.ctrl
+            && !modifiers.meta
+            && let KeyCode::Character(character) = key
+            && let Some(slug) = menu_slug_for_hotkey(character)
+        {
+            return self
+                .app
+                .apply_clicked_node_name(&format!("fabricad.menu.{slug}"));
+        }
+
+        false
+    }
+
+    fn handle_view_cycle_shortcut(&mut self, key: KeyCode, modifiers: KeyModifiers) -> bool {
+        if key != KeyCode::Tab || !primary_shortcut(modifiers) {
+            return false;
+        }
+
+        let views = fabricad_app::StartupView::ALL;
+        let current = views
+            .iter()
+            .position(|view| *view == self.app.active_view())
+            .unwrap_or(0);
+        let next = if modifiers.shift {
+            current.checked_sub(1).unwrap_or(views.len() - 1)
+        } else {
+            (current + 1) % views.len()
+        };
+        self.app.set_active_view(views[next]);
+        self.layout_pan_drag = None;
+        self.flycam_keys = FlycamKeyState::default();
+        true
+    }
+
+    fn handle_editor_shortcut(&mut self, key: KeyCode, modifiers: KeyModifiers) -> bool {
+        if !matches!(
+            self.app.active_view(),
+            fabricad_app::StartupView::Layout2d | fabricad_app::StartupView::Layout3d
+        ) {
+            return false;
+        }
+
+        if primary_shortcut(modifiers) && matches_shortcut_char(key, 'c') {
+            return self
+                .app
+                .apply_clicked_node_name("fabricad.menu.item.edit.copy");
+        }
+        if primary_shortcut(modifiers) && matches_shortcut_char(key, 'v') {
+            return self
+                .app
+                .apply_clicked_node_name("fabricad.menu.item.edit.paste");
+        }
+        if primary_shortcut(modifiers) && matches_shortcut_char(key, 'd') {
+            return self
+                .app
+                .apply_clicked_node_name("fabricad.menu.item.edit.duplicate");
+        }
+        if primary_shortcut(modifiers) && matches_shortcut_char(key, 'z') {
+            let action = if modifiers.shift {
+                "fabricad.menu.item.edit.redo"
+            } else {
+                "fabricad.menu.item.edit.undo"
+            };
+            return self.app.apply_clicked_node_name(action);
+        }
+        if primary_shortcut(modifiers) && matches_shortcut_char(key, 'y') {
+            return self
+                .app
+                .apply_clicked_node_name("fabricad.menu.item.edit.redo");
+        }
+        if self.app.active_view() == fabricad_app::StartupView::Layout3d
+            && self.app.handle_layout_3d_key(key, modifiers)
+        {
+            return true;
+        }
+        if !has_command_modifier(modifiers) && self.app.active_view() == StartupView::Layout2d {
+            if let Some(node) = layout_tool_shortcut_node(key) {
+                return self.app.apply_clicked_node_name(node);
+            }
+            if matches_shortcut_char(key, 'r') {
+                return self
+                    .app
+                    .apply_clicked_node_name("fabricad.menu.item.edit.rotate90");
+            }
+            if matches_shortcut_char(key, 'h') {
+                return self
+                    .app
+                    .apply_clicked_node_name("fabricad.menu.item.edit.mirror_x");
+            }
+            if matches_shortcut_char(key, 'v') {
+                return self
+                    .app
+                    .apply_clicked_node_name("fabricad.menu.item.edit.mirror_y");
+            }
+        }
+        if self.app.handle_layout_editor_key(key, modifiers) {
+            return true;
+        }
+        if key == KeyCode::Delete && !has_command_modifier(modifiers) {
+            return self
+                .app
+                .apply_clicked_node_name("fabricad.menu.item.edit.delete");
+        }
+
+        false
+    }
+
+    fn handle_raw_mouse_motion(&mut self, input: NativeRawMouseMotion) -> bool {
+        if !self.app.flycam_captured() {
+            return false;
+        }
+        self.app.apply_layout_3d_mouse_delta(
+            UiPoint::new(input.delta.0 as f32, input.delta.1 as f32),
+            true,
+        )
+    }
+
+    fn before_render(&mut self) {
+        if self.app.active_view() != StartupView::Layout3d {
+            self.flycam_keys = FlycamKeyState::default();
+            self.last_flycam_tick = Instant::now();
+            return;
+        }
+        if !self.app.flycam_captured() || !self.flycam_keys.any() {
+            self.last_flycam_tick = Instant::now();
             return;
         }
 
-        match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::CursorMoved { position, .. } => {
-                let point = point_from_position(position);
-                self.cursor_position = Some(point);
-                if self.handle_ui_input(UiInputEvent::PointerMove(point))
-                    && let Some(window) = &self.window
-                {
-                    window.request_redraw();
-                }
-            }
-            WindowEvent::MouseInput {
-                state,
-                button: MouseButton::Left,
-                ..
-            } => {
-                if let Some(point) = self.cursor_position {
-                    let event = match state {
-                        ElementState::Pressed => UiInputEvent::PointerDown(point),
-                        ElementState::Released => UiInputEvent::PointerUp(point),
-                    };
-                    if self.handle_ui_input(event)
-                        && let Some(window) = &self.window
-                    {
-                        window.request_redraw();
-                    }
-                }
-            }
-            WindowEvent::MouseWheel { delta, .. } => {
-                if let Some(point) = self.cursor_position {
-                    let ui_scale = self
-                        .window
-                        .as_ref()
-                        .map(|window| window_ui_scale(window).factor())
-                        .unwrap_or(1.0);
-                    let scroll = match delta {
-                        MouseScrollDelta::LineDelta(x, y) => {
-                            UiPoint::new(x * 36.0 * ui_scale, -y * 36.0 * ui_scale)
-                        }
-                        MouseScrollDelta::PixelDelta(delta) => {
-                            UiPoint::new(delta.x as f32, delta.y as f32)
-                        }
-                    };
-                    if self.handle_ui_input(UiInputEvent::wheel(point, scroll))
-                        && let Some(window) = &self.window
-                    {
-                        window.request_redraw();
-                    }
-                }
-            }
-            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
-                if let Some(window) = &self.window {
-                    window.request_redraw();
-                }
-            }
-            WindowEvent::RedrawRequested => {
-                if let Err(error) = self.render() {
-                    Self::handle_error(event_loop, error);
-                }
-            }
-            _ => {}
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_flycam_tick).as_secs_f32();
+        self.last_flycam_tick = now;
+        self.app.advance_layout_3d_flycam(
+            self.flycam_keys.forward,
+            self.flycam_keys.backward,
+            self.flycam_keys.left,
+            self.flycam_keys.right,
+            self.flycam_keys.up,
+            self.flycam_keys.down,
+            self.modifiers.shift,
+            dt,
+        );
+    }
+
+    fn idle_redraw(&self) -> bool {
+        self.app.flycam_captured() && self.flycam_keys.any()
+    }
+
+    fn platform_requests(&mut self) -> Vec<PlatformRequest> {
+        let should_capture =
+            self.app.active_view() == StartupView::Layout3d && self.app.flycam_captured();
+        if self.native_flycam_captured == should_capture {
+            return Vec::new();
+        }
+        self.native_flycam_captured = should_capture;
+        if should_capture {
+            vec![
+                PlatformRequest::Cursor(CursorRequest::SetGrab(CursorGrabMode::Locked)),
+                PlatformRequest::Cursor(CursorRequest::SetVisible(false)),
+            ]
+        } else {
+            vec![
+                PlatformRequest::Cursor(CursorRequest::SetGrab(CursorGrabMode::None)),
+                PlatformRequest::Cursor(CursorRequest::SetVisible(true)),
+            ]
+        }
+    }
+
+    fn set_native_flycam_capture(&mut self, captured: bool) -> bool {
+        let changed = self.app.set_layout_3d_flycam_capture(captured);
+        if !captured {
+            self.flycam_keys = FlycamKeyState::default();
+        }
+        changed
+    }
+
+    fn update_flycam_key_state(&mut self, key: KeyCode, pressed: bool) -> bool {
+        if self.app.active_view() != StartupView::Layout3d {
+            return false;
+        }
+        self.flycam_keys.set_key(key, pressed)
+    }
+
+    fn handle_layout_secondary_click(&mut self, point: UiPoint, canvas_rect: UiRect) -> bool {
+        if !matches!(self.app.active_tool(), ToolMode::Polygon | ToolMode::Path) {
+            return false;
+        }
+        self.app
+            .handle_layout_canvas_secondary_click(point, canvas_rect)
+    }
+
+    fn begin_layout_pan_drag(&mut self, point: UiPoint, canvas_rect: UiRect) -> bool {
+        if !canvas_rect.contains_point(point) || self.app.active_view() != StartupView::Layout2d {
+            return false;
+        }
+        self.layout_pan_drag = Some(point);
+        true
+    }
+
+    fn update_layout_pan_drag(&mut self, point: UiPoint) -> bool {
+        let Some(previous) = self.layout_pan_drag else {
+            return false;
+        };
+        let delta = UiPoint::new(point.x - previous.x, point.y - previous.y);
+        self.layout_pan_drag = Some(point);
+        self.app.pan_layout_canvas_by(delta)
+    }
+
+    fn end_layout_pan_drag(&mut self) -> bool {
+        self.layout_pan_drag.take().is_some()
+    }
+
+    fn consume_left_double_click(&mut self, point: UiPoint) -> bool {
+        let now = Instant::now();
+        let double_click = self.last_left_click.is_some_and(|(previous, at)| {
+            now.duration_since(at) <= DOUBLE_CLICK_MAX_INTERVAL
+                && ui_point_distance(previous, point) <= DOUBLE_CLICK_MAX_DISTANCE
+        });
+        self.last_left_click = if double_click {
+            None
+        } else {
+            Some((point, now))
+        };
+        double_click
+    }
+}
+
+fn native_hooks() -> NativeWindowHooks<FabricadNativeState> {
+    NativeWindowHooks::new()
+        .with_scale_factor(|_state: &FabricadNativeState, metrics| native_ui_scale(metrics))
+        .with_keyboard_input(|state: &mut FabricadNativeState, input| {
+            state.handle_keyboard_input(input)
+        })
+        .with_raw_mouse_motion(|state: &mut FabricadNativeState, input| {
+            state.handle_raw_mouse_motion(input)
+        })
+        .with_canvas_input(|state: &mut FabricadNativeState, input| {
+            state.handle_canvas_input(input)
+        })
+        .with_platform_requests(|state: &mut FabricadNativeState, _metrics| {
+            state.platform_requests()
+        })
+        .with_before_render(|state: &mut FabricadNativeState, _metrics| state.before_render())
+        .with_idle_redraw(|state: &FabricadNativeState| state.idle_redraw())
+}
+
+fn update_native_state(state: &mut FabricadNativeState, action: WidgetAction) {
+    state.handle_widget_action(action);
+}
+
+fn view_native_state(state: &FabricadNativeState, viewport: UiSize) -> UiDocument {
+    state.build_document(viewport)
+}
+
+fn render_native_layout_2d_canvas(
+    state: &mut FabricadNativeState,
+    context: NativeWgpuCanvasRenderContext<'_>,
+) -> Result<CanvasRenderOutput, RenderError> {
+    render_layout_2d_canvas_with_size(
+        &state.app,
+        &mut state.layout_canvas,
+        context.surface,
+        UiSize::new(context.request.rect.width, context.request.rect.height),
+    )
+    .map_err(RenderError::Backend)?;
+    Ok(CanvasRenderOutput::default())
+}
+
+fn render_native_layout_3d_canvas(
+    state: &mut FabricadNativeState,
+    context: NativeWgpuCanvasRenderContext<'_>,
+) -> Result<CanvasRenderOutput, RenderError> {
+    render_layout_3d_canvas(&state.app, &mut state.viewport_3d_canvas, context.surface)
+        .map_err(RenderError::Backend)?;
+    Ok(CanvasRenderOutput::default())
+}
+
+fn attach_default_pointer_actions(document: &mut UiDocument) {
+    for index in 0..document.node_count() {
+        let id = UiNodeId(index);
+        let action = {
+            let node = document.node(id);
+            let is_canvas = matches!(node.content, UiContent::Canvas(_));
+            (node.action.is_none() && node.input.pointer && !is_canvas).then(|| node.name.clone())
+        };
+        if let Some(action) = action {
+            document.node_mut(id).action = Some(WidgetActionBinding::action(action));
         }
     }
 }
 
-fn point_from_position(position: PhysicalPosition<f64>) -> UiPoint {
-    UiPoint::new(position.x as f32, position.y as f32)
+fn native_canvas_ui_event(input: &NativeCanvasInput) -> Option<UiInputEvent> {
+    input.input.to_ui_input_event_with_wheel_scale(
+        CANVAS_LINE_SCROLL_POINTS,
+        UiSize::new(input.rect.width, input.rect.height),
+    )
 }
 
-fn window_ui_scale(window: &Window) -> UiScale {
-    let os_scale = window.scale_factor() as f32;
-    let monitor_scale = window
-        .current_monitor()
-        .map(|monitor| {
-            let size = monitor.size();
-            ((size.width as f32 / 2560.0).min(size.height as f32 / 1440.0)).clamp(1.0, 2.0)
-        })
-        .unwrap_or(1.0);
+fn key_modifiers(modifiers: winit::keyboard::ModifiersState) -> KeyModifiers {
+    KeyModifiers {
+        shift: modifiers.shift_key(),
+        ctrl: modifiers.control_key(),
+        alt: modifiers.alt_key(),
+        meta: modifiers.super_key(),
+    }
+}
+
+fn native_ui_scale(metrics: NativeWindowMetrics) -> f32 {
     let env_scale = std::env::var("FABRICAD_UI_SCALE")
         .ok()
         .and_then(|value| value.parse::<f32>().ok())
         .unwrap_or(1.0);
-    UiScale::new(os_scale.max(monitor_scale).max(env_scale))
+    metrics
+        .dpi_scale
+        .max(monitor_ui_scale(metrics.physical_size))
+        .max(env_scale)
 }
 
-async fn create_renderer(window: &Arc<Window>) -> Result<WgpuSurfaceRenderer<'static>, String> {
-    let size = window.inner_size();
-    let width = size.width.max(1);
-    let height = size.height.max(1);
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-    let surface = instance
-        .create_surface(Arc::clone(window))
-        .map_err(|err| format!("create WGPU surface: {err}"))?;
-    let adapter = instance
-        .request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            force_fallback_adapter: false,
-            compatible_surface: Some(&surface),
-        })
-        .await
-        .map_err(|err| format!("request WGPU adapter: {err}"))?;
-    let adapter_features = adapter.features();
-    let required_features = if adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY) {
-        wgpu::Features::TIMESTAMP_QUERY
-    } else {
-        wgpu::Features::empty()
+fn monitor_ui_scale(size: operad::platform::PixelSize) -> f32 {
+    ((size.width as f32 / 1920.0).min(size.height as f32 / 1080.0)).clamp(1.0, 2.0)
+}
+
+fn ui_point_distance(a: UiPoint, b: UiPoint) -> f32 {
+    (a.x - b.x).hypot(a.y - b.y)
+}
+
+fn has_command_modifier(modifiers: KeyModifiers) -> bool {
+    modifiers.ctrl || modifiers.alt || modifiers.meta
+}
+
+fn primary_shortcut(modifiers: KeyModifiers) -> bool {
+    (modifiers.ctrl || modifiers.meta) && !modifiers.alt
+}
+
+fn matches_shortcut_char(key: KeyCode, expected: char) -> bool {
+    matches!(
+        key,
+        KeyCode::Character(character)
+            if character.eq_ignore_ascii_case(&expected)
+    )
+}
+
+fn layout_tool_shortcut_node(key: KeyCode) -> Option<&'static str> {
+    let KeyCode::Character(character) = key else {
+        return None;
     };
-    let (device, queue) = adapter
-        .request_device(&wgpu::DeviceDescriptor {
-            label: Some("fabricad-window-device"),
-            required_features,
-            required_limits: wgpu::Limits::default(),
+    match character {
+        '1' => Some("fabricad.tool.select"),
+        '2' => Some("fabricad.tool.rect"),
+        '3' => Some("fabricad.tool.poly"),
+        '4' => Some("fabricad.tool.path"),
+        '5' => Some("fabricad.tool.measure"),
+        '6' => Some("fabricad.tool.route"),
+        _ => None,
+    }
+}
+
+fn menu_slug_for_hotkey(character: char) -> Option<&'static str> {
+    match character.to_ascii_lowercase() {
+        'f' => Some("file"),
+        'e' => Some("edit"),
+        'v' => Some("view"),
+        'b' => Some("bookmarks"),
+        'd' => Some("display"),
+        'o' => Some("options"),
+        't' => Some("tools"),
+        'm' => Some("macros"),
+        'h' => Some("help"),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn monitor_scale_uses_readable_4k_fallback() {
+        assert_eq!(monitor_ui_scale(PixelSize::new(1920, 1080)), 1.0);
+        assert!((monitor_ui_scale(PixelSize::new(2560, 1440)) - 1.333).abs() < 0.01);
+        assert_eq!(monitor_ui_scale(PixelSize::new(3840, 2160)), 2.0);
+        assert_eq!(monitor_ui_scale(PixelSize::new(7680, 4320)), 2.0);
+    }
+
+    #[test]
+    fn native_document_assigns_button_actions_for_operad_runner() {
+        let state = FabricadNativeState::new(StartupOptions::default());
+        let document = state.build_document(UiSize::new(1024.0, 720.0));
+        let nav = document
+            .nodes()
+            .iter()
+            .find(|node| node.name == "fabricad.nav.action.layout2d")
+            .expect("layout nav node should be present");
+        assert_eq!(
+            nav.action.as_ref().and_then(|action| action.action_id()),
+            Some(&operad::WidgetActionId::new("fabricad.nav.action.layout2d"))
+        );
+    }
+
+    #[test]
+    fn native_widget_actions_route_through_existing_node_names() {
+        let mut state = FabricadNativeState::new(StartupOptions::default());
+        assert!(state.handle_widget_action(WidgetAction::activate(
+            UiNodeId(0),
+            "fabricad.nav.action.layout2d"
+        )));
+        assert_eq!(state.app.active_view(), StartupView::Layout2d);
+    }
+
+    #[test]
+    fn native_pointer_events_route_to_layout_canvas_editor() {
+        let mut state = FabricadNativeState::new(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            zoom: Some(0.1),
             ..Default::default()
-        })
-        .await
-        .map_err(|err| format!("request WGPU device: {err}"))?;
-    let surface_config = surface
-        .get_default_config(&adapter, width, height)
-        .ok_or_else(|| "WGPU adapter cannot present to Fabricad window".to_string())?;
-    WgpuSurfaceRenderer::new(surface, device, queue, surface_config)
-        .map_err(|err| format!("initialize Operad surface renderer: {err}"))
+        });
+        assert!(state.app.apply_clicked_node_name("fabricad.tool.rect"));
+        let document = state.build_document(UiSize::new(1024.0, 720.0));
+        let canvas = layout_canvas_rect(&document).expect("layout canvas should exist");
+        let shape_count = state.app.workspace().document.shapes.len();
+        let start = UiPoint::new(canvas.x + canvas.width * 0.5 - 30.0, canvas.y + 80.0);
+        let end = UiPoint::new(canvas.x + canvas.width * 0.5 + 30.0, canvas.y + 140.0);
+
+        assert!(state.handle_canvas_input(pointer_canvas_input(
+            "fabricad.layout.viewport.2d",
+            canvas,
+            PointerEventKind::Down(PointerButton::Primary),
+            start,
+        )));
+        assert!(state.handle_canvas_input(pointer_canvas_input(
+            "fabricad.layout.viewport.2d",
+            canvas,
+            PointerEventKind::Move,
+            end,
+        )));
+        assert!(state.handle_canvas_input(pointer_canvas_input(
+            "fabricad.layout.viewport.2d",
+            canvas,
+            PointerEventKind::Up(PointerButton::Primary),
+            end,
+        )));
+
+        assert_eq!(state.app.workspace().document.shapes.len(), shape_count + 1);
+        assert!(
+            state.app.selected_layout_shape().is_some(),
+            "canvas-created geometry should become the layout selection"
+        );
+    }
+
+    #[test]
+    fn native_middle_or_right_drag_pans_layout_canvas() {
+        let mut state = FabricadNativeState::new(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            zoom: Some(0.1),
+            ..Default::default()
+        });
+        let document = state.build_document(UiSize::new(1024.0, 720.0));
+        let canvas = layout_canvas_rect(&document).expect("layout canvas should exist");
+        let start = UiPoint::new(
+            canvas.x + canvas.width * 0.5,
+            canvas.y + canvas.height * 0.5,
+        );
+        let end = UiPoint::new(start.x + 50.0, start.y - 25.0);
+
+        let before = state.app.layout_pan();
+        assert!(state.handle_canvas_input(pointer_canvas_input(
+            "fabricad.layout.viewport.2d",
+            canvas,
+            PointerEventKind::Down(PointerButton::Auxiliary),
+            start,
+        )));
+        assert!(state.handle_canvas_input(pointer_canvas_input(
+            "fabricad.layout.viewport.2d",
+            canvas,
+            PointerEventKind::Move,
+            end,
+        )));
+        assert!(state.handle_canvas_input(pointer_canvas_input(
+            "fabricad.layout.viewport.2d",
+            canvas,
+            PointerEventKind::Up(PointerButton::Auxiliary),
+            end,
+        )));
+        assert_eq!(state.app.layout_pan(), [before[0] + 50.0, before[1] - 25.0]);
+    }
+
+    #[test]
+    fn native_right_click_finishes_layout_polyline_instead_of_panning() {
+        let mut state = FabricadNativeState::new(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            zoom: Some(0.1),
+            ..Default::default()
+        });
+        let document = state.build_document(UiSize::new(1024.0, 720.0));
+        let canvas = layout_canvas_rect(&document).expect("layout canvas should exist");
+        let shape_count = state.app.workspace().document.shapes.len();
+        assert!(state.app.apply_clicked_node_name("fabricad.tool.poly"));
+
+        for point in [
+            UiPoint::new(canvas.x + 220.0, canvas.y + 220.0),
+            UiPoint::new(canvas.x + 280.0, canvas.y + 220.0),
+            UiPoint::new(canvas.x + 280.0, canvas.y + 280.0),
+        ] {
+            assert!(state.handle_canvas_input(pointer_canvas_input(
+                "fabricad.layout.viewport.2d",
+                canvas,
+                PointerEventKind::Down(PointerButton::Primary),
+                point,
+            )));
+            assert!(state.handle_canvas_input(pointer_canvas_input(
+                "fabricad.layout.viewport.2d",
+                canvas,
+                PointerEventKind::Up(PointerButton::Primary),
+                point,
+            )));
+        }
+        assert!(state.handle_canvas_input(pointer_canvas_input(
+            "fabricad.layout.viewport.2d",
+            canvas,
+            PointerEventKind::Down(PointerButton::Secondary),
+            UiPoint::new(canvas.x + 280.0, canvas.y + 280.0),
+        )));
+
+        assert_eq!(state.app.workspace().document.shapes.len(), shape_count + 1);
+        assert_eq!(state.layout_pan_drag, None);
+    }
+
+    #[test]
+    fn native_3d_canvas_click_captures_flycam_and_wasd_advances() {
+        let mut state = FabricadNativeState::new(StartupOptions {
+            view_mode: Some(StartupView::Layout3d),
+            ..Default::default()
+        });
+        let document = state.build_document(UiSize::new(1024.0, 720.0));
+        let canvas = layout_canvas_rect(&document).expect("3D canvas should exist");
+        let point = UiPoint::new(
+            canvas.x + canvas.width * 0.5,
+            canvas.y + canvas.height * 0.5,
+        );
+
+        assert!(state.handle_canvas_input(pointer_canvas_input(
+            "fabricad.layout.viewport.3d",
+            canvas,
+            PointerEventKind::Down(PointerButton::Primary),
+            point,
+        )));
+        assert!(state.app.flycam_captured());
+        assert!(!state.platform_requests().is_empty());
+        assert!(state.native_flycam_captured);
+
+        let before = state
+            .app
+            .workspace()
+            .document
+            .flattened_shape_count_estimate();
+        assert!(before > 0);
+        assert!(state.update_flycam_key_state(KeyCode::Character('w'), true));
+        assert!(state.app.advance_layout_3d_flycam(
+            state.flycam_keys.forward,
+            state.flycam_keys.backward,
+            state.flycam_keys.left,
+            state.flycam_keys.right,
+            state.flycam_keys.up,
+            state.flycam_keys.down,
+            false,
+            1.0 / 60.0,
+        ));
+
+        assert!(state.set_native_flycam_capture(false));
+        assert!(!state.app.flycam_captured());
+    }
+
+    #[test]
+    fn native_alt_hotkeys_open_underlined_top_menus() {
+        let mut state = FabricadNativeState::new(StartupOptions::default());
+        let alt = KeyModifiers {
+            alt: true,
+            ..KeyModifiers::NONE
+        };
+
+        assert!(state.handle_keyboard_shortcut(KeyCode::Character('v'), alt));
+        assert_eq!(state.app.active_menu(), Some(fabricad_app::AppMenu::View));
+
+        assert!(state.handle_keyboard_shortcut(KeyCode::Character('D'), alt));
+        assert_eq!(
+            state.app.active_menu(),
+            Some(fabricad_app::AppMenu::Display)
+        );
+    }
+
+    #[test]
+    fn native_primary_palette_shortcuts_open_command_palette() {
+        let ctrl = KeyModifiers {
+            ctrl: true,
+            ..KeyModifiers::NONE
+        };
+        let ctrl_shift = KeyModifiers {
+            ctrl: true,
+            shift: true,
+            ..KeyModifiers::NONE
+        };
+
+        for (key, modifiers, label) in [
+            (KeyCode::Character('k'), ctrl, "Ctrl/Cmd+K"),
+            (KeyCode::Character('p'), ctrl, "Ctrl/Cmd+P"),
+            (KeyCode::Character('P'), ctrl_shift, "Ctrl/Cmd+Shift+P"),
+        ] {
+            let mut state = FabricadNativeState::new(StartupOptions::default());
+            assert!(state.handle_keyboard_shortcut(key, modifiers));
+            let document = state.build_document(UiSize::new(1024.0, 720.0));
+            assert!(
+                document
+                    .nodes()
+                    .iter()
+                    .any(|node| node.name == "fabricad.command_palette"),
+                "{label} should expose the command palette"
+            );
+        }
+    }
+
+    #[test]
+    fn native_escape_closes_keyboard_opened_shell_ui() {
+        let mut state = FabricadNativeState::new(StartupOptions::default());
+        let alt = KeyModifiers {
+            alt: true,
+            ..KeyModifiers::NONE
+        };
+        let ctrl = KeyModifiers {
+            ctrl: true,
+            ..KeyModifiers::NONE
+        };
+
+        assert!(state.handle_keyboard_shortcut(KeyCode::Character('f'), alt));
+        assert_eq!(state.app.active_menu(), Some(fabricad_app::AppMenu::File));
+        assert!(state.handle_keyboard_shortcut(KeyCode::Escape, KeyModifiers::NONE));
+        assert_eq!(state.app.active_menu(), None);
+
+        assert!(state.handle_keyboard_shortcut(KeyCode::Character('k'), ctrl));
+        assert!(state.handle_keyboard_shortcut(KeyCode::Escape, KeyModifiers::NONE));
+        let document = state.build_document(UiSize::new(1024.0, 720.0));
+        assert!(
+            !document
+                .nodes()
+                .iter()
+                .any(|node| node.name == "fabricad.command_palette"),
+            "Escape should close the command palette"
+        );
+    }
+
+    #[test]
+    fn native_primary_tab_cycles_between_apps() {
+        let mut state = FabricadNativeState::new(StartupOptions::default());
+        let ctrl = KeyModifiers {
+            ctrl: true,
+            ..KeyModifiers::NONE
+        };
+        let ctrl_shift = KeyModifiers {
+            ctrl: true,
+            shift: true,
+            ..KeyModifiers::NONE
+        };
+
+        assert_eq!(state.app.active_view(), StartupView::Workflow);
+        assert!(state.handle_keyboard_shortcut(KeyCode::Tab, ctrl));
+        assert_eq!(state.app.active_view(), StartupView::Layout2d);
+
+        assert!(state.handle_keyboard_shortcut(KeyCode::Tab, ctrl_shift));
+        assert_eq!(state.app.active_view(), StartupView::Workflow);
+    }
+
+    #[test]
+    fn native_editor_shortcuts_route_to_layout_actions() {
+        let mut state = FabricadNativeState::new(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            ..Default::default()
+        });
+        let ctrl = KeyModifiers {
+            ctrl: true,
+            ..KeyModifiers::NONE
+        };
+        let shape_id = state
+            .app
+            .workspace()
+            .document
+            .shapes
+            .keys()
+            .next()
+            .copied()
+            .expect("demo document should have shapes");
+        assert!(
+            state
+                .app
+                .apply_clicked_node_name(&format!("fabricad.viewctl.layout.shape.{}", shape_id.0))
+        );
+
+        assert!(state.handle_keyboard_shortcut(KeyCode::Character('c'), ctrl));
+        let shape_count = state.app.workspace().document.shapes.len();
+
+        assert!(state.handle_keyboard_shortcut(KeyCode::Character('v'), ctrl));
+        assert_eq!(state.app.workspace().document.shapes.len(), shape_count + 1);
+
+        assert!(state.handle_keyboard_shortcut(KeyCode::Character('d'), ctrl));
+        assert_eq!(state.app.workspace().document.shapes.len(), shape_count + 2);
+
+        assert!(state.handle_keyboard_shortcut(KeyCode::Delete, KeyModifiers::NONE));
+        assert_eq!(state.app.workspace().document.shapes.len(), shape_count + 1);
+    }
+
+    #[test]
+    fn native_editor_shortcuts_route_undo_and_redo() {
+        let mut state = FabricadNativeState::new(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            ..Default::default()
+        });
+        let ctrl = KeyModifiers {
+            ctrl: true,
+            ..KeyModifiers::NONE
+        };
+        let ctrl_shift = KeyModifiers {
+            ctrl: true,
+            shift: true,
+            ..KeyModifiers::NONE
+        };
+        let shape_id = state
+            .app
+            .workspace()
+            .document
+            .shapes
+            .keys()
+            .next()
+            .copied()
+            .expect("demo document should have shapes");
+        assert!(
+            state
+                .app
+                .apply_clicked_node_name(&format!("fabricad.viewctl.layout.shape.{}", shape_id.0))
+        );
+        let shape_count = state.app.workspace().document.shapes.len();
+
+        assert!(state.handle_keyboard_shortcut(KeyCode::Character('d'), ctrl));
+        assert_eq!(state.app.workspace().document.shapes.len(), shape_count + 1);
+
+        assert!(state.handle_keyboard_shortcut(KeyCode::Character('z'), ctrl));
+        assert_eq!(state.app.workspace().document.shapes.len(), shape_count);
+
+        assert!(state.handle_keyboard_shortcut(KeyCode::Character('Z'), ctrl_shift));
+        assert_eq!(state.app.workspace().document.shapes.len(), shape_count + 1);
+
+        assert!(state.handle_keyboard_shortcut(KeyCode::Character('z'), ctrl));
+        assert_eq!(state.app.workspace().document.shapes.len(), shape_count);
+
+        assert!(state.handle_keyboard_shortcut(KeyCode::Character('y'), ctrl));
+        assert_eq!(state.app.workspace().document.shapes.len(), shape_count + 1);
+    }
+
+    #[test]
+    fn native_layout_single_key_shortcuts_switch_tools_and_transform() {
+        let mut state = FabricadNativeState::new(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            ..Default::default()
+        });
+        let shape_id = state
+            .app
+            .workspace()
+            .document
+            .shapes
+            .keys()
+            .next()
+            .copied()
+            .expect("demo document should have shapes");
+        assert!(
+            state
+                .app
+                .apply_clicked_node_name(&format!("fabricad.viewctl.layout.shape.{}", shape_id.0))
+        );
+
+        assert!(state.handle_keyboard_shortcut(KeyCode::Character('2'), KeyModifiers::NONE));
+        assert_eq!(state.app.active_tool(), ToolMode::Rect);
+        assert!(state.handle_keyboard_shortcut(KeyCode::Character('6'), KeyModifiers::NONE));
+        assert_eq!(state.app.active_tool(), ToolMode::Route);
+        assert!(state.handle_keyboard_shortcut(KeyCode::Character('1'), KeyModifiers::NONE));
+        assert_eq!(state.app.active_tool(), ToolMode::Select);
+
+        assert!(state.handle_keyboard_shortcut(KeyCode::Character('r'), KeyModifiers::NONE));
+        assert!(state.app.status_message().contains("Rotated"));
+        assert!(
+            state.handle_keyboard_shortcut(KeyCode::Character('h'), KeyModifiers::NONE),
+            "H should route to the mirror-X edit action"
+        );
+    }
+
+    #[test]
+    fn layout_3d_batch_covers_demo_shapes() {
+        let document = Document::demo();
+        let batch = build_layout_3d_batch_with_options(&document, true);
+        let validation = batch
+            .validate_geometry()
+            .expect("demo 3D canvas batch should validate");
+        assert!(validation.rect_slabs >= 6, "{validation:?}");
+        assert!(validation.guide_segments > 2, "{validation:?}");
+    }
+
+    #[test]
+    fn fitted_layout_viewport_tracks_canvas_aspect() {
+        let viewport = fabricad_app::fitted_layout_viewport(
+            Some(Rect::from_min_size(Point::new(0, 0), 1_000, 500)),
+            PixelSize::new(1600, 800),
+        );
+        assert_eq!(viewport.width(), viewport.height() * 2);
+        assert!(viewport.width() > 1_000);
+        assert!(viewport.height() > 500);
+    }
+
+    fn layout_canvas_rect(document: &UiDocument) -> Option<UiRect> {
+        document
+            .nodes()
+            .iter()
+            .find(|node| node.name == "fabricad.layout.preview")
+            .map(|node| node.layout.rect)
+    }
+
+    fn pointer_canvas_input(
+        key: &'static str,
+        rect: UiRect,
+        kind: PointerEventKind,
+        position: UiPoint,
+    ) -> NativeCanvasInput {
+        NativeCanvasInput {
+            node: UiNodeId(0),
+            key: key.to_string(),
+            rect,
+            local_position: Some(UiPoint::new(position.x - rect.x, position.y - rect.y)),
+            input: RawInputEvent::Pointer(RawPointerEvent::new(kind, position, 1)),
+        }
+    }
 }

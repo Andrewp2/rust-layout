@@ -1,6 +1,6 @@
 # Non-UI Foundation Audit
 
-This tracks backend and domain work that can move independently while Operad evolves. The goal is to make the product harder to corrupt, easier to load on every target, and measurable under realistic demo data before more UI is layered on top.
+This tracks backend and domain work that can move independently while the UI layer evolves. The goal is to make the product harder to corrupt, easier to load on every target, and measurable under realistic demo data before more UI is layered on top.
 
 ## Current Slice
 

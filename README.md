@@ -13,7 +13,7 @@ crates/
   drc/            Simplified semiconductor rule deck and violation reporting
   router/         A* maze router over layout obstacles
   renderer/       GPU vertex batching, 3D viewport targets, and Slang WGSL/SPIR-V build hook
-  native_app/     Operad v4 native window, audit, and snapshot entry points
+  native_app/     Native window, audit, and snapshot entry points
   sync_server/    Axum WebSocket collaboration server
   wasm_app/       wasm-bindgen web validation entry point
 ```
@@ -62,9 +62,11 @@ Cargo also runs this through `crates/renderer/build.rs`. Set `FABRICAD_SLANGC=/p
 
 ## Rendering Architecture
 
-The native shell now builds an Operad v4 document directly and opens it in a winit/wgpu
-window by default. Use `fabricad --audit` to print the retained UI summary and exit, or
-`fabricad --operad-snapshot` to render through Operad's optional wgpu snapshot renderer.
+The native shell builds the retained UI document and opens it in a winit/wgpu
+window by default. Use `fabricad --audit` to print the UI summary and exit, or
+`fabricad --snapshot` to render a deterministic snapshot. Snapshot and audit
+runs accept `--ui-scale <factor>` for checking HiDPI layouts without opening a
+window.
 The domain renderer crate remains responsible for layout GPU batches, 3D viewport targets,
 offscreen document rendering, and the Slang WGSL/SPIR-V shader build hook.
 
@@ -140,7 +142,7 @@ The offscreen native mode renders through the same wgpu layout pipeline, reads
 back pixels, prints a one-line render summary, and exits without opening a
 window. You can also enable it with `FABRICAD_OFFSCREEN=1`.
 
-Screenshot-based render E2E checks drive the native Operad v4 snapshot renderer,
+Screenshot-based render E2E checks drive the native snapshot renderer,
 capture deterministic workflow, layout, hierarchy, stress-layout, 3D, and process-flow
 screenshots, and assert targeted visual invariants such as nonblank coverage,
 accent/chrome visibility, and expected layout-preview colors:
@@ -162,10 +164,10 @@ When an intentional rendering change updates the quarantined expected output, re
 ./scripts/render_e2e.py --update-baselines
 ```
 
-Whole-app layout audits capture every Fabricad module through the native Operad v4
-snapshot renderer across a fixed viewport matrix and write raw screenshots plus contact
-sheets for manual review of clipped labels, crowded margins, awkward wrapping, and
-missing content:
+Whole-app layout audits capture every module through the native
+snapshot renderer across a fixed viewport matrix, including a scaled HiDPI case,
+and write raw screenshots plus contact sheets for manual review of clipped labels,
+crowded margins, awkward wrapping, and missing content:
 
 ```bash
 ./scripts/ui_layout_audit.py
@@ -178,6 +180,38 @@ smoke pass while iterating on chrome/layout changes, run:
 ```bash
 ./scripts/ui_layout_audit.py --quick
 ```
+
+Interactive UI states can be captured with named presets. These apply the same
+startup click path used by snapshot tests, so dropdowns and modal panels can be
+reviewed without opening the native window:
+
+```bash
+./scripts/ui_layout_audit.py --all-presets --size desktop --out target/ui-menu-audit
+./scripts/ui_layout_audit.py --preset canvas-2d --size desktop --out target/ui-canvas-2d-audit
+./scripts/ui_layout_audit.py --preset canvas-3d --size desktop --out target/ui-canvas-3d-audit
+./scripts/ui_layout_audit.py --preset file-menu --size desktop --out target/ui-menu-audit-file
+./scripts/ui_layout_audit.py --preset edit-menu --size desktop --out target/ui-menu-audit-edit
+./scripts/ui_layout_audit.py --preset bookmarks-menu --size desktop --out target/ui-menu-audit-bookmarks
+./scripts/ui_layout_audit.py --preset display-menu --size desktop --out target/ui-menu-audit-display
+./scripts/ui_layout_audit.py --preset details-panel --size desktop --out target/ui-details-panel-audit
+./scripts/ui_layout_audit.py --preset secondary-panel --size desktop --out target/ui-secondary-panel-audit
+./scripts/ui_layout_audit.py --preset tools-menu --size desktop --out target/ui-menu-audit-tools
+./scripts/ui_layout_audit.py --preset macros-menu --size desktop --out target/ui-menu-audit-macros
+./scripts/ui_layout_audit.py --preset help-menu --size desktop --out target/ui-menu-audit-help
+./scripts/ui_layout_audit.py --preset more-menu --size desktop --out target/ui-menu-audit-more
+./scripts/ui_layout_audit.py --preset view-design --size desktop --out target/ui-menu-audit-view-design
+./scripts/ui_layout_audit.py --preset view-operations --size desktop --out target/ui-menu-audit-view-operations
+./scripts/ui_layout_audit.py --preset view-analysis --size desktop --out target/ui-menu-audit-view-analysis
+./scripts/ui_layout_audit.py --preset view-engineering --size desktop --out target/ui-menu-audit-view
+./scripts/ui_layout_audit.py --preset command-palette --size desktop --out target/ui-menu-audit-command-palette
+./scripts/ui_layout_audit.py --preset sidebar-modules --size desktop --out target/ui-menu-audit-sidebar
+./scripts/ui_layout_audit.py --preset options-panel --size desktop --out target/ui-menu-audit-options
+```
+
+Use `--all-presets` for a single review index of every named state. Presets
+choose the view needed for their interaction by default, such as the Layout
+Editor for the Edit menu. Use repeated `--click NODE_NAME` arguments when a new
+interactive state does not yet have a preset.
 
 ## Web Build
 

@@ -91,7 +91,7 @@ pub const VIEWPORT_3D_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::D
 #[derive(Clone, Copy, Debug)]
 pub struct Viewport3dUniforms {
     view_projection: [f32; 16],
-    rect_side_faces: [u32; 4],
+    rect_camera_position: [f32; 4],
 }
 
 pub struct Viewport3dRenderer {
@@ -121,7 +121,7 @@ pub struct Viewport3dRenderer {
     guide_vertex_capacity: usize,
     guide_index_capacity: usize,
     render_fingerprint: Option<crate::BatchFingerprint>,
-    rect_slab_template_faces: Option<[u32; 2]>,
+    rect_slab_template_uploaded: bool,
     index_count: u32,
     rect_slab_instance_count: u32,
     guide_index_count: u32,
@@ -155,17 +155,13 @@ impl Viewport3dUniforms {
     pub fn from_view_projection(view_projection: [f32; 16]) -> Self {
         Self {
             view_projection,
-            rect_side_faces: [1, 2, 0, 0],
+            rect_camera_position: [0.0, 0.0, 1.0, 0.0],
         }
     }
 
-    pub fn with_rect_side_faces(mut self, side_faces: [u32; 2]) -> Self {
-        self.rect_side_faces = [side_faces[0], side_faces[1], 0, 0];
+    pub fn with_rect_camera_position(mut self, position: [f32; 3]) -> Self {
+        self.rect_camera_position = [position[0], position[1], position[2], 0.0];
         self
-    }
-
-    fn rect_side_faces(self) -> [u32; 2] {
-        [self.rect_side_faces[0], self.rect_side_faces[1]]
     }
 
     fn as_bytes(self) -> [u8; 80] {
@@ -173,7 +169,7 @@ impl Viewport3dUniforms {
         for (index, value) in self.view_projection.into_iter().enumerate() {
             bytes[index * 4..index * 4 + 4].copy_from_slice(&value.to_ne_bytes());
         }
-        for (index, value) in self.rect_side_faces.into_iter().enumerate() {
+        for (index, value) in self.rect_camera_position.into_iter().enumerate() {
             let offset = 64 + index * 4;
             bytes[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
         }
@@ -259,8 +255,8 @@ impl LayoutGpuRenderer {
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Fabricad layout pipeline layout"),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
         });
         let targets = [Some(wgpu::ColorTargetState {
             format: target_format,
@@ -310,7 +306,7 @@ impl LayoutGpuRenderer {
             },
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
         let pick_targets = [Some(wgpu::ColorTargetState {
@@ -361,7 +357,7 @@ impl LayoutGpuRenderer {
             },
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -552,6 +548,7 @@ impl LayoutGpuRenderer {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             render_pass.set_pipeline(&self.pick_pipeline);
             render_pass.set_bind_group(0, &self.bind_group, &[]);
@@ -736,8 +733,8 @@ impl Viewport3dRenderer {
         let scene_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Fabricad 3D scene pipeline layout"),
-                bind_group_layouts: &[&scene_bind_group_layout],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(&scene_bind_group_layout)],
+                immediate_size: 0,
             });
         let scene_targets = [Some(wgpu::ColorTargetState {
             format: VIEWPORT_3D_COLOR_FORMAT,
@@ -870,8 +867,8 @@ impl Viewport3dRenderer {
         let composite_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Fabricad 3D composite pipeline layout"),
-                bind_group_layouts: &[&composite_bind_group_layout],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(&composite_bind_group_layout)],
+                immediate_size: 0,
             });
         let composite_targets = [Some(wgpu::ColorTargetState {
             format: target_format,
@@ -904,7 +901,7 @@ impl Viewport3dRenderer {
             },
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
         let composite_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -970,7 +967,7 @@ impl Viewport3dRenderer {
             guide_vertex_capacity: 4,
             guide_index_capacity: 4,
             render_fingerprint: None,
-            rect_slab_template_faces: None,
+            rect_slab_template_uploaded: false,
             index_count: 0,
             rect_slab_instance_count: 0,
             guide_index_count: 0,
@@ -995,7 +992,7 @@ impl Viewport3dRenderer {
         fingerprint: crate::BatchFingerprint,
         uniforms: Viewport3dUniforms,
     ) -> BufferUploadResult {
-        self.update_rect_slab_template(queue, uniforms.rect_side_faces());
+        self.update_rect_slab_template(queue);
         queue.write_buffer(&self.uniform_buffer, 0, &uniforms.as_bytes());
         let changed = self.render_fingerprint != Some(fingerprint);
         let mut bytes_uploaded = 0;
@@ -1085,7 +1082,53 @@ impl Viewport3dRenderer {
             }),
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
+        self.draw_scene(&mut render_pass);
+    }
+
+    pub fn render_to_view(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        target_view: &wgpu::TextureView,
+        target_size: [u32; 2],
+        clear_color: wgpu::Color,
+    ) {
+        let width = target_size[0].max(1);
+        let height = target_size[1].max(1);
+        self.ensure_depth_target(device, width, height);
+        let Some(depth_view) = self.depth_view.as_ref() else {
+            return;
+        };
+
+        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Fabricad 3D viewport direct render pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(clear_color),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Discard,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        self.draw_scene(&mut render_pass);
+    }
+
+    fn draw_scene(&self, render_pass: &mut wgpu::RenderPass<'_>) {
         if self.index_count > 0 {
             render_pass.set_pipeline(&self.scene_pipeline);
             render_pass.set_bind_group(0, &self.scene_bind_group, &[]);
@@ -1161,13 +1204,13 @@ impl Viewport3dRenderer {
         );
     }
 
-    fn update_rect_slab_template(&mut self, queue: &wgpu::Queue, side_faces: [u32; 2]) {
-        if self.rect_slab_template_faces == Some(side_faces) {
+    fn update_rect_slab_template(&mut self, queue: &wgpu::Queue) {
+        if self.rect_slab_template_uploaded {
             return;
         }
-        let bytes = rect_slab_template_bytes(side_faces);
+        let bytes = rect_slab_template_bytes();
         queue.write_buffer(&self.rect_slab_template_buffer, 0, &bytes);
-        self.rect_slab_template_faces = Some(side_faces);
+        self.rect_slab_template_uploaded = true;
     }
 
     fn ensure_guide_vertex_capacity(&mut self, device: &wgpu::Device, required: usize) {
@@ -1257,6 +1300,34 @@ impl Viewport3dRenderer {
         self.depth_view = Some(depth_view);
         self.composite_bind_group = Some(composite_bind_group);
     }
+
+    fn ensure_depth_target(&mut self, device: &wgpu::Device, width: u32, height: u32) {
+        if self.target_size == [width, height] && self.depth_view.is_some() {
+            return;
+        }
+
+        self.target_size = [width, height];
+        self.color_texture = None;
+        self.color_view = None;
+        self.composite_bind_group = None;
+        let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Fabricad 3D viewport depth target"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: VIEWPORT_3D_DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let depth_view = depth_texture.create_view(&Default::default());
+        self.depth_texture = Some(depth_texture);
+        self.depth_view = Some(depth_view);
+    }
 }
 
 pub async fn render_document_offscreen(
@@ -1326,7 +1397,7 @@ async fn render_tiled_frame_offscreen(
         )));
     }
 
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::from_env().unwrap_or_else(|| {
             warn!("WGPU_BACKEND did not resolve to a backend; using primary backends");
             wgpu::Backends::PRIMARY
@@ -1334,6 +1405,7 @@ async fn render_tiled_frame_offscreen(
         flags: wgpu::InstanceFlags::from_build_config().with_env(),
         backend_options: wgpu::BackendOptions::from_env_or_default(),
         memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+        display: None,
     });
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
@@ -1413,6 +1485,7 @@ async fn render_tiled_frame_offscreen(
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             })
             .forget_lifetime();
         resources.paint(&mut render_pass);
@@ -1540,13 +1613,13 @@ fn create_viewport_3d_pipeline(
         },
         depth_stencil: Some(wgpu::DepthStencilState {
             format: VIEWPORT_3D_DEPTH_FORMAT,
-            depth_write_enabled,
-            depth_compare,
+            depth_write_enabled: Some(depth_write_enabled),
+            depth_compare: Some(depth_compare),
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
         multisample: wgpu::MultisampleState::default(),
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     })
 }
@@ -1663,72 +1736,45 @@ fn rect_slab_instance_bytes(instances: &[GpuRectSlabInstance]) -> Vec<u8> {
     bytes
 }
 
-fn rect_slab_template_bytes(side_faces: [u32; 2]) -> Vec<u8> {
+fn rect_slab_template_bytes() -> Vec<u8> {
     let mut bytes = Vec::with_capacity(RECT_SLAB_TEMPLATE_VERTEX_COUNT * 16);
-    append_rect_slab_template_face(&mut bytes, 0);
-    append_rect_slab_template_face(&mut bytes, side_faces[0]);
-    append_rect_slab_template_face(&mut bytes, side_faces[1]);
+    append_rect_slab_template_slot(&mut bytes, 0);
+    append_rect_slab_template_slot(&mut bytes, 1);
+    append_rect_slab_template_slot(&mut bytes, 2);
     bytes
 }
 
-fn append_rect_slab_template_face(bytes: &mut Vec<u8>, face: u32) {
-    let corners: [[f32; 3]; 6] = match face {
+fn append_rect_slab_template_slot(bytes: &mut Vec<u8>, slot: u32) {
+    let corners: [[f32; 3]; 6] = match slot {
         0 => [
-            [0.0, 0.0, 1.0],
-            [1.0, 0.0, 1.0],
-            [1.0, 1.0, 1.0],
-            [0.0, 0.0, 1.0],
-            [1.0, 1.0, 1.0],
-            [0.0, 1.0, 1.0],
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
         ],
         1 => [
             [0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-            [1.0, 0.0, 1.0],
-            [0.0, 0.0, 0.0],
-            [1.0, 0.0, 1.0],
-            [0.0, 0.0, 1.0],
-        ],
-        2 => [
-            [1.0, 0.0, 0.0],
-            [1.0, 1.0, 0.0],
-            [1.0, 1.0, 1.0],
-            [1.0, 0.0, 0.0],
-            [1.0, 1.0, 1.0],
-            [1.0, 0.0, 1.0],
-        ],
-        3 => [
-            [1.0, 1.0, 0.0],
             [0.0, 1.0, 0.0],
             [0.0, 1.0, 1.0],
-            [1.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0],
             [0.0, 1.0, 1.0],
-            [1.0, 1.0, 1.0],
+            [0.0, 0.0, 1.0],
         ],
         _ => [
-            [0.0, 1.0, 0.0],
             [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 0.0, 1.0],
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 1.0],
             [0.0, 0.0, 1.0],
-            [0.0, 1.0, 0.0],
-            [0.0, 0.0, 1.0],
-            [0.0, 1.0, 1.0],
         ],
     };
-    let shade = rect_slab_face_shade(face);
     for [x_select, y_select, z_select] in corners {
-        for value in [x_select, y_select, z_select, shade] {
+        for value in [x_select, y_select, z_select, slot as f32] {
             bytes.extend_from_slice(&value.to_ne_bytes());
         }
-    }
-}
-
-fn rect_slab_face_shade(face: u32) -> f32 {
-    match face {
-        0 => 0.9040,
-        1 => 0.4543,
-        2 => 0.4037,
-        3 => 0.3796,
-        _ => 0.4221,
     }
 }
 
@@ -1754,7 +1800,7 @@ fn index_bytes(indices: &[u32]) -> Vec<u8> {
 const VIEWPORT_3D_SCENE_SHADER: &str = r#"
 struct Viewport3dUniforms {
     view_projection: mat4x4<f32>,
-    rect_side_faces: vec4<u32>,
+    rect_camera_position: vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -1802,7 +1848,7 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
 const VIEWPORT_3D_RECT_SLAB_SHADER: &str = r#"
 struct Viewport3dUniforms {
     view_projection: mat4x4<f32>,
-    rect_side_faces: vec4<u32>,
+    rect_camera_position: vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -1822,14 +1868,49 @@ struct VertexOutput {
 
 	@vertex
 	fn vertex_main(input: InstanceInput) -> VertexOutput {
+	    let rect_center = vec2<f32>(
+	        (input.rect.x + input.rect.z) * 0.5,
+	        (input.rect.y + input.rect.w) * 0.5,
+	    );
+	    let z_center = (input.z_range.x + input.z_range.y) * 0.5;
+	    let slot = u32(input.corner.w + 0.5);
+	    var x_select = input.corner.x;
+	    var y_select = input.corner.y;
+	    var z_select = input.corner.z;
+	    var shade = 0.9040;
+	    if slot == 0u {
+	        if viewport.rect_camera_position.z < z_center {
+	            z_select = 0.0;
+	            shade = 0.3375;
+	        } else {
+	            z_select = 1.0;
+	            shade = 0.9040;
+	        }
+	    } else if slot == 1u {
+	        if viewport.rect_camera_position.x < rect_center.x {
+	            x_select = 0.0;
+	            shade = 0.4221;
+	        } else {
+	            x_select = 1.0;
+	            shade = 0.4037;
+	        }
+	    } else {
+	        if viewport.rect_camera_position.y < rect_center.y {
+	            y_select = 0.0;
+	            shade = 0.4543;
+	        } else {
+	            y_select = 1.0;
+	            shade = 0.3796;
+	        }
+	    }
 	    let point = vec3<f32>(
-	        input.rect.x + (input.rect.z - input.rect.x) * input.corner.x,
-	        input.rect.y + (input.rect.w - input.rect.y) * input.corner.y,
-	        input.z_range.x + (input.z_range.y - input.z_range.x) * input.corner.z,
+	        input.rect.x + (input.rect.z - input.rect.x) * x_select,
+	        input.rect.y + (input.rect.w - input.rect.y) * y_select,
+	        input.z_range.x + (input.z_range.y - input.z_range.x) * z_select,
 	    );
 	    var output: VertexOutput;
 	    output.position = viewport.view_projection * vec4<f32>(point, 1.0);
-	    output.color = vec4<f32>(input.color.rgb * input.corner.w, input.color.a);
+	    output.color = vec4<f32>(input.color.rgb * shade, input.color.a);
 	    return output;
 	}
 
@@ -1957,5 +2038,39 @@ mod tests {
     fn viewport_3d_target_size_sanitizes_empty_or_invalid_inputs() {
         assert_eq!(viewport_3d_target_size([0.0, -4.0], 2.0), [1, 1]);
         assert_eq!(viewport_3d_target_size([f32::NAN, 10.0], f32::NAN), [1, 10]);
+    }
+
+    #[test]
+    fn rect_slab_template_contains_dynamic_visible_face_slots() {
+        let template = rect_slab_template_bytes();
+        assert_eq!(template.len(), RECT_SLAB_TEMPLATE_VERTEX_COUNT * 16);
+
+        let vertices = template
+            .chunks_exact(16)
+            .map(|vertex| {
+                [
+                    f32::from_ne_bytes(vertex[0..4].try_into().unwrap()),
+                    f32::from_ne_bytes(vertex[4..8].try_into().unwrap()),
+                    f32::from_ne_bytes(vertex[8..12].try_into().unwrap()),
+                    f32::from_ne_bytes(vertex[12..16].try_into().unwrap()),
+                ]
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(vertices.len(), 18);
+        assert_eq!(
+            vertices.iter().filter(|vertex| vertex[3] == 0.0).count(),
+            6,
+            "rect slab template should include one dynamic top/bottom cap slot"
+        );
+        assert_eq!(
+            vertices.iter().filter(|vertex| vertex[3] == 1.0).count(),
+            6,
+            "rect slab template should include one dynamic X-side slot"
+        );
+        assert_eq!(
+            vertices.iter().filter(|vertex| vertex[3] == 2.0).count(),
+            6,
+            "rect slab template should include one dynamic Y-side slot"
+        );
     }
 }

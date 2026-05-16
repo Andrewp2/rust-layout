@@ -1349,6 +1349,16 @@ mod tests {
     use super::*;
     use layout_model::{ProcessLayer, ShapeKind};
 
+    #[cfg(not(target_arch = "wasm32"))]
+    static WGPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn wgpu_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        WGPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn tile_cache_deduplicates_shapes_spanning_tiles() {
         let mut document = Document::new("tile cache");
@@ -1574,6 +1584,7 @@ mod tests {
     #[test]
     #[cfg(not(target_arch = "wasm32"))]
     fn viewport_3d_renderer_initializes_gpu_pipelines() {
+        let _wgpu_guard = wgpu_test_guard();
         let Some((device, _queue)) = test_wgpu_device() else {
             return;
         };
@@ -1584,6 +1595,7 @@ mod tests {
     #[test]
     #[cfg(not(target_arch = "wasm32"))]
     fn viewport_3d_renderer_draws_ten_k_instanced_slabs() {
+        let _wgpu_guard = wgpu_test_guard();
         let Some((device, queue)) = test_wgpu_device() else {
             return;
         };
@@ -1685,6 +1697,7 @@ mod tests {
     #[test]
     #[cfg(not(target_arch = "wasm32"))]
     fn viewport_3d_renderer_screenshot_tracks_camera_facing_slab_side() {
+        let _wgpu_guard = wgpu_test_guard();
         let Some((device, queue)) = test_wgpu_device() else {
             return;
         };
@@ -1698,7 +1711,7 @@ mod tests {
         let front_uniforms = gpu::Viewport3dUniforms::from_view_projection(
             view_projection_3d_test([0.0, -4.0, 0.5], [0.0, 0.0, 0.5], 1.0),
         )
-        .with_rect_side_faces([4, 1]);
+        .with_rect_camera_position([0.0, -4.0, 0.5]);
         let mut renderer = gpu::Viewport3dRenderer::new(&device, gpu::VIEWPORT_3D_COLOR_FORMAT);
         renderer.upload_with_fingerprint(&device, &queue, &batch, fingerprint, front_uniforms);
 
@@ -1725,7 +1738,7 @@ mod tests {
             [0.0, 0.0, 0.5],
             1.0,
         ))
-        .with_rect_side_faces([4, 3]);
+        .with_rect_camera_position([0.0, 4.0, 0.5]);
         let upload =
             renderer.upload_with_fingerprint(&device, &queue, &batch, fingerprint, back_uniforms);
         assert!(upload.skipped);
@@ -1749,6 +1762,7 @@ mod tests {
     #[test]
     #[cfg(not(target_arch = "wasm32"))]
     fn viewport_3d_renderer_screenshot_keeps_mesh_above_rect_slabs() {
+        let _wgpu_guard = wgpu_test_guard();
         let Some((device, queue)) = test_wgpu_device() else {
             return;
         };
@@ -1837,6 +1851,7 @@ mod tests {
                     depth_stencil_attachment: None,
                     timestamp_writes: None,
                     occlusion_query_set: None,
+                    multiview_mask: None,
                 })
                 .forget_lifetime();
             renderer.paint(&mut render_pass);
@@ -1916,6 +1931,7 @@ mod tests {
                     depth_stencil_attachment: None,
                     timestamp_writes: None,
                     occlusion_query_set: None,
+                    multiview_mask: None,
                 })
                 .forget_lifetime();
             renderer.paint(&mut render_pass);
@@ -2013,6 +2029,7 @@ mod tests {
                     depth_stencil_attachment: None,
                     timestamp_writes: None,
                     occlusion_query_set: None,
+                    multiview_mask: None,
                 })
                 .forget_lifetime();
             renderer.paint(&mut render_pass);
@@ -2389,11 +2406,12 @@ mod tests {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn test_wgpu_device() -> Option<(wgpu::Device, wgpu::Queue)> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::from_env().unwrap_or(wgpu::Backends::PRIMARY),
             flags: wgpu::InstanceFlags::from_build_config().with_env(),
             backend_options: wgpu::BackendOptions::from_env_or_default(),
             memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+            display: None,
         });
         let adapter =
             match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {

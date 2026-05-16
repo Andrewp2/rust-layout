@@ -1,6 +1,7 @@
 use fabricad_app::{
     Benchmark3dOptions, OffscreenRenderOptions, OffscreenScene, OperadSnapshotReport,
-    StartupOptions, StartupView, render_operad_snapshot, run_operad_audit,
+    StartupOptions, StartupView, UiScale, render_operad_snapshot_scaled, run_3d_benchmark_scaled,
+    run_operad_audit_scaled,
 };
 use operad::ResourceFormat;
 use std::{
@@ -18,6 +19,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         print_usage();
         return Ok(());
     }
+    if launch.list_views {
+        print_view_list();
+        return Ok(());
+    }
     if let Some(path) = launch.export_gds {
         fabricad_app::export_demo_gds(&path)?;
         println!("exported GDSII {}", path.display());
@@ -30,14 +35,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let startup_options = launch.startup_options();
-    if let Some((width, height)) = launch.operad_snapshot {
-        let report = render_operad_snapshot(startup_options, width, height)?;
+    let ui_scale = UiScale::new(launch.ui_scale);
+    if launch.benchmark_3d.is_some() {
+        let report = run_3d_benchmark_scaled(startup_options, ui_scale)?;
+        println!("{}", report.summary());
+    } else if let Some((width, height)) = launch.operad_snapshot {
+        let report = render_operad_snapshot_scaled(startup_options, width, height, ui_scale)?;
         if let Some(path) = &launch.snapshot_rgba {
             write_snapshot_rgba(path, &report)?;
         }
         println!("{}", report.summary());
     } else if launch.audit {
-        let report = run_operad_audit(startup_options)?;
+        let report = run_operad_audit_scaled(startup_options, ui_scale)?;
         println!("{}", report.summary());
     } else {
         native_window::run(startup_options)?;
@@ -48,7 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn init_logging() {
     let filter = match std::env::var("RUST_LOG") {
         Ok(value) => tracing_subscriber::EnvFilter::try_new(value).unwrap_or_else(|err| {
-            eprintln!("WARN invalid RUST_LOG filter; using Fabricad defaults: {err}");
+            eprintln!("WARN invalid RUST_LOG filter; using default filters: {err}");
             default_log_filter()
         }),
         Err(_) => default_log_filter(),
@@ -65,12 +74,14 @@ fn default_log_filter() -> tracing_subscriber::EnvFilter {
 #[derive(Debug, PartialEq)]
 struct LaunchOptions {
     help: bool,
+    list_views: bool,
     audit: bool,
     offscreen: Option<OffscreenRenderOptions>,
     export_gds: Option<PathBuf>,
     benchmark_3d: Option<Benchmark3dLaunch>,
     operad_snapshot: Option<(u32, u32)>,
     snapshot_rgba: Option<PathBuf>,
+    ui_scale: f32,
     startup_options: StartupOptions,
 }
 
@@ -91,6 +102,7 @@ impl LaunchOptions {
 
     fn parse(args: impl IntoIterator<Item = String>, env_offscreen: bool) -> Result<Self, String> {
         let mut help = false;
+        let mut list_views = false;
         let mut audit = false;
         let mut offscreen_requested = env_offscreen;
         let mut offscreen = OffscreenRenderOptions::default();
@@ -98,15 +110,17 @@ impl LaunchOptions {
         let mut benchmark_3d = None;
         let mut operad_snapshot = None;
         let mut snapshot_rgba = None;
+        let mut ui_scale = 1.0;
         let mut startup_options = StartupOptions::default();
         let mut args = args.into_iter();
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "-h" | "--help" => help = true,
-                "--audit" | "--operad-audit" => audit = true,
+                "--list-views" => list_views = true,
+                "--audit" => audit = true,
                 "--offscreen" | "--headless" => offscreen_requested = true,
-                "--operad-snapshot" => operad_snapshot = Some((1440, 920)),
+                "--snapshot" => operad_snapshot = Some((1440, 920)),
                 "--snapshot-rgba" => {
                     snapshot_rgba = Some(PathBuf::from(next_value(&mut args, "--snapshot-rgba")?));
                     operad_snapshot.get_or_insert((1440, 920));
@@ -118,6 +132,11 @@ impl LaunchOptions {
                     apply_view(&mut startup_options, &next_value(&mut args, "--view")?)?;
                 }
                 "--options" => startup_options.show_options = true,
+                "--click" => {
+                    startup_options
+                        .startup_actions
+                        .push(next_value(&mut args, "--click")?);
+                }
                 "--select" => {
                     apply_select(&mut startup_options, &next_value(&mut args, "--select")?)?;
                 }
@@ -153,6 +172,9 @@ impl LaunchOptions {
                         operad_snapshot = Some((width, offscreen.height));
                     }
                     offscreen_requested = true;
+                }
+                "--ui-scale" => {
+                    ui_scale = parse_ui_scale(&next_value(&mut args, "--ui-scale")?)?;
                 }
                 "--zoom" => {
                     let value = next_value(&mut args, "--zoom")?;
@@ -192,6 +214,20 @@ impl LaunchOptions {
                         .options
                         .warmup_frames = parse_usize(&value, "--bench-3d-warmup")?;
                 }
+                "--bench-3d-width" => {
+                    let value = next_value(&mut args, "--bench-3d-width")?;
+                    benchmark_3d
+                        .get_or_insert_with(Benchmark3dLaunch::default)
+                        .options
+                        .width = parse_u32(&value, "--bench-3d-width")?;
+                }
+                "--bench-3d-height" => {
+                    let value = next_value(&mut args, "--bench-3d-height")?;
+                    benchmark_3d
+                        .get_or_insert_with(Benchmark3dLaunch::default)
+                        .options
+                        .height = parse_u32(&value, "--bench-3d-height")?;
+                }
                 _ => {
                     if let Some(value) = arg.strip_prefix("--scene=") {
                         offscreen.scene = parse_scene(value)?;
@@ -215,6 +251,8 @@ impl LaunchOptions {
                             operad_snapshot = Some((width, offscreen.height));
                         }
                         offscreen_requested = true;
+                    } else if let Some(value) = arg.strip_prefix("--ui-scale=") {
+                        ui_scale = parse_ui_scale(value)?;
                     } else if let Some(value) = arg.strip_prefix("--zoom=") {
                         offscreen.zoom = parse_f32(value, "--zoom")?;
                         startup_options.zoom = Some(offscreen.zoom);
@@ -232,6 +270,8 @@ impl LaunchOptions {
                         apply_workspace(&mut startup_options, value)?;
                     } else if let Some(value) = arg.strip_prefix("--view=") {
                         apply_view(&mut startup_options, value)?;
+                    } else if let Some(value) = arg.strip_prefix("--click=") {
+                        startup_options.startup_actions.push(value.to_string());
                     } else if let Some(value) = arg.strip_prefix("--select=") {
                         apply_select(&mut startup_options, value)?;
                     } else if let Some(value) = arg.strip_prefix("--edit=") {
@@ -250,6 +290,16 @@ impl LaunchOptions {
                             .get_or_insert_with(Benchmark3dLaunch::default)
                             .options
                             .warmup_frames = parse_usize(value, "--bench-3d-warmup")?;
+                    } else if let Some(value) = arg.strip_prefix("--bench-3d-width=") {
+                        benchmark_3d
+                            .get_or_insert_with(Benchmark3dLaunch::default)
+                            .options
+                            .width = parse_u32(value, "--bench-3d-width")?;
+                    } else if let Some(value) = arg.strip_prefix("--bench-3d-height=") {
+                        benchmark_3d
+                            .get_or_insert_with(Benchmark3dLaunch::default)
+                            .options
+                            .height = parse_u32(value, "--bench-3d-height")?;
                     } else {
                         return Err(format!("unknown argument {arg:?}; use --help"));
                     }
@@ -259,27 +309,26 @@ impl LaunchOptions {
 
         Ok(Self {
             help,
+            list_views,
             audit,
             offscreen: (offscreen_requested && operad_snapshot.is_none()).then_some(offscreen),
             export_gds,
             benchmark_3d,
             operad_snapshot,
             snapshot_rgba,
+            ui_scale,
             startup_options,
         })
     }
 
     fn startup_options(&self) -> StartupOptions {
+        let mut options = self.startup_options.clone();
         if let Some(benchmark) = self.benchmark_3d {
-            StartupOptions {
-                stress_count: Some(benchmark.count),
-                view_3d: true,
-                benchmark_3d: Some(benchmark.options),
-                ..self.startup_options
-            }
-        } else {
-            self.startup_options
+            options.stress_count = Some(benchmark.count);
+            options.view_3d = true;
+            options.benchmark_3d = Some(benchmark.options);
         }
+        options
     }
 }
 
@@ -341,7 +390,7 @@ fn apply_scene(
 
 fn apply_view(options: &mut StartupOptions, value: &str) -> Result<(), String> {
     let view = StartupView::from_slug(value)
-        .ok_or_else(|| format!("unsupported view {value:?}; use a Fabricad view slug"))?;
+        .ok_or_else(|| format!("unsupported view {value:?}; use a supported view slug"))?;
     options.view_3d = view == StartupView::Layout3d;
     options.view_mode = Some(view);
     Ok(())
@@ -392,6 +441,15 @@ fn parse_f32(value: &str, flag: &str) -> Result<f32, String> {
     }
 }
 
+fn parse_ui_scale(value: &str) -> Result<f32, String> {
+    let scale = parse_f32(value, "--ui-scale")?;
+    if scale > 0.0 {
+        Ok(scale)
+    } else {
+        Err("--ui-scale must be greater than zero".to_string())
+    }
+}
+
 fn parse_pan(value: &str) -> Result<[f32; 2], String> {
     let (x, y) = value
         .split_once(',')
@@ -412,9 +470,11 @@ fn write_snapshot_rgba(
     path: &Path,
     report: &OperadSnapshotReport,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let image = report.render.snapshot.as_ref().ok_or_else(|| {
-        std::io::Error::other("Operad snapshot render did not produce image pixels")
-    })?;
+    let image = report
+        .render
+        .snapshot
+        .as_ref()
+        .ok_or_else(|| std::io::Error::other("snapshot render did not produce image pixels"))?;
     if image.format != ResourceFormat::Rgba8 {
         return Err(Box::new(std::io::Error::other(format!(
             "unsupported snapshot format {:?}; expected Rgba8",
@@ -431,16 +491,31 @@ fn write_snapshot_rgba(
 
 fn print_usage() {
     println!(
-        "Fabricad\n\n\
-         Usage:\n  \
+        "Usage:\n  \
          fabricad\n  \
-         fabricad --audit\n  \
-         fabricad --operad-snapshot [--width W] [--height H] [--snapshot-rgba PATH] [--view SLUG] [--scene demo|hierarchy|stress]\n  \
+         fabricad --list-views\n  \
+         fabricad --audit [--ui-scale SCALE]\n  \
+         fabricad --snapshot [--width W] [--height H] [--ui-scale SCALE] [--snapshot-rgba PATH] [--view SLUG] [--click NODE] [--scene demo|hierarchy|stress]\n  \
          fabricad --offscreen [--scene demo|hierarchy|stress] [--count N] [--width W] [--height H] [--zoom Z] [--pan X,Y]\n  \
-         fabricad --bench-3d [--bench-3d-count N] [--bench-3d-frames N] [--bench-3d-warmup N]\n  \
+         fabricad --bench-3d [--bench-3d-count N] [--bench-3d-frames N] [--bench-3d-warmup N] [--bench-3d-width W] [--bench-3d-height H]\n  \
          fabricad --export-gds PATH\n\n\
-         The default path opens a native Operad v4 window. Use --audit for the noninteractive summary."
+         The default path opens a native window. Use --audit for the noninteractive summary."
     );
+}
+
+fn print_view_list() {
+    print!("{}", view_list_text());
+}
+
+fn view_list_text() -> String {
+    let mut output = String::new();
+    for view in StartupView::ALL {
+        output.push_str(view.slug());
+        output.push('\t');
+        output.push_str(view.nav_label());
+        output.push('\n');
+    }
+    output
 }
 
 #[cfg(test)]
@@ -501,6 +576,9 @@ mod tests {
                 "120".to_string(),
                 "--bench-3d-warmup".to_string(),
                 "12".to_string(),
+                "--bench-3d-width=3840".to_string(),
+                "--bench-3d-height".to_string(),
+                "2160".to_string(),
             ],
             false,
         )
@@ -514,6 +592,8 @@ mod tests {
                 options: Benchmark3dOptions {
                     frames: 120,
                     warmup_frames: 12,
+                    width: 3840,
+                    height: 2160,
                 },
             })
         );
@@ -522,28 +602,32 @@ mod tests {
             Some(Benchmark3dOptions {
                 frames: 120,
                 warmup_frames: 12,
+                width: 3840,
+                height: 2160,
             })
         );
     }
 
     #[test]
-    fn parses_operad_snapshot_flag() {
-        let launch = LaunchOptions::parse(["--operad-snapshot".to_string()], false).unwrap();
+    fn parses_snapshot_flag() {
+        let launch = LaunchOptions::parse(["--snapshot".to_string()], false).unwrap();
         assert!(!launch.audit);
         assert_eq!(launch.offscreen, None);
         assert_eq!(launch.operad_snapshot, Some((1440, 920)));
         assert_eq!(launch.snapshot_rgba, None);
+        assert_eq!(launch.ui_scale, 1.0);
     }
 
     #[test]
-    fn parses_operad_snapshot_scene_view_and_output() {
+    fn parses_snapshot_scene_view_and_output() {
         let launch = LaunchOptions::parse(
             [
-                "--operad-snapshot".to_string(),
+                "--snapshot".to_string(),
                 "--scene=hierarchy".to_string(),
+                "--ui-scale=2.0".to_string(),
                 "--view".to_string(),
                 "layout".to_string(),
-                "--snapshot-rgba=target/operad.rgba".to_string(),
+                "--snapshot-rgba=target/snapshot.rgba".to_string(),
             ],
             false,
         )
@@ -553,8 +637,9 @@ mod tests {
         assert_eq!(launch.operad_snapshot, Some((1440, 920)));
         assert_eq!(
             launch.snapshot_rgba,
-            Some(PathBuf::from("target/operad.rgba"))
+            Some(PathBuf::from("target/snapshot.rgba"))
         );
+        assert_eq!(launch.ui_scale, 2.0);
         assert!(launch.startup_options().hierarchy_demo);
         assert_eq!(
             launch.startup_options().view_mode,
@@ -563,10 +648,52 @@ mod tests {
     }
 
     #[test]
+    fn parses_snapshot_startup_clicks() {
+        let launch = LaunchOptions::parse(
+            [
+                "--snapshot".to_string(),
+                "--click".to_string(),
+                "fabricad.menu.view".to_string(),
+                "--click=fabricad.menu.item.view.group.engineering".to_string(),
+            ],
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            launch.startup_options().startup_actions,
+            vec![
+                "fabricad.menu.view".to_string(),
+                "fabricad.menu.item.view.group.engineering".to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn parses_audit_flag() {
         let launch = LaunchOptions::parse(["--audit".to_string()], false).unwrap();
         assert!(launch.audit);
+        assert!(!launch.list_views);
         assert_eq!(launch.offscreen, None);
         assert_eq!(launch.operad_snapshot, None);
+    }
+
+    #[test]
+    fn parses_list_views_flag() {
+        let launch = LaunchOptions::parse(["--list-views".to_string()], false).unwrap();
+        assert!(launch.list_views);
+        assert!(!launch.audit);
+        assert_eq!(launch.offscreen, None);
+        assert_eq!(launch.operad_snapshot, None);
+    }
+
+    #[test]
+    fn list_views_output_matches_startup_views() {
+        let output = view_list_text();
+        let lines = output.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), StartupView::ALL.len());
+        for (line, view) in lines.iter().zip(StartupView::ALL) {
+            assert_eq!(*line, format!("{}\t{}", view.slug(), view.nav_label()));
+        }
     }
 }

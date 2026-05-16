@@ -1,7 +1,7 @@
 # Hosting Plan
 
 This repository is ready for an internet-hosted browser demo through its existing
-WebAssembly path. `crates/wasm_app` exposes the shared Fabricad validation surface
+WebAssembly path. `crates/wasm_app` exposes the shared validation surface
 through wasm-bindgen, and `Trunk.toml` builds `crates/wasm_app/index.html` into
 `dist/`.
 
@@ -13,7 +13,7 @@ WASM.
 
 ## Current Architecture
 
-- `native_app` owns the Operad v4 native window, audit, and snapshot entry points,
+- `native_app` owns the native window, audit, and snapshot entry points,
   and it has a `web` feature used by `wasm_app`.
 - `wasm_app` is browser-capable today. A release build succeeds with:
 
@@ -36,8 +36,8 @@ Required repository changes:
 1. Add a GitHub Actions workflow, for example `.github/workflows/deploy-web.yml`.
 2. In GitHub repository settings, set Pages source to "GitHub Actions".
 3. Keep `dist/` ignored. CI should upload it as a build artifact, not commit it.
-4. For a project page at `https://<owner>.github.io/rust-layout/`, build with
-   `--public-url /rust-layout/`. For a custom domain or user/org page at the
+4. For a project page at `https://<owner>.github.io/<project-slug>/`, build with
+   `--public-url /<project-slug>/`. For a custom domain or user/org page at the
    domain root, use `--public-url /`.
 5. Unset `NO_COLOR` in the workflow because this Trunk version rejects `NO_COLOR=1`.
 
@@ -73,7 +73,7 @@ jobs:
       - name: Check core model
         run: cargo test -p layout_model
       - name: Build web app
-        run: env -u NO_COLOR trunk build --release --public-url /rust-layout/
+        run: env -u NO_COLOR trunk build --release --public-url /<project-slug>/
       - uses: actions/upload-pages-artifact@v4
         with:
           path: dist
@@ -102,7 +102,7 @@ GitHub Actions and upload the prebuilt `dist/` directory with Wrangler:
 
 ```bash
 env -u NO_COLOR trunk build --release --public-url /
-npx wrangler pages deploy dist --project-name rust-layout
+npx wrangler pages deploy dist --project-name <pages-project>
 ```
 
 Required setup:
@@ -160,7 +160,7 @@ work in WebAssembly.
   Enable gzip or Brotli on the host and consider re-enabling `wasm-opt` after build
   stability is verified.
 - Public URL: GitHub Pages project sites need a subpath-aware Trunk build, for
-  example `--public-url /rust-layout/`.
+  example `--public-url /<project-slug>/`.
 - Browser rendering: verify Chrome, Firefox, and Safari behavior for WebGL,
   WebGPU, and large layouts.
 - Collaboration default URL: the current browser default assumes the sync server is

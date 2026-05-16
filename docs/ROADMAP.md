@@ -8,7 +8,7 @@ This roadmap is the working checklist. Each milestone should leave the app in a 
 
 The app already has a usable baseline:
 
-- Native Operad v4 winit/wgpu window, audit path, and wgpu snapshot path.
+- Native winit/wgpu window, audit path, and snapshot path.
 - WebAssembly build through Trunk.
 - Shared Rust crates for geometry, layout data, DRC, routing, rendering, sync, native, and web.
 - Slang shader source compiled to WGSL and SPIR-V.
@@ -276,7 +276,7 @@ Completion pass:
 - Native performance overlay now reports resident/evicted tiles, resident/evicted shape batches, draw range count, pick candidate count, pick-build time, and tile-cache budget pressure.
 - Existing tiled rendering continues to use hierarchy-aware R-tree occurrence queries and dense-layout LOD overview tiles.
 - Added renderer tests for cache eviction under a tight budget, draw range emission, and pick batches being limited to visible tile occurrences instead of the full scene.
-- Operad snapshot render E2E scenes cover workflow, layout, hierarchy, 3D, process-flow, and stress LOD rendering.
+- Snapshot render E2E scenes cover workflow, layout, hierarchy, 3D, process-flow, and stress LOD rendering.
 
 ## Milestone 8: Scriptable DRC And Marker Browser
 

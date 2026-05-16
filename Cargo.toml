@@ -24,7 +24,7 @@ futures-util = "0.3"
 glam = { version = "0.30.4", features = ["serde"] }
 log = "0.4"
 loro = "1.12.0"
-operad = { git = "https://github.com/Andrewp2/Operad.git", rev = "eeee4153e9d5b261da337a06f0c23c5ae7b1bd52", features = [
+operad = { git = "https://github.com/Andrewp2/Operad.git", rev = "bb7ac5f4d1fb2cf05f07a9b762622227ef9d99cc", default-features = false, features = [
 	"widgets",
 	"wgpu",
 ] }
@@ -44,7 +44,7 @@ wasm-bindgen = "0.2.100"
 wasm-bindgen-futures = "0.4.50"
 web-sys = "0.3.77"
 web-time = "1.1"
-wgpu = { version = "27.0.1", default-features = false, features = [
+wgpu = { version = "29.0.3", default-features = false, features = [
 	"dx12",
 	"gles",
 	"metal",
