@@ -410,8 +410,18 @@ impl LayoutGpuRenderer {
         batch: &RenderBatch,
         uniforms: ViewUniforms,
     ) -> BufferUploadResult {
+        self.upload_with_fingerprint(device, queue, batch, batch.fingerprint(), uniforms)
+    }
+
+    pub fn upload_with_fingerprint(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        batch: &RenderBatch,
+        fingerprint: crate::BatchFingerprint,
+        uniforms: ViewUniforms,
+    ) -> BufferUploadResult {
         queue.write_buffer(&self.uniform_buffer, 0, &uniforms.as_bytes());
-        let fingerprint = batch.fingerprint();
         let changed = self.render_fingerprint != Some(fingerprint);
         let mut bytes_uploaded = 0;
         if changed {

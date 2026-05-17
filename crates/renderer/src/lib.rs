@@ -18,6 +18,8 @@ use web_time::Instant;
 pub const DEFAULT_TILE_SIZE: i64 = 16_384;
 pub const DEFAULT_LOD_MAX_TILE_SCREEN_PX: f32 = 220.0;
 pub const DEFAULT_LOD_MIN_SHAPES_PER_TILE: usize = 512;
+pub const DEFAULT_LOD_EXTREME_MAX_TILE_SCREEN_PX: f32 = 1_536.0;
+pub const DEFAULT_LOD_EXTREME_MIN_SHAPES_PER_TILE: usize = 20_000;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -249,6 +251,8 @@ pub struct TileLodConfig {
     pub enabled: bool,
     pub max_tile_screen_px: f32,
     pub min_shapes_per_tile: usize,
+    pub extreme_max_tile_screen_px: f32,
+    pub extreme_min_shapes_per_tile: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -295,6 +299,8 @@ impl Default for TileLodConfig {
             enabled: true,
             max_tile_screen_px: DEFAULT_LOD_MAX_TILE_SCREEN_PX,
             min_shapes_per_tile: DEFAULT_LOD_MIN_SHAPES_PER_TILE,
+            extreme_max_tile_screen_px: DEFAULT_LOD_EXTREME_MAX_TILE_SCREEN_PX,
+            extreme_min_shapes_per_tile: DEFAULT_LOD_EXTREME_MIN_SHAPES_PER_TILE,
         }
     }
 }
@@ -611,6 +617,10 @@ impl TileCache {
         self.tiles.clear();
         self.shapes.clear();
         self.frame_counter = 0;
+    }
+
+    pub fn tile_keys_for_viewport(&self, viewport: Rect) -> Vec<TileKey> {
+        tile_keys_for_rect(viewport, self.tile_size)
     }
 
     pub fn invalidate_rect(&mut self, rect: Rect) -> usize {
@@ -959,9 +969,14 @@ pub fn build_shape_view_triangles(
 }
 
 fn should_use_overview(tile_size: i64, shape_count: usize, options: TileFrameOptions) -> bool {
-    options.lod.enabled
-        && shape_count >= options.lod.min_shapes_per_tile
-        && (tile_size as f32 * options.zoom) <= options.lod.max_tile_screen_px
+    if !options.lod.enabled {
+        return false;
+    }
+    let tile_screen_px = tile_size as f32 * options.zoom;
+    (shape_count >= options.lod.min_shapes_per_tile
+        && tile_screen_px <= options.lod.max_tile_screen_px)
+        || (shape_count >= options.lod.extreme_min_shapes_per_tile
+            && tile_screen_px <= options.lod.extreme_max_tile_screen_px)
 }
 
 fn tile_keys_for_rect(rect: Rect, tile_size: i64) -> Vec<TileKey> {
@@ -2294,6 +2309,7 @@ mod tests {
             enabled: true,
             max_tile_screen_px: 220.0,
             min_shapes_per_tile: 8,
+            ..Default::default()
         };
         let mut lod_cache = TileCache::new(1_024);
         let mut precise_cache = TileCache::new(1_024);
@@ -2336,6 +2352,40 @@ mod tests {
     }
 
     #[test]
+    fn tile_cache_uses_overview_lod_for_extremely_dense_tiles() {
+        let document = Document::stress(1_000);
+        let index = LayoutIndex::rebuild(&document);
+        let viewport = Rect::from_min_size(Point::new(-6_000, -6_000), 12_000, 12_000);
+        let mut cache = TileCache::new(1_024);
+
+        let frame = cache.build_frame_with_options(
+            &document,
+            &index,
+            viewport,
+            TileFrameOptions {
+                include_pick: false,
+                zoom: 1.0,
+                lod: TileLodConfig {
+                    enabled: true,
+                    max_tile_screen_px: 0.0,
+                    min_shapes_per_tile: usize::MAX,
+                    extreme_max_tile_screen_px: 2_048.0,
+                    extreme_min_shapes_per_tile: 8,
+                },
+                ..Default::default()
+            },
+        );
+
+        assert!(frame.stats.lod_tiles > 0);
+        assert!(
+            frame
+                .draw_ranges
+                .iter()
+                .any(|range| matches!(range.kind, DrawBatchRangeKind::TileOverview { .. }))
+        );
+    }
+
+    #[test]
     fn tile_cache_keeps_precise_geometry_at_close_zoom() {
         let document = Document::stress(1_000);
         let index = LayoutIndex::rebuild(&document);
@@ -2352,6 +2402,7 @@ mod tests {
                     enabled: true,
                     max_tile_screen_px: 220.0,
                     min_shapes_per_tile: 1,
+                    ..Default::default()
                 },
                 ..Default::default()
             },

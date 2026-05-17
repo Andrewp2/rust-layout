@@ -1,7 +1,8 @@
 use fabricad_app::{
-    Benchmark3dOptions, OffscreenRenderOptions, OffscreenScene, OperadSnapshotReport,
-    StartupOptions, StartupView, UiScale, render_operad_snapshot_scaled, run_3d_benchmark_scaled,
-    run_operad_audit_scaled,
+    AppOptions, Benchmark3dOptions, OffscreenRenderOptions, OffscreenScene, OperadSnapshotReport,
+    StartupOptions, StartupView, UiScale, default_options_path, load_options_file,
+    render_operad_snapshot_scaled, run_3d_benchmark_scaled, run_operad_audit_scaled,
+    save_options_file,
 };
 use operad::ResourceFormat;
 use std::{
@@ -23,6 +24,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         print_view_list();
         return Ok(());
     }
+    if let Some(path) = &launch.write_default_options {
+        save_options_file(path, &AppOptions::default()).map_err(std::io::Error::other)?;
+        println!("wrote default options {}", path.display());
+        return Ok(());
+    }
     if let Some(path) = launch.export_gds {
         fabricad_app::export_demo_gds(&path)?;
         println!("exported GDSII {}", path.display());
@@ -34,8 +40,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let startup_options = launch.startup_options();
-    let ui_scale = UiScale::new(launch.ui_scale);
+    let (app_options, options_file_path) =
+        load_launch_options_file(&launch).map_err(std::io::Error::other)?;
+    if launch.print_options {
+        println!(
+            "{}",
+            app_options
+                .to_pretty_json()
+                .map_err(std::io::Error::other)?
+        );
+        return Ok(());
+    }
+
+    let mut startup_options = launch.startup_options();
+    startup_options.app_options = Some(app_options.clone());
+    startup_options.options_file_path = Some(options_file_path.display().to_string());
+    let ui_scale = UiScale::new(if launch.ui_scale_overridden {
+        launch.ui_scale
+    } else {
+        app_options.appearance.ui_scale
+    });
     if launch.benchmark_3d.is_some() {
         let report = run_3d_benchmark_scaled(startup_options, ui_scale)?;
         println!("{}", report.summary());
@@ -82,6 +106,10 @@ struct LaunchOptions {
     operad_snapshot: Option<(u32, u32)>,
     snapshot_rgba: Option<PathBuf>,
     ui_scale: f32,
+    ui_scale_overridden: bool,
+    options_file: Option<PathBuf>,
+    write_default_options: Option<PathBuf>,
+    print_options: bool,
     startup_options: StartupOptions,
 }
 
@@ -111,6 +139,10 @@ impl LaunchOptions {
         let mut operad_snapshot = None;
         let mut snapshot_rgba = None;
         let mut ui_scale = 1.0;
+        let mut ui_scale_overridden = false;
+        let mut options_file = None;
+        let mut write_default_options = None;
+        let mut print_options = false;
         let mut startup_options = StartupOptions::default();
         let mut args = args.into_iter();
 
@@ -132,6 +164,16 @@ impl LaunchOptions {
                     apply_view(&mut startup_options, &next_value(&mut args, "--view")?)?;
                 }
                 "--options" => startup_options.show_options = true,
+                "--options-file" => {
+                    options_file = Some(PathBuf::from(next_value(&mut args, "--options-file")?));
+                }
+                "--write-default-options" => {
+                    write_default_options = Some(PathBuf::from(next_value(
+                        &mut args,
+                        "--write-default-options",
+                    )?));
+                }
+                "--print-options" => print_options = true,
                 "--click" => {
                     startup_options
                         .startup_actions
@@ -175,6 +217,7 @@ impl LaunchOptions {
                 }
                 "--ui-scale" => {
                     ui_scale = parse_ui_scale(&next_value(&mut args, "--ui-scale")?)?;
+                    ui_scale_overridden = true;
                 }
                 "--zoom" => {
                     let value = next_value(&mut args, "--zoom")?;
@@ -253,6 +296,11 @@ impl LaunchOptions {
                         offscreen_requested = true;
                     } else if let Some(value) = arg.strip_prefix("--ui-scale=") {
                         ui_scale = parse_ui_scale(value)?;
+                        ui_scale_overridden = true;
+                    } else if let Some(value) = arg.strip_prefix("--options-file=") {
+                        options_file = Some(PathBuf::from(value));
+                    } else if let Some(value) = arg.strip_prefix("--write-default-options=") {
+                        write_default_options = Some(PathBuf::from(value));
                     } else if let Some(value) = arg.strip_prefix("--zoom=") {
                         offscreen.zoom = parse_f32(value, "--zoom")?;
                         startup_options.zoom = Some(offscreen.zoom);
@@ -317,6 +365,10 @@ impl LaunchOptions {
             operad_snapshot,
             snapshot_rgba,
             ui_scale,
+            ui_scale_overridden,
+            options_file,
+            write_default_options,
+            print_options,
             startup_options,
         })
     }
@@ -329,6 +381,18 @@ impl LaunchOptions {
             options.benchmark_3d = Some(benchmark.options);
         }
         options
+    }
+}
+
+fn load_launch_options_file(launch: &LaunchOptions) -> Result<(AppOptions, PathBuf), String> {
+    let path = launch
+        .options_file
+        .clone()
+        .unwrap_or_else(default_options_path);
+    if path.exists() {
+        load_options_file(&path).map(|options| (options, path))
+    } else {
+        Ok((AppOptions::default(), path))
     }
 }
 
@@ -498,7 +562,9 @@ fn print_usage() {
          fabricad --snapshot [--width W] [--height H] [--ui-scale SCALE] [--snapshot-rgba PATH] [--view SLUG] [--click NODE] [--scene demo|hierarchy|stress]\n  \
          fabricad --offscreen [--scene demo|hierarchy|stress] [--count N] [--width W] [--height H] [--zoom Z] [--pan X,Y]\n  \
          fabricad --bench-3d [--bench-3d-count N] [--bench-3d-frames N] [--bench-3d-warmup N] [--bench-3d-width W] [--bench-3d-height H]\n  \
-         fabricad --export-gds PATH\n\n\
+         fabricad --export-gds PATH\n  \
+         fabricad --print-options [--options-file PATH]\n  \
+         fabricad --write-default-options PATH\n\n\
          The default path opens a native window. Use --audit for the noninteractive summary."
     );
 }
@@ -564,6 +630,30 @@ mod tests {
         assert_eq!(launch.offscreen, None);
         assert_eq!(launch.export_gds, Some(PathBuf::from("target/demo.gds")));
         assert_eq!(launch.benchmark_3d, None);
+    }
+
+    #[test]
+    fn parses_options_file_flags() {
+        let launch = LaunchOptions::parse(
+            [
+                "--options-file".to_string(),
+                "target/options.json".to_string(),
+                "--print-options".to_string(),
+                "--write-default-options=target/default-options.json".to_string(),
+            ],
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            launch.options_file,
+            Some(PathBuf::from("target/options.json"))
+        );
+        assert!(launch.print_options);
+        assert_eq!(
+            launch.write_default_options,
+            Some(PathBuf::from("target/default-options.json"))
+        );
     }
 
     #[test]

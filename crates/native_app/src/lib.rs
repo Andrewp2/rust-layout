@@ -8,13 +8,15 @@ use std::{fs, io::Write, path::Path};
 use drc::{DrcIssueStore, DrcValidationFinding, DrcViolation, RuleDeck, run_drc};
 use geometry_core::{Coord, Point, Rect, Vector, distance_point_to_segment};
 #[cfg(not(target_arch = "wasm32"))]
+use layout_model::ShapeKindView;
+#[cfg(not(target_arch = "wasm32"))]
 use layout_model::gdsii::export_gdsii;
 pub use layout_model::workspace::BuiltinDemoWorkspaceReport;
 use layout_model::{
     Cell, CellId, CellInstance, Document, InstanceArray, InstanceId, Layer, LayerId, LayoutIndex,
     MarkerState, NetId, Operation, ProcessLayer, Shape, ShapeId, ShapeKind, ShapeOccurrenceId,
-    TechnologyFile, Transform,
-    connectivity::{ConnectivityIssueKind, ConnectivityReport, NetComponent, extract_connectivity},
+    Transform,
+    connectivity::{ConnectivityIssueKind, ConnectivityReport, extract_connectivity},
     cross_section::MaterialId,
     environment::{
         CleanroomEnvironment, EnvironmentAlarmSeverity, EnvironmentSensor, TrendDirection,
@@ -33,7 +35,7 @@ use layout_model::{
     layout_diff::{LayoutDiffReport, ShapeChangeKind, diff_documents},
     maintenance::{DueState, FabDate, MaintenanceKind, ToolReleaseState},
     mask::{MaskCheckReport, MaskIssueSeverity, ReticlePrep},
-    mes::{LotId, ToolClass as SchedulerToolClass, ToolId as SchedulerToolId, WaferId},
+    mes::{LotId, ToolId as SchedulerToolId, WaferId},
     metrology::{DieCoord, MeasurementKind, MeasurementStatus, MeasurementSummary, WaferMap},
     notebook::{NotebookEntryId, NotebookFilter, NotebookLinkKind},
     process_control::{
@@ -48,27 +50,22 @@ use layout_model::{
     yield_analysis::{DieOutcome, FailureMode, ProcessMeasurement, YieldAnalysis, YieldSummary},
 };
 #[cfg(not(target_arch = "wasm32"))]
-use layout_model::{FlattenedShapeView, ShapeKindView};
-#[cfg(not(target_arch = "wasm32"))]
 use operad::WgpuCanvasContext;
-use operad::widgets::{
-    AnchoredPopup, ButtonOptions, CollapsingHeaderOptions, MenuItem as OperadMenuItem,
-    MenuListOptions, PopupAlign, PopupPlacement, PopupSide, button, collapsing_header,
-    menu_list_popup,
-};
+use operad::widgets::{ButtonOptions, CollapsingHeaderOptions, button, collapsing_header};
 use operad::{
-    AccessibilityAction, AccessibilityMeta, AccessibilityRole, ApproxTextMeasurer, CanvasContent,
+    AccessibilityAction, AccessibilityMeta, AccessibilityRole, ApproxTextMeasurer,
     CanvasInteractionPolicy, ClipBehavior, ColorRgba, FontWeight, InputBehavior, LayoutStyle,
     PaintText, RenderFrameOutput, RenderFrameRequest, RenderOptions, RenderTarget, RendererAdapter,
-    ScenePrimitive, ScrollAxes, StrokeStyle, TextStyle, TextWrap, UiContent, UiDocument, UiNode,
-    UiNodeStyle, UiPoint, UiRect, UiSize, UiVisual, WgpuRenderer, WidgetActionBinding, layout,
-    platform::PixelSize, root_style,
+    ScenePrimitive, ScrollAxes, StrokeStyle, TextHorizontalAlign, TextStyle, TextVerticalAlign,
+    TextWrap, UiContent, UiDocument, UiNode, UiNodeStyle, UiPoint, UiRect, UiSize, UiVisual,
+    WgpuRenderer, WidgetActionBinding, layout, platform::PixelSize, root_style,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use operad_wgpu as wgpu;
 #[cfg(not(target_arch = "wasm32"))]
 use renderer::{
     BatchFingerprint, GpuRectSlabInstance, GpuVertex3d, RenderBatch3d, TileCache, TileFrameOptions,
+    TileKey, TileLodConfig, TiledFrame,
     gpu::{
         LayoutGpuRenderer, OffscreenRenderRequest, VIEWPORT_3D_COLOR_FORMAT, ViewUniforms,
         Viewport3dRenderer, Viewport3dUniforms,
@@ -77,18 +74,41 @@ use renderer::{
 #[cfg(not(target_arch = "wasm32"))]
 use uuid::Uuid;
 
+mod camera;
+mod labels;
+mod options;
+mod ui;
+use camera::{CAMERA_NEAR_PLANE, Camera3d, Vec3, view_projection_3d};
+use labels::{
+    capitalize_ascii_first, compact_button_label, display_inventory_actor_identifier,
+    display_layout_revision_identifier, display_lot_identifier, display_mask_identifier,
+    display_measurement_identifier, display_owner_identifier, display_product_label,
+    display_recipe_identifier, display_reticle_field_identifier, display_reticle_identifier,
+    display_route_identifier, display_spc_control_identifier, display_step_identifier,
+    display_technology_name, display_tool_run_identifier, display_wafer_identifier,
+    humanize_identifier, inventory_usage_link_label, trace_lot_button_label, trace_lot_label,
+    workflow_lot_label, yield_wafer_label, yield_wafer_short_label,
+};
+pub use options::{APP_OPTIONS_SCHEMA_VERSION, AppOptions, FABRICAD_OPTIONS_FILE_ENV};
+#[cfg(not(target_arch = "wasm32"))]
+pub use options::{default_options_path, load_options_file, save_options_file};
+pub use ui::UiScale;
+use ui::{
+    ShellMetrics, ShellMetricsOptions, add_node_marker, inspector_panel_width,
+    pad_pre_shell_node_ids, secondary_panel_width,
+};
+
 const LAYOUT_MIN_ZOOM: f32 = 0.000_05;
 const LAYOUT_MAX_ZOOM: f32 = 512.0;
-const CAMERA_NEAR_PLANE: f32 = 10.0;
 const CAMERA_FAR_PLANE_MIN: f32 = 250_000.0;
 const CAMERA_FAR_PLANE_SPAN_MULTIPLIER: f32 = 4.0;
 const CAMERA_FAR_PLANE_MARGIN_MULTIPLIER: f32 = 1.5;
+const LAYOUT_FPS_EMA_ALPHA: f64 = 0.18;
 const MAX_CONNECTIVITY_OVERLAY_SHAPES: usize = 50_000;
 const INVENTORY_DEMO_TODAY: u32 = 20260508;
 const MASK_ISSUE_PAGE_SIZE: usize = 50;
 const LAYOUT_DIFF_DEFAULT_PAGE_SIZE: usize = 50;
 const LAYOUT_DIFF_PAGE_SIZE_OPTIONS: [usize; 4] = [25, 50, 100, 200];
-const MAX_DRC_OVERLAY_MARKERS: usize = 32;
 const MAX_DRC_INSPECTOR_SHAPES: usize = 50_000;
 
 const COLOR_APP_BG: ColorRgba = ColorRgba::new(8, 11, 14, 255);
@@ -98,7 +118,6 @@ const COLOR_PANEL_ALT: ColorRgba = ColorRgba::new(18, 25, 31, 255);
 const COLOR_PANEL_STROKE: ColorRgba = ColorRgba::new(31, 41, 50, 255);
 const COLOR_BUTTON_BG: ColorRgba = ColorRgba::new(18, 25, 31, 255);
 const COLOR_BUTTON_SELECTED: ColorRgba = ColorRgba::new(43, 105, 153, 255);
-const COLOR_BUTTON_STROKE: ColorRgba = ColorRgba::new(48, 61, 72, 255);
 const COLOR_BUTTON_STROKE_SELECTED: ColorRgba = ColorRgba::new(72, 148, 204, 255);
 const COLOR_TEXT: ColorRgba = ColorRgba::new(222, 229, 235, 255);
 const COLOR_TEXT_MUTED: ColorRgba = ColorRgba::new(142, 152, 162, 255);
@@ -569,6 +588,42 @@ impl ProcessFlowNodeFilter {
             "metrology" => Some(Self::Metrology),
             "holds" => Some(Self::Holds),
             "rework" => Some(Self::Rework),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControlLoopFilter {
+    All,
+    Active,
+    Attention,
+}
+
+impl ControlLoopFilter {
+    const ALL: [Self; 3] = [Self::All, Self::Active, Self::Attention];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::All => "All loops",
+            Self::Active => "Active",
+            Self::Attention => "Attention",
+        }
+    }
+
+    const fn slug(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Active => "active",
+            Self::Attention => "attention",
+        }
+    }
+
+    fn from_slug(value: &str) -> Option<Self> {
+        match value {
+            "all" => Some(Self::All),
+            "active" => Some(Self::Active),
+            "attention" => Some(Self::Attention),
             _ => None,
         }
     }
@@ -1436,6 +1491,99 @@ fn default_nav_rail_views() -> BTreeSet<StartupView> {
     StartupView::ALL.into_iter().collect()
 }
 
+fn nav_rail_views_from_option_slugs(slugs: &[String]) -> BTreeSet<StartupView> {
+    slugs
+        .iter()
+        .filter_map(|slug| StartupView::from_slug(slug))
+        .collect()
+}
+
+fn option_enabled(enabled: bool) -> &'static str {
+    if enabled { "enabled" } else { "disabled" }
+}
+
+fn option_scale_from_slug(slug: &str) -> Option<f32> {
+    match slug {
+        "100" => Some(1.0),
+        "125" => Some(1.25),
+        "150" => Some(1.5),
+        "200" => Some(2.0),
+        _ => None,
+    }
+}
+
+fn option_zoom_from_slug(slug: &str) -> Option<f32> {
+    match slug {
+        "tiny" => Some(0.005),
+        "default" => Some(0.02),
+        "close" => Some(0.1),
+        _ => None,
+    }
+}
+
+fn option_speed_from_slug(slug: &str) -> Option<f32> {
+    match slug {
+        "slow" => Some(1_000.0),
+        "default" => Some(4_000.0),
+        "fast" => Some(12_000.0),
+        _ => None,
+    }
+}
+
+fn option_fov_from_slug(slug: &str) -> Option<f32> {
+    match slug {
+        "45" => Some(45.0),
+        "58" => Some(58.0),
+        "75" => Some(75.0),
+        _ => None,
+    }
+}
+
+fn option_sensitivity_from_slug(slug: &str) -> Option<f32> {
+    match slug {
+        "low" => Some(0.0015),
+        "default" => Some(0.003),
+        "high" => Some(0.006),
+        _ => None,
+    }
+}
+
+fn option_fast_multiplier_from_slug(slug: &str) -> Option<f32> {
+    match slug {
+        "2" => Some(2.0),
+        "4" => Some(4.0),
+        "8" => Some(8.0),
+        _ => None,
+    }
+}
+
+fn option_fps_alpha_from_slug(slug: &str) -> Option<f64> {
+    match slug {
+        "10" => Some(0.10),
+        "18" => Some(0.18),
+        "30" => Some(0.30),
+        _ => None,
+    }
+}
+
+fn option_interval_from_slug(slug: &str) -> Option<u64> {
+    match slug {
+        "60" => Some(60),
+        "120" => Some(120),
+        "300" => Some(300),
+        _ => None,
+    }
+}
+
+fn option_recent_limit_from_slug(slug: &str) -> Option<usize> {
+    match slug {
+        "5" => Some(5),
+        "10" => Some(10),
+        "25" => Some(25),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct StartupOptions {
     pub demo_workspace: bool,
@@ -1445,6 +1593,8 @@ pub struct StartupOptions {
     pub view_mode: Option<StartupView>,
     pub benchmark_3d: Option<Benchmark3dOptions>,
     pub show_options: bool,
+    pub app_options: Option<AppOptions>,
+    pub options_file_path: Option<String>,
     pub select_first_shape: bool,
     pub move_first_vertex: bool,
     pub zoom: Option<f32>,
@@ -1559,7 +1709,12 @@ pub struct FabricadApp {
     measure_start: Option<Point>,
     route_points: Vec<Point>,
     layout_frame_ms: StdCell<Option<f64>>,
+    layout_frame_ema_ms: StdCell<Option<f64>>,
+    layout_frame_last_at: StdCell<Option<std::time::Instant>>,
     layout_revision: u64,
+    layout_index_cache: RefCell<Option<LayoutIndexCacheValue>>,
+    connectivity_report_cache: RefCell<Option<ConnectivityReportCacheValue>>,
+    drc_report_cache: RefCell<Option<DrcReportCacheEntry>>,
     nav_rail_views: BTreeSet<StartupView>,
     active_layer: LayerId,
     selected_layout_shape: Option<ShapeId>,
@@ -1609,6 +1764,7 @@ pub struct FabricadApp {
     selected_process_node: Option<ProcessFlowNodeId>,
     process_flow_filter: ProcessFlowNodeFilter,
     process_flow_errors_only: bool,
+    process_control_loop_filter: ControlLoopFilter,
     selected_control_loop: Option<ControlLoopId>,
     selected_control_action: Option<ControlActionId>,
     selected_spc_chart: Option<String>,
@@ -1638,6 +1794,7 @@ pub struct FabricadApp {
     experiment_show_missing_only: bool,
     status_message: String,
     dark_theme: bool,
+    theme_preference: options::ThemePreference,
     show_command_palette: bool,
     show_sidebar_modules: bool,
     show_options_panel: bool,
@@ -1651,6 +1808,8 @@ pub struct FabricadApp {
     show_drc_overlay: bool,
     show_inspector: bool,
     show_layers: bool,
+    app_options: AppOptions,
+    options_file_path: Option<String>,
     layout_modifiers: operad::KeyModifiers,
 }
 
@@ -1701,6 +1860,24 @@ struct DrcReportCacheValue {
     violations: Vec<DrcViolation>,
 }
 
+#[derive(Clone, Debug)]
+struct LayoutIndexCacheValue {
+    revision: u64,
+    index: LayoutIndex,
+}
+
+#[derive(Clone, Debug)]
+struct ConnectivityReportCacheValue {
+    revision: u64,
+    report: Result<ConnectivityReport, String>,
+}
+
+#[derive(Clone, Debug)]
+struct DrcReportCacheEntry {
+    revision: u64,
+    value: DrcReportCacheValue,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LayoutVertexHit {
     shape_id: ShapeId,
@@ -1713,95 +1890,12 @@ struct LayoutEdgeHit {
     edge: usize,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Camera3d {
-    position: Vec3,
-    yaw: f32,
-    pitch: f32,
-    speed: f32,
-    fov_y: f32,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct CameraBasis {
-    forward: Vec3,
-    right: Vec3,
-    up: Vec3,
-}
-
-impl Default for Camera3d {
-    fn default() -> Self {
-        Self {
-            position: Vec3::new(-8_000.0, -9_000.0, 6_000.0),
-            yaw: 45.0_f32.to_radians(),
-            pitch: -28.0_f32.to_radians(),
-            speed: 4_000.0,
-            fov_y: 58.0_f32.to_radians(),
-        }
-    }
-}
-
-impl Camera3d {
-    fn look_at(position: Vec3, target: Vec3, speed: f32) -> Self {
-        let to_target = target - position;
-        let direction = to_target.normalized();
-        let yaw = direction.y.atan2(direction.x);
-        let horizontal = (direction.x * direction.x + direction.y * direction.y).sqrt();
-        let pitch = direction.z.atan2(horizontal).clamp(-1.45, 1.45);
-        Self {
-            position,
-            yaw,
-            pitch,
-            speed: speed.max(100.0),
-            fov_y: 58.0_f32.to_radians(),
-        }
-    }
-
-    fn forward(self) -> Vec3 {
-        let cp = self.pitch.cos();
-        Vec3::new(self.yaw.cos() * cp, self.yaw.sin() * cp, self.pitch.sin()).normalized()
-    }
-
-    fn basis(self) -> CameraBasis {
-        let forward = self.forward();
-        let right = Vec3::new(-self.yaw.sin(), self.yaw.cos(), 0.0).normalized();
-        let up = forward.cross(right).normalized();
-        CameraBasis { forward, right, up }
-    }
-
-    fn look_delta(&mut self, delta: UiPoint, sensitivity: f32) {
-        self.yaw += delta.x * sensitivity;
-        self.pitch = (self.pitch - delta.y * sensitivity).clamp(-1.45, 1.45);
-    }
-
-    fn scroll_forward(&mut self, scroll: f32) {
-        self.position += self.forward() * scroll * self.speed * 0.0015;
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct UiScale {
-    factor: f32,
-}
-
-impl UiScale {
-    pub fn new(factor: f32) -> Self {
-        Self {
-            factor: factor.clamp(1.0, 3.0),
-        }
-    }
-
-    pub fn factor(self) -> f32 {
-        self.factor
-    }
-
-    fn value(self, value: f32) -> f32 {
-        value * self.factor
-    }
-}
-
 impl FabricadApp {
     pub fn new_with_options(options: StartupOptions) -> Self {
+        let mut app_options = options.app_options.clone().unwrap_or_default().normalized();
+        if options.show_options {
+            app_options.shell.show_options_panel = true;
+        }
         let mut workspace = if let Some(count) = options.stress_count {
             let mut workspace = WorkspaceDataset::demo();
             workspace.document = Document::stress(count);
@@ -1817,7 +1911,13 @@ impl FabricadApp {
             .move_first_vertex
             .then(|| move_first_layout_shape_vertex(&mut workspace.document))
             .flatten();
-        let active_layer = default_active_layer(&workspace);
+        let configured_layer = LayerId(app_options.layout.active_layer);
+        let active_layer = workspace
+            .document
+            .layers
+            .contains_key(&configured_layer)
+            .then_some(configured_layer)
+            .unwrap_or_else(|| default_active_layer(&workspace));
         let selected_layout_shape = moved_shape.or_else(|| {
             options
                 .select_first_shape
@@ -1826,16 +1926,42 @@ impl FabricadApp {
         });
         let selected_yield_lot = default_yield_lot(&workspace);
         let selected_yield_wafer = default_yield_wafer(&workspace, selected_yield_lot.as_deref());
-        let workflow_focus_lot = default_workflow_focus_lot(&workspace);
-        let selected_equipment_tool = default_equipment_tool(&workspace);
+        let workflow_focus_lot = app_options
+            .domains
+            .workflow
+            .focus_lot
+            .as_ref()
+            .filter(|lot_id| workflow_lot_ids(&workspace).iter().any(|id| id == *lot_id))
+            .cloned()
+            .or_else(|| default_workflow_focus_lot(&workspace));
+        let selected_equipment_tool = app_options
+            .domains
+            .fab_control
+            .auto_select_first_tool
+            .then(|| default_equipment_tool(&workspace))
+            .flatten();
         let selected_maintenance_tool = default_maintenance_tool(&workspace);
-        let selected_environment_sensor = default_environment_sensor(&workspace);
-        let selected_inventory_lot = default_inventory_lot(&workspace, InventoryQuickFilter::All);
+        let selected_environment_sensor = default_environment_sensor_with_options(
+            &workspace,
+            app_options.domains.environment.show_alarm_sensors_first,
+        );
+        let inventory_filter =
+            InventoryQuickFilter::from_slug(&app_options.domains.inventory.quick_filter)
+                .unwrap_or(InventoryQuickFilter::All);
+        let selected_inventory_lot = default_inventory_lot(&workspace, inventory_filter);
         let mask_source_lot = default_mask_lot(&workspace);
         let selected_scheduler_tool = default_scheduler_tool(&workspace);
         let selected_safety_tool = default_safety_tool(&workspace);
-        let selected_process_node = default_process_flow_node(&workspace);
-        let selected_control_loop = default_control_loop(&workspace);
+        let process_flow_filter =
+            ProcessFlowNodeFilter::from_slug(&app_options.domains.process_flow.node_filter)
+                .unwrap_or(ProcessFlowNodeFilter::All);
+        let selected_process_node =
+            default_process_flow_node_for_filter(&workspace, process_flow_filter);
+        let process_control_loop_filter =
+            ControlLoopFilter::from_slug(&app_options.domains.run_to_run.loop_filter)
+                .unwrap_or(ControlLoopFilter::All);
+        let selected_control_loop =
+            default_control_loop_for_filter(&workspace, process_control_loop_filter);
         let selected_control_action =
             default_control_action(&workspace, selected_control_loop.as_ref());
         let selected_spc_chart = default_spc_chart(&workspace);
@@ -1855,33 +1981,53 @@ impl FabricadApp {
         let active_view = options
             .view_mode
             .or_else(|| options.view_3d.then_some(StartupView::Layout3d))
+            .or_else(|| StartupView::from_slug(&app_options.shell.startup_view))
             .unwrap_or(StartupView::Workflow);
+        let active_tool =
+            ToolMode::from_slug(&app_options.layout.default_tool).unwrap_or(ToolMode::Select);
+        let unit_display = UnitDisplay::from_slug(&app_options.appearance.unit_display)
+            .unwrap_or(UnitDisplay::Auto);
+        let theme_preference = app_options.appearance.theme;
+        let nav_rail_views = nav_rail_views_from_option_slugs(&app_options.shell.nav_rail_views);
+        let mut camera_3d = Camera3d::default();
+        camera_3d.speed = app_options.viewport3d.movement_speed;
+        camera_3d.fov_y = app_options.viewport3d.fov_degrees.to_radians();
+        let cross_section_step = app_options
+            .domains
+            .cross_section
+            .step
+            .min(workspace.cross_section.steps.len());
 
         let mut app = Self {
             workspace,
             active_view,
             active_menu: None,
             active_view_group: None,
-            active_tool: ToolMode::Select,
+            active_tool,
             layout_zoom: options
                 .zoom
-                .unwrap_or(0.02)
+                .unwrap_or(app_options.layout.zoom)
                 .clamp(LAYOUT_MIN_ZOOM, LAYOUT_MAX_ZOOM),
-            layout_pan: options.pan.unwrap_or([0.0, 0.0]),
+            layout_pan: options.pan.unwrap_or(app_options.layout.pan),
             layout_pointer: None,
             layout_canvas_size: None,
             layout_drag: None,
             layout_3d_drag: None,
-            camera_3d: Camera3d::default(),
+            camera_3d,
             flycam_captured: false,
-            viewport_fullscreen: false,
+            viewport_fullscreen: app_options.viewport3d.fullscreen_on_start,
             drawing_start: None,
             drawing_points: Vec::new(),
             measure_start: None,
             route_points: Vec::new(),
             layout_frame_ms: StdCell::new(None),
+            layout_frame_ema_ms: StdCell::new(None),
+            layout_frame_last_at: StdCell::new(None),
             layout_revision: 0,
-            nav_rail_views: default_nav_rail_views(),
+            layout_index_cache: RefCell::new(None),
+            connectivity_report_cache: RefCell::new(None),
+            drc_report_cache: RefCell::new(None),
+            nav_rail_views,
             active_layer,
             selected_layout_shape,
             selected_layout_occurrence: selected_layout_shape.map(ShapeOccurrenceId::top_level),
@@ -1892,91 +2038,132 @@ impl FabricadApp {
             selected_equipment_tool,
             equipment_recipe_drafts: BTreeMap::new(),
             selected_maintenance_tool,
-            maintenance_work_filter: MaintenanceWorkFilter::Actionable,
-            maintenance_history_filter: MaintenanceHistoryFilter::SelectedTool,
+            maintenance_work_filter: MaintenanceWorkFilter::from_slug(
+                &app_options.domains.maintenance.work_filter,
+            )
+            .unwrap_or(MaintenanceWorkFilter::Actionable),
+            maintenance_history_filter: MaintenanceHistoryFilter::from_slug(
+                &app_options.domains.maintenance.history_filter,
+            )
+            .unwrap_or(MaintenanceHistoryFilter::SelectedTool),
             selected_environment_sensor,
             selected_inventory_lot,
-            inventory_filter: InventoryQuickFilter::All,
+            inventory_filter,
             mask_source_lot,
-            mask_issue_severity_filter: MaskIssueSeverityFilter::All,
-            mask_issue_grouping: MaskIssueGrouping::Code,
+            mask_issue_severity_filter: MaskIssueSeverityFilter::from_slug(
+                &app_options.domains.mask_prep.severity_filter,
+            )
+            .unwrap_or(MaskIssueSeverityFilter::All),
+            mask_issue_grouping: MaskIssueGrouping::from_slug(
+                &app_options.domains.mask_prep.grouping,
+            )
+            .unwrap_or(MaskIssueGrouping::Code),
             mask_issue_page: 0,
             layout_diff_baseline: LayoutDiffSource::Demo,
             layout_diff_candidate: LayoutDiffSource::Current,
-            layout_diff_changed_only: true,
+            layout_diff_changed_only: app_options.domains.layout_diff.changed_only,
             layout_diff_change_filter: LayoutChangeFilter::All,
             layout_diff_change_page: 0,
-            layout_diff_page_size: LAYOUT_DIFF_DEFAULT_PAGE_SIZE,
+            layout_diff_page_size: app_options.domains.layout_diff.page_size,
             layout_diff_review_state: LayoutReviewDisposition::NeedsReview,
             selected_trace_lot,
             selected_trace_wafer,
             selected_trace_detail,
-            trace_impact_mode: TraceImpactMode::ToolRun,
-            trace_related_only: false,
+            trace_impact_mode: TraceImpactMode::from_slug(
+                &app_options.domains.traceability.impact_mode,
+            )
+            .unwrap_or(TraceImpactMode::ToolRun),
+            trace_related_only: app_options.domains.traceability.related_only,
             selected_notebook_entry,
-            notebook_tag_filter: None,
+            notebook_tag_filter: app_options.domains.notebook.tag_filter.clone(),
             notebook_link_kind_filter: None,
-            notebook_preview_mode: true,
-            notebook_followups_only: false,
-            scheduler_policy: DispatchPolicy::PriorityThenFifo,
+            notebook_preview_mode: app_options.domains.notebook.preview_mode,
+            notebook_followups_only: app_options.domains.notebook.followups_only,
+            scheduler_policy: dispatch_policy_from_slug(
+                &app_options.domains.scheduler.dispatch_policy,
+            )
+            .unwrap_or(DispatchPolicy::PriorityThenFifo),
             selected_scheduler_tool,
-            scheduler_min_priority: 0,
-            scheduler_conflicts_only: false,
-            scheduler_focus_selected_tool: false,
+            scheduler_min_priority: app_options.domains.scheduler.minimum_priority,
+            scheduler_conflicts_only: app_options.domains.scheduler.conflicts_only,
+            scheduler_focus_selected_tool: app_options.domains.scheduler.focus_selected_tool,
             selected_safety_tool,
             acknowledged_conditions: BTreeSet::new(),
             acknowledged_lockouts: BTreeSet::new(),
             acknowledged_incidents: BTreeSet::new(),
             selected_process_node,
-            process_flow_filter: ProcessFlowNodeFilter::All,
-            process_flow_errors_only: false,
+            process_flow_filter,
+            process_flow_errors_only: app_options.domains.process_flow.errors_only,
+            process_control_loop_filter,
             selected_control_loop,
             selected_control_action,
             selected_spc_chart,
             selected_fdc_trace,
-            spc_severity_filter: SpcSeverityFilter::All,
-            spc_source_filter: SpcSourceFilter::All,
-            spc_context_filter: String::new(),
-            cross_section_step: 0,
+            spc_severity_filter: SpcSeverityFilter::from_slug(
+                &app_options.domains.spc_fdc.severity_filter,
+            )
+            .unwrap_or(SpcSeverityFilter::All),
+            spc_source_filter: SpcSourceFilter::from_slug(
+                &app_options.domains.spc_fdc.source_filter,
+            )
+            .unwrap_or(SpcSourceFilter::All),
+            spc_context_filter: app_options.domains.spc_fdc.context_filter.clone(),
+            cross_section_step,
             selected_cross_section_material,
-            cross_section_show_mask: true,
-            cross_section_show_dimensions: true,
-            cross_section_show_risks: true,
-            metrology_map_mode: MetrologyMapMode::ValueMap,
-            metrology_kind: MeasurementKind::CriticalDimensionNm,
-            metrology_failed_only: false,
+            cross_section_show_mask: app_options.domains.cross_section.show_mask,
+            cross_section_show_dimensions: app_options.domains.cross_section.show_dimensions,
+            cross_section_show_risks: app_options.domains.cross_section.show_risks,
+            metrology_map_mode: MetrologyMapMode::from_slug(
+                &app_options.domains.metrology.map_mode,
+            )
+            .unwrap_or(MetrologyMapMode::ValueMap),
+            metrology_kind: measurement_kind_from_slug(
+                &app_options.domains.metrology.measurement_kind,
+            )
+            .unwrap_or(MeasurementKind::CriticalDimensionNm),
+            metrology_failed_only: app_options.domains.metrology.failed_only,
             selected_die: None,
-            yield_map_filter: YieldMapFilter::All,
-            show_only_attention_wafers: false,
-            show_only_excursions: false,
+            yield_map_filter: YieldMapFilter::from_slug(
+                &app_options.domains.yield_dashboard.map_filter,
+            )
+            .unwrap_or(YieldMapFilter::All),
+            show_only_attention_wafers: app_options.domains.yield_dashboard.attention_only,
+            show_only_excursions: app_options.domains.yield_dashboard.excursions_only,
             selected_yield_lot,
             selected_yield_wafer,
             selected_experiment_run,
             selected_experiment_response,
-            experiment_capture_value: 72.0,
-            experiment_run_filter: ExperimentRunFilter::All,
+            experiment_capture_value: app_options.domains.experiment.capture_value,
+            experiment_run_filter: ExperimentRunFilter::from_slug(
+                &app_options.domains.experiment.run_filter,
+            )
+            .unwrap_or(ExperimentRunFilter::All),
             experiment_lot_filter: None,
-            experiment_show_missing_only: false,
+            experiment_show_missing_only: app_options.domains.experiment.show_missing_only,
             status_message: "Ready".to_string(),
-            dark_theme: true,
-            show_command_palette: false,
-            show_sidebar_modules: false,
-            show_options_panel: options.show_options,
-            show_diagnostics_panel: false,
+            dark_theme: theme_preference != options::ThemePreference::Light,
+            theme_preference,
+            show_command_palette: app_options.shell.show_command_palette_on_start,
+            show_sidebar_modules: app_options.shell.show_sidebar_modules,
+            show_options_panel: app_options.shell.show_options_panel,
+            show_diagnostics_panel: app_options.shell.show_diagnostics_panel,
             collapsed_detail_sections: BTreeSet::new(),
-            unit_display: UnitDisplay::Auto,
-            snap_enabled: true,
-            show_grid: true,
-            show_3d_grid: true,
-            show_origin_marker: true,
-            show_drc_overlay: true,
-            show_inspector: false,
-            show_layers: false,
+            unit_display,
+            snap_enabled: app_options.layout.snap_enabled,
+            show_grid: app_options.layout.show_2d_grid,
+            show_3d_grid: app_options.viewport3d.show_grid,
+            show_origin_marker: app_options.layout.show_origin_marker,
+            show_drc_overlay: app_options.layout.show_drc_overlay,
+            show_inspector: app_options.shell.show_details_panel,
+            show_layers: app_options.shell.show_secondary_panel,
+            app_options,
+            options_file_path: options.options_file_path,
             layout_modifiers: operad::KeyModifiers::NONE,
         };
         for action in options.startup_actions {
             app.apply_clicked_node_name(&action);
         }
+        app.sync_app_options_from_state();
         app
     }
 
@@ -2041,25 +2228,393 @@ impl FabricadApp {
         self.selected_layout_shape
     }
 
+    pub fn layout_revision(&self) -> u64 {
+        self.layout_revision
+    }
+
+    fn record_layout_frame_sample(
+        &self,
+        frame_started: std::time::Instant,
+        fallback_ms: Option<f64>,
+    ) {
+        let frame_ms = self
+            .layout_frame_last_at
+            .get()
+            .map(|previous| frame_started.duration_since(previous).as_secs_f64() * 1000.0)
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .or_else(|| fallback_ms.filter(|value| value.is_finite() && *value > 0.0));
+        self.layout_frame_last_at.set(Some(frame_started));
+        let Some(frame_ms) = frame_ms else {
+            return;
+        };
+        let alpha = if self.app_options.performance.fps_ema_alpha.is_finite() {
+            self.app_options.performance.fps_ema_alpha.clamp(0.01, 1.0)
+        } else {
+            LAYOUT_FPS_EMA_ALPHA
+        };
+        let smoothed = self
+            .layout_frame_ema_ms
+            .get()
+            .map(|previous| previous + (frame_ms - previous) * alpha)
+            .unwrap_or(frame_ms);
+        self.layout_frame_ms.set(Some(frame_ms));
+        self.layout_frame_ema_ms.set(Some(smoothed));
+    }
+
+    #[cfg(test)]
+    fn record_layout_frame_timing(&self, frame_started: std::time::Instant, render_ms: f64) {
+        self.record_layout_frame_sample(frame_started, Some(render_ms));
+    }
+
+    pub fn record_layout_frame_tick(&self, frame_started: std::time::Instant) {
+        self.record_layout_frame_sample(frame_started, None);
+    }
+
+    fn reset_layout_frame_timing(&self) {
+        self.layout_frame_ms.set(None);
+        self.layout_frame_ema_ms.set(None);
+        self.layout_frame_last_at.set(None);
+    }
+
+    pub fn layout_fps_frame_ms(&self) -> Option<f64> {
+        self.layout_frame_ema_ms
+            .get()
+            .or_else(|| self.layout_frame_ms.get())
+    }
+
+    pub fn app_options(&self) -> &AppOptions {
+        &self.app_options
+    }
+
+    pub fn options_file_path(&self) -> Option<&str> {
+        self.options_file_path.as_deref()
+    }
+
+    pub fn live_layout_fps_meter(&self) -> bool {
+        self.app_options.performance.live_fps_meter
+            && self.app_options.performance.idle_redraw_layout_viewports
+    }
+
+    fn options_file_path_for_display(&self) -> String {
+        self.options_file_path
+            .clone()
+            .unwrap_or_else(|| "default config path".to_string())
+    }
+
+    fn sync_app_options_from_state(&mut self) {
+        self.app_options = self.app_options_from_state();
+    }
+
+    fn app_options_from_state(&self) -> AppOptions {
+        let mut options = self.app_options.clone();
+        options.schema_version = APP_OPTIONS_SCHEMA_VERSION;
+        options.appearance.theme = self.theme_preference;
+        options.appearance.unit_display = self.unit_display.slug().to_string();
+        options.shell.startup_view = self.active_view.slug().to_string();
+        options.shell.show_command_palette_on_start = self.show_command_palette;
+        options.shell.show_sidebar_modules = self.show_sidebar_modules;
+        options.shell.show_options_panel = self.show_options_panel;
+        options.shell.show_diagnostics_panel = self.show_diagnostics_panel;
+        options.shell.show_details_panel = self.show_inspector;
+        options.shell.show_secondary_panel = self.show_layers;
+        options.shell.nav_rail_views = self
+            .nav_rail_views
+            .iter()
+            .map(|view| view.slug().to_string())
+            .collect();
+        options.layout.default_tool = self.active_tool.slug().to_string();
+        options.layout.active_layer = self.active_layer.0;
+        options.layout.snap_enabled = self.snap_enabled;
+        options.layout.show_2d_grid = self.show_grid;
+        options.layout.show_origin_marker = self.show_origin_marker;
+        options.layout.show_drc_overlay = self.show_drc_overlay;
+        options.layout.zoom = self.layout_zoom;
+        options.layout.pan = self.layout_pan;
+        options.viewport3d.show_grid = self.show_3d_grid;
+        options.viewport3d.movement_speed = self.camera_3d.speed;
+        options.viewport3d.fov_degrees = self.camera_3d.fov_y.to_degrees();
+        options.viewport3d.fullscreen_on_start = self.viewport_fullscreen;
+        options.domains.mask_prep.severity_filter = self.mask_issue_severity_filter.slug().into();
+        options.domains.mask_prep.grouping = self.mask_issue_grouping.slug().into();
+        options.domains.layout_diff.changed_only = self.layout_diff_changed_only;
+        options.domains.layout_diff.page_size = self.layout_diff_page_size;
+        options.domains.inventory.quick_filter = self.inventory_filter.slug().into();
+        options.domains.maintenance.work_filter = self.maintenance_work_filter.slug().into();
+        options.domains.maintenance.history_filter = self.maintenance_history_filter.slug().into();
+        options.domains.scheduler.dispatch_policy =
+            dispatch_policy_slug(self.scheduler_policy).into();
+        options.domains.scheduler.minimum_priority = self.scheduler_min_priority;
+        options.domains.scheduler.conflicts_only = self.scheduler_conflicts_only;
+        options.domains.scheduler.focus_selected_tool = self.scheduler_focus_selected_tool;
+        options.domains.traceability.impact_mode = self.trace_impact_mode.slug().into();
+        options.domains.traceability.related_only = self.trace_related_only;
+        options.domains.metrology.map_mode = self.metrology_map_mode.slug().into();
+        options.domains.metrology.measurement_kind =
+            measurement_kind_slug(self.metrology_kind).into();
+        options.domains.metrology.failed_only = self.metrology_failed_only;
+        options.domains.yield_dashboard.map_filter = self.yield_map_filter.slug().into();
+        options.domains.yield_dashboard.attention_only = self.show_only_attention_wafers;
+        options.domains.yield_dashboard.excursions_only = self.show_only_excursions;
+        options.domains.spc_fdc.severity_filter = self.spc_severity_filter.slug().into();
+        options.domains.spc_fdc.source_filter = self.spc_source_filter.slug().into();
+        options.domains.spc_fdc.context_filter = self.spc_context_filter.clone();
+        options.domains.process_flow.node_filter = self.process_flow_filter.slug().into();
+        options.domains.process_flow.errors_only = self.process_flow_errors_only;
+        options.domains.run_to_run.loop_filter = self.process_control_loop_filter.slug().into();
+        options.domains.cross_section.step = self.cross_section_step;
+        options.domains.cross_section.show_mask = self.cross_section_show_mask;
+        options.domains.cross_section.show_dimensions = self.cross_section_show_dimensions;
+        options.domains.cross_section.show_risks = self.cross_section_show_risks;
+        options.domains.notebook.preview_mode = self.notebook_preview_mode;
+        options.domains.notebook.followups_only = self.notebook_followups_only;
+        options.domains.notebook.tag_filter = self.notebook_tag_filter.clone();
+        options.domains.experiment.run_filter = self.experiment_run_filter.slug().into();
+        options.domains.experiment.show_missing_only = self.experiment_show_missing_only;
+        options.domains.experiment.capture_value = self.experiment_capture_value;
+        options.normalized()
+    }
+
+    pub fn apply_app_options(&mut self, options: AppOptions) {
+        let options = options.normalized();
+        self.theme_preference = options.appearance.theme;
+        self.dark_theme = self.theme_preference != options::ThemePreference::Light;
+        self.unit_display =
+            UnitDisplay::from_slug(&options.appearance.unit_display).unwrap_or(UnitDisplay::Auto);
+        if let Some(view) = StartupView::from_slug(&options.shell.startup_view) {
+            self.set_active_view(view);
+        }
+        self.show_command_palette = options.shell.show_command_palette_on_start;
+        self.show_sidebar_modules = options.shell.show_sidebar_modules;
+        self.show_options_panel = options.shell.show_options_panel;
+        self.show_diagnostics_panel = options.shell.show_diagnostics_panel;
+        self.show_inspector = options.shell.show_details_panel;
+        self.show_layers = options.shell.show_secondary_panel;
+        self.nav_rail_views = nav_rail_views_from_option_slugs(&options.shell.nav_rail_views);
+        self.active_tool =
+            ToolMode::from_slug(&options.layout.default_tool).unwrap_or(ToolMode::Select);
+        let active_layer = LayerId(options.layout.active_layer);
+        if self.workspace.document.layers.contains_key(&active_layer) {
+            self.active_layer = active_layer;
+        }
+        self.snap_enabled = options.layout.snap_enabled;
+        self.show_grid = options.layout.show_2d_grid;
+        self.show_origin_marker = options.layout.show_origin_marker;
+        self.show_drc_overlay = options.layout.show_drc_overlay;
+        self.layout_zoom = options.layout.zoom.clamp(LAYOUT_MIN_ZOOM, LAYOUT_MAX_ZOOM);
+        self.layout_pan = options.layout.pan;
+        self.show_3d_grid = options.viewport3d.show_grid;
+        self.camera_3d.speed = options.viewport3d.movement_speed;
+        self.camera_3d.fov_y = options.viewport3d.fov_degrees.to_radians();
+        self.viewport_fullscreen = options.viewport3d.fullscreen_on_start;
+        if options.domains.environment.show_alarm_sensors_first {
+            self.selected_environment_sensor =
+                default_environment_sensor_with_options(&self.workspace, true);
+        }
+        if options.domains.fab_control.auto_select_first_tool
+            && self.selected_equipment_tool.is_none()
+        {
+            self.selected_equipment_tool = default_equipment_tool(&self.workspace);
+        } else if !options.domains.fab_control.auto_select_first_tool {
+            self.selected_equipment_tool = None;
+        }
+        self.mask_issue_severity_filter =
+            MaskIssueSeverityFilter::from_slug(&options.domains.mask_prep.severity_filter)
+                .unwrap_or(MaskIssueSeverityFilter::All);
+        self.mask_issue_grouping =
+            MaskIssueGrouping::from_slug(&options.domains.mask_prep.grouping)
+                .unwrap_or(MaskIssueGrouping::Code);
+        self.layout_diff_changed_only = options.domains.layout_diff.changed_only;
+        self.layout_diff_page_size = options.domains.layout_diff.page_size;
+        self.inventory_filter =
+            InventoryQuickFilter::from_slug(&options.domains.inventory.quick_filter)
+                .unwrap_or(InventoryQuickFilter::All);
+        self.maintenance_work_filter =
+            MaintenanceWorkFilter::from_slug(&options.domains.maintenance.work_filter)
+                .unwrap_or(MaintenanceWorkFilter::Actionable);
+        self.maintenance_history_filter =
+            MaintenanceHistoryFilter::from_slug(&options.domains.maintenance.history_filter)
+                .unwrap_or(MaintenanceHistoryFilter::SelectedTool);
+        self.scheduler_policy =
+            dispatch_policy_from_slug(&options.domains.scheduler.dispatch_policy)
+                .unwrap_or(DispatchPolicy::PriorityThenFifo);
+        self.scheduler_min_priority = options.domains.scheduler.minimum_priority;
+        self.scheduler_conflicts_only = options.domains.scheduler.conflicts_only;
+        self.scheduler_focus_selected_tool = options.domains.scheduler.focus_selected_tool;
+        self.trace_impact_mode =
+            TraceImpactMode::from_slug(&options.domains.traceability.impact_mode)
+                .unwrap_or(TraceImpactMode::ToolRun);
+        self.trace_related_only = options.domains.traceability.related_only;
+        self.metrology_map_mode = MetrologyMapMode::from_slug(&options.domains.metrology.map_mode)
+            .unwrap_or(MetrologyMapMode::ValueMap);
+        self.metrology_kind =
+            measurement_kind_from_slug(&options.domains.metrology.measurement_kind)
+                .unwrap_or(MeasurementKind::CriticalDimensionNm);
+        self.metrology_failed_only = options.domains.metrology.failed_only;
+        self.yield_map_filter =
+            YieldMapFilter::from_slug(&options.domains.yield_dashboard.map_filter)
+                .unwrap_or(YieldMapFilter::All);
+        self.show_only_attention_wafers = options.domains.yield_dashboard.attention_only;
+        self.show_only_excursions = options.domains.yield_dashboard.excursions_only;
+        self.spc_severity_filter =
+            SpcSeverityFilter::from_slug(&options.domains.spc_fdc.severity_filter)
+                .unwrap_or(SpcSeverityFilter::All);
+        self.spc_source_filter = SpcSourceFilter::from_slug(&options.domains.spc_fdc.source_filter)
+            .unwrap_or(SpcSourceFilter::All);
+        self.spc_context_filter = options.domains.spc_fdc.context_filter.clone();
+        self.process_flow_filter =
+            ProcessFlowNodeFilter::from_slug(&options.domains.process_flow.node_filter)
+                .unwrap_or(ProcessFlowNodeFilter::All);
+        self.process_flow_errors_only = options.domains.process_flow.errors_only;
+        self.process_control_loop_filter =
+            ControlLoopFilter::from_slug(&options.domains.run_to_run.loop_filter)
+                .unwrap_or(ControlLoopFilter::All);
+        if !self
+            .selected_control_loop
+            .as_ref()
+            .and_then(|id| self.workspace.process_control.loop_by_id(id))
+            .is_some_and(|loop_definition| {
+                control_loop_matches(
+                    &self.workspace,
+                    self.process_control_loop_filter,
+                    loop_definition,
+                )
+            })
+        {
+            self.selected_control_loop =
+                default_control_loop_for_filter(&self.workspace, self.process_control_loop_filter);
+            self.selected_control_action =
+                default_control_action(&self.workspace, self.selected_control_loop.as_ref());
+        }
+        self.cross_section_step = options
+            .domains
+            .cross_section
+            .step
+            .min(self.workspace.cross_section.steps.len());
+        self.cross_section_show_mask = options.domains.cross_section.show_mask;
+        self.cross_section_show_dimensions = options.domains.cross_section.show_dimensions;
+        self.cross_section_show_risks = options.domains.cross_section.show_risks;
+        self.notebook_preview_mode = options.domains.notebook.preview_mode;
+        self.notebook_followups_only = options.domains.notebook.followups_only;
+        self.notebook_tag_filter = options.domains.notebook.tag_filter.clone();
+        self.experiment_run_filter =
+            ExperimentRunFilter::from_slug(&options.domains.experiment.run_filter)
+                .unwrap_or(ExperimentRunFilter::All);
+        self.experiment_show_missing_only = options.domains.experiment.show_missing_only;
+        self.experiment_capture_value = options.domains.experiment.capture_value;
+        self.app_options = options;
+        self.reset_layout_frame_timing();
+    }
+
+    pub fn reset_app_options_to_defaults(&mut self) {
+        self.apply_app_options(AppOptions::default());
+        self.status_message = "Options reset to defaults".to_string();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn save_app_options_to_file(&mut self) -> Result<(), String> {
+        self.sync_app_options_from_state();
+        let path = self
+            .options_file_path
+            .clone()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(default_options_path);
+        save_options_file(&path, &self.app_options)?;
+        self.options_file_path = Some(path.display().to_string());
+        self.status_message = format!("Saved options to {}", path.display());
+        Ok(())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn reload_app_options_from_file(&mut self) -> Result<(), String> {
+        let path = self
+            .options_file_path
+            .clone()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(default_options_path);
+        let options = load_options_file(&path)?;
+        self.apply_app_options(options);
+        self.options_file_path = Some(path.display().to_string());
+        self.status_message = format!("Reloaded options from {}", path.display());
+        Ok(())
+    }
+
     fn with_layout_index<T>(&self, f: impl FnOnce(&LayoutIndex) -> T) -> T {
-        let index = LayoutIndex::rebuild_hierarchical(&self.workspace.document);
-        f(&index)
+        if !self.app_options.performance.cache_layout_index {
+            let index = LayoutIndex::rebuild_hierarchical(&self.workspace.document);
+            return f(&index);
+        }
+        let mut cache = self.layout_index_cache.borrow_mut();
+        let needs_rebuild = cache
+            .as_ref()
+            .is_none_or(|cache| cache.revision != self.layout_revision);
+        if needs_rebuild {
+            *cache = Some(LayoutIndexCacheValue {
+                revision: self.layout_revision,
+                index: LayoutIndex::rebuild_hierarchical(&self.workspace.document),
+            });
+        }
+        f(&cache
+            .as_ref()
+            .expect("layout index cache should be populated")
+            .index)
     }
 
     fn connectivity_report(&self) -> Result<ConnectivityReport, String> {
-        extract_connectivity(
-            &self.workspace.document,
-            &layout_model::default_technology(),
-        )
-        .map_err(|error| error.to_string())
+        if !self.app_options.performance.cache_connectivity_reports {
+            return extract_connectivity(
+                &self.workspace.document,
+                &layout_model::default_technology(),
+            )
+            .map_err(|error| error.to_string());
+        }
+        let mut cache = self.connectivity_report_cache.borrow_mut();
+        let needs_rebuild = cache
+            .as_ref()
+            .is_none_or(|cache| cache.revision != self.layout_revision);
+        if needs_rebuild {
+            *cache = Some(ConnectivityReportCacheValue {
+                revision: self.layout_revision,
+                report: extract_connectivity(
+                    &self.workspace.document,
+                    &layout_model::default_technology(),
+                )
+                .map_err(|error| error.to_string()),
+            });
+        }
+        cache
+            .as_ref()
+            .expect("connectivity cache should be populated")
+            .report
+            .clone()
     }
 
     fn drc_report(&self) -> DrcReportCacheValue {
-        let rules = RuleDeck::demo(&self.workspace.document);
-        DrcReportCacheValue {
-            findings: rules.validate_for_document(&self.workspace.document),
-            violations: run_drc(&self.workspace.document, &rules),
+        if !self.app_options.performance.cache_drc_reports {
+            let rules = RuleDeck::demo(&self.workspace.document);
+            return DrcReportCacheValue {
+                findings: rules.validate_for_document(&self.workspace.document),
+                violations: run_drc(&self.workspace.document, &rules),
+            };
         }
+        let mut cache = self.drc_report_cache.borrow_mut();
+        let needs_rebuild = cache
+            .as_ref()
+            .is_none_or(|cache| cache.revision != self.layout_revision);
+        if needs_rebuild {
+            let rules = RuleDeck::demo(&self.workspace.document);
+            *cache = Some(DrcReportCacheEntry {
+                revision: self.layout_revision,
+                value: DrcReportCacheValue {
+                    findings: rules.validate_for_document(&self.workspace.document),
+                    violations: run_drc(&self.workspace.document, &rules),
+                },
+            });
+        }
+        cache
+            .as_ref()
+            .expect("DRC cache should be populated")
+            .value
+            .clone()
     }
 
     pub fn handle_layout_canvas_input(
@@ -2083,6 +2638,7 @@ impl FabricadApp {
         if self.active_view != StartupView::Layout2d {
             return false;
         }
+        let modifiers = self.effective_layout_modifiers(modifiers);
         self.layout_modifiers = modifiers;
         self.layout_canvas_size = Some(rect_size(canvas_rect));
         match event {
@@ -2225,7 +2781,9 @@ impl FabricadApp {
                     return false;
                 }
                 self.layout_3d_drag = Some(*point);
-                self.flycam_captured = true;
+                if self.app_options.viewport3d.capture_flycam_on_click {
+                    self.flycam_captured = true;
+                }
                 true
             }
             operad::UiInputEvent::PointerMove(point) => {
@@ -2234,7 +2792,11 @@ impl FabricadApp {
                 };
                 let delta = UiPoint::new(point.x - previous.x, point.y - previous.y);
                 self.layout_3d_drag = Some(*point);
-                let sensitivity = if self.flycam_captured { 0.003 } else { 0.006 };
+                let sensitivity = if self.flycam_captured {
+                    self.app_options.viewport3d.mouse_sensitivity
+                } else {
+                    self.app_options.viewport3d.mouse_sensitivity * 2.0
+                };
                 self.camera_3d.look_delta(delta, sensitivity);
                 true
             }
@@ -2362,7 +2924,11 @@ impl FabricadApp {
         if !delta.x.is_finite() || !delta.y.is_finite() || (delta.x == 0.0 && delta.y == 0.0) {
             return false;
         }
-        let sensitivity = if _raw_motion { 0.003 } else { 0.006 };
+        let sensitivity = if _raw_motion {
+            self.app_options.viewport3d.mouse_sensitivity
+        } else {
+            self.app_options.viewport3d.mouse_sensitivity * 2.0
+        };
         self.camera_3d.look_delta(delta, sensitivity);
         true
     }
@@ -2404,7 +2970,12 @@ impl FabricadApp {
         if direction.length() <= f32::EPSILON {
             return false;
         }
-        let speed = self.camera_3d.speed * if fast { 3.0 } else { 1.0 };
+        let speed = self.camera_3d.speed
+            * if fast {
+                self.app_options.viewport3d.fast_multiplier
+            } else {
+                1.0
+            };
         let delta = direction.normalized() * (speed * dt.clamp(1.0 / 240.0, 1.0 / 20.0));
         self.camera_3d.position += delta;
         true
@@ -2604,8 +3175,9 @@ impl FabricadApp {
             return;
         }
 
-        let index = LayoutIndex::rebuild_hierarchical(&self.workspace.document);
-        if let Some(occurrence) = index.hit_test_occurrence(world, tolerance) {
+        let occurrence_hit =
+            self.with_layout_index(|index| index.hit_test_occurrence(world, tolerance));
+        if let Some(occurrence) = occurrence_hit {
             let shape_id = occurrence.source_shape_id();
             self.selected_layout_shape = Some(shape_id);
             self.selected_layout_occurrence = Some(occurrence.clone());
@@ -2743,16 +3315,6 @@ impl FabricadApp {
             .and_then(|shape| shape.net)
     }
 
-    fn move_layout_vertex(&mut self, shape_id: ShapeId, vertex: usize, position: Point) -> bool {
-        let Some(old_shape) = self.workspace.document.shapes.get(&shape_id) else {
-            return false;
-        };
-        let Some(new_shape) = shape_with_moved_vertex(&old_shape, vertex, position) else {
-            return false;
-        };
-        self.replace_layout_shape(shape_id, old_shape, new_shape, "Edited vertex")
-    }
-
     fn insert_layout_vertex(&mut self, shape_id: ShapeId, edge: usize, position: Point) -> bool {
         let Some(old_shape) = self.workspace.document.shapes.get(&shape_id) else {
             return false;
@@ -2787,19 +3349,6 @@ impl FabricadApp {
             return false;
         };
         self.delete_layout_vertex(hit.shape_id, hit.vertex)
-    }
-
-    fn move_layout_edge(&mut self, shape_id: ShapeId, edge: usize, delta: Vector) -> bool {
-        if delta == Vector::ZERO {
-            return false;
-        }
-        let Some(old_shape) = self.workspace.document.shapes.get(&shape_id) else {
-            return false;
-        };
-        let Some(new_shape) = shape_with_moved_edge(&old_shape, edge, delta) else {
-            return false;
-        };
-        self.replace_layout_shape(shape_id, old_shape, new_shape, "Moved edge")
     }
 
     fn replace_layout_shape(
@@ -3628,9 +4177,15 @@ impl FabricadApp {
     }
 
     fn detail_section_key_for_header_node(&self, name: &str) -> Option<String> {
+        if let Some(raw_index) = name.strip_prefix("fabricad.domain.section.") {
+            let index = raw_index.strip_suffix(".header")?.parse::<usize>().ok()?;
+            return Some(domain_section_key(self.active_view, index));
+        }
         let (raw_index, sections) =
             if let Some(raw_index) = name.strip_prefix("fabricad.layout.inspector.section.") {
                 (raw_index, layout_editor_inspector_sections(self))
+            } else if let Some(raw_index) = name.strip_prefix("fabricad.details.section.") {
+                (raw_index, view_detail_sections(self))
             } else if let Some(raw_index) = name.strip_prefix("fabricad.inspector.section.") {
                 (
                     raw_index,
@@ -3649,9 +4204,13 @@ impl FabricadApp {
     }
 
     pub fn set_active_view(&mut self, view: StartupView) {
+        let previous = self.active_view;
         self.active_view = view;
         self.active_menu = None;
         self.active_view_group = None;
+        if previous != view {
+            self.reset_layout_frame_timing();
+        }
         if view != StartupView::Layout3d {
             self.flycam_captured = false;
             self.layout_3d_drag = None;
@@ -3662,6 +4221,14 @@ impl FabricadApp {
     }
 
     pub fn apply_clicked_node_name(&mut self, name: &str) -> bool {
+        if let Some(target) = name.strip_prefix("fabricad.options.proxy.") {
+            let handled = self.apply_clicked_node_name(target);
+            if handled {
+                self.sync_app_options_from_state();
+            }
+            return handled;
+        }
+
         if let Some(slug) = name.strip_prefix("fabricad.menu.") {
             if let Some(menu) = AppMenu::from_slug(slug) {
                 let next_menu = (self.active_menu != Some(menu)).then_some(menu);
@@ -3715,6 +4282,7 @@ impl FabricadApp {
             let mut candidate = raw;
             loop {
                 if self.apply_view_control_action(candidate) {
+                    self.sync_app_options_from_state();
                     return true;
                 }
                 let Some((_, next)) = candidate.split_once('.') else {
@@ -3725,7 +4293,11 @@ impl FabricadApp {
         }
 
         if let Some(action) = name.strip_prefix("fabricad.viewctl.") {
-            return self.apply_view_control_action(action);
+            let handled = self.apply_view_control_action(action);
+            if handled {
+                self.sync_app_options_from_state();
+            }
+            return handled;
         }
 
         if let Some(action) = name.strip_prefix("fabricad.toolbar.") {
@@ -3777,6 +4349,7 @@ impl FabricadApp {
                 } else {
                     self.nav_rail_views.insert(view);
                 }
+                self.sync_app_options_from_state();
                 return true;
             }
         }
@@ -3789,14 +4362,17 @@ impl FabricadApp {
             match action {
                 "default" | "all" => {
                     self.nav_rail_views = default_nav_rail_views();
+                    self.sync_app_options_from_state();
                     return true;
                 }
                 "none" => {
                     self.nav_rail_views.clear();
+                    self.sync_app_options_from_state();
                     return true;
                 }
                 "close" => {
                     self.show_sidebar_modules = false;
+                    self.sync_app_options_from_state();
                     return true;
                 }
                 _ => {}
@@ -3810,16 +4386,23 @@ impl FabricadApp {
 
         if name == "fabricad.options.close" {
             self.show_options_panel = false;
+            self.sync_app_options_from_state();
             return true;
         }
 
         if name == "fabricad.diagnostics.close" {
             self.show_diagnostics_panel = false;
+            self.sync_app_options_from_state();
             return true;
+        }
+
+        if let Some(action) = name.strip_prefix("fabricad.options.action.") {
+            return self.apply_options_action(action);
         }
 
         if let Some(action) = name.strip_prefix("fabricad.menu.item.") {
             self.apply_menu_action(action);
+            self.sync_app_options_from_state();
             return true;
         }
 
@@ -3849,6 +4432,407 @@ impl FabricadApp {
                 .iter()
                 .any(|event| event.sequence == *sequence),
         }
+    }
+
+    fn apply_options_action(&mut self, action: &str) -> bool {
+        if let Some(theme) = action.strip_prefix("appearance.theme.") {
+            self.theme_preference = match theme {
+                "dark" => options::ThemePreference::Dark,
+                "light" => options::ThemePreference::Light,
+                "system" => options::ThemePreference::System,
+                _ => return false,
+            };
+            self.dark_theme = self.theme_preference != options::ThemePreference::Light;
+            self.app_options.appearance.theme = self.theme_preference;
+            self.status_message = format!("Theme preference set to {theme}");
+            return true;
+        }
+        if let Some(scale) = action.strip_prefix("appearance.ui_scale.") {
+            let Some(scale) = option_scale_from_slug(scale) else {
+                return false;
+            };
+            self.app_options.appearance.ui_scale = scale;
+            self.status_message = format!("UI scale preference set to {:.0}%", scale * 100.0);
+            return true;
+        }
+        if action == "appearance.dense_mode" {
+            self.app_options.appearance.dense_mode = !self.app_options.appearance.dense_mode;
+            self.status_message = format!(
+                "Dense UI mode {}",
+                if self.app_options.appearance.dense_mode {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
+            return true;
+        }
+        if action == "shell.command_palette_on_start" {
+            self.app_options.shell.show_command_palette_on_start =
+                !self.app_options.shell.show_command_palette_on_start;
+            self.show_command_palette = self.app_options.shell.show_command_palette_on_start;
+            self.status_message = format!(
+                "Startup command palette {}",
+                option_enabled(self.app_options.shell.show_command_palette_on_start)
+            );
+            return true;
+        }
+        if let Some(layer) = action.strip_prefix("layout.active_layer.") {
+            let Some(layer) = layer.parse::<u32>().ok().map(LayerId) else {
+                return false;
+            };
+            if !self.workspace.document.layers.contains_key(&layer) {
+                return false;
+            }
+            self.active_layer = layer;
+            self.app_options.layout.active_layer = layer.0;
+            self.status_message = format!("Default layer set to L{}", layer.0);
+            return true;
+        }
+        if let Some(zoom) = action.strip_prefix("layout.zoom.") {
+            let Some(zoom) = option_zoom_from_slug(zoom) else {
+                return false;
+            };
+            self.layout_zoom = zoom;
+            self.app_options.layout.zoom = zoom;
+            self.status_message = format!("Default layout zoom set to {zoom:.4}");
+            return true;
+        }
+        if action == "layout.pan.reset" {
+            self.layout_pan = [0.0, 0.0];
+            self.app_options.layout.pan = self.layout_pan;
+            self.status_message = "Default layout pan reset".to_string();
+            return true;
+        }
+        if let Some(modifier) = action.strip_prefix("layout.modifier.") {
+            let target = match modifier {
+                "shift" => &mut self.app_options.layout.constrain_with_shift,
+                "ctrl" => &mut self.app_options.layout.bypass_snap_with_ctrl,
+                "alt" => &mut self.app_options.layout.duplicate_drag_with_alt,
+                _ => return false,
+            };
+            *target = !*target;
+            self.status_message = format!("Layout modifier {modifier} {}", option_enabled(*target));
+            return true;
+        }
+        if let Some(speed) = action.strip_prefix("viewport3d.speed.") {
+            let Some(speed) = option_speed_from_slug(speed) else {
+                return false;
+            };
+            self.camera_3d.speed = speed;
+            self.app_options.viewport3d.movement_speed = speed;
+            self.status_message = format!("3D flycam speed set to {speed:.0}");
+            return true;
+        }
+        if let Some(fov) = action.strip_prefix("viewport3d.fov.") {
+            let Some(fov) = option_fov_from_slug(fov) else {
+                return false;
+            };
+            self.camera_3d.fov_y = fov.to_radians();
+            self.app_options.viewport3d.fov_degrees = fov;
+            self.status_message = format!("3D FOV set to {fov:.0} degrees");
+            return true;
+        }
+        if let Some(sensitivity) = action.strip_prefix("viewport3d.sensitivity.") {
+            let Some(sensitivity) = option_sensitivity_from_slug(sensitivity) else {
+                return false;
+            };
+            self.app_options.viewport3d.mouse_sensitivity = sensitivity;
+            self.status_message = format!("3D mouse sensitivity set to {sensitivity:.4}");
+            return true;
+        }
+        if let Some(multiplier) = action.strip_prefix("viewport3d.fast_multiplier.") {
+            let Some(multiplier) = option_fast_multiplier_from_slug(multiplier) else {
+                return false;
+            };
+            self.app_options.viewport3d.fast_multiplier = multiplier;
+            self.status_message = format!("3D fast multiplier set to {multiplier:.0}x");
+            return true;
+        }
+        if action == "viewport3d.capture_flycam" {
+            self.app_options.viewport3d.capture_flycam_on_click =
+                !self.app_options.viewport3d.capture_flycam_on_click;
+            self.status_message = format!(
+                "Click-to-capture flycam {}",
+                option_enabled(self.app_options.viewport3d.capture_flycam_on_click)
+            );
+            return true;
+        }
+        if action == "domains.workflow.load_demo_on_start" {
+            self.app_options.domains.workflow.load_demo_on_start =
+                !self.app_options.domains.workflow.load_demo_on_start;
+            self.status_message = format!(
+                "Startup sample workspace {}",
+                option_enabled(self.app_options.domains.workflow.load_demo_on_start)
+            );
+            return true;
+        }
+        if action == "domains.fab_control.auto_select_first_tool" {
+            self.app_options.domains.fab_control.auto_select_first_tool =
+                !self.app_options.domains.fab_control.auto_select_first_tool;
+            if self.app_options.domains.fab_control.auto_select_first_tool
+                && self.selected_equipment_tool.is_none()
+            {
+                self.selected_equipment_tool = default_equipment_tool(&self.workspace);
+            } else if !self.app_options.domains.fab_control.auto_select_first_tool {
+                self.selected_equipment_tool = None;
+            }
+            self.status_message = format!(
+                "Fab Control startup tool selection {}",
+                option_enabled(self.app_options.domains.fab_control.auto_select_first_tool)
+            );
+            return true;
+        }
+        if action == "domains.environment.alarm_sensors_first" {
+            self.app_options
+                .domains
+                .environment
+                .show_alarm_sensors_first = !self
+                .app_options
+                .domains
+                .environment
+                .show_alarm_sensors_first;
+            if self
+                .app_options
+                .domains
+                .environment
+                .show_alarm_sensors_first
+            {
+                self.selected_environment_sensor =
+                    default_environment_sensor_with_options(&self.workspace, true);
+            }
+            self.status_message = format!(
+                "Environment alarm sensors first {}",
+                option_enabled(
+                    self.app_options
+                        .domains
+                        .environment
+                        .show_alarm_sensors_first
+                )
+            );
+            return true;
+        }
+        if action == "domains.safety.show_acknowledged" {
+            self.app_options.domains.safety.show_acknowledged =
+                !self.app_options.domains.safety.show_acknowledged;
+            self.status_message = format!(
+                "Acknowledged safety items {}",
+                if self.app_options.domains.safety.show_acknowledged {
+                    "shown"
+                } else {
+                    "hidden"
+                }
+            );
+            return true;
+        }
+        if let Some(alpha) = action.strip_prefix("performance.fps_alpha.") {
+            let Some(alpha) = option_fps_alpha_from_slug(alpha) else {
+                return false;
+            };
+            self.app_options.performance.fps_ema_alpha = alpha;
+            self.reset_layout_frame_timing();
+            self.status_message = format!("FPS smoothing set to {alpha:.2}");
+            return true;
+        }
+        if let Some(interval) = action.strip_prefix("files.autosave_interval.") {
+            let Some(interval) = option_interval_from_slug(interval) else {
+                return false;
+            };
+            self.app_options.files.autosave_interval_seconds = interval;
+            self.status_message = format!("Autosave interval set to {interval}s");
+            return true;
+        }
+        if let Some(limit) = action.strip_prefix("files.recent_limit.") {
+            let Some(limit) = option_recent_limit_from_slug(limit) else {
+                return false;
+            };
+            self.app_options.files.recent_workspace_limit = limit;
+            self.status_message = format!("Recent workspace limit set to {limit}");
+            return true;
+        }
+        match action {
+            "file.save" => {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    if let Err(error) = self.save_app_options_to_file() {
+                        self.status_message = error;
+                    }
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    self.status_message = "Options file save is not available on web".to_string();
+                }
+                true
+            }
+            "file.reload" => {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    if let Err(error) = self.reload_app_options_from_file() {
+                        self.status_message = error;
+                    }
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    self.status_message = "Options file reload is not available on web".to_string();
+                }
+                true
+            }
+            "file.defaults" => {
+                self.reset_app_options_to_defaults();
+                true
+            }
+            "performance.live_fps" => {
+                self.app_options.performance.live_fps_meter =
+                    !self.app_options.performance.live_fps_meter;
+                self.reset_layout_frame_timing();
+                self.status_message = format!(
+                    "Live FPS meter {}",
+                    if self.app_options.performance.live_fps_meter {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                );
+                true
+            }
+            "performance.idle_redraw" => {
+                self.app_options.performance.idle_redraw_layout_viewports =
+                    !self.app_options.performance.idle_redraw_layout_viewports;
+                self.reset_layout_frame_timing();
+                self.status_message = format!(
+                    "Layout idle redraw {}",
+                    if self.app_options.performance.idle_redraw_layout_viewports {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                );
+                true
+            }
+            "performance.cache_layout_index" => {
+                self.app_options.performance.cache_layout_index =
+                    !self.app_options.performance.cache_layout_index;
+                self.layout_index_cache.borrow_mut().take();
+                self.status_message = format!(
+                    "Layout index cache {}",
+                    if self.app_options.performance.cache_layout_index {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                );
+                true
+            }
+            "performance.cache_drc" => {
+                self.app_options.performance.cache_drc_reports =
+                    !self.app_options.performance.cache_drc_reports;
+                self.drc_report_cache.borrow_mut().take();
+                self.status_message = format!(
+                    "DRC cache {}",
+                    if self.app_options.performance.cache_drc_reports {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                );
+                true
+            }
+            "performance.cache_connectivity" => {
+                self.app_options.performance.cache_connectivity_reports =
+                    !self.app_options.performance.cache_connectivity_reports;
+                self.connectivity_report_cache.borrow_mut().take();
+                self.status_message = format!(
+                    "Connectivity cache {}",
+                    if self.app_options.performance.cache_connectivity_reports {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                );
+                true
+            }
+            "performance.dense_2d_lod" => {
+                self.app_options.performance.dense_2d_lod =
+                    !self.app_options.performance.dense_2d_lod;
+                self.status_message = format!(
+                    "Dense 2D LOD {}",
+                    if self.app_options.performance.dense_2d_lod {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                );
+                true
+            }
+            "performance.dense_3d_instancing" => {
+                self.app_options.performance.dense_3d_instancing =
+                    !self.app_options.performance.dense_3d_instancing;
+                self.status_message = format!(
+                    "Dense 3D instancing {}",
+                    if self.app_options.performance.dense_3d_instancing {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                );
+                true
+            }
+            "files.autosave" => {
+                self.app_options.files.autosave_enabled = !self.app_options.files.autosave_enabled;
+                self.status_message = format!(
+                    "Autosave {}",
+                    if self.app_options.files.autosave_enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                );
+                true
+            }
+            "files.remember_workspace" => {
+                self.app_options.files.remember_last_workspace =
+                    !self.app_options.files.remember_last_workspace;
+                self.status_message = format!(
+                    "Remember workspace {}",
+                    if self.app_options.files.remember_last_workspace {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                );
+                true
+            }
+            "files.prompt_destructive" => {
+                self.app_options.files.prompt_before_destructive_actions =
+                    !self.app_options.files.prompt_before_destructive_actions;
+                self.status_message = format!(
+                    "Destructive prompts {}",
+                    if self.app_options.files.prompt_before_destructive_actions {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                );
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn effective_layout_modifiers(
+        &self,
+        mut modifiers: operad::KeyModifiers,
+    ) -> operad::KeyModifiers {
+        if !self.app_options.layout.constrain_with_shift {
+            modifiers.shift = false;
+        }
+        if !self.app_options.layout.bypass_snap_with_ctrl {
+            modifiers.ctrl = false;
+        }
+        if !self.app_options.layout.duplicate_drag_with_alt {
+            modifiers.alt = false;
+        }
+        modifiers
     }
 
     fn select_trace_detail(&mut self, selection: TraceSelection) -> bool {
@@ -4400,6 +5384,29 @@ impl FabricadApp {
 
         if let Some(loop_id) = action.strip_prefix("process_control.loop.") {
             return self.select_control_loop(loop_id);
+        }
+
+        if let Some(slug) = action.strip_prefix("process_control.filter.") {
+            if let Some(filter) = ControlLoopFilter::from_slug(slug) {
+                self.process_control_loop_filter = filter;
+                if !self
+                    .selected_control_loop
+                    .as_ref()
+                    .and_then(|id| self.workspace.process_control.loop_by_id(id))
+                    .is_some_and(|loop_definition| {
+                        control_loop_matches(&self.workspace, filter, loop_definition)
+                    })
+                {
+                    self.selected_control_loop =
+                        default_control_loop_for_filter(&self.workspace, filter);
+                    self.selected_control_action = default_control_action(
+                        &self.workspace,
+                        self.selected_control_loop.as_ref(),
+                    );
+                }
+                self.status_message = format!("Run-to-run loop filter {}", filter.label());
+                return true;
+            }
         }
 
         if let Some(action_id) = action.strip_prefix("process_control.action.") {
@@ -5046,6 +6053,21 @@ impl FabricadApp {
                 self.active_menu = None;
                 self.active_view_group = None;
             }
+            "display.theme.dark" => {
+                self.theme_preference = options::ThemePreference::Dark;
+                self.dark_theme = true;
+                self.status_message = "Theme: dark".to_string();
+            }
+            "display.theme.light" => {
+                self.theme_preference = options::ThemePreference::Light;
+                self.dark_theme = false;
+                self.status_message = "Theme: light".to_string();
+            }
+            "display.theme.system" => {
+                self.theme_preference = options::ThemePreference::System;
+                self.dark_theme = true;
+                self.status_message = "Theme: system".to_string();
+            }
             "display.options" => {
                 self.show_options_panel = true;
                 self.status_message = "Options".to_string();
@@ -5183,6 +6205,7 @@ impl FabricadApp {
         self.selected_process_node = default_process_flow_node(&self.workspace);
         self.process_flow_filter = ProcessFlowNodeFilter::All;
         self.process_flow_errors_only = false;
+        self.process_control_loop_filter = ControlLoopFilter::All;
         self.selected_control_loop = default_control_loop(&self.workspace);
         self.selected_control_action =
             default_control_action(&self.workspace, self.selected_control_loop.as_ref());
@@ -5799,6 +6822,9 @@ impl FabricadApp {
 
     fn mark_layout_dirty(&mut self) {
         self.layout_revision = self.layout_revision.wrapping_add(1);
+        self.layout_index_cache.get_mut().take();
+        self.connectivity_report_cache.get_mut().take();
+        self.drc_report_cache.get_mut().take();
     }
 
     fn apply_layout_operation_with_history(&mut self, redo: Operation, undo: Operation) -> bool {
@@ -6212,6 +7238,7 @@ impl FabricadApp {
         self.selected_layout_occurrence = None;
         self.layout_clipboard_shapes.clear();
         self.clear_layout_edit_drafts();
+        self.mark_layout_dirty();
     }
 
     fn ensure_notebook_selection(&mut self) {
@@ -6520,6 +7547,7 @@ impl FabricadApp {
                 ui_scale,
             );
         }
+        pad_pre_shell_node_ids(&mut document, app);
 
         let shell = document.add_child(
             app,
@@ -6543,15 +7571,19 @@ impl FabricadApp {
             ),
         );
 
-        let compact_nav = viewport.width < ui_scale.value(700.0);
-        let compact_primary_rows = viewport.width < ui_scale.value(1180.0);
-        let nav_width = ui_scale.value(if compact_nav { 150.0 } else { 240.0 });
-        let body_width = (viewport.width - nav_width).max(0.0);
-        let wide_primary_rows = body_width > ui_scale.value(1280.0);
-        let nav_gap = ui_scale.value(if compact_nav { 5.0 } else { 8.0 });
-        let nav_padding = ui_scale.value(if compact_nav { 8.0 } else { 14.0 });
-        let nav_button_height = ui_scale.value(if compact_nav { 26.0 } else { 28.0 });
-        let nav_font_size = ui_scale.value(if compact_nav { 12.0 } else { 13.0 });
+        let shell_metrics = ShellMetrics::new(ShellMetricsOptions {
+            viewport_width: viewport.width,
+            ui_scale,
+            has_secondary_panel: self.has_secondary_panel(),
+            show_layers: self.show_layers,
+            inline_side_panels: matches!(
+                self.active_view,
+                StartupView::Layout2d | StartupView::Layout3d
+            ) && viewport.width >= ui_scale.value(980.0),
+            show_inspector: self.show_inspector,
+            has_inspector_panel: self.has_inspector_panel(),
+        });
+        let nav_metrics = shell_metrics.nav;
         let nav = document.add_child(
             shell,
             UiNode::container(
@@ -6562,12 +7594,12 @@ impl FabricadApp {
                             layout::with_gap_all(
                                 layout::with_size(
                                     layout::column(),
-                                    layout::px(nav_width),
+                                    layout::px(nav_metrics.width),
                                     layout::percent(1.0),
                                 ),
-                                nav_gap,
+                                nav_metrics.gap,
                             ),
-                            nav_padding,
+                            nav_metrics.padding,
                         ),
                         layout::px(0.0),
                         layout::px(0.0),
@@ -6597,8 +7629,8 @@ impl FabricadApp {
                 format!("fabricad.nav.action.{}", view.slug()),
                 view.nav_label(),
                 selected,
-                layout::size(layout::percent(1.0), layout::px(nav_button_height)),
-                UiScale::new(nav_font_size / 13.0),
+                layout::size(layout::percent(1.0), layout::px(nav_metrics.button_height)),
+                nav_metrics.button_text_scale,
             );
             if let Some(accessibility) = document.node_mut(nav_button).accessibility.as_mut() {
                 accessibility.label = Some(view.label().to_string());
@@ -6674,21 +7706,28 @@ impl FabricadApp {
                 self,
                 viewport,
                 ui_scale,
-                compact_primary_rows,
-                wide_primary_rows,
-                body_width,
+                shell_metrics.compact_primary_rows,
+                shell_metrics.wide_primary_rows,
+                shell_metrics.body_width,
             );
         } else {
-            add_view_controls(&mut document, body, self, ui_scale, compact_primary_rows);
+            add_view_controls(
+                &mut document,
+                body,
+                self,
+                ui_scale,
+                shell_metrics.compact_primary_rows,
+                shell_metrics.body_width,
+            );
             add_primary_view_panel(
                 &mut document,
                 body,
                 self,
                 viewport,
                 ui_scale,
-                compact_primary_rows,
-                wide_primary_rows,
-                body_width,
+                shell_metrics.compact_primary_rows,
+                shell_metrics.wide_primary_rows,
+                shell_metrics.body_width,
             );
         }
 
@@ -6702,7 +7741,7 @@ impl FabricadApp {
         if self.show_inspector && self.has_inspector_panel() {
             add_inspector_panel(&mut document, shell, self, ui_scale);
         }
-        if self.show_layers && self.has_secondary_panel() {
+        if shell_metrics.show_secondary_panel {
             add_secondary_panel(&mut document, shell, self, ui_scale);
         }
         if self.show_command_palette {
@@ -7034,6 +8073,10 @@ pub struct LayoutCanvasResources {
     target_format: Option<wgpu::TextureFormat>,
     tile_cache: TileCache,
     layout_revision: u64,
+    frame: Option<TiledFrame>,
+    frame_fingerprint: Option<BatchFingerprint>,
+    frame_tiles: Vec<TileKey>,
+    frame_zoom: f32,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -7044,6 +8087,10 @@ impl Default for LayoutCanvasResources {
             target_format: None,
             tile_cache: TileCache::default(),
             layout_revision: u64::MAX,
+            frame: None,
+            frame_fingerprint: None,
+            frame_tiles: Vec::new(),
+            frame_zoom: 0.0,
         }
     }
 }
@@ -7052,6 +8099,11 @@ impl Default for LayoutCanvasResources {
 pub struct Viewport3dCanvasResources {
     renderer: Option<Viewport3dRenderer>,
     target_format: Option<wgpu::TextureFormat>,
+    batch: Option<RenderBatch3d>,
+    batch_fingerprint: Option<BatchFingerprint>,
+    batch_revision: u64,
+    batch_show_grid: bool,
+    batch_instanced_rect_slabs: bool,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -7060,6 +8112,11 @@ impl Default for Viewport3dCanvasResources {
         Self {
             renderer: None,
             target_format: None,
+            batch: None,
+            batch_fingerprint: None,
+            batch_revision: u64::MAX,
+            batch_show_grid: false,
+            batch_instanced_rect_slabs: true,
         }
     }
 }
@@ -7135,26 +8192,16 @@ pub fn render_layout_2d_canvas_with_size(
     surface: WgpuCanvasContext<'_>,
     logical_size: UiSize,
 ) -> Result<(), String> {
-    let frame_start = std::time::Instant::now();
-    let document = &app.workspace().document;
     let viewport = app.layout_viewport_for_size(logical_size);
     let zoom = app.layout_zoom;
     if resources.layout_revision != app.layout_revision {
         resources.tile_cache.clear();
         resources.layout_revision = app.layout_revision;
+        resources.frame = None;
+        resources.frame_fingerprint = None;
+        resources.frame_tiles.clear();
     }
-    let frame = app.with_layout_index(|index| {
-        resources.tile_cache.build_frame_with_options(
-            document,
-            index,
-            viewport,
-            TileFrameOptions {
-                include_pick: false,
-                zoom,
-                ..Default::default()
-            },
-        )
-    });
+    let fingerprint = refresh_layout_2d_frame_cache(app, resources, viewport, zoom);
     let format = surface.format();
     if resources.target_format != Some(format) {
         resources.renderer = Some(
@@ -7167,10 +8214,15 @@ pub fn render_layout_2d_canvas_with_size(
         .renderer
         .as_mut()
         .ok_or_else(|| "2D layout GPU canvas renderer unavailable".to_string())?;
-    renderer.upload(
+    let frame = resources
+        .frame
+        .as_ref()
+        .ok_or_else(|| "2D layout frame cache unavailable".to_string())?;
+    renderer.upload_with_fingerprint(
         surface.device(),
         surface.queue(),
         &frame.render,
+        fingerprint,
         ViewUniforms::from_viewport(viewport),
     );
 
@@ -7182,9 +8234,47 @@ pub fn render_layout_2d_canvas_with_size(
         renderer.paint(&mut render_pass);
     }
     surface.queue().submit([encoder.finish()]);
-    app.layout_frame_ms
-        .set(Some(frame_start.elapsed().as_secs_f64() * 1000.0));
     Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn refresh_layout_2d_frame_cache(
+    app: &FabricadApp,
+    resources: &mut LayoutCanvasResources,
+    viewport: Rect,
+    zoom: f32,
+) -> BatchFingerprint {
+    let frame_tiles = resources.tile_cache.tile_keys_for_viewport(viewport);
+    let needs_rebuild = resources.frame.is_none()
+        || resources.layout_revision != app.layout_revision
+        || resources.frame_tiles != frame_tiles
+        || (resources.frame_zoom - zoom).abs() > f32::EPSILON;
+    if needs_rebuild {
+        let frame = app.with_layout_index(|index| {
+            resources.tile_cache.build_frame_with_options(
+                &app.workspace().document,
+                index,
+                viewport,
+                TileFrameOptions {
+                    include_pick: false,
+                    zoom,
+                    lod: TileLodConfig {
+                        enabled: app.app_options.performance.dense_2d_lod,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+        });
+        resources.frame_fingerprint = Some(frame.render.fingerprint());
+        resources.frame = Some(frame);
+        resources.layout_revision = app.layout_revision;
+        resources.frame_tiles = frame_tiles;
+        resources.frame_zoom = zoom;
+    }
+    resources
+        .frame_fingerprint
+        .expect("2D frame fingerprint should be populated")
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -7193,17 +8283,12 @@ pub fn render_layout_3d_canvas(
     resources: &mut Viewport3dCanvasResources,
     surface: WgpuCanvasContext<'_>,
 ) -> Result<(), String> {
-    let frame_start = std::time::Instant::now();
     let format = surface.format();
     if resources.target_format != Some(format) {
         resources.renderer = Some(Viewport3dRenderer::new(surface.device(), format));
         resources.target_format = Some(format);
     }
-    let renderer = resources
-        .renderer
-        .as_mut()
-        .ok_or_else(|| "3D layout GPU canvas renderer unavailable".to_string())?;
-    let batch = build_layout_3d_batch_for_app(app);
+    let fingerprint = refresh_layout_3d_batch_cache(app, resources);
     let size = surface.size();
     let aspect = size.width as f32 / size.height.max(1) as f32;
     let uniforms = Viewport3dUniforms::from_view_projection(view_projection_3d(
@@ -7216,7 +8301,21 @@ pub fn render_layout_3d_canvas(
         app.camera_3d.position.y,
         app.camera_3d.position.z,
     ]);
-    renderer.upload(surface.device(), surface.queue(), &batch, uniforms);
+    let renderer = resources
+        .renderer
+        .as_mut()
+        .ok_or_else(|| "3D layout GPU canvas renderer unavailable".to_string())?;
+    let batch = resources
+        .batch
+        .as_ref()
+        .ok_or_else(|| "3D layout batch cache unavailable".to_string())?;
+    renderer.upload_with_fingerprint(
+        surface.device(),
+        surface.queue(),
+        batch,
+        fingerprint,
+        uniforms,
+    );
 
     let mut encoder = surface.create_command_encoder(Some("Fabricad 3D layout canvas encoder"));
     renderer.render_to_view(
@@ -7232,9 +8331,29 @@ pub fn render_layout_3d_canvas(
         },
     );
     surface.queue().submit([encoder.finish()]);
-    app.layout_frame_ms
-        .set(Some(frame_start.elapsed().as_secs_f64() * 1000.0));
     Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn refresh_layout_3d_batch_cache(
+    app: &FabricadApp,
+    resources: &mut Viewport3dCanvasResources,
+) -> BatchFingerprint {
+    let needs_rebuild = resources.batch.is_none()
+        || resources.batch_revision != app.layout_revision
+        || resources.batch_show_grid != app.show_3d_grid
+        || resources.batch_instanced_rect_slabs != app.app_options.performance.dense_3d_instancing;
+    if needs_rebuild {
+        let batch = build_layout_3d_batch_for_app(app);
+        resources.batch_fingerprint = Some(batch.fingerprint());
+        resources.batch = Some(batch);
+        resources.batch_revision = app.layout_revision;
+        resources.batch_show_grid = app.show_3d_grid;
+        resources.batch_instanced_rect_slabs = app.app_options.performance.dense_3d_instancing;
+    }
+    resources
+        .batch_fingerprint
+        .expect("3D batch fingerprint should be populated")
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -7289,7 +8408,13 @@ pub fn fitted_layout_viewport(bounds: Option<Rect>, canvas_size: PixelSize) -> R
 
 #[cfg(not(target_arch = "wasm32"))]
 fn build_layout_3d_batch_for_app(app: &FabricadApp) -> RenderBatch3d {
-    build_layout_3d_batch_with_options(&app.workspace().document, app.show_3d_grid)
+    let bounds = app.with_layout_index(|index| index.bounds());
+    build_layout_3d_batch_with_bounds_and_options(
+        &app.workspace().document,
+        app.show_3d_grid,
+        bounds,
+        app.app_options.performance.dense_3d_instancing,
+    )
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -7300,7 +8425,26 @@ pub fn build_layout_3d_batch(document: &Document) -> RenderBatch3d {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn build_layout_3d_batch_with_options(document: &Document, show_grid: bool) -> RenderBatch3d {
     let index = LayoutIndex::rebuild_hierarchical(document);
-    let Some(bounds) = index.bounds() else {
+    build_layout_3d_batch_with_bounds(document, show_grid, index.bounds())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn build_layout_3d_batch_with_bounds(
+    document: &Document,
+    show_grid: bool,
+    bounds: Option<Rect>,
+) -> RenderBatch3d {
+    build_layout_3d_batch_with_bounds_and_options(document, show_grid, bounds, true)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn build_layout_3d_batch_with_bounds_and_options(
+    document: &Document,
+    show_grid: bool,
+    bounds: Option<Rect>,
+    use_instanced_rect_slabs: bool,
+) -> RenderBatch3d {
+    let Some(bounds) = bounds else {
         return RenderBatch3d::default();
     };
     let layer_slots = layout_layer_slots(document);
@@ -7328,16 +8472,20 @@ pub fn build_layout_3d_batch_with_options(document: &Document, show_grid: bool) 
             .unwrap_or_else(|| default_layer_3d_stack_range(default_slot));
         let mut color = document.layer_color(shape.shape.layer);
         color[3] = 1.0;
-        batch.rect_slabs.push(GpuRectSlabInstance {
-            rect: [
-                rect.min.x as f32,
-                rect.min.y as f32,
-                rect.max.x as f32,
-                rect.max.y as f32,
-            ],
-            z_range: [z_min, z_max],
-            color,
-        });
+        if use_instanced_rect_slabs {
+            batch.rect_slabs.push(GpuRectSlabInstance {
+                rect: [
+                    rect.min.x as f32,
+                    rect.min.y as f32,
+                    rect.max.x as f32,
+                    rect.max.y as f32,
+                ],
+                z_range: [z_min, z_max],
+                color,
+            });
+        } else {
+            add_3d_rect_slab_mesh(&mut batch, rect, z_min, z_max, color);
+        }
     });
 
     add_3d_reference_guides(&mut batch, bounds);
@@ -7361,6 +8509,104 @@ fn layout_layer_slots(document: &Document) -> BTreeMap<LayerId, usize> {
         .enumerate()
         .map(|(index, (_, _, id))| (id, index))
         .collect()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn add_3d_rect_slab_mesh(
+    batch: &mut RenderBatch3d,
+    rect: Rect,
+    z_min: f32,
+    z_max: f32,
+    color: [f32; 4],
+) {
+    let x0 = rect.min.x as f32;
+    let y0 = rect.min.y as f32;
+    let x1 = rect.max.x as f32;
+    let y1 = rect.max.y as f32;
+    add_3d_quad(
+        batch,
+        [
+            [x0, y0, z_max],
+            [x1, y0, z_max],
+            [x1, y1, z_max],
+            [x0, y1, z_max],
+        ],
+        [0.0, 0.0, 1.0],
+        color,
+    );
+    add_3d_quad(
+        batch,
+        [
+            [x0, y1, z_min],
+            [x1, y1, z_min],
+            [x1, y0, z_min],
+            [x0, y0, z_min],
+        ],
+        [0.0, 0.0, -1.0],
+        color,
+    );
+    add_3d_quad(
+        batch,
+        [
+            [x0, y0, z_min],
+            [x1, y0, z_min],
+            [x1, y0, z_max],
+            [x0, y0, z_max],
+        ],
+        [0.0, -1.0, 0.0],
+        color,
+    );
+    add_3d_quad(
+        batch,
+        [
+            [x1, y0, z_min],
+            [x1, y1, z_min],
+            [x1, y1, z_max],
+            [x1, y0, z_max],
+        ],
+        [1.0, 0.0, 0.0],
+        color,
+    );
+    add_3d_quad(
+        batch,
+        [
+            [x1, y1, z_min],
+            [x0, y1, z_min],
+            [x0, y1, z_max],
+            [x1, y1, z_max],
+        ],
+        [0.0, 1.0, 0.0],
+        color,
+    );
+    add_3d_quad(
+        batch,
+        [
+            [x0, y1, z_min],
+            [x0, y0, z_min],
+            [x0, y0, z_max],
+            [x0, y1, z_max],
+        ],
+        [-1.0, 0.0, 0.0],
+        color,
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn add_3d_quad(
+    batch: &mut RenderBatch3d,
+    positions: [[f32; 3]; 4],
+    normal: [f32; 3],
+    color: [f32; 4],
+) {
+    let base = batch.vertices.len() as u32;
+    batch.vertices.extend(positions.map(|position| GpuVertex3d {
+        position,
+        normal,
+        color,
+    }));
+    batch
+        .indices
+        .extend([base, base + 1, base + 2, base, base + 2, base + 3]);
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -7494,130 +8740,6 @@ fn floor_to_step(value: Coord, step: Coord) -> Coord {
 #[cfg(not(target_arch = "wasm32"))]
 fn ceil_to_step(value: Coord, step: Coord) -> Coord {
     value.div_euclid(step) * step + if value.rem_euclid(step) == 0 { 0 } else { step }
-}
-
-fn view_projection_3d(camera: Camera3d, aspect: f32, far: f32) -> [f32; 16] {
-    let basis = camera.basis();
-    let y_scale = 1.0 / (camera.fov_y * 0.5).tan();
-    let x_scale = y_scale / aspect.max(0.001);
-    let near = CAMERA_NEAR_PLANE.max(0.001);
-    let far = far.max(near + 1.0);
-    let z_scale = far / (far - near);
-    let z_bias = -near * far / (far - near);
-    let position = camera.position;
-    row_major_4x4_to_column_major([
-        [
-            basis.right.x * x_scale,
-            basis.right.y * x_scale,
-            basis.right.z * x_scale,
-            -position.dot(basis.right) * x_scale,
-        ],
-        [
-            basis.up.x * y_scale,
-            basis.up.y * y_scale,
-            basis.up.z * y_scale,
-            -position.dot(basis.up) * y_scale,
-        ],
-        [
-            basis.forward.x * z_scale,
-            basis.forward.y * z_scale,
-            basis.forward.z * z_scale,
-            -position.dot(basis.forward) * z_scale + z_bias,
-        ],
-        [
-            basis.forward.x,
-            basis.forward.y,
-            basis.forward.z,
-            -position.dot(basis.forward),
-        ],
-    ])
-}
-
-fn row_major_4x4_to_column_major(matrix: [[f32; 4]; 4]) -> [f32; 16] {
-    let mut out = [0.0; 16];
-    for row in 0..4 {
-        for column in 0..4 {
-            out[column * 4 + row] = matrix[row][column];
-        }
-    }
-    out
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Vec3 {
-    x: f32,
-    y: f32,
-    z: f32,
-}
-
-impl Vec3 {
-    const ZERO: Self = Self::new(0.0, 0.0, 0.0);
-
-    const fn new(x: f32, y: f32, z: f32) -> Self {
-        Self { x, y, z }
-    }
-
-    fn dot(self, other: Self) -> f32 {
-        self.x * other.x + self.y * other.y + self.z * other.z
-    }
-
-    fn cross(self, other: Self) -> Self {
-        Self::new(
-            self.y * other.z - self.z * other.y,
-            self.z * other.x - self.x * other.z,
-            self.x * other.y - self.y * other.x,
-        )
-    }
-
-    fn length(self) -> f32 {
-        self.dot(self).sqrt()
-    }
-
-    fn normalized(self) -> Self {
-        let length = self.length();
-        if length <= f32::EPSILON {
-            return Self::ZERO;
-        }
-        self / length
-    }
-}
-
-impl std::ops::Add for Vec3 {
-    type Output = Self;
-
-    fn add(self, rhs: Self) -> Self::Output {
-        Self::new(self.x + rhs.x, self.y + rhs.y, self.z + rhs.z)
-    }
-}
-
-impl std::ops::AddAssign for Vec3 {
-    fn add_assign(&mut self, rhs: Self) {
-        *self = *self + rhs;
-    }
-}
-
-impl std::ops::Sub for Vec3 {
-    type Output = Self;
-
-    fn sub(self, rhs: Self) -> Self::Output {
-        Self::new(self.x - rhs.x, self.y - rhs.y, self.z - rhs.z)
-    }
-}
-
-impl std::ops::Mul<f32> for Vec3 {
-    type Output = Self;
-
-    fn mul(self, rhs: f32) -> Self::Output {
-        Self::new(self.x * rhs, self.y * rhs, self.z * rhs)
-    }
-}
-
-impl std::ops::Div<f32> for Vec3 {
-    type Output = Self;
-
-    fn div(self, rhs: f32) -> Self::Output {
-        Self::new(self.x / rhs, self.y / rhs, self.z / rhs)
-    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -7896,6 +9018,22 @@ fn default_environment_sensor(workspace: &WorkspaceDataset) -> Option<String> {
         .map(|sensor| sensor.id.clone())
 }
 
+fn default_environment_sensor_with_options(
+    workspace: &WorkspaceDataset,
+    alarm_sensors_first: bool,
+) -> Option<String> {
+    if alarm_sensors_first
+        && let Some(alarm) = workspace
+            .environment
+            .evaluate_alarms()
+            .into_iter()
+            .find(|alarm| alarm.active)
+    {
+        return Some(alarm.sensor_id);
+    }
+    default_environment_sensor(workspace)
+}
+
 fn inventory_filter_matches(filter: InventoryQuickFilter, lot: &MaterialLot) -> bool {
     match filter {
         InventoryQuickFilter::All => true,
@@ -7966,59 +9104,6 @@ fn mask_check_report(app: &FabricadApp) -> MaskCheckReport {
     reticle_prep_for_app(app).validate_document(&app.workspace.document)
 }
 
-fn display_mask_identifier(value: &str) -> String {
-    let Some(suffix) = value.strip_prefix("FABRICAD-DEMO-") else {
-        return value.to_string();
-    };
-    capitalize_ascii_first(humanize_identifier(suffix))
-}
-
-fn display_reticle_identifier(value: &str) -> String {
-    display_mask_identifier(&value.replace("-RETICLE-", "-"))
-}
-
-fn display_layout_revision_identifier(value: &str) -> String {
-    let value = value.strip_prefix("layout_model:").unwrap_or(value);
-    let value = value
-        .strip_prefix("demo-")
-        .or_else(|| value.strip_prefix("demo_"))
-        .unwrap_or(value);
-    let value = value.replace('@', " ");
-    capitalize_ascii_first(humanize_identifier(&value))
-}
-
-fn display_route_identifier(value: &str) -> String {
-    let value = value
-        .strip_prefix("ROUTE-DEMO-")
-        .or_else(|| value.strip_prefix("ROUTE-"))
-        .unwrap_or(value);
-    capitalize_ascii_first(humanize_identifier(value))
-}
-
-fn display_reticle_field_identifier(value: &str) -> String {
-    capitalize_ascii_first(humanize_identifier(
-        value.strip_prefix("F-").unwrap_or(value),
-    ))
-}
-
-fn display_recipe_identifier(value: &str) -> String {
-    value
-        .split(['_', '-'])
-        .filter(|part| !part.is_empty())
-        .enumerate()
-        .map(|(index, part)| format_recipe_token(part, index == 0))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn display_measurement_identifier(value: &str) -> String {
-    capitalize_ascii_first(humanize_identifier(value))
-}
-
-fn display_spc_control_identifier(value: &str) -> String {
-    display_measurement_identifier(value.strip_suffix("_thickness").unwrap_or(value))
-}
-
 fn display_spc_trace_name(trace: &SensorTrace) -> String {
     format!(
         "{} / {}",
@@ -8057,59 +9142,6 @@ fn display_process_flow_route_name(value: &str) -> String {
     ))
 }
 
-fn display_step_identifier(value: &str) -> String {
-    capitalize_ascii_first(humanize_identifier(value))
-}
-
-fn display_tool_run_identifier(value: &str) -> String {
-    if let Some(suffix) = value.strip_prefix("RUN-") {
-        let parts = suffix
-            .split('-')
-            .filter(|part| !part.is_empty())
-            .collect::<Vec<_>>();
-        if let Some((run_number, run_kind)) = parts.split_last() {
-            let kind = run_kind
-                .iter()
-                .map(|part| part.to_ascii_lowercase())
-                .collect::<Vec<_>>()
-                .join(" ");
-            if kind.is_empty() {
-                return format!("run {run_number}");
-            }
-            return format!("{kind} run {run_number}");
-        }
-    }
-    if let Some((tool_id, run_id)) = value.split_once("-RUN-") {
-        return format!(
-            "{} run {}",
-            capitalize_ascii_first(humanize_identifier(tool_id)),
-            humanize_identifier(run_id)
-        );
-    }
-    capitalize_ascii_first(humanize_identifier(value))
-}
-
-fn display_lot_identifier(value: &str) -> String {
-    if let Some(suffix) = value.strip_prefix("L-") {
-        format!("Lot {suffix}")
-    } else {
-        capitalize_ascii_first(humanize_identifier(value))
-    }
-}
-
-fn display_wafer_identifier(value: &str) -> String {
-    if let Some((_, suffix)) = value.rsplit_once("-W") {
-        return format!("Wafer W{suffix}");
-    }
-    if let Some(suffix) = value.strip_prefix('W') {
-        return format!("Wafer W{suffix}");
-    }
-    format!(
-        "Wafer {}",
-        capitalize_ascii_first(humanize_identifier(value))
-    )
-}
-
 fn display_process_flow_node_label(node: &layout_model::process_flow::ProcessFlowNode) -> String {
     if node.name.trim().is_empty() {
         capitalize_ascii_first(humanize_identifier(node.id.as_str()))
@@ -8131,48 +9163,6 @@ fn compact_process_step_button_label(label: &str, max_chars: usize) -> String {
 fn process_flow_node_button_label(node: &layout_model::process_flow::ProcessFlowNode) -> String {
     let label = display_process_flow_node_label(node);
     compact_process_step_button_label(&label, 18)
-}
-
-fn display_owner_identifier(value: &str) -> String {
-    let expanded = value
-        .split(|ch: char| ch == '-' || ch == '_' || ch == '.' || ch.is_whitespace())
-        .filter(|part| !part.is_empty())
-        .map(|part| match part.to_ascii_lowercase().as_str() {
-            "eng" => "engineer".to_string(),
-            other => other.to_string(),
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-    capitalize_ascii_first(expanded)
-}
-
-fn display_technology_name(value: &str) -> String {
-    let without_product = value
-        .trim()
-        .strip_prefix("Fabricad ")
-        .unwrap_or(value.trim());
-    capitalize_ascii_first(
-        without_product
-            .replace("demo", "sample")
-            .replace("Demo", "Sample"),
-    )
-}
-
-fn display_inventory_actor_identifier(value: &str) -> String {
-    let words = value
-        .split(|ch: char| ch == '-' || ch == '_' || ch == '.' || ch.is_whitespace())
-        .filter(|part| !part.is_empty())
-        .filter_map(|part| match part.to_ascii_lowercase().as_str() {
-            "demo" => None,
-            "op" | "ops" => Some("operator".to_string()),
-            other => Some(other.to_string()),
-        })
-        .collect::<Vec<_>>();
-    if words.is_empty() {
-        "Operator".to_string()
-    } else {
-        capitalize_ascii_first(words.join(" "))
-    }
 }
 
 fn experiment_run_order_label(run_order: u32) -> String {
@@ -8284,47 +9274,6 @@ fn environment_alarm_short_label(severity: Option<EnvironmentAlarmSeverity>) -> 
         Some(EnvironmentAlarmSeverity::Advisory) => "adv",
         None => "nom",
     }
-}
-
-fn capitalize_ascii_first(mut value: String) -> String {
-    if let Some(first_byte) = value.get_mut(0..1) {
-        first_byte.make_ascii_uppercase();
-    }
-    value
-}
-
-fn format_recipe_token(value: &str, first: bool) -> String {
-    let has_digit = value.chars().any(|ch| ch.is_ascii_digit());
-    let all_upper = value.chars().all(|ch| !ch.is_ascii_lowercase());
-    if value.chars().all(|ch| ch.is_ascii_digit())
-        || (all_upper && value.chars().count() <= 3)
-        || (has_digit && all_upper)
-    {
-        return value.to_string();
-    }
-
-    let mut lower = value.to_ascii_lowercase();
-    if first {
-        if let Some(first_byte) = lower.get_mut(0..1) {
-            first_byte.make_ascii_uppercase();
-        }
-    }
-    lower
-}
-
-fn humanize_identifier(value: &str) -> String {
-    value
-        .split(|ch: char| ch == '-' || ch == '_' || ch == '.' || ch.is_whitespace())
-        .filter(|part| !part.is_empty())
-        .map(|part| {
-            if part.chars().count() == 1 {
-                part.to_ascii_uppercase()
-            } else {
-                part.to_ascii_lowercase()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 fn mask_issue_matches_filter(app: &FabricadApp, issue: &layout_model::mask::MaskPrepIssue) -> bool {
@@ -8836,6 +9785,49 @@ fn default_control_loop(workspace: &WorkspaceDataset) -> Option<ControlLoopId> {
         .map(|loop_definition| loop_definition.id.clone())
 }
 
+fn control_loop_matches(
+    workspace: &WorkspaceDataset,
+    filter: ControlLoopFilter,
+    loop_definition: &ControlLoop,
+) -> bool {
+    match filter {
+        ControlLoopFilter::All => true,
+        ControlLoopFilter::Active => workspace
+            .process_control
+            .actions_for_loop(&loop_definition.id)
+            .iter()
+            .any(|action| {
+                !matches!(
+                    action.state,
+                    ControlActionState::Applied | ControlActionState::Rejected
+                )
+            }),
+        ControlLoopFilter::Attention => workspace
+            .process_control
+            .actions_for_loop(&loop_definition.id)
+            .iter()
+            .any(|action| {
+                matches!(
+                    action.state,
+                    ControlActionState::Proposed | ControlActionState::Held
+                )
+            }),
+    }
+}
+
+fn default_control_loop_for_filter(
+    workspace: &WorkspaceDataset,
+    filter: ControlLoopFilter,
+) -> Option<ControlLoopId> {
+    workspace
+        .process_control
+        .loops
+        .iter()
+        .find(|loop_definition| control_loop_matches(workspace, filter, loop_definition))
+        .map(|loop_definition| loop_definition.id.clone())
+        .or_else(|| default_control_loop(workspace))
+}
+
 fn default_control_action(
     workspace: &WorkspaceDataset,
     loop_id: Option<&ControlLoopId>,
@@ -8863,7 +9855,42 @@ fn selected_control_loop<'a>(
     app.selected_control_loop
         .as_ref()
         .and_then(|id| app.workspace.process_control.loop_by_id(id))
+        .filter(|loop_definition| {
+            control_loop_matches(
+                &app.workspace,
+                app.process_control_loop_filter,
+                loop_definition,
+            )
+        })
+        .or_else(|| {
+            app.workspace
+                .process_control
+                .loops
+                .iter()
+                .find(|loop_definition| {
+                    control_loop_matches(
+                        &app.workspace,
+                        app.process_control_loop_filter,
+                        loop_definition,
+                    )
+                })
+        })
         .or_else(|| app.workspace.process_control.loops.first())
+}
+
+fn filtered_control_loops(app: &FabricadApp) -> Vec<&ControlLoop> {
+    app.workspace
+        .process_control
+        .loops
+        .iter()
+        .filter(|loop_definition| {
+            control_loop_matches(
+                &app.workspace,
+                app.process_control_loop_filter,
+                loop_definition,
+            )
+        })
+        .collect()
 }
 
 fn selected_control_action<'a>(
@@ -8974,15 +10001,6 @@ fn process_control_loop_button_label(name: &str) -> String {
         "Contact resistance cleanup" => "Contact resistance".to_string(),
         _ => compact_button_label(name, 18),
     }
-}
-
-fn compact_button_label(value: &str, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
-        return value.to_string();
-    }
-    let prefix_len = max_chars.saturating_sub(2);
-    let prefix = value.chars().take(prefix_len).collect::<String>();
-    format!("{prefix}..")
 }
 
 fn spc_fdc_monitor(workspace: &WorkspaceDataset) -> SpcFdcMonitor {
@@ -9200,6 +10218,28 @@ fn environment_sensor_status(app: &FabricadApp) -> String {
         .unwrap_or_else(|| "No samples".to_string())
 }
 
+fn ordered_environment_sensors(app: &FabricadApp) -> Vec<&EnvironmentSensor> {
+    let mut sensors = app.workspace.environment.sensors.iter().collect::<Vec<_>>();
+    if app.app_options.domains.environment.show_alarm_sensors_first {
+        let alarm_severity_by_sensor = app
+            .workspace
+            .environment
+            .evaluate_alarms()
+            .into_iter()
+            .filter(|alarm| alarm.active)
+            .map(|alarm| (alarm.sensor_id, alarm.severity))
+            .collect::<BTreeMap<_, _>>();
+        sensors.sort_by(|left, right| {
+            let left_severity = alarm_severity_by_sensor.get(&left.id);
+            let right_severity = alarm_severity_by_sensor.get(&right.id);
+            right_severity
+                .cmp(&left_severity)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+    }
+    sensors
+}
+
 fn equipment_active_alarm_count(tool: &EquipmentTool) -> usize {
     tool.active_alarms
         .iter()
@@ -9405,6 +10445,201 @@ impl DomainSection {
     }
 }
 
+fn domain_section_key(view: StartupView, section_index: usize) -> String {
+    format!("{}.domain.{section_index}", view.slug())
+}
+
+fn domain_section_expanded(app: &FabricadApp, section_index: usize) -> bool {
+    let default_expanded = section_index == 0;
+    let toggled = app
+        .collapsed_detail_sections
+        .contains(&domain_section_key(app.active_view, section_index));
+    default_expanded ^ toggled
+}
+
+fn add_domain_section(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    section_index: usize,
+    section: &DomainSection,
+    app: &FabricadApp,
+    ui_scale: UiScale,
+) {
+    let key = domain_section_key(app.active_view, section_index);
+    let expanded = domain_section_expanded(app, section_index);
+    let row_count = if section.rows.is_empty() {
+        0
+    } else {
+        section.rows.len().min(section.max_rows)
+    };
+    let title = if row_count == 0 {
+        format!("{} - empty", section.title)
+    } else {
+        format!("{} - {row_count}", section.title)
+    };
+    let mut options = CollapsingHeaderOptions::default()
+        .expanded(expanded)
+        .with_toggle_action(format!("fabricad.inspector.section.toggle.{key}"));
+    options.layout = LayoutStyle::column().with_width_percent(1.0);
+    options.header_layout = layout::with_padding_all(
+        layout::with_gap_all(
+            layout::with_size(
+                layout::row(),
+                layout::percent(1.0),
+                layout::px(ui_scale.value(24.0)),
+            ),
+            ui_scale.value(4.0),
+        ),
+        ui_scale.value(3.0),
+    );
+    options.body_layout = layout::with_gap_all(
+        layout::with_padding_all(layout::column(), ui_scale.value(3.0)),
+        ui_scale.value(3.0),
+    );
+    options.header_visual = UiVisual::panel(
+        COLOR_PANEL_BG,
+        Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
+        ui_scale.value(2.0),
+    );
+    options.hovered_visual = UiVisual::panel(
+        COLOR_PANEL_ALT,
+        Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
+        ui_scale.value(2.0),
+    );
+    options.pressed_visual = UiVisual::panel(
+        COLOR_BUTTON_SELECTED,
+        Some(StrokeStyle::new(
+            COLOR_BUTTON_STROKE_SELECTED,
+            ui_scale.value(1.0),
+        )),
+        ui_scale.value(2.0),
+    );
+    options.body_visual = UiVisual::panel(COLOR_APP_BG, None, 0.0);
+    options.text_style = text_style(ui_scale.value(12.0), FontWeight::BOLD, COLOR_TEXT);
+    options.indicator_text_style =
+        text_style(ui_scale.value(11.0), FontWeight::BOLD, COLOR_TEXT_MUTED);
+    options.accessibility_label = Some(section.title.clone());
+
+    let nodes = collapsing_header(
+        document,
+        parent,
+        format!("fabricad.domain.section.{section_index}"),
+        title,
+        options,
+    );
+    if let Some(body) = nodes.body {
+        if section.rows.is_empty() {
+            let empty_row = PrimaryRow::new(
+                format!("{}.empty", section.name),
+                section.title.clone(),
+                section.empty.clone(),
+                "",
+            );
+            add_primary_section_row(
+                document,
+                body,
+                &section.name,
+                section_index,
+                0,
+                &empty_row,
+                ui_scale,
+            );
+        } else {
+            for (row_index, row) in section.rows.iter().take(section.max_rows).enumerate() {
+                add_primary_section_row(
+                    document,
+                    body,
+                    &section.name,
+                    section_index,
+                    row_index,
+                    row,
+                    ui_scale,
+                );
+            }
+        }
+    }
+}
+
+fn add_primary_section_row(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    section_name: &str,
+    section_index: usize,
+    row_index: usize,
+    row_data: &PrimaryRow,
+    ui_scale: UiScale,
+) {
+    let row_name = format!("{section_name}.row.{row_index}");
+    let row = document.add_child(
+        parent,
+        UiNode::container(
+            row_name.clone(),
+            layout::with_gap_all(
+                layout::with_size(
+                    layout::row(),
+                    layout::percent(1.0),
+                    layout::px(ui_scale.value(28.0)),
+                ),
+                ui_scale.value(6.0),
+            ),
+        )
+        .with_visual(UiVisual::panel(
+            if row_index % 2 == 0 {
+                COLOR_PANEL_ALT
+            } else {
+                COLOR_PANEL_BG
+            },
+            Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
+            ui_scale.value(2.0),
+        )),
+    );
+    if let Some(action) = row_data.action.as_ref() {
+        let button_name = action
+            .strip_prefix("fabricad.viewctl.")
+            .map(|action| {
+                format!("fabricad.primary.action.domain{section_index}_{row_index}.{action}")
+            })
+            .unwrap_or_else(|| format!("{row_name}.action.{}", row_data.name));
+        add_button(
+            document,
+            row,
+            button_name,
+            compact_button_label(&row_data.title, 24),
+            row_data.selected,
+            primary_cell_layout(1.4),
+            ui_scale,
+        );
+    } else {
+        add_primary_cell(
+            document,
+            row,
+            format!("{row_name}.title.{}", row_data.name),
+            compact_button_label(&row_data.title, 26),
+            1.4,
+            false,
+            ui_scale,
+        );
+    }
+    add_primary_cell(
+        document,
+        row,
+        format!("{row_name}.value.{}", row_data.name),
+        compact_button_label(&row_data.value, 22),
+        1.0,
+        false,
+        ui_scale,
+    );
+    add_primary_cell(
+        document,
+        row,
+        format!("{row_name}.detail.{}", row_data.name),
+        compact_button_label(&row_data.detail, 72),
+        2.4,
+        false,
+        ui_scale,
+    );
+}
+
 fn dashboard_metric_rows(prefix: &str, metrics: Vec<DashboardMetric>) -> Vec<PrimaryRow> {
     metrics
         .into_iter()
@@ -9420,26 +10655,6 @@ fn dashboard_metric_rows(prefix: &str, metrics: Vec<DashboardMetric>) -> Vec<Pri
         .collect()
 }
 
-fn control_rows_to_primary(prefix: &str, rows: Vec<Vec<ViewControlButton>>) -> Vec<PrimaryRow> {
-    rows.into_iter()
-        .flatten()
-        .enumerate()
-        .map(|(index, button)| {
-            PrimaryRow::new(
-                format!("{prefix}.{index}"),
-                button.label,
-                if button.selected { "selected" } else { "" },
-                "",
-            )
-            .action(button.name, button.selected)
-        })
-        .collect()
-}
-
-fn workflow_action_rows(app: &FabricadApp) -> Vec<PrimaryRow> {
-    control_rows_to_primary("workflow-action", workflow_control_rows(app))
-}
-
 fn workflow_lot_rows(app: &FabricadApp) -> Vec<PrimaryRow> {
     workflow_primary_rows(app)
 }
@@ -9452,22 +10667,6 @@ fn workflow_spine_rows(app: &FabricadApp) -> Vec<PrimaryRow> {
     workflow_cross_link_rows(app)
 }
 
-fn mask_field_rows(app: &FabricadApp) -> Vec<PrimaryRow> {
-    mask_primary_rows(app)
-}
-
-fn mask_check_rows(app: &FabricadApp) -> Vec<PrimaryRow> {
-    mask_primary_rows(app)
-}
-
-fn layout_diff_layer_rows(app: &FabricadApp) -> Vec<PrimaryRow> {
-    layout_diff_primary_rows(app)
-}
-
-fn layout_diff_change_rows(app: &FabricadApp) -> Vec<PrimaryRow> {
-    layout_diff_primary_rows(app)
-}
-
 fn fab_tool_rows(app: &FabricadApp) -> Vec<PrimaryRow> {
     fab_primary_rows(app)
 }
@@ -9475,45 +10674,90 @@ fn fab_tool_rows(app: &FabricadApp) -> Vec<PrimaryRow> {
 fn add_domain_panel(
     document: &mut UiDocument,
     parent: operad::UiNodeId,
+    app: &FabricadApp,
     _name: &str,
     subtitle: &str,
     title: &str,
     sections: Vec<DomainSection>,
     ui_scale: UiScale,
-    compact_rows: bool,
+    _compact_rows: bool,
 ) {
     let section_markers = sections.clone();
-    let rows = sections
+    let expanded_rows = sections
         .iter()
-        .flat_map(|section| {
-            let mut rows = section.rows.clone();
-            if rows.is_empty() {
-                rows.push(PrimaryRow::new(
-                    format!("{}.empty", section.name),
-                    section.title.clone(),
-                    section.empty.clone(),
-                    subtitle.to_string(),
-                ));
+        .enumerate()
+        .filter(|(section_index, _)| domain_section_expanded(app, *section_index))
+        .map(|(_, section)| {
+            if section.rows.is_empty() {
+                1
+            } else {
+                section.rows.len().min(section.max_rows)
             }
-            rows.into_iter().take(section.max_rows)
         })
-        .collect::<Vec<_>>();
-    add_overview_view_panel(
-        document,
+        .sum::<usize>();
+    let title_height = ui_scale.value(24.0);
+    let subtitle_height = ui_scale.value(18.0);
+    let header_height = ui_scale.value(24.0);
+    let row_height = ui_scale.value(30.0);
+    let gap = ui_scale.value(4.0);
+    let panel_height = (ui_scale.value(18.0)
+        + title_height
+        + subtitle_height
+        + sections.len() as f32 * header_height
+        + expanded_rows as f32 * row_height
+        + sections.len().saturating_sub(1) as f32 * gap
+        + ui_scale.value(16.0))
+    .max(ui_scale.value(220.0));
+
+    let panel = document.add_child(
         parent,
-        "fabricad.domain",
-        title,
-        Vec::new(),
-        rows,
-        ui_scale,
-        compact_rows,
+        UiNode::container(
+            "fabricad.primary",
+            layout::with_padding_all(
+                layout::with_gap_all(
+                    layout::with_size(
+                        layout::column(),
+                        layout::percent(1.0),
+                        layout::px(panel_height),
+                    ),
+                    gap,
+                ),
+                ui_scale.value(8.0),
+            ),
+        )
+        .with_visual(UiVisual::panel(
+            COLOR_PANEL_BG,
+            Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
+            ui_scale.value(2.0),
+        )),
     );
-    for section in &section_markers {
+    add_text(
+        document,
+        panel,
+        "fabricad.primary.title",
+        title,
+        text_style(ui_scale.value(15.0), FontWeight::BOLD, COLOR_TEXT),
+        layout::size(layout::percent(1.0), layout::px(title_height)),
+    );
+    add_text(
+        document,
+        panel,
+        "fabricad.primary.subtitle",
+        subtitle,
+        text_style(ui_scale.value(11.0), FontWeight::NORMAL, COLOR_TEXT_MUTED),
+        layout::size(layout::percent(1.0), layout::px(subtitle_height)),
+    );
+
+    for (section_index, section) in sections.iter().enumerate() {
+        add_domain_section(document, panel, section_index, section, app, ui_scale);
+    }
+
+    for (section_index, section) in section_markers.iter().enumerate() {
         if section.name.ends_with(".controls") || section.name.ends_with(".commands") {
             continue;
         }
         add_node_marker(document, parent, section.name.clone());
-        if !section.rows.is_empty() {
+        if !section.rows.is_empty() && !domain_section_expanded(app, section_index) {
             add_node_marker(document, parent, format!("{}.row.0", section.name));
         }
     }
@@ -9525,6 +10769,7 @@ fn add_view_controls(
     app: &FabricadApp,
     ui_scale: UiScale,
     compact_rows: bool,
+    body_width: f32,
 ) {
     match app.active_view {
         StartupView::Layout2d | StartupView::Layout3d => add_control_panel(
@@ -9534,6 +10779,7 @@ fn add_view_controls(
             "Layout Editor Controls",
             layout_editor_control_rows(app),
             ui_scale,
+            body_width,
         ),
         StartupView::Workflow => add_control_panel_with_button_width(
             document,
@@ -9543,6 +10789,7 @@ fn add_view_controls(
             workflow_control_rows(app),
             116.0,
             ui_scale,
+            body_width,
         ),
         StartupView::MaskPrep => add_control_panel(
             document,
@@ -9551,6 +10798,7 @@ fn add_view_controls(
             "Reticle Prep Controls",
             mask_prep_control_rows(app),
             ui_scale,
+            body_width,
         ),
         StartupView::LayoutDiff => add_control_panel(
             document,
@@ -9559,6 +10807,7 @@ fn add_view_controls(
             "Layout Diff Controls",
             layout_diff_control_rows(app, compact_rows),
             ui_scale,
+            body_width,
         ),
         StartupView::FabControl => add_control_panel(
             document,
@@ -9567,6 +10816,7 @@ fn add_view_controls(
             "Fab Control",
             fab_control_rows(app, compact_rows),
             ui_scale,
+            body_width,
         ),
         StartupView::Maintenance => add_control_panel(
             document,
@@ -9575,6 +10825,7 @@ fn add_view_controls(
             "Maintenance Controls",
             maintenance_control_rows(app, compact_rows),
             ui_scale,
+            body_width,
         ),
         StartupView::Environment => add_control_panel(
             document,
@@ -9583,6 +10834,7 @@ fn add_view_controls(
             "Environment Controls",
             environment_control_rows(app),
             ui_scale,
+            body_width,
         ),
         StartupView::Inventory => add_control_panel(
             document,
@@ -9591,6 +10843,7 @@ fn add_view_controls(
             "Inventory Controls",
             inventory_control_rows(app),
             ui_scale,
+            body_width,
         ),
         StartupView::Scheduler => add_control_panel(
             document,
@@ -9599,6 +10852,7 @@ fn add_view_controls(
             "Dispatch Controls",
             scheduler_control_rows(app),
             ui_scale,
+            body_width,
         ),
         StartupView::Safety => add_control_panel(
             document,
@@ -9607,6 +10861,7 @@ fn add_view_controls(
             "Safety Controls",
             safety_control_rows(app, compact_rows),
             ui_scale,
+            body_width,
         ),
         StartupView::Traceability => add_control_panel(
             document,
@@ -9615,6 +10870,7 @@ fn add_view_controls(
             "Traceability Controls",
             traceability_control_rows(app, compact_rows),
             ui_scale,
+            body_width,
         ),
         StartupView::ProcessFlow => add_control_panel(
             document,
@@ -9623,6 +10879,7 @@ fn add_view_controls(
             "Process Flow Controls",
             process_flow_control_rows(app),
             ui_scale,
+            body_width,
         ),
         StartupView::ProcessControl => add_control_panel(
             document,
@@ -9631,6 +10888,7 @@ fn add_view_controls(
             "Run-to-Run Controls",
             process_control_rows(app),
             ui_scale,
+            body_width,
         ),
         StartupView::SpcFdc => add_control_panel(
             document,
@@ -9639,6 +10897,7 @@ fn add_view_controls(
             "SPC / FDC Controls",
             spc_fdc_control_rows(app, compact_rows),
             ui_scale,
+            body_width,
         ),
         StartupView::CrossSection => add_control_panel(
             document,
@@ -9647,6 +10906,7 @@ fn add_view_controls(
             "Cross-Section Controls",
             cross_section_control_rows(app),
             ui_scale,
+            body_width,
         ),
         StartupView::Metrology => add_control_panel(
             document,
@@ -9655,6 +10915,7 @@ fn add_view_controls(
             "Metrology Controls",
             metrology_control_rows(app, compact_rows),
             ui_scale,
+            body_width,
         ),
         StartupView::Yield => add_control_panel(
             document,
@@ -9663,6 +10924,7 @@ fn add_view_controls(
             "Yield Controls",
             yield_control_rows(app, compact_rows),
             ui_scale,
+            body_width,
         ),
         StartupView::Experiment => add_control_panel_with_button_width(
             document,
@@ -9672,6 +10934,7 @@ fn add_view_controls(
             experiment_control_rows(app, compact_rows),
             132.0,
             ui_scale,
+            body_width,
         ),
         StartupView::Notebook => add_control_panel_with_button_width(
             document,
@@ -9681,8 +10944,71 @@ fn add_view_controls(
             notebook_control_rows(app, compact_rows),
             132.0,
             ui_scale,
+            body_width,
         ),
     }
+}
+
+fn add_layout_canvas_mode_hud(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    active_view: StartupView,
+    ui_scale: UiScale,
+) {
+    let label = match active_view {
+        StartupView::Layout2d => {
+            "2D Layout | wheel zoom | middle/right drag pan | Shift constrain | Ctrl bypass snap"
+        }
+        StartupView::Layout3d => {
+            "3D Stack | click to capture flycam | mouse look | WASD move | Q/E down/up | Esc release"
+        }
+        _ => return,
+    };
+    document.add_child(
+        parent,
+        UiNode::scene(
+            "fabricad.layout.mode_hud",
+            vec![ScenePrimitive::Text(PaintText::new(
+                label,
+                UiRect::new(
+                    ui_scale.value(8.0),
+                    ui_scale.value(4.0),
+                    ui_scale.value(680.0),
+                    ui_scale.value(18.0),
+                ),
+                text_style(ui_scale.value(12.0), FontWeight::NORMAL, COLOR_TEXT_MUTED),
+            ))],
+            layout::with_absolute_position(
+                layout::size(layout::percent(1.0), layout::px(ui_scale.value(22.0))),
+                0.0,
+                0.0,
+            ),
+        ),
+    );
+}
+
+fn add_layout_canvas_fps(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    app: &FabricadApp,
+    preview_height: f32,
+    ui_scale: UiScale,
+) {
+    add_text(
+        document,
+        parent,
+        "fabricad.layout.fps",
+        format_fps_label(app.layout_fps_frame_ms()),
+        text_style(ui_scale.value(12.0), FontWeight::NORMAL, COLOR_TEXT_MUTED),
+        layout::with_absolute_position(
+            layout::size(
+                layout::px(ui_scale.value(96.0)),
+                layout::px(ui_scale.value(18.0)),
+            ),
+            ui_scale.value(8.0),
+            (preview_height - ui_scale.value(24.0)).max(0.0),
+        ),
+    );
 }
 
 fn add_primary_view_panel(
@@ -9780,11 +11106,8 @@ fn add_primary_view_panel(
                 0.0,
                 0.0,
             );
-            let mut canvas_node = if app.active_view == StartupView::Layout3d {
-                UiNode::gpu_canvas("fabricad.layout.preview", canvas_key, canvas_layout)
-            } else {
-                UiNode::canvas("fabricad.layout.preview", canvas_key, canvas_layout)
-            };
+            let mut canvas_node =
+                UiNode::gpu_canvas("fabricad.layout.preview", canvas_key, canvas_layout);
             if let UiContent::Canvas(canvas) = &mut canvas_node.content {
                 canvas.interaction = CanvasInteractionPolicy::EDITOR;
             }
@@ -9819,43 +11142,10 @@ fn add_primary_view_panel(
                         ),
                     ),
                 );
-                add_text(
-                    document,
-                    viewport_stack,
-                    "fabricad.layout.fps",
-                    format_fps_label(app.layout_frame_ms.get()),
-                    text_style(ui_scale.value(12.0), FontWeight::NORMAL, COLOR_TEXT_MUTED),
-                    layout::with_absolute_position(
-                        layout::size(
-                            layout::px(ui_scale.value(96.0)),
-                            layout::px(ui_scale.value(18.0)),
-                        ),
-                        ui_scale.value(8.0),
-                        (preview_height - ui_scale.value(24.0)).max(0.0),
-                    ),
-                );
-            } else {
-                document.add_child(
-                    viewport_stack,
-                    UiNode::scene(
-                        "fabricad.layout.3d.overlay",
-                        vec![ScenePrimitive::Text(PaintText::new(
-                            "3D Stack | click to capture flycam | mouse look | WASD move | Q/E down/up | Esc release",
-                            UiRect::new(
-                                ui_scale.value(8.0),
-                                ui_scale.value(4.0),
-                                ui_scale.value(620.0),
-                                ui_scale.value(18.0),
-                            ),
-                            text_style(ui_scale.value(12.0), FontWeight::NORMAL, COLOR_TEXT_MUTED),
-                        ))],
-                        layout::with_absolute_position(
-                            layout::size(layout::percent(1.0), layout::px(ui_scale.value(22.0))),
-                            0.0,
-                            0.0,
-                        ),
-                    ),
-                );
+            }
+            add_layout_canvas_mode_hud(document, viewport_stack, app.active_view, ui_scale);
+            if app.app_options.performance.live_fps_meter {
+                add_layout_canvas_fps(document, viewport_stack, app, preview_height, ui_scale);
             }
         }
         StartupView::Workflow => {
@@ -9923,6 +11213,7 @@ fn add_workflow_view_panel(
     add_domain_panel(
         document,
         parent,
+        app,
         "Fab Workflow",
         "Workspace workflow, production focus, route operations, and cross-links",
         "Fab Workflow",
@@ -9934,13 +11225,6 @@ fn add_workflow_view_panel(
                 dashboard_metric_rows("workflow", workflow_dashboard_metrics(app)),
             )
             .max_rows(5),
-            DomainSection::new(
-                "fabricad.workflow.actions",
-                "Actions",
-                "No workflow actions available",
-                workflow_action_rows(app),
-            )
-            .max_rows(6),
             DomainSection::new(
                 "fabricad.workflow.lots",
                 "Lot Focus",
@@ -9983,10 +11267,10 @@ fn add_mask_view_panel(
     compact_rows: bool,
 ) {
     let prep = reticle_prep_for_app(app);
-    let report = mask_check_report(app);
     add_domain_panel(
         document,
         parent,
+        app,
         "Mask / Reticle Prep",
         "Reticle prep, layer stack, exposure blocks, fields, and retained mask checks",
         "Mask / Reticle Prep",
@@ -9998,13 +11282,6 @@ fn add_mask_view_panel(
                 dashboard_metric_rows("mask", mask_dashboard_metrics(app, compact_rows)),
             )
             .max_rows(5),
-            DomainSection::new(
-                "fabricad.mask.controls",
-                "Reticle Prep Controls",
-                "No mask controls available",
-                control_rows_to_primary("mask-control", mask_prep_control_rows(app)),
-            )
-            .max_rows(8),
             DomainSection::new(
                 "fabricad.mask.reticle",
                 "Reticle",
@@ -10046,10 +11323,10 @@ fn add_layout_diff_view_panel(
     ui_scale: UiScale,
     compact_rows: bool,
 ) {
-    let report = layout_diff_report(app);
     add_domain_panel(
         document,
         parent,
+        app,
         "Layout Diff Review",
         "Baseline/candidate comparison, layer deltas, change paging, and review state",
         "Layout Diff Review",
@@ -10061,13 +11338,6 @@ fn add_layout_diff_view_panel(
                 dashboard_metric_rows("diff", layout_diff_dashboard_metrics(app)),
             )
             .max_rows(5),
-            DomainSection::new(
-                "fabricad.layout_diff.controls",
-                "Diff Controls",
-                "No diff controls available",
-                control_rows_to_primary("diff-control", layout_diff_control_rows(app, false)),
-            )
-            .max_rows(8),
             DomainSection::new(
                 "fabricad.layout_diff.layers",
                 "Changed Layers",
@@ -10098,6 +11368,7 @@ fn add_fab_control_view_panel(
     add_domain_panel(
         document,
         parent,
+        app,
         "Fab Control Room",
         "Equipment state, recipe loading, host commands, alarms, and telemetry",
         "Fab Control Room",
@@ -10116,13 +11387,6 @@ fn add_fab_control_view_panel(
                 fab_tool_rows(app),
             )
             .max_rows(8),
-            DomainSection::new(
-                "fabricad.fab_control.commands",
-                "Tool Commands",
-                "No tool commands available",
-                control_rows_to_primary("fab-control", fab_control_rows(app, false)),
-            )
-            .max_rows(10),
             DomainSection::new(
                 "fabricad.fab_control.detail",
                 "Selected Tool",
@@ -11765,7 +13029,7 @@ fn add_inventory_lot_card(
 fn add_inventory_detail_panel(
     document: &mut UiDocument,
     parent: operad::UiNodeId,
-    app: &FabricadApp,
+    _app: &FabricadApp,
     lot: Option<&MaterialLot>,
     ui_scale: UiScale,
 ) {
@@ -11975,8 +13239,20 @@ fn add_safety_view_panel(
     compact_rows: bool,
 ) {
     let summary = app.workspace.safety.summary();
-    let lockouts = app.workspace.safety.evaluate_lockouts();
-    let active_conditions = app.workspace.safety.active_conditions();
+    let show_acknowledged = app.app_options.domains.safety.show_acknowledged;
+    let mut lockouts = app.workspace.safety.evaluate_lockouts();
+    if !show_acknowledged {
+        lockouts.retain(|lockout| !app.acknowledged_lockouts.contains(&lockout.tool_id));
+    }
+    let active_conditions = app
+        .workspace
+        .safety
+        .active_conditions()
+        .into_iter()
+        .filter(|sensor| {
+            show_acknowledged || !app.acknowledged_conditions.contains(sensor.id.as_str())
+        })
+        .collect::<Vec<_>>();
     let stacked_workbench = compact_rows || ui_scale.factor() > 1.25;
     let panel_height = if compact_rows {
         860.0
@@ -12688,7 +13964,17 @@ fn add_safety_incident_section(
     ui_scale: UiScale,
     compact_rows: bool,
 ) {
-    let visible_incidents = app.workspace.safety.incidents.len().max(1).min(2);
+    let incidents = app
+        .workspace
+        .safety
+        .incidents
+        .iter()
+        .filter(|incident| {
+            app.app_options.domains.safety.show_acknowledged
+                || !app.acknowledged_incidents.contains(incident.id.0.as_str())
+        })
+        .collect::<Vec<_>>();
+    let visible_incidents = incidents.len().max(1).min(2);
     let section_height = if compact_rows {
         ui_scale.value(30.0) + ui_scale.value(76.0) * visible_incidents as f32
     } else {
@@ -12716,7 +14002,7 @@ fn add_safety_incident_section(
         text_style(ui_scale.value(13.0), FontWeight::BOLD, COLOR_TEXT),
         layout::size(layout::percent(1.0), layout::px(ui_scale.value(20.0))),
     );
-    if app.workspace.safety.incidents.is_empty() {
+    if incidents.is_empty() {
         add_primary_cell(
             document,
             section,
@@ -12729,7 +14015,7 @@ fn add_safety_incident_section(
         return;
     }
     if compact_rows {
-        for (index, incident) in app.workspace.safety.incidents.iter().take(2).enumerate() {
+        for (index, incident) in incidents.iter().take(2).enumerate() {
             add_safety_incident_card(document, section, app, incident, index, ui_scale);
         }
         return;
@@ -12747,7 +14033,7 @@ fn add_safety_incident_section(
         ],
         ui_scale,
     );
-    for (index, incident) in app.workspace.safety.incidents.iter().take(2).enumerate() {
+    for (index, incident) in incidents.iter().take(2).enumerate() {
         let row = add_inventory_table_row(
             document,
             section,
@@ -12967,132 +14253,46 @@ fn add_traceability_view_panel(
     ui_scale: UiScale,
     compact_rows: bool,
 ) {
-    add_overview_view_panel(
+    add_domain_panel(
         document,
         parent,
-        "fabricad.traceability.overview",
+        app,
         "Lot Traceability",
-        traceability_dashboard_metrics(app),
-        traceability_primary_rows(app),
+        "Lot genealogy, wafer lineage, material provenance, and event impact",
+        "Lot Traceability",
+        vec![
+            DomainSection::new(
+                "fabricad.traceability.overview",
+                "Traceability Summary",
+                "No traceability summary available",
+                dashboard_metric_rows("traceability", traceability_dashboard_metrics(app)),
+            )
+            .max_rows(5),
+            DomainSection::new(
+                "fabricad.traceability.lots",
+                "Lots",
+                "No lots available",
+                traceability_lot_rows(app),
+            )
+            .max_rows(8),
+            DomainSection::new(
+                "fabricad.traceability.wafers",
+                "Wafers",
+                "No wafers available for the selected lot",
+                traceability_wafer_rows(app),
+            )
+            .max_rows(8),
+            DomainSection::new(
+                "fabricad.traceability.detail",
+                "Selected Evidence",
+                "No selected genealogy evidence",
+                trace_selected_wafer_rows(app),
+            )
+            .max_rows(10),
+        ],
         ui_scale,
         compact_rows,
     );
-    for marker in [
-        "fabricad.traceability.lots",
-        "fabricad.traceability.lots.row.0",
-        "fabricad.traceability.wafers",
-        "fabricad.traceability.detail",
-    ] {
-        add_node_marker(document, parent, marker);
-    }
-}
-
-fn add_overview_view_panel(
-    document: &mut UiDocument,
-    parent: operad::UiNodeId,
-    scene_name: &str,
-    title: &str,
-    metrics: Vec<DashboardMetric>,
-    rows: Vec<PrimaryRow>,
-    ui_scale: UiScale,
-    compact_rows: bool,
-) {
-    let panel_height = if compact_rows { 372.0 } else { 414.0 };
-    let scene_height = if compact_rows { 174.0 } else { 210.0 };
-    let panel = document.add_child(
-        parent,
-        UiNode::container(
-            "fabricad.primary",
-            layout::with_padding_all(
-                layout::with_gap_all(
-                    layout::with_size(
-                        layout::column(),
-                        layout::percent(1.0),
-                        layout::px(ui_scale.value(panel_height)),
-                    ),
-                    ui_scale.value(8.0),
-                ),
-                ui_scale.value(10.0),
-            ),
-        )
-        .with_visual(UiVisual::panel(
-            COLOR_PANEL_BG,
-            Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
-            ui_scale.value(2.0),
-        )),
-    );
-    add_text(
-        document,
-        panel,
-        "fabricad.primary.title",
-        title,
-        text_style(ui_scale.value(15.0), FontWeight::BOLD, COLOR_TEXT),
-        layout::size(layout::percent(1.0), layout::px(ui_scale.value(24.0))),
-    );
-
-    let metric_row = document.add_child(
-        panel,
-        UiNode::container(
-            "fabricad.primary.metrics",
-            layout::with_gap_all(
-                layout::with_size(
-                    layout::row(),
-                    layout::percent(1.0),
-                    layout::px(ui_scale.value(46.0)),
-                ),
-                ui_scale.value(8.0),
-            ),
-        ),
-    );
-    for (index, metric) in metrics.iter().take(4).enumerate() {
-        add_dashboard_metric_cell(document, metric_row, index, metric, ui_scale);
-    }
-
-    document.add_child(
-        panel,
-        UiNode::scene(
-            scene_name,
-            overview_scene_primitives(&rows, ui_scale),
-            layout::with_size(
-                layout::row(),
-                layout::percent(1.0),
-                layout::px(ui_scale.value(scene_height)),
-            ),
-        )
-        .with_visual(UiVisual::panel(
-            COLOR_APP_BG,
-            Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
-            ui_scale.value(2.0),
-        )),
-    );
-
-    if rows.is_empty() {
-        let empty = document.add_child(
-            panel,
-            UiNode::container(
-                "fabricad.primary.row.0",
-                layout::with_size(
-                    layout::row(),
-                    layout::percent(1.0),
-                    layout::px(ui_scale.value(42.0)),
-                ),
-            ),
-        );
-        add_primary_cell(
-            document,
-            empty,
-            "fabricad.primary.row.0.empty",
-            "No rows match the active filters",
-            1.0,
-            false,
-            ui_scale,
-        );
-        return;
-    }
-
-    for (row_index, row_data) in rows.iter().take(2).enumerate() {
-        add_primary_summary_row(document, panel, row_index, row_data, ui_scale);
-    }
 }
 
 fn add_fullscreen_3d_view(
@@ -13179,103 +14379,6 @@ fn add_fullscreen_3d_view(
                 Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
                 ui_scale.value(2.0),
             )),
-    );
-}
-
-fn add_dashboard_metric_cell(
-    document: &mut UiDocument,
-    parent: operad::UiNodeId,
-    index: usize,
-    metric: &DashboardMetric,
-    ui_scale: UiScale,
-) {
-    add_text(
-        document,
-        parent,
-        format!("fabricad.primary.metric.{index}"),
-        format!("{}: {}", metric.label, metric.value),
-        text_style(ui_scale.value(12.0), FontWeight::BOLD, COLOR_TEXT),
-        layout::size(layout::percent(1.0), layout::px(ui_scale.value(22.0))),
-    );
-}
-
-fn overview_scene_primitives(_rows: &[PrimaryRow], _ui_scale: UiScale) -> Vec<ScenePrimitive> {
-    Vec::new()
-}
-
-fn add_primary_summary_row(
-    document: &mut UiDocument,
-    parent: operad::UiNodeId,
-    row_index: usize,
-    row_data: &PrimaryRow,
-    ui_scale: UiScale,
-) {
-    let row_name = format!("fabricad.primary.row.{row_index}");
-    let row = document.add_child(
-        parent,
-        UiNode::container(
-            row_name.clone(),
-            layout::with_gap_all(
-                layout::with_size(
-                    layout::row(),
-                    layout::percent(1.0),
-                    layout::px(ui_scale.value(38.0)),
-                ),
-                ui_scale.value(8.0),
-            ),
-        )
-        .with_visual(UiVisual::panel(
-            if row_index % 2 == 0 {
-                COLOR_PANEL_ALT
-            } else {
-                COLOR_PANEL_BG
-            },
-            Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
-            ui_scale.value(2.0),
-        )),
-    );
-    if let Some(action) = row_data.action.as_ref() {
-        let button_name = action
-            .strip_prefix("fabricad.viewctl.")
-            .map(|action| format!("fabricad.primary.action.{row_index}.{action}"))
-            .unwrap_or_else(|| format!("{row_name}.action.{}", row_data.name));
-        add_button(
-            document,
-            row,
-            button_name,
-            compact_button_label(&row_data.title, 24),
-            row_data.selected,
-            primary_cell_layout(1.4),
-            ui_scale,
-        );
-    } else {
-        add_primary_cell(
-            document,
-            row,
-            format!("{row_name}.title.{}", row_data.name),
-            compact_button_label(&row_data.title, 26),
-            1.4,
-            false,
-            ui_scale,
-        );
-    }
-    add_primary_cell(
-        document,
-        row,
-        format!("{row_name}.value.{}", row_data.name),
-        compact_button_label(&row_data.value, 22),
-        1.0,
-        false,
-        ui_scale,
-    );
-    add_primary_cell(
-        document,
-        row,
-        format!("{row_name}.detail.{}", row_data.name),
-        compact_button_label(&row_data.detail, 72),
-        2.4,
-        false,
-        ui_scale,
     );
 }
 
@@ -14826,14 +15929,8 @@ fn add_process_control_view_panel(
             ),
         ),
     );
-    for (index, loop_definition) in app
-        .workspace
-        .process_control
-        .loops
-        .iter()
-        .take(5)
-        .enumerate()
-    {
+    let filtered_loops = filtered_control_loops(app);
+    for (index, loop_definition) in filtered_loops.iter().take(5).enumerate() {
         add_button(
             document,
             loops,
@@ -16054,35 +17151,19 @@ fn add_primary_text_cell(
     );
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum OverviewTone {
-    Danger,
-    Warning,
-    Success,
-    Info,
-    Neutral,
-}
-
 #[derive(Clone, Debug)]
 struct DashboardMetric {
     label: String,
     value: String,
     detail: String,
-    tone: OverviewTone,
 }
 
 impl DashboardMetric {
-    fn new(
-        label: impl Into<String>,
-        value: impl Into<String>,
-        detail: impl Into<String>,
-        tone: OverviewTone,
-    ) -> Self {
+    fn new(label: impl Into<String>, value: impl Into<String>, detail: impl Into<String>) -> Self {
         Self {
             label: label.into(),
             value: value.into(),
             detail: detail.into(),
-            tone,
         }
     }
 }
@@ -16098,23 +17179,16 @@ fn workflow_dashboard_metrics(app: &FabricadApp) -> Vec<DashboardMetric> {
                 .flattened_shape_count_estimate()
                 .to_string(),
             format!("{} layers", workspace.document.layers.len()),
-            OverviewTone::Info,
         ),
         DashboardMetric::new(
             "Flow",
             workspace.process_flow.route.nodes.len().to_string(),
             format!("{} findings", workspace.process_flow.findings().len()),
-            if process_flow_error_count(workspace) > 0 {
-                OverviewTone::Danger
-            } else {
-                OverviewTone::Success
-            },
         ),
         DashboardMetric::new(
             "WIP",
             workspace.mes.lots.len().to_string(),
             format!("{} dispatches", dispatch.assignments.len()),
-            OverviewTone::Warning,
         ),
         DashboardMetric::new(
             "Factory",
@@ -16124,17 +17198,11 @@ fn workflow_dashboard_metrics(app: &FabricadApp) -> Vec<DashboardMetric> {
                 equipment_running_count(workspace),
                 equipment_alarm_count(workspace)
             ),
-            if equipment_alarm_count(workspace) > 0 {
-                OverviewTone::Danger
-            } else {
-                OverviewTone::Success
-            },
         ),
         DashboardMetric::new(
             "Quality",
             workflow_focus_yield_label(app),
             format!("{} notebook entries", workspace.lab_notebook.entries.len()),
-            OverviewTone::Info,
         ),
     ]
 }
@@ -16148,7 +17216,6 @@ fn mask_dashboard_metrics(app: &FabricadApp, compact_rows: bool) -> Vec<Dashboar
             "Reticle",
             display_reticle_identifier(prep.reticle.id.as_str()),
             format!("{} fields", report.field_count),
-            OverviewTone::Info,
         ),
         DashboardMetric::new(
             "Issues",
@@ -16158,25 +17225,16 @@ fn mask_dashboard_metrics(app: &FabricadApp, compact_rows: bool) -> Vec<Dashboar
                 report.error_count(),
                 report.warning_count()
             ),
-            if report.error_count() > 0 {
-                OverviewTone::Danger
-            } else if report.warning_count() > 0 {
-                OverviewTone::Warning
-            } else {
-                OverviewTone::Success
-            },
         ),
         DashboardMetric::new(
             "Layers",
             report.layer_count.to_string(),
             format!("{} printable shapes", report.printable_shape_count),
-            OverviewTone::Neutral,
         ),
         DashboardMetric::new(
             "Grouping",
             app.mask_issue_grouping.label(),
             format!("{} groups", mask_issue_group_count(app, &report)),
-            OverviewTone::Info,
         ),
         DashboardMetric::new(
             "Exposures",
@@ -16194,7 +17252,6 @@ fn mask_dashboard_metrics(app: &FabricadApp, compact_rows: bool) -> Vec<Dashboar
                     }
                 })
                 .unwrap_or_else(|| "unlinked lot".to_string()),
-            OverviewTone::Neutral,
         ),
     ]
 }
@@ -16206,39 +17263,26 @@ fn layout_diff_dashboard_metrics(app: &FabricadApp) -> Vec<DashboardMetric> {
             "Changes",
             layout_diff_filtered_change_count(app, &report).to_string(),
             format!("{} total", layout_diff_total_changes(&report)),
-            if report.summary.modified_shapes + report.summary.removed_shapes > 0 {
-                OverviewTone::Warning
-            } else {
-                OverviewTone::Info
-            },
         ),
         DashboardMetric::new(
             "Added",
             report.summary.added_shapes.to_string(),
             format!("{} removed", report.summary.removed_shapes),
-            OverviewTone::Info,
         ),
         DashboardMetric::new(
             "Modified",
             report.summary.modified_shapes.to_string(),
             format!("{} layers", report.layers.len()),
-            if report.summary.modified_shapes > 0 {
-                OverviewTone::Warning
-            } else {
-                OverviewTone::Success
-            },
         ),
         DashboardMetric::new(
             "Sources",
             app.layout_diff_baseline.label(),
             format!("candidate {}", app.layout_diff_candidate.label()),
-            OverviewTone::Neutral,
         ),
         DashboardMetric::new(
             "Review",
             app.layout_diff_review_state.label(),
             app.layout_diff_change_filter.detail_label(),
-            OverviewTone::Info,
         ),
     ]
 }
@@ -16252,23 +17296,16 @@ fn fab_control_dashboard_metrics(app: &FabricadApp) -> Vec<DashboardMetric> {
             "Tools",
             tools.to_string(),
             format!("{} running", equipment_running_count(workspace)),
-            OverviewTone::Info,
         ),
         DashboardMetric::new(
             "Alarms",
             equipment_alarm_count(workspace).to_string(),
             "active equipment alarms",
-            if equipment_alarm_count(workspace) > 0 {
-                OverviewTone::Danger
-            } else {
-                OverviewTone::Success
-            },
         ),
         DashboardMetric::new(
             "Telemetry",
             equipment_sample_count(workspace).to_string(),
             "recent sensor samples",
-            OverviewTone::Neutral,
         ),
         DashboardMetric::new(
             "Selected",
@@ -16278,7 +17315,6 @@ fn fab_control_dashboard_metrics(app: &FabricadApp) -> Vec<DashboardMetric> {
             selected
                 .map(|tool| tool.state.label().to_string())
                 .unwrap_or_else(|| "no tool selected".to_string()),
-            OverviewTone::Info,
         ),
         DashboardMetric::new(
             "Recipe",
@@ -16286,7 +17322,6 @@ fn fab_control_dashboard_metrics(app: &FabricadApp) -> Vec<DashboardMetric> {
                 .map(equipment_recipe_summary)
                 .unwrap_or_else(|| "n/a".to_string()),
             "loaded/draft recipe",
-            OverviewTone::Neutral,
         ),
     ]
 }
@@ -16298,29 +17333,21 @@ fn traceability_dashboard_metrics(app: &FabricadApp) -> Vec<DashboardMetric> {
             "Lots",
             summary.lot_count.to_string(),
             format!("{} wafers", summary.wafer_count),
-            OverviewTone::Info,
         ),
         DashboardMetric::new(
             "Lineage",
             trace_related_wafer_count(app).to_string(),
             "related wafers",
-            OverviewTone::Info,
         ),
         DashboardMetric::new(
             "Impact",
             trace_impact_count(app).to_string(),
             app.trace_impact_mode.label(),
-            if trace_impact_count(app) > 0 {
-                OverviewTone::Warning
-            } else {
-                OverviewTone::Success
-            },
         ),
         DashboardMetric::new(
             "Records",
             summary.process_record_count.to_string(),
             format!("{} material lots", summary.material_lot_count),
-            OverviewTone::Neutral,
         ),
         DashboardMetric::new(
             "Events",
@@ -16329,7 +17356,6 @@ fn traceability_dashboard_metrics(app: &FabricadApp) -> Vec<DashboardMetric> {
                 "{} splits / {} merges",
                 summary.split_count, summary.merge_count
             ),
-            OverviewTone::Neutral,
         ),
     ]
 }
@@ -17075,7 +18101,7 @@ fn inventory_lot_primary_row<'a>(app: &'a FabricadApp) -> impl Fn(&'a MaterialLo
     }
 }
 
-fn inventory_selected_lot_rows(app: &FabricadApp, lot: &MaterialLot) -> Vec<PrimaryRow> {
+fn inventory_selected_lot_rows(_app: &FabricadApp, lot: &MaterialLot) -> Vec<PrimaryRow> {
     let mut rows = vec![
         PrimaryRow::new(
             format!("inventory-detail-stock-{}", lot.id),
@@ -19861,39 +20887,6 @@ fn metrology_summary_label(summary: MeasurementSummary) -> String {
     }
 }
 
-fn metrology_status_compact_label(summary: MeasurementSummary) -> String {
-    format!(
-        "{} fail / {} outlier",
-        summary.fail_count, summary.outlier_count
-    )
-}
-
-fn metrology_summary_compact_label(summary: MeasurementSummary) -> String {
-    let (Some(mean), Some(stddev)) = (summary.mean, summary.stddev) else {
-        return "No summary".to_string();
-    };
-    let mean = metrology_format_value(summary.kind, mean);
-    let stddev = metrology_format_value(summary.kind, stddev);
-    let unit = summary.kind.unit();
-    if unit.is_empty() {
-        return format!("{mean} +/- {stddev}");
-    }
-    let with_unit = format!("{mean} +/- {stddev} {unit}");
-    if with_unit.chars().count() <= 20 {
-        with_unit
-    } else {
-        format!("{mean} +/- {stddev}")
-    }
-}
-
-fn metrology_defects_compact_label(map: &WaferMap) -> String {
-    format!(
-        "{} defects; {} notes",
-        map.defects.len(),
-        map.annotations.len()
-    )
-}
-
 fn metrology_selected_die_label(map: &WaferMap, selected_die: Option<DieCoord>) -> String {
     let Some(die) = selected_die else {
         return "No selected die - use Next or attention buttons".to_string();
@@ -21012,6 +22005,78 @@ fn safety_limit_label(limit: &layout_model::safety::SafetyLimit) -> String {
     }
 }
 
+fn traceability_lot_rows(app: &FabricadApp) -> Vec<PrimaryRow> {
+    let genealogy = &app.workspace.genealogy;
+    genealogy
+        .lot_ids()
+        .into_iter()
+        .take(10)
+        .map(|lot_id| {
+            let wafer_count = genealogy.wafer_refs_for_lot(&lot_id).len();
+            PrimaryRow::new(
+                format!("trace-lot-{lot_id}"),
+                trace_lot_label(genealogy, &lot_id, 32),
+                format!("{wafer_count} wafers"),
+                if app.selected_trace_lot.as_ref() == Some(&lot_id) {
+                    "selected lot".to_string()
+                } else {
+                    "available lot".to_string()
+                },
+            )
+            .action(
+                format!("fabricad.viewctl.trace.lot.{lot_id}"),
+                app.selected_trace_lot.as_ref() == Some(&lot_id),
+            )
+        })
+        .collect()
+}
+
+fn traceability_wafer_rows(app: &FabricadApp) -> Vec<PrimaryRow> {
+    let Some(lot_id) = app
+        .selected_trace_lot
+        .clone()
+        .or_else(|| app.workspace.genealogy.lot_ids().into_iter().next())
+    else {
+        return Vec::new();
+    };
+    let related_wafers = selected_trace_wafer_ref(app)
+        .map(|wafer| {
+            app.workspace
+                .genealogy
+                .wafer_lineage(&wafer)
+                .into_iter()
+                .chain(app.workspace.genealogy.wafer_descendants(&wafer))
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    app.workspace
+        .genealogy
+        .wafer_refs_for_lot(&lot_id)
+        .into_iter()
+        .filter(|wafer| {
+            !app.trace_related_only || related_wafers.is_empty() || related_wafers.contains(wafer)
+        })
+        .take(10)
+        .map(|wafer| {
+            let selected = app.selected_trace_lot.as_ref() == Some(&wafer.lot_id)
+                && app.selected_trace_wafer.as_ref() == Some(&wafer.wafer_id);
+            PrimaryRow::new(
+                format!("trace-wafer-{}-{}", wafer.lot_id, wafer.wafer_id),
+                trace_wafer_label(&wafer),
+                trace_wafer_context_label(&app.workspace.genealogy, &wafer),
+                trace_latest_step_label(app, &wafer),
+            )
+            .action(
+                format!(
+                    "fabricad.viewctl.trace.wafer.{}|{}",
+                    wafer.lot_id, wafer.wafer_id
+                ),
+                selected,
+            )
+        })
+        .collect()
+}
+
 fn traceability_primary_rows(app: &FabricadApp) -> Vec<PrimaryRow> {
     let Some(lot_id) = app
         .selected_trace_lot
@@ -21728,10 +22793,8 @@ fn process_control_primary_rows(app: &FabricadApp) -> Vec<PrimaryRow> {
         .unwrap_or_default();
     if rows.is_empty() {
         rows.extend(
-            app.workspace
-                .process_control
-                .loops
-                .iter()
+            filtered_control_loops(app)
+                .into_iter()
                 .take(10)
                 .map(|loop_definition| {
                     PrimaryRow::new(
@@ -22294,15 +23357,6 @@ fn notebook_link_value_label(kind: NotebookLinkKind, value: &str) -> String {
         NotebookLinkKind::Metrology | NotebookLinkKind::Image => {
             display_notebook_shared_link_label(value)
         }
-    }
-}
-
-fn notebook_entry_button_label(entry: &layout_model::notebook::NotebookEntry) -> String {
-    match entry.title.as_str() {
-        "Reduce poly etch residue" => "Etch residue".to_string(),
-        "Photoresist coat uniformity check" => "PR coat check".to_string(),
-        "Night shift handoff" => "Shift handoff".to_string(),
-        _ => compact_button_label(&entry.title, 18),
     }
 }
 
@@ -23758,15 +24812,8 @@ fn maintenance_control_rows(app: &FabricadApp, compact_rows: bool) -> Vec<Vec<Vi
 
 fn environment_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
     let mut rows: Vec<Vec<ViewControlButton>> = Vec::new();
-    for chunk in app
-        .workspace
-        .environment
-        .sensors
-        .iter()
-        .take(8)
-        .collect::<Vec<_>>()
-        .chunks(2)
-    {
+    let ordered_sensors = ordered_environment_sensors(app);
+    for chunk in ordered_sensors.iter().take(8).collect::<Vec<_>>().chunks(2) {
         rows.push(
             chunk
                 .iter()
@@ -24237,15 +25284,20 @@ fn process_flow_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
 
 fn process_control_rows(app: &FabricadApp) -> Vec<Vec<ViewControlButton>> {
     let mut rows: Vec<Vec<ViewControlButton>> = Vec::new();
-    for chunk in app
-        .workspace
-        .process_control
-        .loops
-        .iter()
-        .take(6)
-        .collect::<Vec<_>>()
-        .chunks(2)
-    {
+    rows.push(
+        ControlLoopFilter::ALL
+            .iter()
+            .map(|filter| {
+                ViewControlButton::new(
+                    format!("fabricad.viewctl.process_control.filter.{}", filter.slug()),
+                    filter.label(),
+                    app.process_control_loop_filter == *filter,
+                )
+            })
+            .collect(),
+    );
+    let loops = filtered_control_loops(app);
+    for chunk in loops.iter().take(6).collect::<Vec<_>>().chunks(2) {
         rows.push(
             chunk
                 .iter()
@@ -24900,8 +25952,11 @@ fn add_control_panel(
     title: &str,
     rows: Vec<Vec<ViewControlButton>>,
     ui_scale: UiScale,
+    body_width: f32,
 ) {
-    add_control_panel_with_button_width(document, parent, name, title, rows, 132.0, ui_scale);
+    add_control_panel_with_button_width(
+        document, parent, name, title, rows, 132.0, ui_scale, body_width,
+    );
 }
 
 fn add_control_panel_with_button_width(
@@ -24912,12 +25967,30 @@ fn add_control_panel_with_button_width(
     rows: Vec<Vec<ViewControlButton>>,
     button_width: f32,
     ui_scale: UiScale,
+    body_width: f32,
 ) {
-    let row_height = ui_scale.value(30.0);
-    let gap = ui_scale.value(6.0);
-    let height = ui_scale.value(44.0)
-        + rows.len() as f32 * row_height
-        + rows.len().saturating_sub(1) as f32 * gap;
+    let title_height = ui_scale.value(22.0);
+    let label_height = ui_scale.value(14.0);
+    let button_height = ui_scale.value(26.0);
+    let button_gap = ui_scale.value(4.0);
+    let group_gap = ui_scale.value(12.0);
+    let vertical_gap = ui_scale.value(4.0);
+    let padding = ui_scale.value(8.0);
+    let base_button_width = ui_scale.value(button_width.min(124.0));
+    let group_height = label_height + ui_scale.value(2.0) + button_height;
+    let max_group_row_width = (body_width - ui_scale.value(44.0)).max(ui_scale.value(240.0));
+    let groups = control_panel_group_rows(
+        &rows,
+        base_button_width,
+        button_gap,
+        group_gap,
+        max_group_row_width,
+    );
+    let group_row_count = groups.len().max(1);
+    let height = padding * 2.0
+        + title_height
+        + group_row_count as f32 * group_height
+        + group_row_count as f32 * vertical_gap;
     let panel = document.add_child(
         parent,
         UiNode::container(
@@ -24925,9 +25998,9 @@ fn add_control_panel_with_button_width(
             layout::with_padding_all(
                 layout::with_gap_all(
                     layout::with_size(layout::column(), layout::percent(1.0), layout::px(height)),
-                    gap,
+                    vertical_gap,
                 ),
-                ui_scale.value(10.0),
+                padding,
             ),
         )
         .with_visual(UiVisual::panel(
@@ -24942,76 +26015,479 @@ fn add_control_panel_with_button_width(
         format!("{name}.title"),
         title,
         text_style(ui_scale.value(15.0), FontWeight::BOLD, COLOR_TEXT),
-        layout::size(layout::percent(1.0), layout::px(ui_scale.value(24.0))),
+        layout::size(layout::percent(1.0), layout::px(title_height)),
     );
 
-    for (row_index, row_buttons) in rows.iter().enumerate() {
+    for (group_row_index, group_row) in groups.iter().enumerate() {
         let row = document.add_child(
             panel,
             UiNode::container(
-                format!("{name}.row.{row_index}"),
+                format!("{name}.group_row.{group_row_index}"),
                 layout::with_gap_all(
-                    layout::with_size(layout::row(), layout::percent(1.0), layout::px(row_height)),
-                    gap,
+                    layout::with_size(
+                        layout::row(),
+                        layout::percent(1.0),
+                        layout::px(group_height),
+                    ),
+                    group_gap,
                 ),
             ),
         );
-        for button in row_buttons {
-            add_button(
-                document,
-                row,
-                button.name.clone(),
-                button.label.clone(),
-                button.selected,
-                layout::size(
-                    layout::px(ui_scale.value(button_width)),
-                    layout::px(ui_scale.value(28.0)),
-                ),
-                ui_scale,
+
+        for &row_index in group_row {
+            let row_buttons = &rows[row_index];
+            let row_label = control_row_label(name, row_index, row_buttons);
+            let group_button_width = control_panel_button_width(
+                row_buttons.len(),
+                base_button_width,
+                button_gap,
+                max_group_row_width,
             );
+            let group_width = control_panel_group_width(
+                row_buttons.len(),
+                group_button_width,
+                button_gap,
+                max_group_row_width,
+            );
+            let group = document.add_child(
+                row,
+                UiNode::container(
+                    format!("{name}.row.{row_index}"),
+                    layout::with_gap_all(
+                        layout::with_size(
+                            layout::column(),
+                            layout::px(group_width),
+                            layout::px(group_height),
+                        ),
+                        ui_scale.value(2.0),
+                    ),
+                ),
+            );
+            add_text(
+                document,
+                group,
+                format!("{name}.row.{row_index}.label"),
+                row_label,
+                text_style(ui_scale.value(11.0), FontWeight::BOLD, COLOR_TEXT_MUTED),
+                layout::size(layout::px(group_width), layout::px(label_height)),
+            );
+            let buttons = document.add_child(
+                group,
+                UiNode::container(
+                    format!("{name}.row.{row_index}.buttons"),
+                    layout::with_gap_all(
+                        layout::with_size(
+                            layout::row(),
+                            layout::px(group_width),
+                            layout::px(button_height),
+                        ),
+                        button_gap,
+                    ),
+                ),
+            );
+            for button in row_buttons {
+                add_button(
+                    document,
+                    buttons,
+                    button.name.clone(),
+                    button.label.clone(),
+                    button.selected,
+                    layout::size(layout::px(group_button_width), layout::px(button_height)),
+                    ui_scale,
+                );
+            }
         }
     }
 }
 
-fn add_menu_drawer_toggles(
-    document: &mut UiDocument,
-    parent: operad::UiNodeId,
-    app: &FabricadApp,
-    viewport_width: f32,
-    ui_scale: UiScale,
-) {
-    let compact = viewport_width < ui_scale.value(760.0);
-    if app.has_inspector_panel() {
-        add_button(
-            document,
-            parent,
-            "fabricad.drawer.inspector",
-            if compact { "Info" } else { "Details" },
-            app.show_inspector,
-            layout::size(
-                layout::px(ui_scale.value(if compact { 58.0 } else { 112.0 })),
-                layout::px(ui_scale.value(22.0)),
-            ),
-            ui_scale,
-        );
+fn control_panel_group_rows(
+    rows: &[Vec<ViewControlButton>],
+    base_button_width: f32,
+    button_gap: f32,
+    group_gap: f32,
+    max_width: f32,
+) -> Vec<Vec<usize>> {
+    let mut grouped_rows = Vec::new();
+    let mut current_row = Vec::new();
+    let mut current_width = 0.0;
+    for (row_index, row) in rows.iter().enumerate() {
+        let group_button_width =
+            control_panel_button_width(row.len(), base_button_width, button_gap, max_width);
+        let group_width =
+            control_panel_group_width(row.len(), group_button_width, button_gap, max_width);
+        let next_width = if current_row.is_empty() {
+            group_width
+        } else {
+            current_width + group_gap + group_width
+        };
+        if !current_row.is_empty() && next_width > max_width {
+            grouped_rows.push(current_row);
+            current_row = Vec::new();
+            current_width = 0.0;
+        }
+        current_width = if current_row.is_empty() {
+            group_width
+        } else {
+            current_width + group_gap + group_width
+        };
+        current_row.push(row_index);
     }
-    if app.has_secondary_panel() {
-        add_button(
-            document,
-            parent,
-            "fabricad.drawer.layers",
-            if compact {
-                "Side"
+    if !current_row.is_empty() {
+        grouped_rows.push(current_row);
+    }
+    grouped_rows
+}
+
+fn control_panel_button_width(
+    button_count: usize,
+    base_button_width: f32,
+    button_gap: f32,
+    max_group_width: f32,
+) -> f32 {
+    let button_count = button_count.max(1);
+    let fit_width = (max_group_width - button_count.saturating_sub(1) as f32 * button_gap)
+        / button_count as f32;
+    base_button_width.min(fit_width).max(52.0)
+}
+
+fn control_panel_group_width(
+    button_count: usize,
+    button_width: f32,
+    button_gap: f32,
+    max_group_width: f32,
+) -> f32 {
+    let button_count = button_count.max(1);
+    (button_count as f32 * button_width + button_count.saturating_sub(1) as f32 * button_gap)
+        .min(max_group_width)
+}
+
+fn control_row_label(
+    panel_name: &str,
+    row_index: usize,
+    row_buttons: &[ViewControlButton],
+) -> &'static str {
+    let Some(first) = row_buttons.first().map(|button| button.name.as_str()) else {
+        return "Controls";
+    };
+    if panel_name == "fabricad.viewctl.workflow" {
+        return match row_index {
+            0 => "Design",
+            1 => "Operations",
+            2 => "Materials",
+            3 => "Facilities",
+            4 => "Quality",
+            5 => "Trace",
+            6 => "Data",
+            _ => "Lot focus",
+        };
+    }
+    if panel_name == "fabricad.viewctl.fab" {
+        if first.contains(".fab.select.") {
+            return if row_index == 0 {
+                "Tools"
             } else {
-                app.secondary_panel_label()
-            },
-            app.show_layers,
-            layout::size(
-                layout::px(ui_scale.value(if compact { 58.0 } else { 108.0 })),
-                layout::px(ui_scale.value(22.0)),
-            ),
-            ui_scale,
-        );
+                "More tools"
+            };
+        }
+        if first.contains(".fab.recipe.") {
+            return "Recipe";
+        }
+        if first.contains(".fab.command.online") {
+            return "Run";
+        }
+        if first.contains(".fab.command.alarm") {
+            return "Service";
+        }
+    }
+    if first.contains(".layout_diff.demo_current") || first.contains(".layout_diff.empty_current") {
+        return "Load";
+    }
+    if first.contains(".layout_diff.reset_filters") {
+        return "Reset";
+    }
+    if first.contains(".workflow.open.") {
+        return "Open";
+    }
+    if first.contains(".workflow.load_demo") {
+        return "Data";
+    }
+    if first.contains(".workflow.focus_lot.") {
+        return "Lot focus";
+    }
+    if first.contains(".mask.lot.") {
+        return "Source lot";
+    }
+    if first.contains(".mask.severity.") {
+        return "Severity";
+    }
+    if first.contains(".mask.group.") {
+        return "Group by";
+    }
+    if first.contains(".mask.prev_page") || first.contains(".mask.next_page") {
+        return "Issues";
+    }
+    if first.contains(".mask.rebuild") || first.contains(".mask.clear_filters") {
+        return "Actions";
+    }
+    if first.contains(".layout_diff.baseline.") {
+        return "Baseline";
+    }
+    if first.contains(".layout_diff.candidate.") {
+        return "Candidate";
+    }
+    if first.contains(".layout_diff.swap") || first.contains(".layout_diff.toggle_changed_only") {
+        return "Compare";
+    }
+    if first.contains(".layout_diff.filter.") {
+        return "Filter";
+    }
+    if first.contains(".layout_diff.page_size.") {
+        return "Page size";
+    }
+    if first.contains(".layout_diff.prev_page") || first.contains(".layout_diff.next_page") {
+        return "Changes";
+    }
+    if first.contains(".layout_diff.review.") {
+        return "Review";
+    }
+    if first.contains(".layout_diff.demo_current")
+        || first.contains(".layout_diff.empty_current")
+        || first.contains(".layout_diff.reset_filters")
+    {
+        return "Actions";
+    }
+    if first.contains(".maintenance.history.") {
+        return "History";
+    }
+    if first.contains(".maintenance.tool.") {
+        return "Tool";
+    }
+    if first.contains(".maintenance.status.") {
+        return "Actions";
+    }
+    if first.contains(".environment.sensor.") {
+        return "Sensor";
+    }
+    if first.contains(".environment.zone.") {
+        return "Zone";
+    }
+    if first.contains(".inventory.lot.") {
+        return "Lot";
+    }
+    if first.contains(".scheduler.policy.") {
+        return "Policy";
+    }
+    if first.contains(".scheduler.priority.") {
+        return "Priority";
+    }
+    if first.contains(".scheduler.toggle_") {
+        return "Scope";
+    }
+    if first.contains(".scheduler.tool.") {
+        return "Tool";
+    }
+    if first.contains(".safety.tool.") {
+        return "Tool";
+    }
+    if first.contains(".safety.ack.condition.") {
+        return "Interlock";
+    }
+    if first.contains(".safety.ack.lockout.") {
+        return "Lockout";
+    }
+    if first.contains(".safety.ack.incident.") {
+        return "Incident";
+    }
+    if first.contains(".trace.lot.") {
+        return "Lot";
+    }
+    if first.contains(".trace.wafer.") {
+        return "Wafer";
+    }
+    if first.contains(".trace.toggle_related") {
+        return "Scope";
+    }
+    if first.contains(".trace.impact.") {
+        return "Impact";
+    }
+    if first.contains(".trace.detail.process.") {
+        return "Process";
+    }
+    if first.contains(".trace.detail.material.") {
+        return "Material";
+    }
+    if first.contains(".trace.detail.event.") {
+        return "Event";
+    }
+    if first.contains(".process_flow.toggle_errors") {
+        return "Review";
+    }
+    if first.contains(".process_flow.export") {
+        return "Export";
+    }
+    if first.contains(".process_flow.node.") {
+        return "Node";
+    }
+    if first.contains(".process_control.filter.") {
+        return "Filter";
+    }
+    if first.contains(".process_control.loop.") {
+        return "Loop";
+    }
+    if first.contains(".process_control.action.") {
+        return "Action";
+    }
+    if first.contains(".process_control.transition.") {
+        return "State";
+    }
+    if first.contains(".spc.severity.") {
+        return "Severity";
+    }
+    if first.contains(".spc.source.") {
+        return "Source";
+    }
+    if first.contains(".spc.chart.") {
+        return "Chart";
+    }
+    if first.contains(".spc.trace.") {
+        return "Trace";
+    }
+    if first.contains(".spc.clear_context") {
+        return "Actions";
+    }
+    if first.contains(".metrology.mode.") {
+        return "Mode";
+    }
+    if first.contains(".metrology.kind.") {
+        return "Measure";
+    }
+    if first.contains(".metrology.failed_only")
+        || first.contains(".metrology.next_attention")
+        || first.contains(".metrology.clear_die")
+    {
+        return "Review";
+    }
+    if first.contains(".yield.attention") {
+        return "Focus";
+    }
+    if first.contains(".yield.lot.") {
+        return "Lot";
+    }
+    if first.contains(".yield.wafer.") {
+        return "Wafer";
+    }
+    if first.contains(".cross_section.step.") {
+        return "Step";
+    }
+    if first.contains(".cross_section.toggle_") {
+        return "Display";
+    }
+    if first.contains(".cross_section.material.") {
+        return "Material";
+    }
+    if first.contains(".notebook.preview") {
+        return "Mode";
+    }
+    if first.contains(".notebook.entry_action.") {
+        return "Add";
+    }
+    if first.contains(".notebook.tag.") {
+        return "Tag";
+    }
+    if first.contains(".notebook.link.") {
+        return "Link";
+    }
+    if first.contains(".notebook.focus_link.") {
+        return "Focus";
+    }
+    if first.contains(".notebook.entry.") {
+        return "Entry";
+    }
+    if first.contains(".experiment.pending_only") {
+        return "Queue";
+    }
+    if first.contains(".experiment.use_demo") {
+        return "Capture";
+    }
+    if first.contains(".experiment.response.") {
+        return "Response";
+    }
+    if first.contains(".experiment.filter.") {
+        return "Filter";
+    }
+    if first.contains(".experiment.lot.") {
+        return "Lot";
+    }
+    if first.contains(".experiment.run.") {
+        return "Run";
+    }
+    if first.contains(".layout.view.") {
+        return "View";
+    }
+    if first.contains(".layout.toggle_grid") || first.contains(".layout.toggle_snap") {
+        return "Viewport";
+    }
+    if first.contains(".layout.toggle_drc") || first.contains(".layout.run_drc") {
+        return "Review";
+    }
+    if first.contains(".layout.add_layer") || first.contains(".layout.layer.") {
+        return "Layer";
+    }
+    if first.contains(".layout.toggle_layer.") {
+        return "Visibility";
+    }
+    if first.contains(".layout.shape.") {
+        return "Shape";
+    }
+    if first.contains(".layout.copy")
+        || first.contains(".layout.paste")
+        || first.contains(".layout.duplicate")
+        || first.contains(".layout.delete")
+    {
+        return "Edit";
+    }
+    if first.contains(".layout.clear_selection") || first.contains(".layout.connectivity") {
+        return "Selection";
+    }
+    if first.contains(".select.") {
+        return "Select";
+    }
+    if first.contains(".recipe.") {
+        return "Recipe";
+    }
+    if first.contains(".command.") {
+        return "Command";
+    }
+    if first.contains(".filter.") {
+        return "Filter";
+    }
+    if first.contains(".mode.") || first.contains(".kind.") {
+        return "Mode";
+    }
+    if first.contains(".page") {
+        return "Page";
+    }
+    if first.contains(".ack") || first.contains(".clear") || first.contains(".reset") {
+        return "Actions";
+    }
+    match (panel_name, row_index) {
+        ("fabricad.viewctl.workflow", _) => "Open",
+        ("fabricad.viewctl.fab", 0) => "Tool",
+        ("fabricad.viewctl.maintenance", 0) => "Tool",
+        ("fabricad.viewctl.environment", 0) => "Zone",
+        ("fabricad.viewctl.inventory", 0) => "Lot",
+        ("fabricad.viewctl.scheduler", 0) => "Tool",
+        ("fabricad.viewctl.safety", 0) => "Tool",
+        ("fabricad.viewctl.trace", 0) => "Lot",
+        ("fabricad.viewctl.process_flow", 0) => "Node",
+        ("fabricad.viewctl.process_control", 0) => "Loop",
+        ("fabricad.viewctl.spc", 0) => "Chart",
+        ("fabricad.viewctl.cross_section", 0) => "Step",
+        ("fabricad.viewctl.metrology", 0) => "Map",
+        ("fabricad.viewctl.yield", 0) => "Lot",
+        ("fabricad.viewctl.experiment", 0) => "Response",
+        ("fabricad.viewctl.notebook", 0) => "Entry",
+        _ => "Controls",
     }
 }
 
@@ -25410,10 +26886,6 @@ fn layout_editor_inspector_sections(app: &FabricadApp) -> Vec<DetailSection> {
                         "grid={}, snap={}, drc={}",
                         app.show_grid, app.snap_enabled, app.show_drc_overlay
                     ),
-                ),
-                (
-                    "Frame".to_string(),
-                    format_fps_label(app.layout_frame_ms.get()),
                 ),
             ],
         ),
@@ -26370,7 +27842,7 @@ fn add_inspector_panel(
         title,
         app,
         sections,
-        ui_scale.value(280.0),
+        inspector_panel_width(ui_scale),
         ui_scale,
     );
 }
@@ -26381,7 +27853,7 @@ fn add_layout_layers_panel(
     app: &FabricadApp,
     ui_scale: UiScale,
 ) {
-    let width = ui_scale.value(244.0);
+    let width = secondary_panel_width(ui_scale);
     let panel = document.add_child(
         parent,
         UiNode::container(
@@ -26419,10 +27891,21 @@ fn add_layout_layers_panel(
         document,
         panel,
         "fabricad.secondary.title",
-        "Layers",
+        app.secondary_panel_label(),
         text_style(ui_scale.value(16.0), FontWeight::BOLD, COLOR_TEXT),
         layout::size(layout::percent(1.0), layout::px(ui_scale.value(26.0))),
     );
+    if app.active_view == StartupView::Layout3d {
+        add_layout_3d_stack_panel_rows(document, panel, app, ui_scale);
+        add_text(
+            document,
+            panel,
+            "fabricad.secondary.layers.title",
+            "Layers",
+            text_style(ui_scale.value(13.0), FontWeight::BOLD, COLOR_TEXT_MUTED),
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(20.0))),
+        );
+    }
     add_button(
         document,
         panel,
@@ -26536,6 +28019,45 @@ fn add_layout_layers_panel(
     }
 }
 
+fn add_layout_3d_stack_panel_rows(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    app: &FabricadApp,
+    ui_scale: UiScale,
+) {
+    let mut layers = app
+        .workspace
+        .document
+        .layers
+        .values()
+        .filter(|layer| !matches!(layer.process, ProcessLayer::Annotation))
+        .collect::<Vec<_>>();
+    layers.sort_by_key(|layer| (layer.display_order, layer.id));
+    if layers.is_empty() {
+        add_text(
+            document,
+            parent,
+            "fabricad.secondary.stack.empty",
+            "No printable layers",
+            text_style(ui_scale.value(12.0), FontWeight::NORMAL, COLOR_TEXT_MUTED),
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(22.0))),
+        );
+        return;
+    }
+
+    for layer in layers.into_iter().take(8) {
+        let (z_min, z_max) = layer_3d_stack_range(layer.process);
+        add_text(
+            document,
+            parent,
+            format!("fabricad.secondary.stack.row.{}", layer.id.0),
+            format!("{:?}: {:.0}-{:.0}", layer.process, z_min, z_max),
+            text_style(ui_scale.value(12.0), FontWeight::NORMAL, COLOR_TEXT_MUTED),
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(20.0))),
+        );
+    }
+}
+
 fn add_secondary_panel(
     document: &mut UiDocument,
     parent: operad::UiNodeId,
@@ -26627,7 +28149,7 @@ fn add_secondary_panel(
         "fabricad.secondary",
         app.secondary_panel_label(),
         rows,
-        ui_scale.value(244.0),
+        secondary_panel_width(ui_scale),
         ui_scale,
     );
 }
@@ -26935,26 +28457,16 @@ fn add_detail_sections(
             ui_scale.value(2.0),
         )),
     );
-    for (section_index, section) in sections.iter().take(4).enumerate() {
-        add_text(
-            document,
-            panel,
-            format!("fabricad.details.{section_index}.title"),
-            section.title.clone(),
-            text_style(ui_scale.value(13.0), FontWeight::BOLD, COLOR_TEXT),
-            layout::size(layout::percent(1.0), layout::px(ui_scale.value(22.0))),
-        );
-        for (row_index, (label, value)) in section.rows.iter().take(5).enumerate() {
-            add_text(
-                document,
-                panel,
-                format!("fabricad.details.{section_index}.row.{row_index}"),
-                format!("{label}: {value}"),
-                text_style(ui_scale.value(12.0), FontWeight::NORMAL, COLOR_TEXT_MUTED),
-                layout::size(layout::percent(1.0), layout::px(ui_scale.value(20.0))),
-            );
-        }
-    }
+    add_collapsible_detail_sections(
+        document,
+        panel,
+        "fabricad.details",
+        app,
+        &sections,
+        4,
+        5,
+        ui_scale,
+    );
 }
 
 #[derive(Clone, Debug)]
@@ -26963,7 +28475,6 @@ enum MenuPanelItem {
         action: String,
         label: String,
         selected: bool,
-        checkable: bool,
         enabled: bool,
     },
     Label(String),
@@ -26976,7 +28487,6 @@ impl MenuPanelItem {
             action: action.into(),
             label: label.into(),
             selected: false,
-            checkable: false,
             enabled: true,
         }
     }
@@ -26986,7 +28496,6 @@ impl MenuPanelItem {
             action: action.into(),
             label: label.into(),
             selected,
-            checkable: true,
             enabled: true,
         }
     }
@@ -26996,7 +28505,6 @@ impl MenuPanelItem {
             action: action.into(),
             label: label.into(),
             selected: false,
-            checkable: false,
             enabled: false,
         }
     }
@@ -27006,37 +28514,6 @@ impl MenuPanelItem {
             Self::Action { .. } => ui_scale.value(28.0),
             Self::Label(_) => ui_scale.value(22.0),
             Self::Separator => ui_scale.value(1.0),
-        }
-    }
-
-    fn is_checkable(&self) -> bool {
-        matches!(
-            self,
-            Self::Action {
-                checkable: true,
-                ..
-            }
-        )
-    }
-
-    fn to_operad_menu_item(&self, fallback_id: impl Into<String>) -> OperadMenuItem {
-        match self {
-            Self::Action {
-                action,
-                label,
-                selected,
-                checkable,
-                enabled,
-            } => {
-                let item = if *checkable {
-                    OperadMenuItem::check(action.clone(), label.clone(), *selected)
-                } else {
-                    OperadMenuItem::command(action.clone(), label.clone())
-                };
-                if *enabled { item } else { item.disabled() }
-            }
-            Self::Label(label) => OperadMenuItem::command(fallback_id, label.clone()).disabled(),
-            Self::Separator => OperadMenuItem::separator(),
         }
     }
 }
@@ -27117,8 +28594,21 @@ fn add_menu_panel(
             ),
             MenuPanelItem::Separator,
             MenuPanelItem::Label("Theme".to_string()),
-            MenuPanelItem::selected("display.theme.dark", "Dark", app.dark_theme),
-            MenuPanelItem::selected("display.theme.light", "Light", !app.dark_theme),
+            MenuPanelItem::selected(
+                "display.theme.dark",
+                "Dark",
+                app.theme_preference == options::ThemePreference::Dark,
+            ),
+            MenuPanelItem::selected(
+                "display.theme.light",
+                "Light",
+                app.theme_preference == options::ThemePreference::Light,
+            ),
+            MenuPanelItem::selected(
+                "display.theme.system",
+                "System",
+                app.theme_preference == options::ThemePreference::System,
+            ),
             MenuPanelItem::Separator,
             MenuPanelItem::Label("Units".to_string()),
             MenuPanelItem::selected(
@@ -27291,96 +28781,6 @@ fn add_menu_panel(
                         0.0,
                     )),
                 );
-            }
-        }
-    }
-}
-
-fn add_operad_menu_list_panel(
-    document: &mut UiDocument,
-    parent: operad::UiNodeId,
-    name: impl Into<String>,
-    items: &[MenuPanelItem],
-    panel_width: f32,
-    left: f32,
-    viewport: UiSize,
-    ui_scale: UiScale,
-    z_index: i16,
-) {
-    let name = name.into();
-    let operad_items = items
-        .iter()
-        .enumerate()
-        .map(|(index, item)| item.to_operad_menu_item(format!("__label_{index}")))
-        .collect::<Vec<_>>();
-    let nodes = menu_list_popup(
-        document,
-        parent,
-        name,
-        AnchoredPopup::new(
-            UiRect::new(left, ui_scale.value(26.0), 0.0, 0.0),
-            UiRect::new(0.0, 0.0, viewport.width, viewport.height),
-            PopupPlacement::new(PopupSide::Bottom, PopupAlign::Start)
-                .with_offset(ui_scale.value(4.0))
-                .with_viewport_margin(ui_scale.value(4.0)),
-        ),
-        &operad_items,
-        None,
-        MenuListOptions {
-            width: panel_width,
-            row_height: ui_scale.value(28.0),
-            separator_height: ui_scale.value(8.0),
-            max_visible_rows: operad_items.len().max(1),
-            menu_visual: UiVisual::panel(
-                COLOR_CHROME_BG,
-                Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
-                0.0,
-            ),
-            item_visual: UiVisual::panel(
-                COLOR_BUTTON_BG,
-                Some(button_stroke(false, ui_scale)),
-                0.0,
-            ),
-            active_visual: UiVisual::panel(
-                COLOR_BUTTON_SELECTED,
-                Some(button_stroke(true, ui_scale)),
-                0.0,
-            ),
-            disabled_visual: UiVisual::panel(
-                COLOR_BUTTON_BG,
-                Some(button_stroke(false, ui_scale)),
-                0.0,
-            ),
-            text_style: text_style(ui_scale.value(13.0), FontWeight::NORMAL, COLOR_TEXT),
-            disabled_text_style: text_style(
-                ui_scale.value(12.0),
-                FontWeight::NORMAL,
-                COLOR_TEXT_MUTED,
-            ),
-            shortcut_text_style: text_style(
-                ui_scale.value(12.0),
-                FontWeight::NORMAL,
-                COLOR_TEXT_MUTED,
-            ),
-            destructive_text_style: text_style(
-                ui_scale.value(13.0),
-                FontWeight::NORMAL,
-                ColorRgba::new(238, 116, 106, 255),
-            ),
-            image_size: UiSize::new(ui_scale.value(18.0), ui_scale.value(18.0)),
-            z_index,
-            action_prefix: Some("fabricad.menu.item".to_string()),
-            ..Default::default()
-        },
-    );
-
-    for (row, item) in nodes.rows.iter().zip(items) {
-        if let MenuPanelItem::Action { action, .. } = item {
-            let row_node = document.node_mut(*row);
-            row_node.name = format!("fabricad.menu.item.{action}");
-            if let Some(accessibility) = row_node.accessibility.take() {
-                row_node.accessibility =
-                    Some(accessibility.action(AccessibilityAction::new("activate", "Activate")));
             }
         }
     }
@@ -27994,9 +29394,9 @@ fn add_options_panel(
     ui_scale: UiScale,
 ) {
     let width = (viewport.width - ui_scale.value(48.0))
-        .min(ui_scale.value(380.0))
-        .max(ui_scale.value(300.0));
-    let height = ui_scale.value(360.0);
+        .min(ui_scale.value(1120.0))
+        .max(ui_scale.value(420.0));
+    let height = (viewport.height - ui_scale.value(120.0)).max(ui_scale.value(420.0));
     let left = ((viewport.width - width) * 0.5).max(ui_scale.value(12.0));
     let top = ui_scale.value(64.0);
     let panel = document.add_child(
@@ -28031,64 +29431,1329 @@ fn add_options_panel(
         width,
         ui_scale,
     );
-    add_text(
-        document,
+    let content_height = (height - ui_scale.value(48.0)).max(ui_scale.value(240.0));
+    let content = document.add_child(
         panel,
-        "fabricad.options.label.theme",
-        "Theme",
-        text_style(ui_scale.value(12.0), FontWeight::BOLD, COLOR_TEXT_MUTED),
-        layout::size(layout::percent(1.0), layout::px(ui_scale.value(22.0))),
+        UiNode::container(
+            "fabricad.options.content",
+            UiNodeStyle {
+                layout: layout::with_padding_all(
+                    layout::with_gap_all(
+                        layout::with_size(
+                            layout::column(),
+                            layout::percent(1.0),
+                            layout::px(content_height),
+                        ),
+                        ui_scale.value(8.0),
+                    ),
+                    ui_scale.value(2.0),
+                )
+                .as_taffy_style()
+                .clone(),
+                clip: ClipBehavior::Clip,
+                ..Default::default()
+            },
+        )
+        .with_scroll(ScrollAxes::VERTICAL),
     );
-    add_menu_item_button(
+
+    let file = add_options_section(
         document,
-        panel,
-        "fabricad.menu.item.display.theme.dark",
-        "Dark",
-        app.dark_theme,
-        true,
-        layout::size(layout::percent(1.0), layout::px(ui_scale.value(28.0))),
+        content,
+        "fabricad.options.section.file",
+        "JSON file",
         ui_scale,
     );
-    add_menu_item_button(
+    add_options_value_text(
         document,
-        panel,
-        "fabricad.menu.item.display.theme.light",
-        "Light",
-        !app.dark_theme,
-        true,
-        layout::size(layout::percent(1.0), layout::px(ui_scale.value(28.0))),
+        file,
+        "fabricad.options.file.path",
+        format!("Path: {}", app.options_file_path_for_display()),
         ui_scale,
+    );
+    add_options_button_row(
+        document,
+        file,
+        "fabricad.options.file.actions",
+        vec![
+            (
+                "fabricad.options.action.file.save".to_string(),
+                "Save JSON".to_string(),
+                false,
+            ),
+            (
+                "fabricad.options.action.file.reload".to_string(),
+                "Reload JSON".to_string(),
+                false,
+            ),
+            (
+                "fabricad.options.action.file.defaults".to_string(),
+                "Defaults".to_string(),
+                false,
+            ),
+        ],
+        ui_scale,
+    );
+
+    let appearance = add_options_section(
+        document,
+        content,
+        "fabricad.options.section.appearance",
+        "Appearance",
+        ui_scale,
+    );
+    add_options_button_row(
+        document,
+        appearance,
+        "fabricad.options.appearance.theme",
+        vec![
+            (
+                "fabricad.options.action.appearance.theme.dark".to_string(),
+                "Dark".to_string(),
+                app.app_options.appearance.theme == options::ThemePreference::Dark,
+            ),
+            (
+                "fabricad.options.action.appearance.theme.light".to_string(),
+                "Light".to_string(),
+                app.app_options.appearance.theme == options::ThemePreference::Light,
+            ),
+            (
+                "fabricad.options.action.appearance.theme.system".to_string(),
+                "System".to_string(),
+                app.app_options.appearance.theme == options::ThemePreference::System,
+            ),
+        ],
+        ui_scale,
+    );
+    add_options_button_row(
+        document,
+        appearance,
+        "fabricad.options.appearance.scale",
+        vec![
+            (
+                "fabricad.options.action.appearance.ui_scale.100".to_string(),
+                "100%".to_string(),
+                (app.app_options.appearance.ui_scale - 1.0).abs() < f32::EPSILON,
+            ),
+            (
+                "fabricad.options.action.appearance.ui_scale.125".to_string(),
+                "125%".to_string(),
+                (app.app_options.appearance.ui_scale - 1.25).abs() < f32::EPSILON,
+            ),
+            (
+                "fabricad.options.action.appearance.ui_scale.150".to_string(),
+                "150%".to_string(),
+                (app.app_options.appearance.ui_scale - 1.5).abs() < f32::EPSILON,
+            ),
+            (
+                "fabricad.options.action.appearance.ui_scale.200".to_string(),
+                "200%".to_string(),
+                (app.app_options.appearance.ui_scale - 2.0).abs() < f32::EPSILON,
+            ),
+            (
+                "fabricad.options.action.appearance.dense_mode".to_string(),
+                "Dense".to_string(),
+                app.app_options.appearance.dense_mode,
+            ),
+        ],
+        ui_scale,
+    );
+    add_options_button_row(
+        document,
+        appearance,
+        "fabricad.options.appearance.units",
+        UnitDisplay::ALL
+            .iter()
+            .map(|unit| {
+                (
+                    format!("fabricad.menu.item.display.units.{}", unit.slug()),
+                    unit.label().to_string(),
+                    app.unit_display == *unit,
+                )
+            })
+            .collect(),
+        ui_scale,
+    );
+
+    let shell = add_options_section(
+        document,
+        content,
+        "fabricad.options.section.shell",
+        "Shell and panels",
+        ui_scale,
+    );
+    add_options_button_row(
+        document,
+        shell,
+        "fabricad.options.shell.panels",
+        vec![
+            (
+                "fabricad.menu.item.display.inspector".to_string(),
+                "Details".to_string(),
+                app.show_inspector,
+            ),
+            (
+                "fabricad.menu.item.display.secondary_panel".to_string(),
+                app.secondary_panel_label().to_string(),
+                app.show_layers,
+            ),
+            (
+                "fabricad.menu.item.view.sidebar_modules".to_string(),
+                "Sidebar modules".to_string(),
+                app.show_sidebar_modules,
+            ),
+            (
+                "fabricad.menu.item.tools.diagnostics".to_string(),
+                "Diagnostics".to_string(),
+                app.show_diagnostics_panel,
+            ),
+        ],
+        ui_scale,
+    );
+    add_options_button_row(
+        document,
+        shell,
+        "fabricad.options.shell.nav",
+        vec![
+            (
+                "fabricad.sidebar.default".to_string(),
+                "All nav".to_string(),
+                false,
+            ),
+            (
+                "fabricad.sidebar.none".to_string(),
+                "No nav".to_string(),
+                false,
+            ),
+            (
+                "fabricad.options.action.shell.command_palette_on_start".to_string(),
+                "Palette on start".to_string(),
+                app.app_options.shell.show_command_palette_on_start,
+            ),
+        ],
+        ui_scale,
+    );
+    add_options_button_rows(
+        document,
+        shell,
+        "fabricad.options.shell.startup_view",
+        StartupView::ALL
+            .into_iter()
+            .map(|view| {
+                (
+                    format!("fabricad.menu.item.view.{}", view.slug()),
+                    view.nav_label().to_string(),
+                    app.active_view == view,
+                )
+            })
+            .collect(),
+        4,
+        ui_scale,
+    );
+    add_options_button_rows(
+        document,
+        shell,
+        "fabricad.options.shell.nav_views",
+        StartupView::ALL
+            .into_iter()
+            .map(|view| {
+                (
+                    format!("fabricad.sidebar.view.{}", view.slug()),
+                    view.nav_label().to_string(),
+                    app.nav_rail_views.contains(&view),
+                )
+            })
+            .collect(),
+        4,
+        ui_scale,
+    );
+
+    let layout_section = add_options_section(
+        document,
+        content,
+        "fabricad.options.section.layout",
+        "2D layout editor",
+        ui_scale,
+    );
+    add_options_button_row(
+        document,
+        layout_section,
+        "fabricad.options.layout.display",
+        vec![
+            (
+                "fabricad.menu.item.options.snap".to_string(),
+                "Snap".to_string(),
+                app.snap_enabled,
+            ),
+            (
+                "fabricad.menu.item.display.grid2d".to_string(),
+                "Grid".to_string(),
+                app.show_grid,
+            ),
+            (
+                "fabricad.menu.item.display.origin".to_string(),
+                "Origin".to_string(),
+                app.show_origin_marker,
+            ),
+            (
+                "fabricad.menu.item.display.drc".to_string(),
+                "DRC overlay".to_string(),
+                app.show_drc_overlay,
+            ),
+        ],
+        ui_scale,
+    );
+    add_options_button_row(
+        document,
+        layout_section,
+        "fabricad.options.layout.tools",
+        ToolMode::ALL
+            .iter()
+            .map(|tool| {
+                (
+                    format!("fabricad.menu.item.tool.{}", tool.slug()),
+                    tool.label().to_string(),
+                    app.active_tool == *tool,
+                )
+            })
+            .collect(),
+        ui_scale,
+    );
+    add_options_button_rows(
+        document,
+        layout_section,
+        "fabricad.options.layout.layers",
+        app.workspace
+            .document
+            .layers
+            .keys()
+            .map(|layer| {
+                (
+                    format!("fabricad.options.action.layout.active_layer.{}", layer.0),
+                    format!("L{}", layer.0),
+                    app.active_layer == *layer,
+                )
+            })
+            .collect(),
+        4,
+        ui_scale,
+    );
+    add_options_button_row(
+        document,
+        layout_section,
+        "fabricad.options.layout.zoom",
+        vec![
+            (
+                "fabricad.options.action.layout.zoom.tiny".to_string(),
+                "Far".to_string(),
+                (app.layout_zoom - 0.005).abs() < f32::EPSILON,
+            ),
+            (
+                "fabricad.options.action.layout.zoom.default".to_string(),
+                "Default".to_string(),
+                (app.layout_zoom - 0.02).abs() < f32::EPSILON,
+            ),
+            (
+                "fabricad.options.action.layout.zoom.close".to_string(),
+                "Close".to_string(),
+                (app.layout_zoom - 0.1).abs() < f32::EPSILON,
+            ),
+            (
+                "fabricad.options.action.layout.pan.reset".to_string(),
+                "Reset pan".to_string(),
+                app.layout_pan == [0.0, 0.0],
+            ),
+            (
+                "fabricad.options.action.layout.modifier.shift".to_string(),
+                "Shift constrain".to_string(),
+                app.app_options.layout.constrain_with_shift,
+            ),
+            (
+                "fabricad.options.action.layout.modifier.ctrl".to_string(),
+                "Ctrl bypass snap".to_string(),
+                app.app_options.layout.bypass_snap_with_ctrl,
+            ),
+            (
+                "fabricad.options.action.layout.modifier.alt".to_string(),
+                "Alt duplicate".to_string(),
+                app.app_options.layout.duplicate_drag_with_alt,
+            ),
+        ],
+        ui_scale,
+    );
+
+    let viewport3d = add_options_section(
+        document,
+        content,
+        "fabricad.options.section.viewport3d",
+        "3D viewport",
+        ui_scale,
+    );
+    add_options_button_row(
+        document,
+        viewport3d,
+        "fabricad.options.viewport3d.display",
+        vec![
+            (
+                "fabricad.menu.item.display.grid3d".to_string(),
+                "3D grid".to_string(),
+                app.show_3d_grid,
+            ),
+            (
+                "fabricad.menu.item.tools.reset3d".to_string(),
+                "Reset camera".to_string(),
+                false,
+            ),
+            (
+                "fabricad.menu.item.tools.fullscreen".to_string(),
+                "Fullscreen".to_string(),
+                app.viewport_fullscreen,
+            ),
+        ],
+        ui_scale,
+    );
+    add_options_button_row(
+        document,
+        viewport3d,
+        "fabricad.options.viewport3d.camera",
+        vec![
+            (
+                "fabricad.options.action.viewport3d.capture_flycam".to_string(),
+                "Click capture".to_string(),
+                app.app_options.viewport3d.capture_flycam_on_click,
+            ),
+            (
+                "fabricad.options.action.viewport3d.speed.slow".to_string(),
+                "Slow".to_string(),
+                (app.camera_3d.speed - 1_000.0).abs() < f32::EPSILON,
+            ),
+            (
+                "fabricad.options.action.viewport3d.speed.default".to_string(),
+                "Default speed".to_string(),
+                (app.camera_3d.speed - 4_000.0).abs() < f32::EPSILON,
+            ),
+            (
+                "fabricad.options.action.viewport3d.speed.fast".to_string(),
+                "Fast".to_string(),
+                (app.camera_3d.speed - 12_000.0).abs() < f32::EPSILON,
+            ),
+        ],
+        ui_scale,
+    );
+    add_options_button_row(
+        document,
+        viewport3d,
+        "fabricad.options.viewport3d.lens",
+        vec![
+            (
+                "fabricad.options.action.viewport3d.fov.45".to_string(),
+                "45 deg".to_string(),
+                (app.app_options.viewport3d.fov_degrees - 45.0).abs() < f32::EPSILON,
+            ),
+            (
+                "fabricad.options.action.viewport3d.fov.58".to_string(),
+                "58 deg".to_string(),
+                (app.app_options.viewport3d.fov_degrees - 58.0).abs() < f32::EPSILON,
+            ),
+            (
+                "fabricad.options.action.viewport3d.fov.75".to_string(),
+                "75 deg".to_string(),
+                (app.app_options.viewport3d.fov_degrees - 75.0).abs() < f32::EPSILON,
+            ),
+            (
+                "fabricad.options.action.viewport3d.sensitivity.low".to_string(),
+                "Low look".to_string(),
+                (app.app_options.viewport3d.mouse_sensitivity - 0.0015).abs() < f32::EPSILON,
+            ),
+            (
+                "fabricad.options.action.viewport3d.sensitivity.default".to_string(),
+                "Default look".to_string(),
+                (app.app_options.viewport3d.mouse_sensitivity - 0.003).abs() < f32::EPSILON,
+            ),
+            (
+                "fabricad.options.action.viewport3d.sensitivity.high".to_string(),
+                "High look".to_string(),
+                (app.app_options.viewport3d.mouse_sensitivity - 0.006).abs() < f32::EPSILON,
+            ),
+            (
+                "fabricad.options.action.viewport3d.fast_multiplier.2".to_string(),
+                "2x shift".to_string(),
+                (app.app_options.viewport3d.fast_multiplier - 2.0).abs() < f32::EPSILON,
+            ),
+            (
+                "fabricad.options.action.viewport3d.fast_multiplier.4".to_string(),
+                "4x shift".to_string(),
+                (app.app_options.viewport3d.fast_multiplier - 4.0).abs() < f32::EPSILON,
+            ),
+            (
+                "fabricad.options.action.viewport3d.fast_multiplier.8".to_string(),
+                "8x shift".to_string(),
+                (app.app_options.viewport3d.fast_multiplier - 8.0).abs() < f32::EPSILON,
+            ),
+        ],
+        ui_scale,
+    );
+
+    let performance = add_options_section(
+        document,
+        content,
+        "fabricad.options.section.performance",
+        "Performance",
+        ui_scale,
+    );
+    add_options_button_row(
+        document,
+        performance,
+        "fabricad.options.performance.live",
+        vec![
+            (
+                "fabricad.options.action.performance.live_fps".to_string(),
+                "Live FPS".to_string(),
+                app.app_options.performance.live_fps_meter,
+            ),
+            (
+                "fabricad.options.action.performance.idle_redraw".to_string(),
+                "Idle redraw".to_string(),
+                app.app_options.performance.idle_redraw_layout_viewports,
+            ),
+            (
+                "fabricad.options.action.performance.dense_2d_lod".to_string(),
+                "Dense 2D LOD".to_string(),
+                app.app_options.performance.dense_2d_lod,
+            ),
+            (
+                "fabricad.options.action.performance.dense_3d_instancing".to_string(),
+                "3D instancing".to_string(),
+                app.app_options.performance.dense_3d_instancing,
+            ),
+        ],
+        ui_scale,
+    );
+    add_options_button_row(
+        document,
+        performance,
+        "fabricad.options.performance.caches",
+        vec![
+            (
+                "fabricad.options.action.performance.cache_layout_index".to_string(),
+                "Layout index".to_string(),
+                app.app_options.performance.cache_layout_index,
+            ),
+            (
+                "fabricad.options.action.performance.cache_drc".to_string(),
+                "DRC reports".to_string(),
+                app.app_options.performance.cache_drc_reports,
+            ),
+            (
+                "fabricad.options.action.performance.cache_connectivity".to_string(),
+                "Connectivity".to_string(),
+                app.app_options.performance.cache_connectivity_reports,
+            ),
+        ],
+        ui_scale,
+    );
+    add_options_button_row(
+        document,
+        performance,
+        "fabricad.options.performance.fps_alpha",
+        vec![
+            (
+                "fabricad.options.action.performance.fps_alpha.10".to_string(),
+                "Stable FPS".to_string(),
+                (app.app_options.performance.fps_ema_alpha - 0.10).abs() < f64::EPSILON,
+            ),
+            (
+                "fabricad.options.action.performance.fps_alpha.18".to_string(),
+                "Balanced FPS".to_string(),
+                (app.app_options.performance.fps_ema_alpha - 0.18).abs() < f64::EPSILON,
+            ),
+            (
+                "fabricad.options.action.performance.fps_alpha.30".to_string(),
+                "Responsive FPS".to_string(),
+                (app.app_options.performance.fps_ema_alpha - 0.30).abs() < f64::EPSILON,
+            ),
+        ],
+        ui_scale,
+    );
+
+    let files = add_options_section(
+        document,
+        content,
+        "fabricad.options.section.files",
+        "Files",
+        ui_scale,
+    );
+    add_options_button_row(
+        document,
+        files,
+        "fabricad.options.files.toggles",
+        vec![
+            (
+                "fabricad.options.action.files.autosave".to_string(),
+                "Autosave".to_string(),
+                app.app_options.files.autosave_enabled,
+            ),
+            (
+                "fabricad.options.action.files.remember_workspace".to_string(),
+                "Remember workspace".to_string(),
+                app.app_options.files.remember_last_workspace,
+            ),
+            (
+                "fabricad.options.action.files.prompt_destructive".to_string(),
+                "Destructive prompts".to_string(),
+                app.app_options.files.prompt_before_destructive_actions,
+            ),
+        ],
+        ui_scale,
+    );
+    add_options_button_row(
+        document,
+        files,
+        "fabricad.options.files.intervals",
+        vec![
+            (
+                "fabricad.options.action.files.autosave_interval.60".to_string(),
+                "60s save".to_string(),
+                app.app_options.files.autosave_interval_seconds == 60,
+            ),
+            (
+                "fabricad.options.action.files.autosave_interval.120".to_string(),
+                "120s save".to_string(),
+                app.app_options.files.autosave_interval_seconds == 120,
+            ),
+            (
+                "fabricad.options.action.files.autosave_interval.300".to_string(),
+                "300s save".to_string(),
+                app.app_options.files.autosave_interval_seconds == 300,
+            ),
+            (
+                "fabricad.options.action.files.recent_limit.5".to_string(),
+                "5 recent".to_string(),
+                app.app_options.files.recent_workspace_limit == 5,
+            ),
+            (
+                "fabricad.options.action.files.recent_limit.10".to_string(),
+                "10 recent".to_string(),
+                app.app_options.files.recent_workspace_limit == 10,
+            ),
+            (
+                "fabricad.options.action.files.recent_limit.25".to_string(),
+                "25 recent".to_string(),
+                app.app_options.files.recent_workspace_limit == 25,
+            ),
+        ],
+        ui_scale,
+    );
+
+    add_domain_options_sections(document, content, app, ui_scale);
+}
+
+fn add_domain_options_sections(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    app: &FabricadApp,
+    ui_scale: UiScale,
+) {
+    let workflow = add_options_section(
+        document,
+        parent,
+        "fabricad.options.section.domain.workflow",
+        "Workflow defaults",
+        ui_scale,
+    );
+    add_options_button_row(
+        document,
+        workflow,
+        "fabricad.options.domain.workflow.toggles",
+        vec![(
+            "fabricad.options.action.domains.workflow.load_demo_on_start".to_string(),
+            "Load sample".to_string(),
+            app.app_options.domains.workflow.load_demo_on_start,
+        )],
+        ui_scale,
+    );
+    add_options_button_rows(
+        document,
+        workflow,
+        "fabricad.options.domain.workflow.focus_lot",
+        workflow_lot_ids(&app.workspace)
+            .into_iter()
+            .map(|lot_id| {
+                (
+                    format!("fabricad.viewctl.workflow.focus_lot.{lot_id}"),
+                    workflow_lot_label(&app.workspace, lot_id.as_str(), 18),
+                    app.workflow_focus_lot.as_deref() == Some(lot_id.as_str()),
+                )
+            })
+            .collect(),
+        3,
+        ui_scale,
+    );
+
+    let mask = add_options_section(
+        document,
+        parent,
+        "fabricad.options.section.domain.mask",
+        "Reticle prep defaults",
+        ui_scale,
+    );
+    add_options_button_row(
+        document,
+        mask,
+        "fabricad.options.domain.mask.severity",
+        MaskIssueSeverityFilter::ALL
+            .iter()
+            .map(|filter| {
+                (
+                    format!("fabricad.viewctl.mask.severity.{}", filter.slug()),
+                    filter.label().to_string(),
+                    app.mask_issue_severity_filter == *filter,
+                )
+            })
+            .collect(),
+        ui_scale,
+    );
+    add_options_button_row(
+        document,
+        mask,
+        "fabricad.options.domain.mask.grouping",
+        MaskIssueGrouping::ALL
+            .iter()
+            .map(|grouping| {
+                (
+                    format!("fabricad.viewctl.mask.group.{}", grouping.slug()),
+                    grouping.label().to_string(),
+                    app.mask_issue_grouping == *grouping,
+                )
+            })
+            .collect(),
+        ui_scale,
+    );
+
+    let layout_diff = add_options_section(
+        document,
+        parent,
+        "fabricad.options.section.domain.layout_diff",
+        "Layout diff defaults",
+        ui_scale,
+    );
+    add_options_button_row(
+        document,
+        layout_diff,
+        "fabricad.options.domain.layout_diff.filters",
+        vec![
+            (
+                "fabricad.viewctl.layout_diff.toggle_changed_only".to_string(),
+                "Changed only".to_string(),
+                app.layout_diff_changed_only,
+            ),
+            (
+                "fabricad.viewctl.layout_diff.page_size.25".to_string(),
+                "25 rows".to_string(),
+                app.layout_diff_page_size == 25,
+            ),
+            (
+                "fabricad.viewctl.layout_diff.page_size.50".to_string(),
+                "50 rows".to_string(),
+                app.layout_diff_page_size == 50,
+            ),
+            (
+                "fabricad.viewctl.layout_diff.page_size.100".to_string(),
+                "100 rows".to_string(),
+                app.layout_diff_page_size == 100,
+            ),
+            (
+                "fabricad.viewctl.layout_diff.page_size.200".to_string(),
+                "200 rows".to_string(),
+                app.layout_diff_page_size == 200,
+            ),
+        ],
+        ui_scale,
+    );
+
+    let operations = add_options_section(
+        document,
+        parent,
+        "fabricad.options.section.domain.operations",
+        "Operations defaults",
+        ui_scale,
+    );
+    add_options_button_row(
+        document,
+        operations,
+        "fabricad.options.domain.inventory",
+        InventoryQuickFilter::ALL
+            .iter()
+            .map(|filter| {
+                (
+                    format!("fabricad.viewctl.inventory.filter.{}", filter.slug()),
+                    filter.label().to_string(),
+                    app.inventory_filter == *filter,
+                )
+            })
+            .collect(),
+        ui_scale,
+    );
+    add_options_button_row(
+        document,
+        operations,
+        "fabricad.options.domain.fab_control",
+        vec![(
+            "fabricad.options.action.domains.fab_control.auto_select_first_tool".to_string(),
+            "Auto-select first tool".to_string(),
+            app.app_options.domains.fab_control.auto_select_first_tool,
+        )],
+        ui_scale,
+    );
+    add_options_button_row(
+        document,
+        operations,
+        "fabricad.options.domain.maintenance",
+        MaintenanceWorkFilter::ALL
+            .iter()
+            .map(|filter| {
+                (
+                    format!("fabricad.viewctl.maintenance.filter.{}", filter.slug()),
+                    filter.label().to_string(),
+                    app.maintenance_work_filter == *filter,
+                )
+            })
+            .collect(),
+        ui_scale,
+    );
+    add_options_button_row(
+        document,
+        operations,
+        "fabricad.options.domain.maintenance_history",
+        MaintenanceHistoryFilter::ALL
+            .iter()
+            .map(|filter| {
+                (
+                    format!("fabricad.viewctl.maintenance.history.{}", filter.slug()),
+                    filter.label().to_string(),
+                    app.maintenance_history_filter == *filter,
+                )
+            })
+            .collect(),
+        ui_scale,
+    );
+    add_options_button_row(
+        document,
+        operations,
+        "fabricad.options.domain.environment",
+        vec![(
+            "fabricad.options.action.domains.environment.alarm_sensors_first".to_string(),
+            "Alarm sensors first".to_string(),
+            app.app_options.domains.environment.show_alarm_sensors_first,
+        )],
+        ui_scale,
+    );
+    add_options_button_row(
+        document,
+        operations,
+        "fabricad.options.domain.scheduler",
+        vec![
+            (
+                format!(
+                    "fabricad.viewctl.scheduler.policy.{}",
+                    dispatch_policy_slug(DispatchPolicy::Fifo)
+                ),
+                "FIFO".to_string(),
+                app.scheduler_policy == DispatchPolicy::Fifo,
+            ),
+            (
+                format!(
+                    "fabricad.viewctl.scheduler.policy.{}",
+                    dispatch_policy_slug(DispatchPolicy::PriorityThenFifo)
+                ),
+                "Priority".to_string(),
+                app.scheduler_policy == DispatchPolicy::PriorityThenFifo,
+            ),
+            (
+                format!(
+                    "fabricad.viewctl.scheduler.policy.{}",
+                    dispatch_policy_slug(DispatchPolicy::DueDateThenPriority)
+                ),
+                "Due date".to_string(),
+                app.scheduler_policy == DispatchPolicy::DueDateThenPriority,
+            ),
+            (
+                "fabricad.viewctl.scheduler.toggle_conflicts".to_string(),
+                "Conflicts".to_string(),
+                app.scheduler_conflicts_only,
+            ),
+            (
+                "fabricad.viewctl.scheduler.toggle_focus_tool".to_string(),
+                "Focus tool".to_string(),
+                app.scheduler_focus_selected_tool,
+            ),
+        ],
+        ui_scale,
+    );
+    add_options_button_row(
+        document,
+        operations,
+        "fabricad.options.domain.scheduler_priority",
+        [0_u8, 1, 2, 3, 4, 5]
+            .into_iter()
+            .map(|priority| {
+                (
+                    format!("fabricad.viewctl.scheduler.priority.{priority}"),
+                    format!("P{priority}+"),
+                    app.scheduler_min_priority == priority,
+                )
+            })
+            .collect(),
+        ui_scale,
+    );
+    add_options_button_row(
+        document,
+        operations,
+        "fabricad.options.domain.safety",
+        vec![(
+            "fabricad.options.action.domains.safety.show_acknowledged".to_string(),
+            "Show acknowledged safety".to_string(),
+            app.app_options.domains.safety.show_acknowledged,
+        )],
+        ui_scale,
+    );
+    let analysis = add_options_section(
+        document,
+        parent,
+        "fabricad.options.section.domain.analysis",
+        "Analysis defaults",
+        ui_scale,
+    );
+    add_options_button_row(
+        document,
+        analysis,
+        "fabricad.options.domain.trace",
+        TraceImpactMode::ALL
+            .iter()
+            .map(|mode| {
+                (
+                    format!("fabricad.viewctl.trace.impact.{}", mode.slug()),
+                    mode.label().to_string(),
+                    app.trace_impact_mode == *mode,
+                )
+            })
+            .chain(std::iter::once((
+                "fabricad.viewctl.trace.toggle_related".to_string(),
+                "Related only".to_string(),
+                app.trace_related_only,
+            )))
+            .collect(),
+        ui_scale,
+    );
+    add_options_button_row(
+        document,
+        analysis,
+        "fabricad.options.domain.metrology.mode",
+        MetrologyMapMode::ALL
+            .iter()
+            .map(|mode| {
+                (
+                    format!("fabricad.viewctl.metrology.mode.{}", mode.slug()),
+                    mode.short_label().to_string(),
+                    app.metrology_map_mode == *mode,
+                )
+            })
+            .collect(),
+        ui_scale,
+    );
+    add_options_button_row(
+        document,
+        analysis,
+        "fabricad.options.domain.metrology.kind",
+        MeasurementKind::NUMERIC
+            .iter()
+            .map(|kind| {
+                (
+                    format!(
+                        "fabricad.viewctl.metrology.kind.{}",
+                        measurement_kind_slug(*kind)
+                    ),
+                    kind.label().to_string(),
+                    app.metrology_kind == *kind,
+                )
+            })
+            .collect(),
+        ui_scale,
+    );
+    add_options_button_row(
+        document,
+        analysis,
+        "fabricad.options.domain.metrology.filters",
+        vec![(
+            "fabricad.viewctl.metrology.failed_only".to_string(),
+            "Failed only".to_string(),
+            app.metrology_failed_only,
+        )],
+        ui_scale,
+    );
+    add_options_button_row(
+        document,
+        analysis,
+        "fabricad.options.domain.yield",
+        YieldMapFilter::ALL
+            .iter()
+            .map(|filter| {
+                (
+                    format!("fabricad.viewctl.yield.filter.{}", filter.slug()),
+                    filter.label().to_string(),
+                    app.yield_map_filter == *filter,
+                )
+            })
+            .chain([
+                (
+                    "fabricad.viewctl.yield.attention".to_string(),
+                    "Attention".to_string(),
+                    app.show_only_attention_wafers,
+                ),
+                (
+                    "fabricad.viewctl.yield.excursions".to_string(),
+                    "Excursions".to_string(),
+                    app.show_only_excursions,
+                ),
+            ])
+            .collect(),
+        ui_scale,
+    );
+    add_options_button_row(
+        document,
+        analysis,
+        "fabricad.options.domain.spc.source",
+        SpcSourceFilter::ALL
+            .iter()
+            .map(|filter| {
+                (
+                    format!("fabricad.viewctl.spc.source.{}", filter.slug()),
+                    filter.label().to_string(),
+                    app.spc_source_filter == *filter,
+                )
+            })
+            .collect(),
+        ui_scale,
+    );
+
+    add_options_button_row(
+        document,
+        analysis,
+        "fabricad.options.domain.spc.severity",
+        SpcSeverityFilter::ALL
+            .iter()
+            .map(|filter| {
+                (
+                    format!("fabricad.viewctl.spc.severity.{}", filter.slug()),
+                    filter.label().to_string(),
+                    app.spc_severity_filter == *filter,
+                )
+            })
+            .collect(),
+        ui_scale,
+    );
+    let monitor = spc_fdc_monitor(&app.workspace);
+    let mut spc_context_buttons = vec![(
+        "fabricad.viewctl.spc.clear_context".to_string(),
+        "Any context".to_string(),
+        app.spc_context_filter.is_empty(),
+    )];
+    spc_context_buttons.extend(monitor.charts.iter().take(3).map(|chart| {
+        (
+            format!("fabricad.viewctl.spc.chart.{}", chart.id),
+            compact_button_label(&chart.name, 18),
+            app.spc_context_filter == chart.id.as_str(),
+        )
+    }));
+    spc_context_buttons.extend(monitor.traces.iter().take(2).map(|trace| {
+        (
+            format!("fabricad.viewctl.spc.trace.{}", trace.id),
+            compact_button_label(&trace.display_name(), 18),
+            app.spc_context_filter == trace.id.as_str(),
+        )
+    }));
+    add_options_button_rows(
+        document,
+        analysis,
+        "fabricad.options.domain.spc.context",
+        spc_context_buttons,
+        3,
+        ui_scale,
+    );
+
+    let engineering = add_options_section(
+        document,
+        parent,
+        "fabricad.options.section.domain.engineering",
+        "Engineering defaults",
+        ui_scale,
+    );
+    add_options_button_row(
+        document,
+        engineering,
+        "fabricad.options.domain.process_flow",
+        ProcessFlowNodeFilter::ALL
+            .iter()
+            .map(|filter| {
+                (
+                    format!("fabricad.viewctl.process_flow.filter.{}", filter.slug()),
+                    filter.label().to_string(),
+                    app.process_flow_filter == *filter,
+                )
+            })
+            .chain(std::iter::once((
+                "fabricad.viewctl.process_flow.toggle_errors".to_string(),
+                "Errors only".to_string(),
+                app.process_flow_errors_only,
+            )))
+            .collect(),
+        ui_scale,
+    );
+    add_options_button_row(
+        document,
+        engineering,
+        "fabricad.options.domain.run_to_run",
+        ControlLoopFilter::ALL
+            .iter()
+            .map(|filter| {
+                (
+                    format!("fabricad.viewctl.process_control.filter.{}", filter.slug()),
+                    filter.label().to_string(),
+                    app.process_control_loop_filter == *filter,
+                )
+            })
+            .collect(),
+        ui_scale,
+    );
+    add_options_button_row(
+        document,
+        engineering,
+        "fabricad.options.domain.cross_section",
+        vec![
+            (
+                "fabricad.viewctl.cross_section.toggle_mask".to_string(),
+                "Mask".to_string(),
+                app.cross_section_show_mask,
+            ),
+            (
+                "fabricad.viewctl.cross_section.toggle_dimensions".to_string(),
+                "Dimensions".to_string(),
+                app.cross_section_show_dimensions,
+            ),
+            (
+                "fabricad.viewctl.cross_section.toggle_risks".to_string(),
+                "Risks".to_string(),
+                app.cross_section_show_risks,
+            ),
+            (
+                "fabricad.viewctl.notebook.preview".to_string(),
+                "Notebook preview".to_string(),
+                app.notebook_preview_mode,
+            ),
+            (
+                "fabricad.viewctl.notebook.toggle_followups".to_string(),
+                "Follow-ups".to_string(),
+                app.notebook_followups_only,
+            ),
+        ],
+        ui_scale,
+    );
+    add_options_button_rows(
+        document,
+        engineering,
+        "fabricad.options.domain.cross_section_step",
+        (0..=app.workspace.cross_section.steps.len().min(6))
+            .map(|step| {
+                (
+                    format!("fabricad.viewctl.cross_section.step.{step}"),
+                    format!("Step {step}"),
+                    app.cross_section_step == step,
+                )
+            })
+            .collect(),
+        4,
+        ui_scale,
+    );
+    add_options_button_rows(
+        document,
+        engineering,
+        "fabricad.options.domain.notebook_tags",
+        std::iter::once((
+            "fabricad.viewctl.notebook.tag.all".to_string(),
+            "All notes".to_string(),
+            app.notebook_tag_filter.is_none(),
+        ))
+        .chain(app.workspace.lab_notebook.tags().into_iter().map(|tag| {
+            (
+                format!("fabricad.viewctl.notebook.tag.{tag}"),
+                compact_button_label(&tag, 18),
+                app.notebook_tag_filter.as_deref() == Some(tag.as_str()),
+            )
+        }))
+        .collect(),
+        4,
+        ui_scale,
+    );
+    add_options_button_row(
+        document,
+        engineering,
+        "fabricad.options.domain.experiment",
+        ExperimentRunFilter::ALL
+            .iter()
+            .map(|filter| {
+                (
+                    format!("fabricad.viewctl.experiment.filter.{}", filter.slug()),
+                    filter.short_label().to_string(),
+                    app.experiment_run_filter == *filter,
+                )
+            })
+            .chain(std::iter::once((
+                "fabricad.viewctl.experiment.pending_only".to_string(),
+                "Missing only".to_string(),
+                app.experiment_show_missing_only,
+            )))
+            .collect(),
+        ui_scale,
+    );
+    add_options_button_row(
+        document,
+        engineering,
+        "fabricad.options.domain.experiment_capture",
+        vec![
+            (
+                "fabricad.viewctl.experiment.use_demo".to_string(),
+                "Sample value".to_string(),
+                false,
+            ),
+            (
+                "fabricad.viewctl.experiment.use_target".to_string(),
+                "Target value".to_string(),
+                false,
+            ),
+            (
+                "fabricad.viewctl.experiment.capture_next_demo".to_string(),
+                "Next sample".to_string(),
+                false,
+            ),
+        ],
+        ui_scale,
+    );
+}
+
+fn add_options_section(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    name: impl Into<String>,
+    title: impl Into<String>,
+    ui_scale: UiScale,
+) -> operad::UiNodeId {
+    let name = name.into();
+    let title = title.into();
+    let section = document.add_child(
+        parent,
+        UiNode::container(
+            name.clone(),
+            layout::with_padding_all(
+                layout::with_gap_all(
+                    layout::with_size(layout::column(), layout::percent(1.0), layout::auto()),
+                    ui_scale.value(6.0),
+                ),
+                ui_scale.value(8.0),
+            ),
+        )
+        .with_visual(UiVisual::panel(
+            COLOR_PANEL_ALT,
+            Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
+            ui_scale.value(2.0),
+        )),
     );
     add_text(
         document,
-        panel,
-        "fabricad.options.label.units",
-        "Units",
-        text_style(ui_scale.value(12.0), FontWeight::BOLD, COLOR_TEXT_MUTED),
+        section,
+        format!("{name}.title"),
+        title,
+        text_style(ui_scale.value(13.0), FontWeight::BOLD, COLOR_TEXT),
         layout::size(layout::percent(1.0), layout::px(ui_scale.value(22.0))),
     );
-    for unit in UnitDisplay::ALL {
-        add_menu_item_button(
+    section
+}
+
+fn add_options_value_text(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    name: impl Into<String>,
+    value: impl Into<String>,
+    ui_scale: UiScale,
+) {
+    add_text(
+        document,
+        parent,
+        name,
+        value,
+        text_style(ui_scale.value(12.0), FontWeight::NORMAL, COLOR_TEXT_MUTED),
+        layout::size(layout::percent(1.0), layout::px(ui_scale.value(20.0))),
+    );
+}
+
+fn add_options_button_row(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    name: impl Into<String>,
+    buttons: Vec<(String, String, bool)>,
+    ui_scale: UiScale,
+) {
+    if buttons.is_empty() {
+        return;
+    }
+    let row = document.add_child(
+        parent,
+        UiNode::container(
+            name,
+            layout::with_gap_all(
+                layout::with_size(layout::row(), layout::percent(1.0), layout::auto()),
+                ui_scale.value(4.0),
+            ),
+        ),
+    );
+    for (name, label, selected) in buttons {
+        add_button(
             document,
-            panel,
-            format!("fabricad.menu.item.display.units.{}", unit.slug()),
-            unit.label(),
-            app.unit_display == unit,
-            true,
-            layout::size(layout::percent(1.0), layout::px(ui_scale.value(28.0))),
+            row,
+            options_panel_action_node_name(&name),
+            label,
+            selected,
+            layout::with_flex(layout::row(), 1.0, 1.0, layout::px(ui_scale.value(30.0))),
             ui_scale,
         );
     }
-    add_menu_item_button(
-        document,
-        panel,
-        "fabricad.menu.item.options.snap",
-        "Snap",
-        app.snap_enabled,
-        true,
-        layout::size(layout::percent(1.0), layout::px(ui_scale.value(28.0))),
-        ui_scale,
-    );
+}
+
+fn options_panel_action_node_name(action_name: &str) -> String {
+    if action_name.starts_with("fabricad.options.") {
+        action_name.to_string()
+    } else {
+        format!("fabricad.options.proxy.{action_name}")
+    }
+}
+
+fn add_options_button_rows(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    base_name: impl Into<String>,
+    buttons: Vec<(String, String, bool)>,
+    per_row: usize,
+    ui_scale: UiScale,
+) {
+    let base_name = base_name.into();
+    for (index, chunk) in buttons.chunks(per_row.max(1)).enumerate() {
+        add_options_button_row(
+            document,
+            parent,
+            format!("{base_name}.{index}"),
+            chunk.to_vec(),
+            ui_scale,
+        );
+    }
 }
 
 fn add_diagnostics_panel(
@@ -28310,24 +30975,6 @@ fn add_button(
     button_id
 }
 
-fn add_node_marker(
-    document: &mut UiDocument,
-    parent: operad::UiNodeId,
-    name: impl Into<String>,
-) -> operad::UiNodeId {
-    document.add_child(
-        parent,
-        UiNode::container(
-            name,
-            layout::with_absolute_position(
-                layout::size(layout::px(0.0), layout::px(0.0)),
-                0.0,
-                0.0,
-            ),
-        ),
-    )
-}
-
 fn attach_default_pointer_actions(document: &mut UiDocument) {
     for index in 0..document.node_count() {
         let id = operad::UiNodeId(index);
@@ -28371,177 +31018,6 @@ fn text_style(font_size: f32, weight: FontWeight, color: ColorRgba) -> TextStyle
     }
 }
 
-fn visible_layout_preview_shapes(document: &Document) -> Vec<(ShapeId, Shape)> {
-    document
-        .visible_flattened_shapes()
-        .into_iter()
-        .take(320)
-        .map(|shape| (shape.source_shape_id(), shape.transformed_shape()))
-        .collect()
-}
-
-fn add_layout_preview_grid(primitives: &mut Vec<ScenePrimitive>, ui_scale: UiScale) {
-    let left = ui_scale.value(20.0);
-    let right = ui_scale.value(940.0);
-    let top = ui_scale.value(20.0);
-    let bottom = ui_scale.value(532.0);
-    let minor = StrokeStyle::new(ColorRgba::new(54, 66, 77, 150), ui_scale.value(1.0));
-    let major = StrokeStyle::new(ColorRgba::new(72, 86, 98, 190), ui_scale.value(1.0));
-    for index in 0..=32 {
-        let x = left + index as f32 * ui_scale.value(28.0);
-        if x > right {
-            break;
-        }
-        primitives.push(ScenePrimitive::Line {
-            from: UiPoint::new(x, top),
-            to: UiPoint::new(x, bottom),
-            stroke: if index % 4 == 0 { major } else { minor },
-        });
-    }
-    for index in 0..=20 {
-        let y = top + index as f32 * ui_scale.value(28.0);
-        if y > bottom {
-            break;
-        }
-        primitives.push(ScenePrimitive::Line {
-            from: UiPoint::new(left, y),
-            to: UiPoint::new(right, y),
-            stroke: if index % 4 == 0 { major } else { minor },
-        });
-    }
-}
-
-fn layout_preview_primitives(
-    document: &Document,
-    selected_shape: Option<ShapeId>,
-    show_grid: bool,
-    ui_scale: UiScale,
-) -> Vec<ScenePrimitive> {
-    let shapes = visible_layout_preview_shapes(document);
-    if shapes.is_empty() {
-        return vec![ScenePrimitive::Line {
-            from: UiPoint::new(ui_scale.value(24.0), ui_scale.value(180.0)),
-            to: UiPoint::new(ui_scale.value(936.0), ui_scale.value(180.0)),
-            stroke: StrokeStyle::new(ColorRgba::new(76, 92, 108, 255), ui_scale.value(1.0)),
-        }];
-    }
-
-    let mut bounds: Option<Rect> = None;
-    for (_, shape) in &shapes {
-        if let Some(shape_bounds) = shape_bounds(&shape.kind) {
-            bounds = Some(match bounds {
-                Some(current) => current.union(shape_bounds),
-                None => shape_bounds,
-            });
-        }
-    }
-    let bounds = bounds.unwrap_or_else(|| Rect::from_min_size(Point::ZERO, 1, 1));
-    let scale_x: f32 = ui_scale.value(900.0) / bounds.width().max(1) as f32;
-    let scale_y: f32 = ui_scale.value(300.0) / bounds.height().max(1) as f32;
-    let scale: f32 = scale_x.min(scale_y).max(0.0001);
-    let offset = UiPoint::new(
-        ui_scale.value(30.0) - bounds.min.x as f32 * scale,
-        ui_scale.value(30.0) - bounds.min.y as f32 * scale,
-    );
-
-    let mut primitives = Vec::with_capacity(shapes.len() + 80);
-    if show_grid {
-        add_layout_preview_grid(&mut primitives, ui_scale);
-    }
-
-    for (source_shape_id, shape) in shapes {
-        let layer = document.layers.get(&shape.layer);
-        let selected = selected_shape == Some(source_shape_id);
-        let fill_alpha = if selected { 210 } else { 150 };
-        let stroke_width = if selected {
-            ui_scale.value(2.5)
-        } else {
-            ui_scale.value(1.0)
-        };
-        let fill = layer
-            .map(|layer| layer_color(layer.color, fill_alpha))
-            .unwrap_or_else(|| ColorRgba::new(92, 160, 220, fill_alpha));
-        let stroke_color = if selected {
-            ColorRgba::new(250, 219, 112, 255)
-        } else {
-            layer
-                .map(|layer| layer_color(layer.color, 240))
-                .unwrap_or_else(|| ColorRgba::new(132, 195, 245, 240))
-        };
-        let stroke = Some(StrokeStyle::new(stroke_color, stroke_width));
-        match shape.kind {
-            ShapeKind::Rectangle(rect) => {
-                let mut rect = operad::PaintRect::solid(map_rect(rect, scale, offset), fill);
-                if let Some(stroke) = stroke {
-                    rect = rect.stroke(stroke);
-                }
-                primitives.push(ScenePrimitive::Rect(rect));
-            }
-            ShapeKind::Polygon(ref polygon) => {
-                primitives.push(ScenePrimitive::Polygon {
-                    points: polygon
-                        .points
-                        .iter()
-                        .map(|point| map_point(*point, scale, offset))
-                        .collect(),
-                    fill,
-                    stroke,
-                });
-            }
-            ShapeKind::Path { ref points, .. } => {
-                for pair in points.windows(2) {
-                    primitives.push(ScenePrimitive::Line {
-                        from: map_point(pair[0], scale, offset),
-                        to: map_point(pair[1], scale, offset),
-                        stroke: StrokeStyle::new(fill, ui_scale.value(2.0)),
-                    });
-                }
-            }
-            ShapeKind::Via { center, size, .. } => {
-                primitives.push(ScenePrimitive::Circle {
-                    center: map_point(center, scale, offset),
-                    radius: ((size as f32 * scale) * 0.5)
-                        .clamp(ui_scale.value(3.0), ui_scale.value(18.0)),
-                    fill,
-                    stroke,
-                });
-            }
-            ShapeKind::Label { position, .. } => {
-                primitives.push(ScenePrimitive::Circle {
-                    center: map_point(position, scale, offset),
-                    radius: ui_scale.value(4.0),
-                    fill: ColorRgba::new(234, 218, 132, 220),
-                    stroke: None,
-                });
-            }
-            ShapeKind::Measurement { a, b, .. } => {
-                primitives.push(ScenePrimitive::Line {
-                    from: map_point(a, scale, offset),
-                    to: map_point(b, scale, offset),
-                    stroke: StrokeStyle::new(
-                        ColorRgba::new(238, 188, 116, 230),
-                        ui_scale.value(1.5),
-                    ),
-                });
-            }
-        }
-        if selected && let Some(bounds) = shape_bounds(&shape.kind) {
-            primitives.push(ScenePrimitive::Rect(
-                operad::PaintRect::solid(
-                    map_rect(bounds.expanded(40), scale, offset),
-                    ColorRgba::new(0, 0, 0, 0),
-                )
-                .stroke(StrokeStyle::new(
-                    ColorRgba::new(250, 219, 112, 255),
-                    ui_scale.value(1.5),
-                )),
-            ));
-        }
-    }
-
-    primitives
-}
-
 fn layout_overlay_primitives(
     app: &FabricadApp,
     size: UiSize,
@@ -28551,11 +31027,14 @@ fn layout_overlay_primitives(
     if app.show_grid {
         add_layout_grid_overlay_primitives(&mut primitives, app, size, ui_scale);
     }
+    add_layout_scale_bar_primitives(&mut primitives, app, size, ui_scale);
 
     let highlight = StrokeStyle::new(ColorRgba::new(112, 236, 214, 240), ui_scale.value(2.0));
     if let Some(selected) = app.selected_layout_occurrence.as_ref() {
         let mut highlighted = BTreeSet::new();
-        if let Ok(report) = app.connectivity_report()
+        if app.workspace.document.flattened_shape_count_estimate()
+            <= MAX_CONNECTIVITY_OVERLAY_SHAPES
+            && let Ok(report) = app.connectivity_report()
             && let Some(component_id) = report.component_for_occurrence(selected)
             && let Some(component) = report.component(component_id)
         {
@@ -28595,18 +31074,22 @@ fn layout_overlay_primitives(
     }
 
     if app.show_drc_overlay {
-        let active = app
-            .drc_report()
-            .violations
-            .iter()
-            .filter(|violation| drc_violation_is_active(&app.workspace.document, violation))
-            .count();
+        let shape_count = app.workspace.document.flattened_shape_count_estimate();
+        let active = if shape_count <= MAX_DRC_INSPECTOR_SHAPES {
+            app.drc_report()
+                .violations
+                .iter()
+                .filter(|violation| drc_violation_is_active(&app.workspace.document, violation))
+                .count()
+        } else {
+            0
+        };
         if active > 0 {
             primitives.push(ScenePrimitive::Text(PaintText::new(
                 format!("DRC overlay: {active} active"),
                 UiRect::new(
                     ui_scale.value(10.0),
-                    ui_scale.value(10.0),
+                    ui_scale.value(28.0),
                     ui_scale.value(240.0),
                     ui_scale.value(20.0),
                 ),
@@ -28664,6 +31147,91 @@ fn add_layout_grid_overlay_primitives(
     }
 }
 
+fn add_layout_scale_bar_primitives(
+    primitives: &mut Vec<ScenePrimitive>,
+    app: &FabricadApp,
+    size: UiSize,
+    ui_scale: UiScale,
+) {
+    if size.width < ui_scale.value(160.0) || size.height < ui_scale.value(80.0) {
+        return;
+    }
+    let length_dbu = layout_scale_bar_length_dbu(app.layout_zoom);
+    let length_px = length_dbu as f32 * app.layout_zoom;
+    if length_px < ui_scale.value(24.0) || length_px > size.width - ui_scale.value(40.0) {
+        return;
+    }
+
+    let left = ui_scale.value(18.0);
+    let baseline = size.height - ui_scale.value(22.0);
+    let right = left + length_px;
+    let tick_top = baseline - ui_scale.value(8.0);
+    let bg = UiRect::new(
+        left - ui_scale.value(10.0),
+        tick_top - ui_scale.value(26.0),
+        length_px + ui_scale.value(20.0),
+        ui_scale.value(44.0),
+    );
+    primitives.push(ScenePrimitive::Rect(operad::PaintRect::solid(
+        bg,
+        ColorRgba::new(6, 8, 10, 178),
+    )));
+
+    let stroke = StrokeStyle::new(ColorRgba::new(238, 242, 232, 255), ui_scale.value(2.0));
+    primitives.push(ScenePrimitive::Line {
+        from: UiPoint::new(left, baseline),
+        to: UiPoint::new(right, baseline),
+        stroke,
+    });
+    primitives.push(ScenePrimitive::Line {
+        from: UiPoint::new(left, tick_top),
+        to: UiPoint::new(left, baseline),
+        stroke,
+    });
+    primitives.push(ScenePrimitive::Line {
+        from: UiPoint::new(right, tick_top),
+        to: UiPoint::new(right, baseline),
+        stroke,
+    });
+    primitives.push(ScenePrimitive::Text(
+        PaintText::new(
+            app.format_layout_length(length_dbu as f64),
+            UiRect::new(
+                left - ui_scale.value(10.0),
+                tick_top - ui_scale.value(22.0),
+                length_px + ui_scale.value(20.0),
+                ui_scale.value(18.0),
+            ),
+            text_style(ui_scale.value(12.0), FontWeight::BOLD, COLOR_TEXT),
+        )
+        .horizontal_align(TextHorizontalAlign::Center)
+        .vertical_align(TextVerticalAlign::Bottom)
+        .multiline(false),
+    ));
+}
+
+fn layout_scale_bar_length_dbu(zoom: f32) -> Coord {
+    nice_layout_scale_length_dbu(120.0 / zoom.max(LAYOUT_MIN_ZOOM))
+}
+
+fn nice_layout_scale_length_dbu(target_dbu: f32) -> Coord {
+    if !target_dbu.is_finite() || target_dbu <= 1.0 {
+        return 1;
+    }
+    let exponent = 10f32.powf(target_dbu.log10().floor());
+    let normalized = target_dbu / exponent;
+    let multiplier = if normalized < 1.5 {
+        1.0
+    } else if normalized < 3.5 {
+        2.0
+    } else if normalized < 7.5 {
+        5.0
+    } else {
+        10.0
+    };
+    (multiplier * exponent).round().max(1.0) as Coord
+}
+
 fn add_overlay_rect_outline(
     primitives: &mut Vec<ScenePrimitive>,
     app: &FabricadApp,
@@ -28699,167 +31267,6 @@ fn add_overlay_rect_outline(
     });
 }
 
-fn layout_3d_preview_primitives(
-    document: &Document,
-    selected_shape: Option<ShapeId>,
-    ui_scale: UiScale,
-) -> Vec<ScenePrimitive> {
-    let mut shapes = visible_layout_preview_shapes(document);
-    if shapes.is_empty() {
-        return vec![ScenePrimitive::Line {
-            from: UiPoint::new(ui_scale.value(36.0), ui_scale.value(360.0)),
-            to: UiPoint::new(ui_scale.value(940.0), ui_scale.value(360.0)),
-            stroke: StrokeStyle::new(ColorRgba::new(76, 92, 108, 255), ui_scale.value(1.0)),
-        }];
-    }
-    shapes.sort_by_key(|(_, shape)| shape.layer.0);
-
-    let mut bounds: Option<Rect> = None;
-    for (_, shape) in &shapes {
-        if let Some(shape_bounds) = shape_bounds(&shape.kind) {
-            bounds = Some(match bounds {
-                Some(current) => current.union(shape_bounds),
-                None => shape_bounds,
-            });
-        }
-    }
-    let bounds = bounds.unwrap_or_else(|| Rect::from_min_size(Point::ZERO, 1, 1));
-    let scale_x = ui_scale.value(820.0) / bounds.width().max(1) as f32;
-    let scale_y = ui_scale.value(360.0) / bounds.height().max(1) as f32;
-    let scale = scale_x.min(scale_y).max(0.0001);
-    let max_layer = shapes
-        .iter()
-        .map(|(_, shape)| shape.layer.0)
-        .max()
-        .unwrap_or(1) as f32;
-    let origin = UiPoint::new(
-        ui_scale.value(42.0),
-        ui_scale.value(96.0) + max_layer * ui_scale.value(5.0),
-    );
-    let slab_offset = UiPoint::new(ui_scale.value(10.0), ui_scale.value(14.0));
-
-    let mut primitives = Vec::with_capacity(shapes.len() * 3 + 16);
-    for step in 0..=6 {
-        let t = step as f32 / 6.0;
-        let x = bounds.min.x + ((bounds.width() as f32) * t).round() as Coord;
-        let y = bounds.min.y + ((bounds.height() as f32) * t).round() as Coord;
-        primitives.push(ScenePrimitive::Line {
-            from: map_point_3d(Point::new(x, bounds.min.y), bounds, scale, origin, 0.0),
-            to: map_point_3d(Point::new(x, bounds.max.y), bounds, scale, origin, 0.0),
-            stroke: StrokeStyle::new(ColorRgba::new(28, 42, 52, 180), ui_scale.value(1.0)),
-        });
-        primitives.push(ScenePrimitive::Line {
-            from: map_point_3d(Point::new(bounds.min.x, y), bounds, scale, origin, 0.0),
-            to: map_point_3d(Point::new(bounds.max.x, y), bounds, scale, origin, 0.0),
-            stroke: StrokeStyle::new(ColorRgba::new(28, 42, 52, 180), ui_scale.value(1.0)),
-        });
-    }
-
-    for (source_shape_id, shape) in shapes {
-        let layer = document.layers.get(&shape.layer);
-        let selected = selected_shape == Some(source_shape_id);
-        let alpha = if selected { 225 } else { 176 };
-        let top_fill = layer
-            .map(|layer| layer_color(layer.color, alpha))
-            .unwrap_or_else(|| ColorRgba::new(92, 160, 220, alpha));
-        let side_fill = shade_color(top_fill, 0.58);
-        let stroke_color = if selected {
-            ColorRgba::new(250, 219, 112, 255)
-        } else {
-            shade_color(top_fill, 1.25)
-        };
-        let stroke = Some(StrokeStyle::new(
-            stroke_color,
-            if selected {
-                ui_scale.value(2.0)
-            } else {
-                ui_scale.value(1.0)
-            },
-        ));
-        let z = shape.layer.0 as f32 * ui_scale.value(10.0);
-        match &shape.kind {
-            ShapeKind::Rectangle(rect) => {
-                let top = [
-                    map_point_3d(rect.min, bounds, scale, origin, z),
-                    map_point_3d(Point::new(rect.max.x, rect.min.y), bounds, scale, origin, z),
-                    map_point_3d(rect.max, bounds, scale, origin, z),
-                    map_point_3d(Point::new(rect.min.x, rect.max.y), bounds, scale, origin, z),
-                ];
-                let bottom = top.map(|point| offset_ui_point(point, slab_offset.x, slab_offset.y));
-                primitives.push(ScenePrimitive::Polygon {
-                    points: vec![top[1], top[2], bottom[2], bottom[1]],
-                    fill: shade_color(side_fill, 0.82),
-                    stroke,
-                });
-                primitives.push(ScenePrimitive::Polygon {
-                    points: vec![top[3], top[2], bottom[2], bottom[3]],
-                    fill: side_fill,
-                    stroke,
-                });
-                primitives.push(ScenePrimitive::Polygon {
-                    points: top.to_vec(),
-                    fill: top_fill,
-                    stroke,
-                });
-            }
-            ShapeKind::Polygon(polygon) => {
-                let points = polygon
-                    .points
-                    .iter()
-                    .map(|point| map_point_3d(*point, bounds, scale, origin, z))
-                    .collect::<Vec<_>>();
-                primitives.push(ScenePrimitive::Polygon {
-                    points,
-                    fill: top_fill,
-                    stroke,
-                });
-            }
-            ShapeKind::Path { points, .. } => {
-                for pair in points.windows(2) {
-                    primitives.push(ScenePrimitive::Line {
-                        from: map_point_3d(pair[0], bounds, scale, origin, z),
-                        to: map_point_3d(pair[1], bounds, scale, origin, z),
-                        stroke: StrokeStyle::new(top_fill, ui_scale.value(3.0)),
-                    });
-                }
-            }
-            ShapeKind::Via { center, size, .. } => {
-                primitives.push(ScenePrimitive::Circle {
-                    center: map_point_3d(*center, bounds, scale, origin, z + ui_scale.value(5.0)),
-                    radius: ((*size as f32 * scale) * 0.5)
-                        .clamp(ui_scale.value(4.0), ui_scale.value(18.0)),
-                    fill: top_fill,
-                    stroke,
-                });
-            }
-            ShapeKind::Label { position, .. } => {
-                primitives.push(ScenePrimitive::Circle {
-                    center: map_point_3d(*position, bounds, scale, origin, z),
-                    radius: ui_scale.value(4.0),
-                    fill: ColorRgba::new(234, 218, 132, 230),
-                    stroke: None,
-                });
-            }
-            ShapeKind::Measurement { a, b, .. } => {
-                primitives.push(ScenePrimitive::Line {
-                    from: map_point_3d(*a, bounds, scale, origin, z),
-                    to: map_point_3d(*b, bounds, scale, origin, z),
-                    stroke: StrokeStyle::new(
-                        ColorRgba::new(238, 188, 116, 230),
-                        ui_scale.value(1.5),
-                    ),
-                });
-            }
-        }
-    }
-
-    primitives
-}
-
-fn shape_bounds(kind: &ShapeKind) -> Option<Rect> {
-    Rect::from_points(&kind.key_points())
-}
-
 fn shape_kind_label(kind: &ShapeKind) -> &'static str {
     match kind {
         ShapeKind::Rectangle(_) => "rectangle",
@@ -28889,49 +31296,12 @@ fn rect_summary(rect: Rect) -> String {
     )
 }
 
-fn map_rect(rect: Rect, scale: f32, offset: UiPoint) -> UiRect {
-    let min = map_point(rect.min, scale, offset);
-    UiRect::new(
-        min.x,
-        min.y,
-        (rect.width().max(1) as f32 * scale).max(1.0),
-        (rect.height().max(1) as f32 * scale).max(1.0),
-    )
-}
-
-fn map_point(point: Point, scale: f32, offset: UiPoint) -> UiPoint {
-    UiPoint::new(
-        point.x as f32 * scale + offset.x,
-        point.y as f32 * scale + offset.y,
-    )
-}
-
-fn map_point_3d(point: Point, bounds: Rect, scale: f32, origin: UiPoint, z: f32) -> UiPoint {
-    UiPoint::new(
-        origin.x + (point.x - bounds.min.x) as f32 * scale + z * 0.58,
-        origin.y + (point.y - bounds.min.y) as f32 * scale * 0.62 - z * 0.42,
-    )
-}
-
-fn offset_ui_point(point: UiPoint, dx: f32, dy: f32) -> UiPoint {
-    UiPoint::new(point.x + dx, point.y + dy)
-}
-
 fn layer_color(color: [f32; 4], alpha: u8) -> ColorRgba {
     ColorRgba::new(
         (color[0].clamp(0.0, 1.0) * 255.0).round() as u8,
         (color[1].clamp(0.0, 1.0) * 255.0).round() as u8,
         (color[2].clamp(0.0, 1.0) * 255.0).round() as u8,
         alpha,
-    )
-}
-
-fn shade_color(color: ColorRgba, factor: f32) -> ColorRgba {
-    ColorRgba::new(
-        ((color.r as f32 * factor).round().clamp(0.0, 255.0)) as u8,
-        ((color.g as f32 * factor).round().clamp(0.0, 255.0)) as u8,
-        ((color.b as f32 * factor).round().clamp(0.0, 255.0)) as u8,
-        color.a,
     )
 }
 
@@ -29657,49 +32027,9 @@ fn display_document_name(name: &str) -> String {
 
 fn format_fps_label(frame_ms: Option<f64>) -> String {
     frame_ms
-        .filter(|value| *value > 0.0)
+        .filter(|value| value.is_finite() && *value > 0.0)
         .map(|value| format!("FPS: {:.1}", 1000.0 / value))
         .unwrap_or_else(|| "FPS: --".to_string())
-}
-
-fn workflow_lot_label<T: ToString>(
-    _workspace: &WorkspaceDataset,
-    lot_id: T,
-    max_chars: usize,
-) -> String {
-    compact_button_label(&lot_id.to_string(), max_chars)
-}
-
-fn trace_lot_label<T: ToString>(
-    _genealogy: &layout_model::genealogy::LotGenealogy,
-    lot_id: T,
-    max_chars: usize,
-) -> String {
-    compact_button_label(&lot_id.to_string(), max_chars)
-}
-
-fn trace_lot_button_label<T: ToString>(
-    genealogy: &layout_model::genealogy::LotGenealogy,
-    lot_id: T,
-    compact: bool,
-) -> String {
-    trace_lot_label(genealogy, lot_id, if compact { 11 } else { 18 })
-}
-
-fn yield_wafer_short_label<T: ToString>(wafer_id: T) -> String {
-    compact_button_label(&wafer_id.to_string(), 12)
-}
-
-fn yield_wafer_label<T: ToString>(wafer_id: T) -> String {
-    wafer_id.to_string()
-}
-
-fn inventory_usage_link_label(value: &layout_model::inventory::FabObjectLink) -> String {
-    compact_button_label(&value.label(), 18)
-}
-
-fn display_product_label<T: ToString>(value: T) -> String {
-    value.to_string()
 }
 
 fn equipment_tool_label_for_raw_id(workspace: &WorkspaceDataset, id: &str) -> String {
@@ -29725,17 +32055,6 @@ fn drc_violation_is_active(document: &Document, violation: &DrcViolation) -> boo
         .is_none_or(|state| !state.hidden && !state.waived)
 }
 
-fn button_stroke(selected: bool, ui_scale: UiScale) -> StrokeStyle {
-    StrokeStyle::new(
-        if selected {
-            COLOR_BUTTON_STROKE_SELECTED
-        } else {
-            COLOR_BUTTON_STROKE
-        },
-        ui_scale.value(1.0),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -29758,20 +32077,30 @@ mod tests {
         text.join("\n")
     }
 
-    fn scene_primitive_max_x(primitives: &[ScenePrimitive]) -> f32 {
-        primitives
-            .iter()
-            .filter_map(|primitive| match primitive {
-                ScenePrimitive::Line { from, to, .. } => Some(from.x.max(to.x)),
-                ScenePrimitive::Circle { center, radius, .. } => Some(center.x + radius),
-                ScenePrimitive::Polygon { points, .. } => {
-                    points.iter().map(|point| point.x).reduce(f32::max)
+    fn document_text_by_node(document: &UiDocument) -> std::collections::BTreeMap<String, String> {
+        let mut text_by_node = std::collections::BTreeMap::new();
+        for node in document.nodes() {
+            match &node.content {
+                UiContent::Text(content) => {
+                    text_by_node.insert(node.name.clone(), content.text.clone());
                 }
-                ScenePrimitive::Image { rect, .. } => Some(rect.x + rect.width),
-                ScenePrimitive::Rect(rect) => Some(rect.rect.x + rect.rect.width),
-                _ => None,
-            })
-            .fold(0.0, f32::max)
+                UiContent::Scene(primitives) => {
+                    let scene_text = primitives
+                        .iter()
+                        .filter_map(|primitive| match primitive {
+                            ScenePrimitive::Text(content) => Some(content.text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if !scene_text.is_empty() {
+                        text_by_node.insert(node.name.clone(), scene_text);
+                    }
+                }
+                _ => {}
+            }
+        }
+        text_by_node
     }
 
     #[test]
@@ -29895,7 +32224,7 @@ mod tests {
         assert!(app.apply_clicked_node_name("fabricad.menu.item.display.options"));
         assert!(app.show_options_panel);
         let document = app
-            .build_operad_document(UiSize::new(1024.0, 720.0))
+            .build_operad_document(UiSize::new(1400.0, 1600.0))
             .expect("options panel should build");
         assert_eq!(document.audit_layout(), Vec::new());
         assert!(
@@ -29904,6 +32233,43 @@ mod tests {
                 .iter()
                 .any(|node| node.name == "fabricad.options_panel")
         );
+        for node_name in [
+            "fabricad.options.section.file",
+            "fabricad.options.section.appearance",
+            "fabricad.options.section.shell",
+            "fabricad.options.section.layout",
+            "fabricad.options.section.viewport3d",
+            "fabricad.options.section.performance",
+            "fabricad.options.section.files",
+            "fabricad.options.section.domain.workflow",
+            "fabricad.options.section.domain.mask",
+            "fabricad.options.section.domain.layout_diff",
+            "fabricad.options.section.domain.operations",
+            "fabricad.options.section.domain.analysis",
+            "fabricad.options.section.domain.engineering",
+            "fabricad.options.action.file.save",
+            "fabricad.options.action.appearance.theme.system",
+            "fabricad.options.action.layout.pan.reset",
+            "fabricad.options.action.viewport3d.fast_multiplier.4",
+            "fabricad.options.action.performance.live_fps",
+            "fabricad.options.action.files.autosave_interval.120",
+            "fabricad.options.action.domains.safety.show_acknowledged",
+            "fabricad.options.proxy.fabricad.viewctl.mask.severity.errors",
+            "fabricad.options.proxy.fabricad.viewctl.trace.toggle_related",
+            "fabricad.options.proxy.fabricad.viewctl.scheduler.priority.5",
+            "fabricad.options.proxy.fabricad.viewctl.spc.source.fdc",
+            "fabricad.options.proxy.fabricad.viewctl.spc.clear_context",
+            "fabricad.options.proxy.fabricad.viewctl.process_flow.toggle_errors",
+            "fabricad.options.proxy.fabricad.viewctl.process_control.filter.active",
+            "fabricad.options.proxy.fabricad.viewctl.cross_section.step.1",
+            "fabricad.options.proxy.fabricad.viewctl.notebook.tag.all",
+            "fabricad.options.proxy.fabricad.viewctl.experiment.use_target",
+        ] {
+            assert!(
+                document.nodes().iter().any(|node| node.name == node_name),
+                "{node_name} should be exposed in grouped Options UI"
+            );
+        }
         assert!(app.apply_clicked_node_name("fabricad.options.close"));
         assert!(!app.show_options_panel);
 
@@ -29976,6 +32342,169 @@ mod tests {
                 .iter()
                 .any(|node| node.name == "fabricad.diagnostics_panel")
         );
+    }
+
+    #[test]
+    fn app_options_apply_and_ui_actions_share_state() {
+        let mut options = AppOptions::default();
+        options.appearance.theme = options::ThemePreference::Light;
+        options.appearance.unit_display = "microns".to_string();
+        options.shell.startup_view = "layout2d".to_string();
+        options.shell.show_details_panel = true;
+        options.layout.default_tool = "rect".to_string();
+        options.layout.show_2d_grid = false;
+        options.layout.pan = [10.0, 20.0];
+        options.viewport3d.capture_flycam_on_click = false;
+        options.viewport3d.mouse_sensitivity = 0.006;
+        options.viewport3d.fast_multiplier = 8.0;
+        options.performance.live_fps_meter = false;
+        options.domains.fab_control.auto_select_first_tool = false;
+        options.domains.mask_prep.severity_filter = "warnings".to_string();
+        options.domains.mask_prep.grouping = "layer".to_string();
+        options.domains.layout_diff.changed_only = false;
+        options.domains.layout_diff.page_size = 100;
+        options.domains.inventory.quick_filter = "low-stock".to_string();
+        options.domains.maintenance.work_filter = "calibration".to_string();
+        options.domains.maintenance.history_filter = "all".to_string();
+        options.domains.scheduler.dispatch_policy = "due-date".to_string();
+        options.domains.scheduler.minimum_priority = 3;
+        options.domains.scheduler.conflicts_only = true;
+        options.domains.scheduler.focus_selected_tool = true;
+        options.domains.traceability.impact_mode = "material".to_string();
+        options.domains.traceability.related_only = true;
+        options.domains.metrology.map_mode = "defects".to_string();
+        options.domains.metrology.measurement_kind = "thickness".to_string();
+        options.domains.metrology.failed_only = true;
+        options.domains.yield_dashboard.map_filter = "failing".to_string();
+        options.domains.yield_dashboard.attention_only = true;
+        options.domains.yield_dashboard.excursions_only = true;
+        options.domains.spc_fdc.severity_filter = "critical".to_string();
+        options.domains.spc_fdc.source_filter = "fdc".to_string();
+        options.domains.spc_fdc.context_filter = "context-token".to_string();
+        options.domains.process_flow.node_filter = "recipes".to_string();
+        options.domains.process_flow.errors_only = true;
+        options.domains.run_to_run.loop_filter = "attention".to_string();
+        options.domains.cross_section.step = 1;
+        options.domains.cross_section.show_mask = false;
+        options.domains.cross_section.show_dimensions = false;
+        options.domains.cross_section.show_risks = false;
+        options.domains.notebook.preview_mode = false;
+        options.domains.notebook.followups_only = true;
+        options.domains.experiment.run_filter = "needs-selected-response".to_string();
+        options.domains.experiment.show_missing_only = true;
+        options.domains.experiment.capture_value = 88.0;
+
+        let mut app = FabricadApp::new_with_options(StartupOptions {
+            app_options: Some(options),
+            ..Default::default()
+        });
+
+        assert_eq!(app.active_view(), StartupView::Layout2d);
+        assert_eq!(app.active_tool(), ToolMode::Rect);
+        assert!(!app.dark_theme);
+        assert_eq!(app.unit_display, UnitDisplay::Microns);
+        assert!(app.show_inspector());
+        assert!(!app.show_grid);
+        assert_eq!(app.layout_pan(), [10.0, 20.0]);
+        assert!(!app.app_options().viewport3d.capture_flycam_on_click);
+        assert_eq!(app.app_options().viewport3d.mouse_sensitivity, 0.006);
+        assert_eq!(app.app_options().viewport3d.fast_multiplier, 8.0);
+        assert!(!app.app_options().performance.live_fps_meter);
+        assert_eq!(app.selected_equipment_tool, None);
+        assert_eq!(
+            app.mask_issue_severity_filter,
+            MaskIssueSeverityFilter::Warnings
+        );
+        assert_eq!(app.mask_issue_grouping, MaskIssueGrouping::Layer);
+        assert!(!app.layout_diff_changed_only);
+        assert_eq!(app.layout_diff_page_size, 100);
+        assert_eq!(app.inventory_filter, InventoryQuickFilter::LowStock);
+        assert_eq!(
+            app.maintenance_work_filter,
+            MaintenanceWorkFilter::Calibration
+        );
+        assert_eq!(
+            app.maintenance_history_filter,
+            MaintenanceHistoryFilter::AllTools
+        );
+        assert_eq!(app.scheduler_policy, DispatchPolicy::DueDateThenPriority);
+        assert_eq!(app.scheduler_min_priority, 3);
+        assert!(app.scheduler_conflicts_only);
+        assert!(app.scheduler_focus_selected_tool);
+        assert_eq!(app.trace_impact_mode, TraceImpactMode::Material);
+        assert!(app.trace_related_only);
+        assert_eq!(app.metrology_map_mode, MetrologyMapMode::DefectReview);
+        assert_eq!(app.metrology_kind, MeasurementKind::ThicknessNm);
+        assert!(app.metrology_failed_only);
+        assert_eq!(app.yield_map_filter, YieldMapFilter::Failing);
+        assert!(app.show_only_attention_wafers);
+        assert!(app.show_only_excursions);
+        assert_eq!(app.spc_severity_filter, SpcSeverityFilter::Critical);
+        assert_eq!(app.spc_source_filter, SpcSourceFilter::Fdc);
+        assert_eq!(app.spc_context_filter, "context-token");
+        assert_eq!(app.process_flow_filter, ProcessFlowNodeFilter::RecipeSteps);
+        assert!(app.process_flow_errors_only);
+        assert_eq!(
+            app.process_control_loop_filter,
+            ControlLoopFilter::Attention
+        );
+        assert_eq!(app.cross_section_step, 1);
+        assert!(!app.cross_section_show_mask);
+        assert!(!app.cross_section_show_dimensions);
+        assert!(!app.cross_section_show_risks);
+        assert!(!app.notebook_preview_mode);
+        assert!(app.notebook_followups_only);
+        assert_eq!(
+            app.experiment_run_filter,
+            ExperimentRunFilter::NeedsSelectedResponse
+        );
+        assert!(app.experiment_show_missing_only);
+        assert_eq!(app.experiment_capture_value, 88.0);
+
+        assert!(app.apply_clicked_node_name("fabricad.menu.item.display.grid2d"));
+        assert!(app.show_grid);
+        assert!(app.app_options().layout.show_2d_grid);
+
+        assert!(app.apply_clicked_node_name("fabricad.options.action.performance.live_fps"));
+        assert!(app.app_options().performance.live_fps_meter);
+
+        assert!(app.apply_clicked_node_name("fabricad.viewctl.mask.severity.errors"));
+        assert_eq!(
+            app.app_options().domains.mask_prep.severity_filter,
+            "errors"
+        );
+        assert!(
+            app.apply_clicked_node_name(
+                "fabricad.options.proxy.fabricad.viewctl.mask.severity.all"
+            )
+        );
+        assert_eq!(app.app_options().domains.mask_prep.severity_filter, "all");
+
+        assert!(app.apply_clicked_node_name("fabricad.options.action.layout.pan.reset"));
+        assert_eq!(app.layout_pan(), [0.0, 0.0]);
+        assert_eq!(app.app_options().layout.pan, [0.0, 0.0]);
+        assert!(
+            app.apply_clicked_node_name(
+                "fabricad.options.proxy.fabricad.viewctl.spc.clear_context"
+            )
+        );
+        assert!(app.app_options().domains.spc_fdc.context_filter.is_empty());
+
+        assert!(app.apply_clicked_node_name("fabricad.options.action.appearance.theme.system"));
+        assert_eq!(
+            app.app_options().appearance.theme,
+            options::ThemePreference::System
+        );
+        assert!(
+            app.apply_clicked_node_name("fabricad.options.action.viewport3d.fast_multiplier.4")
+        );
+        assert_eq!(app.app_options().viewport3d.fast_multiplier, 4.0);
+        assert!(
+            app.apply_clicked_node_name("fabricad.options.action.domains.safety.show_acknowledged")
+        );
+        assert!(!app.app_options().domains.safety.show_acknowledged);
+        assert!(app.apply_clicked_node_name("fabricad.viewctl.process_control.filter.active"));
+        assert_eq!(app.app_options().domains.run_to_run.loop_filter, "active");
     }
 
     #[test]
@@ -30660,6 +33189,61 @@ mod tests {
     }
 
     #[test]
+    fn layout_views_restore_wide_inline_secondary_panel() {
+        for (view, expected_title) in [
+            (StartupView::Layout2d, "Layers"),
+            (StartupView::Layout3d, "3D Stack"),
+        ] {
+            let app = FabricadApp::new_with_options(StartupOptions {
+                view_mode: Some(view),
+                ..Default::default()
+            });
+            assert!(
+                !app.show_layers(),
+                "wide inline panels should not depend on the drawer toggle"
+            );
+            let wide = app
+                .build_operad_document(UiSize::new(1440.0, 920.0))
+                .expect("wide layout view should build");
+            assert_eq!(wide.audit_layout(), Vec::new());
+            let secondary = node_rect(&wide, "fabricad.secondary");
+            let preview = node_rect(&wide, "fabricad.layout.preview");
+            assert!(
+                preview.right() <= secondary.x + 1.0,
+                "secondary panel should reserve right-side space instead of overlapping the canvas: preview={preview:?} secondary={secondary:?}"
+            );
+            let title = wide
+                .nodes()
+                .iter()
+                .find(|node| node.name == "fabricad.secondary.title")
+                .expect("secondary panel should have a title");
+            assert!(
+                matches!(&title.content, UiContent::Text(text) if text.text == expected_title),
+                "secondary panel title should match the active layout view"
+            );
+            if view == StartupView::Layout3d {
+                assert!(
+                    wide.nodes()
+                        .iter()
+                        .any(|node| node.name == "fabricad.secondary.layers.title"),
+                    "3D side panel should include the layer stack summary above the layer controls"
+                );
+            }
+
+            let compact = app
+                .build_operad_document(UiSize::new(820.0, 620.0))
+                .expect("compact layout view should build");
+            assert!(
+                !compact
+                    .nodes()
+                    .iter()
+                    .any(|node| node.name == "fabricad.secondary"),
+                "compact layout views should keep the secondary panel in drawer mode until requested"
+            );
+        }
+    }
+
+    #[test]
     fn layout_3d_canvas_input_updates_camera() {
         let mut app = FabricadApp::new_with_options(StartupOptions {
             view_mode: Some(StartupView::Layout3d),
@@ -30724,6 +33308,257 @@ mod tests {
         assert!(!app.viewport_fullscreen);
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn layout_3d_batch_cache_ignores_camera_only_changes() {
+        let mut app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Layout3d),
+            ..Default::default()
+        });
+        let mut resources = Viewport3dCanvasResources::default();
+
+        let first_fingerprint = refresh_layout_3d_batch_cache(&app, &mut resources);
+        let first_batch = resources.batch.as_ref().expect("3D batch should be cached") as *const _;
+        let first_revision = resources.batch_revision;
+
+        app.camera_3d.position.x += 250.0;
+        let camera_fingerprint = refresh_layout_3d_batch_cache(&app, &mut resources);
+        let camera_batch = resources
+            .batch
+            .as_ref()
+            .expect("3D batch should stay cached") as *const _;
+        assert_eq!(first_fingerprint, camera_fingerprint);
+        assert_eq!(first_revision, resources.batch_revision);
+        assert_eq!(
+            first_batch, camera_batch,
+            "camera-only movement must not rebuild the 3D geometry batch"
+        );
+
+        app.show_3d_grid = !app.show_3d_grid;
+        let grid_fingerprint = refresh_layout_3d_batch_cache(&app, &mut resources);
+        assert_ne!(
+            first_fingerprint, grid_fingerprint,
+            "3D grid visibility changes should invalidate the cached batch"
+        );
+
+        app.app_options.performance.dense_3d_instancing = false;
+        let mesh_fingerprint = refresh_layout_3d_batch_cache(&app, &mut resources);
+        assert_ne!(
+            grid_fingerprint, mesh_fingerprint,
+            "switching 3D instancing should invalidate the cached batch"
+        );
+        let mesh_batch = resources
+            .batch
+            .as_ref()
+            .expect("mesh batch should be cached");
+        assert!(mesh_batch.rect_slabs.is_empty());
+        assert!(!mesh_batch.vertices.is_empty());
+
+        let grid_revision = resources.batch_revision;
+        app.mark_layout_dirty();
+        refresh_layout_3d_batch_cache(&app, &mut resources);
+        assert_ne!(grid_revision, resources.batch_revision);
+        assert_eq!(app.layout_revision, resources.batch_revision);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn layout_2d_frame_cache_ignores_pointer_only_changes() {
+        let mut app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            ..Default::default()
+        });
+        let mut resources = LayoutCanvasResources::default();
+        let size = UiSize::new(900.0, 700.0);
+        let viewport = app.layout_viewport_for_size(size);
+        let zoom = app.layout_zoom;
+
+        let first_fingerprint = refresh_layout_2d_frame_cache(&app, &mut resources, viewport, zoom);
+        let first_frame = resources.frame.as_ref().expect("2D frame should be cached") as *const _;
+        let first_revision = resources.layout_revision;
+        let first_tiles = resources.frame_tiles.clone();
+
+        app.layout_pointer = Some(UiPoint::new(120.0, 80.0));
+        let pointer_fingerprint =
+            refresh_layout_2d_frame_cache(&app, &mut resources, viewport, zoom);
+        let pointer_frame = resources
+            .frame
+            .as_ref()
+            .expect("2D frame should stay cached") as *const _;
+        assert_eq!(first_fingerprint, pointer_fingerprint);
+        assert_eq!(first_revision, resources.layout_revision);
+        assert_eq!(
+            first_frame, pointer_frame,
+            "pointer-only movement must not rebuild the 2D tiled frame"
+        );
+
+        app.pan_layout_canvas_by(UiPoint::new(20.0, 0.0));
+        let panned_viewport = app.layout_viewport_for_size(size);
+        let small_pan_fingerprint =
+            refresh_layout_2d_frame_cache(&app, &mut resources, panned_viewport, app.layout_zoom);
+        let small_pan_frame = resources
+            .frame
+            .as_ref()
+            .expect("2D frame should stay cached for same tile coverage")
+            as *const _;
+        assert_eq!(first_fingerprint, small_pan_fingerprint);
+        assert_eq!(first_frame, small_pan_frame);
+        assert_eq!(
+            first_tiles, resources.frame_tiles,
+            "small pans inside the same tile coverage should not rebuild the 2D frame"
+        );
+
+        app.pan_layout_canvas_by(UiPoint::new(3_000.0, 0.0));
+        let large_panned_viewport = app.layout_viewport_for_size(size);
+        refresh_layout_2d_frame_cache(&app, &mut resources, large_panned_viewport, app.layout_zoom);
+        assert_ne!(
+            first_tiles, resources.frame_tiles,
+            "panning across tile coverage should update the cached 2D tile key"
+        );
+
+        let panned_revision = resources.layout_revision;
+        app.mark_layout_dirty();
+        let dirty_viewport = app.layout_viewport_for_size(size);
+        refresh_layout_2d_frame_cache(&app, &mut resources, dirty_viewport, app.layout_zoom);
+        assert_ne!(panned_revision, resources.layout_revision);
+        assert_eq!(app.layout_revision, resources.layout_revision);
+    }
+
+    #[test]
+    fn layout_fps_uses_smoothed_frame_interval() {
+        let mut app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            ..Default::default()
+        });
+        let first = std::time::Instant::now();
+        app.record_layout_frame_timing(first, 100.0);
+        assert_eq!(app.layout_frame_ms.get(), Some(100.0));
+        assert_eq!(app.layout_fps_frame_ms(), Some(100.0));
+
+        app.record_layout_frame_timing(first + std::time::Duration::from_millis(20), 1.0);
+        let latest = app
+            .layout_frame_ms
+            .get()
+            .expect("latest frame interval should be recorded");
+        let smoothed = app
+            .layout_fps_frame_ms()
+            .expect("smoothed frame interval should be recorded");
+        assert!((latest - 20.0).abs() < 0.001);
+        assert!(
+            smoothed > latest && smoothed < 100.0,
+            "EMA should move toward the latest frame interval without jumping instantly"
+        );
+
+        app.set_active_view(StartupView::Layout3d);
+        assert_eq!(app.layout_frame_ms.get(), None);
+        assert_eq!(app.layout_fps_frame_ms(), None);
+    }
+
+    #[test]
+    fn layout_fps_tick_updates_without_dirtying_layout() {
+        let app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            ..Default::default()
+        });
+        let first = std::time::Instant::now();
+        let revision = app.layout_revision;
+
+        app.record_layout_frame_tick(first);
+        assert_eq!(app.layout_revision, revision);
+        assert_eq!(app.layout_fps_frame_ms(), None);
+
+        app.record_layout_frame_tick(first + std::time::Duration::from_millis(16));
+        let latest = app
+            .layout_frame_ms
+            .get()
+            .expect("tick should record frame interval after first sample");
+        assert!((latest - 16.0).abs() < 0.001);
+        assert_eq!(app.layout_revision, revision);
+    }
+
+    #[test]
+    fn layout_fps_tick_only_changes_overlay_text() {
+        for view in [StartupView::Layout2d, StartupView::Layout3d] {
+            let app = FabricadApp::new_with_options(StartupOptions {
+                view_mode: Some(view),
+                ..Default::default()
+            });
+            let first = std::time::Instant::now();
+            app.record_layout_frame_tick(first);
+            app.record_layout_frame_tick(first + std::time::Duration::from_millis(16));
+            let before = app
+                .build_operad_document(UiSize::new(1280.0, 900.0))
+                .expect("layout document should build");
+            app.record_layout_frame_tick(first + std::time::Duration::from_millis(100));
+            let after = app
+                .build_operad_document(UiSize::new(1280.0, 900.0))
+                .expect("layout document should rebuild for FPS text");
+
+            let before_text = document_text_by_node(&before);
+            let after_text = document_text_by_node(&after);
+            let changed = before_text
+                .keys()
+                .chain(after_text.keys())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .filter(|name| before_text.get(*name) != after_text.get(*name))
+                .cloned()
+                .collect::<Vec<_>>();
+
+            assert_eq!(
+                changed,
+                vec!["fabricad.layout.fps".to_string()],
+                "{view:?} FPS tick should only update the live FPS text"
+            );
+        }
+    }
+
+    #[test]
+    fn layout_analysis_reports_are_revision_cached() {
+        let mut app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            ..Default::default()
+        });
+
+        let _ = app.connectivity_report();
+        let _ = app.drc_report();
+        let first_connectivity_revision = app
+            .connectivity_report_cache
+            .borrow()
+            .as_ref()
+            .expect("connectivity report should be cached")
+            .revision;
+        let first_drc_revision = app
+            .drc_report_cache
+            .borrow()
+            .as_ref()
+            .expect("DRC report should be cached")
+            .revision;
+
+        let _ = app.connectivity_report();
+        let _ = app.drc_report();
+        assert_eq!(
+            first_connectivity_revision,
+            app.connectivity_report_cache
+                .borrow()
+                .as_ref()
+                .expect("connectivity cache should remain populated")
+                .revision
+        );
+        assert_eq!(
+            first_drc_revision,
+            app.drc_report_cache
+                .borrow()
+                .as_ref()
+                .expect("DRC cache should remain populated")
+                .revision
+        );
+
+        app.mark_layout_dirty();
+        assert!(app.connectivity_report_cache.borrow().is_none());
+        assert!(app.drc_report_cache.borrow().is_none());
+    }
+
     #[test]
     fn layout_3d_view_exposes_stack_panel_hud_and_fullscreen_viewport() {
         let mut app = FabricadApp::new_with_options(StartupOptions {
@@ -30755,8 +33590,15 @@ mod tests {
             document
                 .nodes()
                 .iter()
-                .any(|node| node.name == "fabricad.layout.3d.overlay"),
+                .any(|node| node.name == "fabricad.layout.mode_hud"),
             "3D viewport should publish a HUD overlay"
+        );
+        assert!(
+            document.nodes().iter().any(|node| {
+                node.name == "fabricad.layout.fps"
+                    && matches!(&node.content, UiContent::Text(text) if text.text.starts_with("FPS:"))
+            }),
+            "3D viewport should expose the same FPS label as the 2D viewport"
         );
         assert!(
             document.nodes().iter().any(|node| {
@@ -30795,14 +33637,25 @@ mod tests {
         let document = Document::demo();
         let basic = build_layout_3d_batch(&document);
         let with_grid = build_layout_3d_batch_with_options(&document, true);
+        let mesh = build_layout_3d_batch_with_bounds_and_options(
+            &document,
+            false,
+            LayoutIndex::rebuild_hierarchical(&document).bounds(),
+            false,
+        );
         let basic_validation = basic
             .validate_geometry()
             .expect("basic 3D batch should validate");
         let grid_validation = with_grid
             .validate_geometry()
             .expect("3D grid batch should validate");
+        let mesh_validation = mesh
+            .validate_geometry()
+            .expect("mesh 3D batch should validate");
 
         assert_eq!(basic_validation.guide_segments, 2);
+        assert_eq!(mesh_validation.rect_slabs, 0);
+        assert!(mesh_validation.mesh_triangles > 0);
         assert!(
             grid_validation.guide_segments > basic_validation.guide_segments,
             "3D grid should add ground guide segments"
@@ -30993,6 +33846,14 @@ mod tests {
             far_lines, panned_lines,
             "panning should move the world-aligned grid instead of leaving a fixed screen grid"
         );
+    }
+
+    #[test]
+    fn layout_scale_bar_picks_readable_world_lengths() {
+        assert_eq!(nice_layout_scale_length_dbu(80.0), 100);
+        assert_eq!(nice_layout_scale_length_dbu(1_600.0), 2_000);
+        assert_eq!(nice_layout_scale_length_dbu(52_000.0), 50_000);
+        assert_eq!(layout_scale_bar_length_dbu(1.0), 100);
     }
 
     #[test]
@@ -31854,12 +34715,30 @@ mod tests {
             "grid/selection/scale affordances should draw line primitives"
         );
         assert!(
+            primitives.iter().any(|primitive| matches!(
+                primitive,
+                ScenePrimitive::Text(text)
+                    if text.text.ends_with(" nm")
+                        || text.text.ends_with(" um")
+                        || text.text.ends_with(" dbu")
+            )),
+            "2D editor should draw a bottom-left scale ruler label"
+        );
+        assert!(
             document.nodes().iter().any(|node| {
                 node.name == "fabricad.layout.fps"
                     && matches!(&node.content, UiContent::Text(text) if text.text.starts_with("FPS:"))
             }),
             "2D editor should expose an FPS label"
         );
+        assert!(
+            document
+                .nodes()
+                .iter()
+                .any(|node| node.name == "fabricad.layout.mode_hud"),
+            "2D editor should expose the shared canvas HUD"
+        );
+        assert!(document_visible_text(&document).contains("2D Layout"));
     }
 
     #[test]
@@ -32128,6 +35007,36 @@ mod tests {
     }
 
     #[test]
+    fn nav_rail_node_ids_stay_stable_between_views() {
+        let base_app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            ..Default::default()
+        });
+        let base_document = base_app
+            .build_operad_document(UiSize::new(1440.0, 920.0))
+            .expect("layout editor document should build");
+
+        for active_view in StartupView::ALL {
+            let app = FabricadApp::new_with_options(StartupOptions {
+                view_mode: Some(active_view),
+                ..Default::default()
+            });
+            let document = app
+                .build_operad_document(UiSize::new(1440.0, 920.0))
+                .unwrap_or_else(|error| panic!("{active_view:?} document should build: {error}"));
+            for nav_view in StartupView::ALL {
+                let name = format!("fabricad.nav.action.{}", nav_view.slug());
+                let base_id = node_id(&base_document, &name);
+                let active_id = node_id(&document, &name);
+                assert_eq!(
+                    base_id, active_id,
+                    "{name} should keep the same node id in {active_view:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn all_view_pointer_controls_have_handlers() {
         for view in StartupView::ALL {
             let app = FabricadApp::new_with_options(StartupOptions {
@@ -32256,12 +35165,11 @@ mod tests {
                 StartupView::Workflow,
                 &[
                     "fabricad.workflow.dashboard",
-                    "fabricad.workflow.actions",
                     "fabricad.workflow.lots",
                     "fabricad.workflow.focus",
                     "fabricad.workflow.spine",
                     "fabricad.workflow.cross_links",
-                    "fabricad.workflow.actions.row.0",
+                    "fabricad.workflow.lots.row.0",
                 ][..],
             ),
             (
@@ -32327,6 +35235,7 @@ mod tests {
         }
 
         for (view, duplicate_control_section) in [
+            (StartupView::Workflow, "fabricad.workflow.actions"),
             (StartupView::MaskPrep, "fabricad.mask.controls"),
             (StartupView::LayoutDiff, "fabricad.layout_diff.controls"),
             (StartupView::FabControl, "fabricad.fab_control.commands"),
@@ -32344,6 +35253,24 @@ mod tests {
                     .iter()
                     .any(|node| node.name == duplicate_control_section),
                 "view {view:?} should not duplicate top controls in {duplicate_control_section}"
+            );
+        }
+        for (view, duplicate_header_prefix) in [
+            (StartupView::Workflow, "Actions -"),
+            (StartupView::MaskPrep, "Reticle Prep Controls -"),
+            (StartupView::LayoutDiff, "Diff Controls -"),
+            (StartupView::FabControl, "Tool Commands -"),
+        ] {
+            let document = FabricadApp::new_with_options(StartupOptions {
+                view_mode: Some(view),
+                ..Default::default()
+            })
+            .build_operad_document(UiSize::new(1440.0, 920.0))
+            .expect("domain primary panel should build");
+            let visible_text = document_visible_text(&document);
+            assert!(
+                !visible_text.contains(duplicate_header_prefix),
+                "view {view:?} should not show duplicate control header {duplicate_header_prefix:?}\n{visible_text}"
             );
         }
 
@@ -32452,7 +35379,11 @@ mod tests {
         match &layout_preview.content {
             UiContent::Canvas(canvas) => {
                 assert_eq!(canvas.key, "fabricad.layout.viewport.2d");
-                assert_eq!(canvas.render_mode, operad::CanvasRenderMode::Callback);
+                assert_eq!(
+                    canvas.render_mode,
+                    operad::CanvasRenderMode::AttachedContext
+                );
+                assert!(canvas.context.kind.is_gpu_backed());
                 assert_eq!(canvas.interaction, CanvasInteractionPolicy::EDITOR);
             }
             other => panic!("layout preview should be a canvas, got {other:?}"),
@@ -33560,6 +36491,185 @@ mod tests {
     }
 
     #[test]
+    fn view_controls_explain_button_groups_and_details_collapse() {
+        let app = FabricadApp::new_with_options(StartupOptions {
+            view_mode: Some(StartupView::MaskPrep),
+            ..Default::default()
+        });
+        let document = app
+            .build_operad_document(UiSize::new(1440.0, 920.0))
+            .expect("mask prep view should build");
+        assert_eq!(document.audit_layout(), Vec::new());
+        let visible_text = document_visible_text(&document);
+        for label in ["Source lot", "Severity", "Group by", "Issues", "Actions"] {
+            assert!(
+                visible_text.contains(label),
+                "mask controls should label what each button group does: {label}\n{visible_text}"
+            );
+        }
+        assert!(
+            document
+                .nodes()
+                .iter()
+                .any(|node| node.name == "fabricad.viewctl.mask.row.1.label"),
+            "control rows should publish semantic row labels, not just a flat button grid"
+        );
+        assert!(
+            document
+                .nodes()
+                .iter()
+                .any(|node| node.name == "fabricad.viewctl.mask.group_row.0"),
+            "control panels should pack related button rows into visible labeled groups"
+        );
+        assert!(
+            document
+                .nodes()
+                .iter()
+                .any(|node| node.name == "fabricad.viewctl.mask.row.1.buttons"),
+            "each control label should be attached to the button row it describes"
+        );
+        assert!(
+            document
+                .nodes()
+                .iter()
+                .any(|node| node.name == "fabricad.domain.section.0.header"),
+            "primary domain panels should group body content into collapsible sections"
+        );
+        assert!(
+            document
+                .nodes()
+                .iter()
+                .any(|node| node.name == "fabricad.domain.section.1.header"),
+            "collapsed primary sections should still expose clear named headers"
+        );
+        assert!(
+            document
+                .nodes()
+                .iter()
+                .any(|node| node.name == "fabricad.details.section.0.header"),
+            "below-view detail panels should use collapsible headers"
+        );
+        assert!(
+            !document
+                .nodes()
+                .iter()
+                .any(|node| node.name == "fabricad.details.0.title"),
+            "detail panels should not render as an always-expanded title-and-row dump"
+        );
+    }
+
+    #[test]
+    fn representative_view_control_rows_use_specific_labels() {
+        for view in StartupView::ALL {
+            let document = FabricadApp::new_with_options(StartupOptions {
+                view_mode: Some(view),
+                ..Default::default()
+            })
+            .build_operad_document(UiSize::new(1440.0, 920.0))
+            .expect("view control document should build");
+            let labels = view_control_row_labels(&document);
+            assert!(
+                !labels.contains(&"Controls"),
+                "view {view:?} should not expose generic row labels: {labels:?}"
+            );
+        }
+
+        for (view, required_labels) in [
+            (
+                StartupView::Workflow,
+                &[
+                    "Design",
+                    "Operations",
+                    "Materials",
+                    "Facilities",
+                    "Quality",
+                    "Trace",
+                    "Data",
+                    "Lot focus",
+                ][..],
+            ),
+            (
+                StartupView::Traceability,
+                &[
+                    "Lot", "Wafer", "Scope", "Impact", "Process", "Material", "Event",
+                ][..],
+            ),
+            (
+                StartupView::LayoutDiff,
+                &[
+                    "Baseline",
+                    "Candidate",
+                    "Compare",
+                    "Filter",
+                    "Page size",
+                    "Changes",
+                    "Review",
+                    "Load",
+                    "Reset",
+                ][..],
+            ),
+            (
+                StartupView::FabControl,
+                &["Tools", "More tools", "Recipe", "Run", "Service"][..],
+            ),
+            (StartupView::Inventory, &["Filter", "Lot"][..]),
+            (StartupView::Environment, &["Sensor", "Zone"][..]),
+            (StartupView::Metrology, &["Mode", "Measure", "Review"][..]),
+            (StartupView::Yield, &["Filter", "Focus", "Lot", "Wafer"][..]),
+            (
+                StartupView::ProcessFlow,
+                &["Filter", "Review", "Export", "Node"][..],
+            ),
+            (
+                StartupView::Safety,
+                &["Tool", "Interlock", "Lockout", "Incident"][..],
+            ),
+            (
+                StartupView::CrossSection,
+                &["Step", "Display", "Material"][..],
+            ),
+            (
+                StartupView::Notebook,
+                &["Mode", "Add", "Tag", "Link", "Focus", "Entry"][..],
+            ),
+            (
+                StartupView::Experiment,
+                &["Queue", "Capture", "Response", "Filter", "Lot", "Run"][..],
+            ),
+        ] {
+            let document = FabricadApp::new_with_options(StartupOptions {
+                view_mode: Some(view),
+                ..Default::default()
+            })
+            .build_operad_document(UiSize::new(1440.0, 920.0))
+            .expect("view control document should build");
+            let labels = view_control_row_labels(&document);
+            for required_label in required_labels {
+                assert!(
+                    labels.contains(required_label),
+                    "view {view:?} should include {required_label:?} among {labels:?}"
+                );
+            }
+        }
+    }
+
+    fn view_control_row_labels(document: &UiDocument) -> Vec<&str> {
+        document
+            .nodes()
+            .iter()
+            .filter(|node| {
+                node.name.contains(".viewctl.")
+                    && node.name.contains(".row.")
+                    && node.name.ends_with(".label")
+            })
+            .filter_map(|node| match &node.content {
+                UiContent::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    }
+
+    #[test]
     fn all_views_are_warning_free_at_audit_sizes() {
         for viewport in [
             UiSize::new(480.0, 900.0),
@@ -33634,6 +36744,16 @@ mod tests {
             .iter()
             .find(|node| node.name == name)
             .map(|node| node.layout.rect)
+            .unwrap_or_else(|| panic!("expected node {name} to exist"))
+    }
+
+    fn node_id(document: &UiDocument, name: &str) -> operad::UiNodeId {
+        document
+            .nodes()
+            .iter()
+            .enumerate()
+            .find(|(_, node)| node.name == name)
+            .map(|(index, _)| operad::UiNodeId(index))
             .unwrap_or_else(|| panic!("expected node {name} to exist"))
     }
 }

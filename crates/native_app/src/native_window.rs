@@ -386,6 +386,13 @@ impl FabricadNativeState {
     }
 
     fn before_render(&mut self) {
+        if matches!(
+            self.app.active_view(),
+            StartupView::Layout2d | StartupView::Layout3d
+        ) && self.app.live_layout_fps_meter()
+        {
+            self.app.record_layout_frame_tick(Instant::now());
+        }
         if self.app.active_view() != StartupView::Layout3d {
             self.flycam_keys = FlycamKeyState::default();
             self.last_flycam_tick = Instant::now();
@@ -412,6 +419,13 @@ impl FabricadNativeState {
     }
 
     fn idle_redraw(&self) -> bool {
+        if matches!(
+            self.app.active_view(),
+            StartupView::Layout2d | StartupView::Layout3d
+        ) && self.app.live_layout_fps_meter()
+        {
+            return true;
+        }
         self.app.flycam_captured() && self.flycam_keys.any()
     }
 
@@ -532,7 +546,9 @@ fn render_native_layout_2d_canvas(
         UiSize::new(context.request.rect.width, context.request.rect.height),
     )
     .map_err(RenderError::Backend)?;
-    Ok(CanvasRenderOutput::default())
+    Ok(layout_canvas_render_output(
+        state.app.live_layout_fps_meter(),
+    ))
 }
 
 fn render_native_layout_3d_canvas(
@@ -541,7 +557,13 @@ fn render_native_layout_3d_canvas(
 ) -> Result<CanvasRenderOutput, RenderError> {
     render_layout_3d_canvas(&state.app, &mut state.viewport_3d_canvas, context.surface)
         .map_err(RenderError::Backend)?;
-    Ok(CanvasRenderOutput::default())
+    Ok(layout_canvas_render_output(
+        state.app.live_layout_fps_meter(),
+    ))
+}
+
+fn layout_canvas_render_output(live_fps: bool) -> CanvasRenderOutput {
+    CanvasRenderOutput::new().repaint_requested(live_fps)
 }
 
 fn attach_default_pointer_actions(document: &mut UiDocument) {
@@ -674,6 +696,41 @@ mod tests {
             "fabricad.nav.action.layout2d"
         )));
         assert_eq!(state.app.active_view(), StartupView::Layout2d);
+    }
+
+    #[test]
+    fn native_layout_canvas_requests_repaint_for_live_fps_meter() {
+        assert!(layout_canvas_render_output(true).repaint_requested);
+        assert!(!layout_canvas_render_output(false).repaint_requested);
+    }
+
+    #[test]
+    fn native_layout_views_idle_redraw_and_tick_fps_without_dirtying_scene() {
+        let workflow = FabricadNativeState::new(StartupOptions::default());
+        assert!(
+            !workflow.idle_redraw(),
+            "non-layout views should not redraw only for the layout FPS meter"
+        );
+
+        let mut layout = FabricadNativeState::new(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            ..Default::default()
+        });
+        assert!(layout.idle_redraw());
+
+        let revision = layout.app.layout_revision();
+        layout.app.record_layout_frame_tick(
+            Instant::now()
+                .checked_sub(Duration::from_millis(16))
+                .expect("test timestamp should be representable"),
+        );
+        layout.before_render();
+
+        assert_eq!(layout.app.layout_revision(), revision);
+        assert!(
+            layout.app.layout_fps_frame_ms().is_some(),
+            "native layout frame tick should refresh only the FPS sample"
+        );
     }
 
     #[test]
