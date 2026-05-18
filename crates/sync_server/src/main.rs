@@ -80,18 +80,18 @@ async fn main() -> anyhow::Result<()> {
         .route("/ws", get(ws_handler))
         .with_state(state);
 
-    let addr: SocketAddr = std::env::var("FABRICAD_SYNC_ADDR")
+    let addr: SocketAddr = std::env::var("GLASSWORKS_SYNC_ADDR")
         .unwrap_or_else(|err| {
             warn!(
                 error = %err,
-                "FABRICAD_SYNC_ADDR missing or invalid Unicode; using default bind address"
+                "GLASSWORKS_SYNC_ADDR missing or invalid Unicode; using default bind address"
             );
             "127.0.0.1:4141".to_string()
         })
         .parse()
-        .context("FABRICAD_SYNC_ADDR must be host:port")?;
+        .context("GLASSWORKS_SYNC_ADDR must be host:port")?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    info!("fabricad sync server listening on ws://{addr}/ws");
+    info!("glassworks sync server listening on ws://{addr}/ws");
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -381,15 +381,15 @@ async fn send_json(
 }
 
 fn persistence_path() -> Option<PathBuf> {
-    match std::env::var("FABRICAD_SYNC_STATE") {
+    match std::env::var("GLASSWORKS_SYNC_STATE") {
         Ok(value) if value.trim().is_empty() || value == "off" || value == "none" => None,
         Ok(value) => Some(PathBuf::from(value)),
         Err(err) => {
             warn!(
                 error = %err,
-                "FABRICAD_SYNC_STATE missing or invalid Unicode; using default persistence path"
+                "GLASSWORKS_SYNC_STATE missing or invalid Unicode; using default persistence path"
             );
-            Some(PathBuf::from("target/fabricad-sync/state.json"))
+            Some(PathBuf::from("target/glassworks-sync/state.json"))
         }
     }
 }
@@ -535,7 +535,7 @@ mod tests {
 
     fn temp_state_path() -> PathBuf {
         let dir =
-            std::env::temp_dir().join(format!("fabricad-sync-test-{}", Uuid::new_v4().simple()));
+            std::env::temp_dir().join(format!("glassworks-sync-test-{}", Uuid::new_v4().simple()));
         fs::create_dir_all(&dir).unwrap();
         dir.join("state.json")
     }
@@ -619,7 +619,7 @@ mod tests {
             loro_snapshot: log.export_snapshot().unwrap(),
         };
         let path = std::env::temp_dir().join(format!(
-            "fabricad-sync-state-{}.json",
+            "glassworks-sync-state-{}.json",
             Uuid::new_v4().simple()
         ));
         write_persisted_state(&path, &persisted).unwrap();

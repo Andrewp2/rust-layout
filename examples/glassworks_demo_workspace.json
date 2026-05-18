@@ -3,7 +3,7 @@
   "document": {
     "schema_version": 5,
     "id": "c7df9788-9e78-46a5-b97d-a3e02f52337b",
-    "name": "Fabricad demo inverter",
+    "name": "Glassworks demo inverter",
     "grid": 10,
     "next_shape_id": 9,
     "next_layer_id": 9,
@@ -326,9 +326,9 @@
     "routes": {
       "ROUTE-DEMO-INVERTER-POLY-A": {
         "id": "ROUTE-DEMO-INVERTER-POLY-A",
-        "name": "Fabricad demo inverter poly module",
+        "name": "Glassworks demo inverter poly module",
         "revision": "A.1",
-        "mask_design_id": "FABRICAD-DEMO-INVERTER",
+        "mask_design_id": "GLASSWORKS-DEMO-INVERTER",
         "layout_revision": "layout_model:demo-inverter@rev-5",
         "steps": [
           {
@@ -407,7 +407,7 @@
         "product": "demo inverter poly loop",
         "priority": 2,
         "route_id": "ROUTE-DEMO-INVERTER-POLY-A",
-        "mask_design_id": "FABRICAD-DEMO-INVERTER",
+        "mask_design_id": "GLASSWORKS-DEMO-INVERTER",
         "layout_revision": "layout_model:demo-inverter@rev-5",
         "wafers": [
           {
@@ -100752,7 +100752,7 @@
       "name": "Demo inverter poly module",
       "owner": "process.engineer",
       "mes_route_id": "ROUTE-DEMO-INVERTER-POLY-A",
-      "mask_design_id": "FABRICAD-DEMO-INVERTER",
+      "mask_design_id": "GLASSWORKS-DEMO-INVERTER",
       "layout_revision": "layout_model:demo-inverter@rev-5",
       "nodes": [
         {

@@ -18,6 +18,6 @@
     "generated_layer_count": 2,
     "warning_count": 1,
     "split_warning_gds_layer": 88,
-    "message_contains": ["multiple Fabricad layers", "DATATYPE 1", "DATATYPE 2"]
+    "message_contains": ["multiple Glassworks layers", "DATATYPE 1", "DATATYPE 2"]
   }
 }

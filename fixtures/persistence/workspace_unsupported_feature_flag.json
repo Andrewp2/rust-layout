@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "metadata": {
-    "producer": "fabricad_native_app",
+    "producer": "glassworks_native_app",
     "producer_version": "0.1.0",
     "workspace_schema_version": 1,
     "document_schema_version": 5,

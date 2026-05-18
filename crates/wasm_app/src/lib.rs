@@ -3,16 +3,16 @@ use wasm_bindgen::JsCast;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
-pub fn builtin_demo_workspace_report() -> Result<fabricad_app::BuiltinDemoWorkspaceReport, String> {
-    fabricad_app::validate_builtin_demo_workspace()
+pub fn builtin_demo_workspace_report() -> Result<glassworks_studio::BuiltinDemoWorkspaceReport, String> {
+    glassworks_studio::validate_builtin_demo_workspace()
 }
 
-pub fn quality_fixture_report() -> Result<fabricad_app::QualityFixtureReport, String> {
-    fabricad_app::validate_quality_fixtures()
+pub fn quality_fixture_report() -> Result<glassworks_studio::QualityFixtureReport, String> {
+    glassworks_studio::validate_quality_fixtures()
 }
 
-pub fn persistence_fixture_report() -> Result<fabricad_app::PersistenceFixtureReport, String> {
-    fabricad_app::validate_persistence_fixtures()
+pub fn persistence_fixture_report() -> Result<glassworks_studio::PersistenceFixtureReport, String> {
+    glassworks_studio::validate_persistence_fixtures()
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -72,12 +72,12 @@ pub fn start() -> Result<(), JsValue> {
         .document()
         .ok_or_else(|| JsValue::from_str("missing document"))?;
     let canvas = document
-        .get_element_by_id("fabricad_canvas")
-        .ok_or_else(|| JsValue::from_str("missing #fabricad_canvas"))?
+        .get_element_by_id("glassworks_canvas")
+        .ok_or_else(|| JsValue::from_str("missing #glassworks_canvas"))?
         .dyn_into::<web_sys::HtmlCanvasElement>()?;
 
     let options = startup_options_from_url();
-    let report = fabricad_app::run_operad_audit(options).map_err(|err| JsValue::from_str(&err))?;
+    let report = glassworks_studio::run_operad_audit(options).map_err(|err| JsValue::from_str(&err))?;
     let summary = report.summary();
     canvas.set_attribute("aria-label", &summary)?;
     canvas.set_text_content(Some(&summary));
@@ -85,16 +85,16 @@ pub fn start() -> Result<(), JsValue> {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn startup_options_from_url() -> fabricad_app::StartupOptions {
+fn startup_options_from_url() -> glassworks_studio::StartupOptions {
     let Some(window) = web_sys::window() else {
-        return fabricad_app::StartupOptions::default();
+        return glassworks_studio::StartupOptions::default();
     };
     let search = window.location().search().unwrap_or_default();
     startup_options_from_query(&search)
 }
 
-pub fn startup_options_from_query(search: &str) -> fabricad_app::StartupOptions {
-    let mut options = fabricad_app::StartupOptions::default();
+pub fn startup_options_from_query(search: &str) -> glassworks_studio::StartupOptions {
+    let mut options = glassworks_studio::StartupOptions::default();
     for (key, value) in query_pairs(search) {
         match key.as_str() {
             "workspace" if value == "demo" => {
@@ -110,7 +110,7 @@ pub fn startup_options_from_query(search: &str) -> fabricad_app::StartupOptions 
                 options.stress_count = Some(options.stress_count.unwrap_or(10_000));
             }
             "view" => {
-                if let Some(view) = fabricad_app::StartupView::from_slug(&value) {
+                if let Some(view) = glassworks_studio::StartupView::from_slug(&value) {
                     options.view_mode = Some(view);
                 } else if value == "3d" {
                     options.view_3d = true;
@@ -208,7 +208,7 @@ mod tests {
         let options = startup_options_from_query("?view=metrology");
         assert_eq!(
             options.view_mode,
-            Some(fabricad_app::StartupView::Metrology)
+            Some(glassworks_studio::StartupView::Metrology)
         );
     }
 
@@ -217,7 +217,7 @@ mod tests {
         let options = startup_options_from_query("?view=process-flow");
         assert_eq!(
             options.view_mode,
-            Some(fabricad_app::StartupView::ProcessFlow)
+            Some(glassworks_studio::StartupView::ProcessFlow)
         );
     }
 }

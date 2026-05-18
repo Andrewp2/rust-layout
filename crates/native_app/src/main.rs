@@ -1,15 +1,10 @@
-use fabricad_app::{
-    AppOptions, Benchmark3dOptions, OffscreenRenderOptions, OffscreenScene, OperadSnapshotReport,
-    StartupOptions, StartupView, UiScale, default_options_path, load_options_file,
-    render_operad_snapshot_scaled, run_3d_benchmark_scaled, run_operad_audit_scaled,
-    save_options_file,
+use glassworks_studio::{
+    AppOptions, Benchmark3dOptions, OffscreenRenderOptions, OffscreenScene, StartupOptions,
+    StartupView, UiScale, default_options_path, load_options_file, render_operad_snapshot_scaled,
+    run_3d_benchmark_scaled, run_operad_audit_scaled, save_options_file,
+    write_operad_snapshot_rgba,
 };
-use operad::ResourceFormat;
-use std::{
-    fs,
-    io::Write,
-    path::{Path, PathBuf},
-};
+use std::path::PathBuf;
 
 mod native_window;
 
@@ -30,12 +25,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     if let Some(path) = launch.export_gds {
-        fabricad_app::export_demo_gds(&path)?;
+        glassworks_studio::export_demo_gds(&path)?;
         println!("exported GDSII {}", path.display());
         return Ok(());
     }
     if let Some(options) = launch.offscreen {
-        let report = fabricad_app::run_offscreen_render(options)?;
+        let report = glassworks_studio::run_offscreen_render(options)?;
         println!("{}", report.summary());
         return Ok(());
     }
@@ -66,7 +61,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else if let Some((width, height)) = launch.operad_snapshot {
         let report = render_operad_snapshot_scaled(startup_options, width, height, ui_scale)?;
         if let Some(path) = &launch.snapshot_rgba {
-            write_snapshot_rgba(path, &report)?;
+            write_operad_snapshot_rgba(path, &report).map_err(std::io::Error::other)?;
         }
         println!("{}", report.summary());
     } else if launch.audit {
@@ -92,7 +87,7 @@ fn init_logging() {
 }
 
 fn default_log_filter() -> tracing_subscriber::EnvFilter {
-    tracing_subscriber::EnvFilter::new("fabricad_app=warn,renderer=warn,sync_server=warn")
+    tracing_subscriber::EnvFilter::new("glassworks_studio=warn,renderer=warn,sync_server=warn")
 }
 
 #[derive(Debug, PartialEq)]
@@ -123,7 +118,7 @@ impl LaunchOptions {
     fn from_env_and_args(
         args: impl IntoIterator<Item = String>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::parse(args, env_flag("FABRICAD_OFFSCREEN")).map_err(|message| {
+        Self::parse(args, env_flag("GLASSWORKS_OFFSCREEN")).map_err(|message| {
             Box::new(std::io::Error::other(message)) as Box<dyn std::error::Error>
         })
     }
@@ -530,41 +525,18 @@ fn env_flag(name: &str) -> bool {
     })
 }
 
-fn write_snapshot_rgba(
-    path: &Path,
-    report: &OperadSnapshotReport,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let image = report
-        .render
-        .snapshot
-        .as_ref()
-        .ok_or_else(|| std::io::Error::other("snapshot render did not produce image pixels"))?;
-    if image.format != ResourceFormat::Rgba8 {
-        return Err(Box::new(std::io::Error::other(format!(
-            "unsupported snapshot format {:?}; expected Rgba8",
-            image.format
-        ))));
-    }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut file = fs::File::create(path)?;
-    file.write_all(&image.pixels)?;
-    Ok(())
-}
-
 fn print_usage() {
     println!(
         "Usage:\n  \
-         fabricad\n  \
-         fabricad --list-views\n  \
-         fabricad --audit [--ui-scale SCALE]\n  \
-         fabricad --snapshot [--width W] [--height H] [--ui-scale SCALE] [--snapshot-rgba PATH] [--view SLUG] [--click NODE] [--scene demo|hierarchy|stress]\n  \
-         fabricad --offscreen [--scene demo|hierarchy|stress] [--count N] [--width W] [--height H] [--zoom Z] [--pan X,Y]\n  \
-         fabricad --bench-3d [--bench-3d-count N] [--bench-3d-frames N] [--bench-3d-warmup N] [--bench-3d-width W] [--bench-3d-height H]\n  \
-         fabricad --export-gds PATH\n  \
-         fabricad --print-options [--options-file PATH]\n  \
-         fabricad --write-default-options PATH\n\n\
+         glassworks\n  \
+         glassworks --list-views\n  \
+         glassworks --audit [--ui-scale SCALE]\n  \
+         glassworks --snapshot [--width W] [--height H] [--ui-scale SCALE] [--snapshot-rgba PATH] [--view SLUG] [--click NODE] [--scene demo|hierarchy|stress]\n  \
+         glassworks --offscreen [--scene demo|hierarchy|stress] [--count N] [--width W] [--height H] [--zoom Z] [--pan X,Y]\n  \
+         glassworks --bench-3d [--bench-3d-count N] [--bench-3d-frames N] [--bench-3d-warmup N] [--bench-3d-width W] [--bench-3d-height H]\n  \
+         glassworks --export-gds PATH\n  \
+         glassworks --print-options [--options-file PATH]\n  \
+         glassworks --write-default-options PATH\n\n\
          The default path opens a native window. Use --audit for the noninteractive summary."
     );
 }
@@ -743,8 +715,8 @@ mod tests {
             [
                 "--snapshot".to_string(),
                 "--click".to_string(),
-                "fabricad.menu.view".to_string(),
-                "--click=fabricad.menu.item.view.group.engineering".to_string(),
+                "glassworks.menu.view".to_string(),
+                "--click=glassworks.menu.item.view.group.engineering".to_string(),
             ],
             false,
         )
@@ -753,8 +725,8 @@ mod tests {
         assert_eq!(
             launch.startup_options().startup_actions,
             vec![
-                "fabricad.menu.view".to_string(),
-                "fabricad.menu.item.view.group.engineering".to_string()
+                "glassworks.menu.view".to_string(),
+                "glassworks.menu.item.view.group.engineering".to_string()
             ]
         );
     }

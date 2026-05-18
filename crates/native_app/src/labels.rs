@@ -3,7 +3,7 @@ use layout_model::{
 };
 
 pub(crate) fn display_mask_identifier(value: &str) -> String {
-    let Some(suffix) = value.strip_prefix("FABRICAD-DEMO-") else {
+    let Some(suffix) = value.strip_prefix("GLASSWORKS-DEMO-") else {
         return value.to_string();
     };
     capitalize_ascii_first(humanize_identifier(suffix))
@@ -124,7 +124,7 @@ pub(crate) fn display_owner_identifier(value: &str) -> String {
 pub(crate) fn display_technology_name(value: &str) -> String {
     let without_product = value
         .trim()
-        .strip_prefix("Fabricad ")
+        .strip_prefix("Glassworks ")
         .unwrap_or(value.trim());
     capitalize_ascii_first(
         without_product
@@ -246,14 +246,14 @@ mod tests {
 
     #[test]
     fn display_helpers_remove_demo_prefixes() {
-        assert_eq!(display_mask_identifier("FABRICAD-DEMO-POLY-M1"), "Poly m1");
+        assert_eq!(display_mask_identifier("GLASSWORKS-DEMO-POLY-M1"), "Poly m1");
         assert_eq!(display_route_identifier("ROUTE-DEMO-FLOW"), "Flow");
         assert_eq!(
             display_layout_revision_identifier("layout_model:demo-poly@r3"),
             "Poly r3"
         );
         assert_eq!(
-            display_technology_name("Fabricad demo process"),
+            display_technology_name("Glassworks demo process"),
             "Sample process"
         );
     }

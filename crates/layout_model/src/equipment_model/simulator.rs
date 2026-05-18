@@ -1,0 +1,1514 @@
+#![allow(unused_imports)]
+use super::*;
+
+pub(crate) const MAX_SENSOR_HISTORY: usize = 192;
+pub(crate) const MAX_RUN_LOG: usize = 24;
+pub(crate) const MAX_EVENT_LOG: usize = 96;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ToolId(pub String);
+
+impl ToolId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ToolId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<&str> for ToolId {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<String> for ToolId {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct RecipeId(pub String);
+
+impl RecipeId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for RecipeId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<&str> for RecipeId {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<String> for RecipeId {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct RunId(pub String);
+
+impl RunId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for RunId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum ToolKind {
+    SpinCoater,
+    HotPlate,
+    MaskAligner,
+    Etcher,
+    Microscope,
+    ProbeStation,
+}
+
+impl ToolKind {
+    pub fn class(self) -> ToolClass {
+        match self {
+            Self::SpinCoater => ToolClass::Coat,
+            Self::HotPlate => ToolClass::Bake,
+            Self::MaskAligner => ToolClass::Lithography,
+            Self::Etcher => ToolClass::Etch,
+            Self::Microscope => ToolClass::Inspection,
+            Self::ProbeStation => ToolClass::Probe,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SpinCoater => "Spin coater",
+            Self::HotPlate => "Hot plate",
+            Self::MaskAligner => "Mask aligner",
+            Self::Etcher => "Etcher",
+            Self::Microscope => "Microscope",
+            Self::ProbeStation => "Probe station",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum ToolClass {
+    Coat,
+    Bake,
+    Lithography,
+    Etch,
+    Inspection,
+    Probe,
+}
+
+impl ToolClass {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Coat => "Coat",
+            Self::Bake => "Bake",
+            Self::Lithography => "Lithography",
+            Self::Etch => "Etch",
+            Self::Inspection => "Inspection",
+            Self::Probe => "Probe",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum ToolState {
+    Offline,
+    OnlineIdle,
+    RecipeLoaded,
+    Running,
+    Completed,
+    Alarm,
+    Maintenance,
+}
+
+impl ToolState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Offline => "Offline",
+            Self::OnlineIdle => "Online idle",
+            Self::RecipeLoaded => "Recipe loaded",
+            Self::Running => "Running",
+            Self::Completed => "Completed",
+            Self::Alarm => "Alarm",
+            Self::Maintenance => "Maintenance",
+        }
+    }
+
+    pub fn accepts_recipe_load(self) -> bool {
+        matches!(
+            self,
+            Self::OnlineIdle | Self::RecipeLoaded | Self::Completed
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RecipeParameter {
+    Number { value: f64, unit: String },
+    Text { value: String },
+    Bool { value: bool },
+}
+
+impl RecipeParameter {
+    pub fn number(value: f64, unit: impl Into<String>) -> Self {
+        Self::Number {
+            value,
+            unit: unit.into(),
+        }
+    }
+
+    pub fn text(value: impl Into<String>) -> Self {
+        Self::Text {
+            value: value.into(),
+        }
+    }
+
+    pub fn bool(value: bool) -> Self {
+        Self::Bool { value }
+    }
+
+    pub fn as_number(&self) -> Option<f64> {
+        match self {
+            Self::Number { value, .. } => Some(*value),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Recipe {
+    pub id: RecipeId,
+    pub name: String,
+    pub tool_kind: ToolKind,
+    pub version: u32,
+    pub duration_s: u64,
+    pub parameters: BTreeMap<String, RecipeParameter>,
+}
+
+impl Recipe {
+    pub fn new(
+        id: impl Into<RecipeId>,
+        name: impl Into<String>,
+        tool_kind: ToolKind,
+        version: u32,
+        duration_s: u64,
+        parameters: BTreeMap<String, RecipeParameter>,
+    ) -> Self {
+        let version = if version == 0 {
+            warn!("equipment recipe version was zero; using version 1");
+            1
+        } else {
+            version
+        };
+        let duration_s = if duration_s == 0 {
+            warn!("equipment recipe duration was zero; using 1 second");
+            1
+        } else {
+            duration_s
+        };
+        Self {
+            id: id.into(),
+            name: name.into(),
+            tool_kind,
+            version,
+            duration_s,
+            parameters,
+        }
+    }
+
+    pub fn number(&self, key: &str, default: f64) -> f64 {
+        match self.parameters.get(key) {
+            Some(parameter) => parameter.as_number().unwrap_or_else(|| {
+                warn!(
+                    recipe_id = %self.id,
+                    parameter_key = key,
+                    default,
+                    "equipment recipe parameter is not numeric; using default"
+                );
+                default
+            }),
+            None => {
+                warn!(
+                    recipe_id = %self.id,
+                    parameter_key = key,
+                    default,
+                    "equipment recipe parameter missing; using default"
+                );
+                default
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecipeSelection {
+    pub recipe_id: RecipeId,
+    pub recipe_version: u32,
+    #[serde(default)]
+    pub lot_id: Option<String>,
+    #[serde(default)]
+    pub wafer_id: Option<String>,
+    #[serde(default)]
+    pub process_step_id: Option<String>,
+    #[serde(default)]
+    pub operator: Option<String>,
+}
+
+impl RecipeSelection {
+    pub fn new(recipe_id: impl Into<RecipeId>, recipe_version: u32) -> Self {
+        let recipe_version = if recipe_version == 0 {
+            warn!("equipment recipe selection version was zero; using version 1");
+            1
+        } else {
+            recipe_version
+        };
+        Self {
+            recipe_id: recipe_id.into(),
+            recipe_version,
+            lot_id: None,
+            wafer_id: None,
+            process_step_id: None,
+            operator: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AlarmSeverity {
+    Advisory,
+    Warning,
+    Critical,
+}
+
+impl AlarmSeverity {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Advisory => "Advisory",
+            Self::Warning => "Warning",
+            Self::Critical => "Critical",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Alarm {
+    pub id: String,
+    pub tool_id: ToolId,
+    pub code: String,
+    pub message: String,
+    pub severity: AlarmSeverity,
+    pub active: bool,
+    pub occurred_at_s: u64,
+    #[serde(default)]
+    pub cleared_at_s: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SensorSample {
+    pub tool_id: ToolId,
+    pub at_s: u64,
+    pub name: String,
+    pub value: f64,
+    pub unit: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RunStatus {
+    Running,
+    Completed,
+    Aborted,
+    Alarmed,
+}
+
+impl RunStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Running => "Running",
+            Self::Completed => "Completed",
+            Self::Aborted => "Aborted",
+            Self::Alarmed => "Alarmed",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolRun {
+    pub id: RunId,
+    pub tool_id: ToolId,
+    pub recipe: RecipeSelection,
+    pub started_at_s: u64,
+    #[serde(default)]
+    pub completed_at_s: Option<u64>,
+    pub status: RunStatus,
+    #[serde(default)]
+    pub sensor_count: usize,
+}
+
+impl ToolRun {
+    pub fn elapsed_s(&self, now_s: u64) -> u64 {
+        let completed_at_s = self.completed_at_s.unwrap_or_else(|| {
+            warn!(
+                run_id = %self.id,
+                now_s,
+                "tool run has no completed timestamp; using current simulator time for elapsed duration"
+            );
+            now_s
+        });
+        completed_at_s.saturating_sub(self.started_at_s)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolLogEntry {
+    pub at_s: u64,
+    pub tool_id: ToolId,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Tool {
+    pub id: ToolId,
+    pub name: String,
+    pub kind: ToolKind,
+    pub class: ToolClass,
+    pub state: ToolState,
+    pub available_recipes: BTreeMap<RecipeId, Recipe>,
+    #[serde(default)]
+    pub selected_recipe: Option<RecipeSelection>,
+    #[serde(default)]
+    pub active_run: Option<ToolRun>,
+    #[serde(default)]
+    pub recent_runs: Vec<ToolRun>,
+    #[serde(default)]
+    pub active_alarms: Vec<Alarm>,
+    #[serde(default)]
+    pub recent_sensors: VecDeque<SensorSample>,
+    #[serde(default)]
+    pub event_log: Vec<ToolLogEntry>,
+    pub last_updated_at_s: u64,
+}
+
+impl Tool {
+    pub fn new(
+        id: impl Into<ToolId>,
+        name: impl Into<String>,
+        kind: ToolKind,
+        recipes: Vec<Recipe>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            kind,
+            class: kind.class(),
+            state: ToolState::Offline,
+            available_recipes: recipes
+                .into_iter()
+                .map(|recipe| (recipe.id.clone(), recipe))
+                .collect(),
+            selected_recipe: None,
+            active_run: None,
+            recent_runs: Vec::new(),
+            active_alarms: Vec::new(),
+            recent_sensors: VecDeque::new(),
+            event_log: Vec::new(),
+            last_updated_at_s: 0,
+        }
+    }
+
+    pub fn recipe(&self, id: &RecipeId) -> Option<&Recipe> {
+        self.available_recipes.get(id)
+    }
+
+    pub fn selected_recipe_details(&self) -> Option<&Recipe> {
+        self.selected_recipe
+            .as_ref()
+            .and_then(|selection| self.recipe(&selection.recipe_id))
+    }
+
+    pub fn latest_sensor(&self, name: &str) -> Option<&SensorSample> {
+        self.recent_sensors
+            .iter()
+            .rev()
+            .find(|sample| sample.name == name)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum HostCommand {
+    BringOnline,
+    LoadRecipe {
+        selection: RecipeSelection,
+    },
+    Start,
+    Stop,
+    ClearAlarm,
+    EnterMaintenance,
+    ExitMaintenance,
+    TriggerAlarm {
+        code: String,
+        message: String,
+        severity: AlarmSeverity,
+    },
+    Reset,
+}
+
+impl HostCommand {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::BringOnline => "bring_online",
+            Self::LoadRecipe { .. } => "load_recipe",
+            Self::Start => "start",
+            Self::Stop => "stop",
+            Self::ClearAlarm => "clear_alarm",
+            Self::EnterMaintenance => "enter_maintenance",
+            Self::ExitMaintenance => "exit_maintenance",
+            Self::TriggerAlarm { .. } => "trigger_alarm",
+            Self::Reset => "reset",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum EquipmentEvent {
+    StateChanged {
+        tool_id: ToolId,
+        from: ToolState,
+        to: ToolState,
+        at_s: u64,
+    },
+    RecipeLoaded {
+        tool_id: ToolId,
+        selection: RecipeSelection,
+        at_s: u64,
+    },
+    RunStarted {
+        run: ToolRun,
+    },
+    RunEnded {
+        run: ToolRun,
+    },
+    AlarmRaised {
+        alarm: Alarm,
+    },
+    AlarmCleared {
+        alarm: Alarm,
+    },
+    SensorSample {
+        sample: SensorSample,
+    },
+    Log {
+        entry: ToolLogEntry,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolTransitionError {
+    pub tool_id: ToolId,
+    pub state: ToolState,
+    pub command: String,
+    pub message: String,
+}
+
+impl fmt::Display for ToolTransitionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} rejected {} while {}: {}",
+            self.tool_id,
+            self.command,
+            self.state.label(),
+            self.message
+        )
+    }
+}
+
+impl Error for ToolTransitionError {}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SyntheticTool {
+    pub tool: Tool,
+    pub(crate) run_elapsed_s: u64,
+    pub(crate) run_counter: u64,
+    pub(crate) alarm_counter: u64,
+    pub(crate) planned_alarm_at_s: Option<u64>,
+}
+
+impl SyntheticTool {
+    pub fn new(
+        id: impl Into<ToolId>,
+        name: impl Into<String>,
+        kind: ToolKind,
+        recipes: Vec<Recipe>,
+    ) -> Self {
+        Self {
+            tool: Tool::new(id, name, kind, recipes),
+            run_elapsed_s: 0,
+            run_counter: 0,
+            alarm_counter: 0,
+            planned_alarm_at_s: None,
+        }
+    }
+
+    pub fn spin_coater(id: impl Into<ToolId>, name: impl Into<String>) -> Self {
+        Self::new(id, name, ToolKind::SpinCoater, spin_coater_recipes())
+    }
+
+    pub fn hot_plate(id: impl Into<ToolId>, name: impl Into<String>) -> Self {
+        Self::new(id, name, ToolKind::HotPlate, hot_plate_recipes())
+    }
+
+    pub fn mask_aligner(id: impl Into<ToolId>, name: impl Into<String>) -> Self {
+        Self::new(id, name, ToolKind::MaskAligner, mask_aligner_recipes())
+    }
+
+    pub fn etcher(id: impl Into<ToolId>, name: impl Into<String>) -> Self {
+        Self::new(id, name, ToolKind::Etcher, etcher_recipes()).with_planned_alarm(14)
+    }
+
+    pub fn microscope(id: impl Into<ToolId>, name: impl Into<String>) -> Self {
+        Self::new(id, name, ToolKind::Microscope, microscope_recipes())
+    }
+
+    pub fn probe_station(id: impl Into<ToolId>, name: impl Into<String>) -> Self {
+        Self::new(id, name, ToolKind::ProbeStation, probe_station_recipes())
+    }
+
+    pub fn with_planned_alarm(mut self, elapsed_s: u64) -> Self {
+        let elapsed_s = if elapsed_s == 0 {
+            warn!("planned alarm elapsed time was zero; using 1 second");
+            1
+        } else {
+            elapsed_s
+        };
+        self.planned_alarm_at_s = Some(elapsed_s);
+        self
+    }
+
+    pub fn command(
+        &mut self,
+        command: HostCommand,
+        at_s: u64,
+    ) -> Result<Vec<EquipmentEvent>, ToolTransitionError> {
+        let mut events = Vec::new();
+        match command {
+            HostCommand::BringOnline => match self.tool.state {
+                ToolState::Offline => {
+                    self.transition_to(ToolState::OnlineIdle, at_s, &mut events);
+                    self.push_log(at_s, "host established online control", &mut events);
+                }
+                ToolState::OnlineIdle => {
+                    self.push_log(at_s, "online handshake refreshed", &mut events);
+                }
+                _ => {
+                    return Err(self.invalid(
+                        "bring_online",
+                        "tool must be offline or already online idle",
+                    ));
+                }
+            },
+            HostCommand::LoadRecipe { selection } => {
+                if !self.tool.state.accepts_recipe_load() {
+                    return Err(self.invalid(
+                        "load_recipe",
+                        "recipe load requires online idle, recipe loaded, or completed",
+                    ));
+                }
+                let Some(recipe) = self.tool.recipe(&selection.recipe_id) else {
+                    return Err(self.invalid(
+                        "load_recipe",
+                        format!("unknown recipe {}", selection.recipe_id),
+                    ));
+                };
+                if recipe.tool_kind != self.tool.kind {
+                    return Err(self.invalid("load_recipe", "recipe is for a different tool kind"));
+                }
+                self.tool.selected_recipe = Some(selection.clone());
+                self.tool.active_run = None;
+                self.run_elapsed_s = 0;
+                self.transition_to(ToolState::RecipeLoaded, at_s, &mut events);
+                events.push(EquipmentEvent::RecipeLoaded {
+                    tool_id: self.tool.id.clone(),
+                    selection: selection.clone(),
+                    at_s,
+                });
+                self.push_log(
+                    at_s,
+                    &format!(
+                        "loaded recipe {} v{}",
+                        selection.recipe_id, selection.recipe_version
+                    ),
+                    &mut events,
+                );
+            }
+            HostCommand::Start => {
+                if self.tool.state != ToolState::RecipeLoaded {
+                    return Err(self.invalid("start", "start requires a loaded recipe"));
+                }
+                let Some(selection) = self.tool.selected_recipe.clone() else {
+                    return Err(self.invalid("start", "no selected recipe"));
+                };
+                let Some(recipe) = self.tool.recipe(&selection.recipe_id) else {
+                    return Err(self.invalid("start", "selected recipe is unavailable"));
+                };
+                let recipe_name = recipe.name.clone();
+                self.run_counter += 1;
+                self.run_elapsed_s = 0;
+                let run = ToolRun {
+                    id: RunId::new(format!(
+                        "{}-R{:04}",
+                        self.tool.id.as_str().replace('-', ""),
+                        self.run_counter
+                    )),
+                    tool_id: self.tool.id.clone(),
+                    recipe: selection,
+                    started_at_s: at_s,
+                    completed_at_s: None,
+                    status: RunStatus::Running,
+                    sensor_count: 0,
+                };
+                self.tool.active_run = Some(run.clone());
+                self.transition_to(ToolState::Running, at_s, &mut events);
+                events.push(EquipmentEvent::RunStarted { run });
+                self.push_log(
+                    at_s,
+                    &format!("remote start accepted for {recipe_name}"),
+                    &mut events,
+                );
+            }
+            HostCommand::Stop => {
+                if self.tool.state != ToolState::Running {
+                    return Err(self.invalid("stop", "stop requires a running tool"));
+                }
+                self.finish_active_run(RunStatus::Aborted, at_s, &mut events);
+                self.transition_to(ToolState::OnlineIdle, at_s, &mut events);
+                self.push_log(at_s, "remote stop aborted active run", &mut events);
+            }
+            HostCommand::ClearAlarm => {
+                if self.tool.state != ToolState::Alarm {
+                    return Err(self.invalid("clear_alarm", "tool is not alarmed"));
+                }
+                let cleared = self
+                    .tool
+                    .active_alarms
+                    .iter_mut()
+                    .filter_map(|alarm| {
+                        if alarm.active {
+                            alarm.active = false;
+                            alarm.cleared_at_s = Some(at_s);
+                            Some(alarm.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                for alarm in cleared {
+                    events.push(EquipmentEvent::AlarmCleared { alarm });
+                }
+                self.transition_to(ToolState::OnlineIdle, at_s, &mut events);
+                self.push_log(at_s, "active alarms cleared by host", &mut events);
+            }
+            HostCommand::EnterMaintenance => {
+                if self.tool.state == ToolState::Running {
+                    return Err(self.invalid(
+                        "enter_maintenance",
+                        "maintenance requires stopping the active run first",
+                    ));
+                }
+                self.transition_to(ToolState::Maintenance, at_s, &mut events);
+                self.push_log(at_s, "tool placed in maintenance", &mut events);
+            }
+            HostCommand::ExitMaintenance => {
+                if self.tool.state != ToolState::Maintenance {
+                    return Err(self.invalid("exit_maintenance", "tool is not in maintenance"));
+                }
+                self.tool.selected_recipe = None;
+                self.tool.active_run = None;
+                self.transition_to(ToolState::Offline, at_s, &mut events);
+                self.push_log(at_s, "maintenance released tool to offline", &mut events);
+            }
+            HostCommand::TriggerAlarm {
+                code,
+                message,
+                severity,
+            } => {
+                if matches!(self.tool.state, ToolState::Offline | ToolState::Maintenance) {
+                    return Err(
+                        self.invalid("trigger_alarm", "alarm injection requires an online tool")
+                    );
+                }
+                self.raise_alarm(code, message, severity, at_s, &mut events);
+            }
+            HostCommand::Reset => {
+                if self.tool.state == ToolState::Running {
+                    return Err(self.invalid("reset", "cannot reset during a running process"));
+                }
+                self.tool.selected_recipe = None;
+                self.tool.active_run = None;
+                self.run_elapsed_s = 0;
+                if self.tool.state != ToolState::Offline {
+                    self.transition_to(ToolState::OnlineIdle, at_s, &mut events);
+                }
+                self.push_log(
+                    at_s,
+                    "host reset cleared recipe and run context",
+                    &mut events,
+                );
+            }
+        }
+        self.tool.last_updated_at_s = at_s;
+        Ok(events)
+    }
+
+    pub fn tick_one(&mut self, at_s: u64) -> Vec<EquipmentEvent> {
+        self.tool.last_updated_at_s = at_s;
+        let mut events = Vec::new();
+        if matches!(self.tool.state, ToolState::Offline | ToolState::Maintenance) {
+            return events;
+        }
+
+        if self.tool.state == ToolState::Running {
+            self.run_elapsed_s += 1;
+        }
+
+        let samples = self.sensor_samples(at_s);
+        if let Some(run) = self.tool.active_run.as_mut() {
+            run.sensor_count += samples.len();
+        }
+        for sample in samples {
+            self.record_sample(sample, &mut events);
+        }
+
+        if self.tool.state == ToolState::Running {
+            if self.planned_alarm_at_s == Some(self.run_elapsed_s) {
+                self.raise_alarm(
+                    "AUTO-INTERLOCK".to_string(),
+                    "deterministic interlock trip during simulated run".to_string(),
+                    AlarmSeverity::Critical,
+                    at_s,
+                    &mut events,
+                );
+                return events;
+            }
+            let duration_s = self
+                .tool
+                .selected_recipe_details()
+                .map(|recipe| recipe.duration_s)
+                .unwrap_or_else(|| {
+                    warn!(
+                        tool_id = %self.tool.id,
+                        "running tool has no selected recipe details; using 1 second duration"
+                    );
+                    1
+                });
+            if self.run_elapsed_s >= duration_s {
+                self.finish_active_run(RunStatus::Completed, at_s, &mut events);
+                self.transition_to(ToolState::Completed, at_s, &mut events);
+                self.push_log(at_s, "run completed", &mut events);
+            }
+        }
+
+        events
+    }
+
+    pub(crate) fn invalid(
+        &self,
+        command: impl Into<String>,
+        message: impl Into<String>,
+    ) -> ToolTransitionError {
+        ToolTransitionError {
+            tool_id: self.tool.id.clone(),
+            state: self.tool.state,
+            command: command.into(),
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn transition_to(
+        &mut self,
+        state: ToolState,
+        at_s: u64,
+        events: &mut Vec<EquipmentEvent>,
+    ) {
+        let from = self.tool.state;
+        if from == state {
+            return;
+        }
+        self.tool.state = state;
+        self.tool.last_updated_at_s = at_s;
+        events.push(EquipmentEvent::StateChanged {
+            tool_id: self.tool.id.clone(),
+            from,
+            to: state,
+            at_s,
+        });
+    }
+
+    pub(crate) fn push_log(&mut self, at_s: u64, message: &str, events: &mut Vec<EquipmentEvent>) {
+        let entry = ToolLogEntry {
+            at_s,
+            tool_id: self.tool.id.clone(),
+            message: message.to_string(),
+        };
+        self.tool.event_log.push(entry.clone());
+        if self.tool.event_log.len() > MAX_EVENT_LOG {
+            let overflow = self.tool.event_log.len() - MAX_EVENT_LOG;
+            warn!(
+                tool_id = %self.tool.id,
+                dropped_events = overflow,
+                max_event_log = MAX_EVENT_LOG,
+                "tool event log exceeded retention limit; dropping oldest events"
+            );
+            self.tool.event_log.drain(0..overflow);
+        }
+        events.push(EquipmentEvent::Log { entry });
+    }
+
+    pub(crate) fn record_sample(&mut self, sample: SensorSample, events: &mut Vec<EquipmentEvent>) {
+        self.tool.recent_sensors.push_back(sample.clone());
+        while self.tool.recent_sensors.len() > MAX_SENSOR_HISTORY {
+            warn!(
+                tool_id = %self.tool.id,
+                max_sensor_history = MAX_SENSOR_HISTORY,
+                "tool sensor history exceeded retention limit; dropping oldest sample"
+            );
+            self.tool.recent_sensors.pop_front();
+        }
+        events.push(EquipmentEvent::SensorSample { sample });
+    }
+
+    pub(crate) fn finish_active_run(
+        &mut self,
+        status: RunStatus,
+        at_s: u64,
+        events: &mut Vec<EquipmentEvent>,
+    ) {
+        let Some(mut run) = self.tool.active_run.take() else {
+            return;
+        };
+        run.completed_at_s = Some(at_s);
+        run.status = status;
+        self.tool.recent_runs.insert(0, run.clone());
+        if self.tool.recent_runs.len() > MAX_RUN_LOG {
+            warn!(
+                tool_id = %self.tool.id,
+                run_count = self.tool.recent_runs.len(),
+                max_run_log = MAX_RUN_LOG,
+                "tool run log exceeded retention limit; dropping oldest runs"
+            );
+        }
+        self.tool.recent_runs.truncate(MAX_RUN_LOG);
+        events.push(EquipmentEvent::RunEnded { run });
+    }
+
+    pub(crate) fn raise_alarm(
+        &mut self,
+        code: String,
+        message: String,
+        severity: AlarmSeverity,
+        at_s: u64,
+        events: &mut Vec<EquipmentEvent>,
+    ) {
+        if self.tool.state == ToolState::Running {
+            self.finish_active_run(RunStatus::Alarmed, at_s, events);
+        }
+        self.alarm_counter += 1;
+        let alarm = Alarm {
+            id: format!(
+                "{}-A{:03}",
+                self.tool.id.as_str().replace('-', ""),
+                self.alarm_counter
+            ),
+            tool_id: self.tool.id.clone(),
+            code,
+            message,
+            severity,
+            active: true,
+            occurred_at_s: at_s,
+            cleared_at_s: None,
+        };
+        self.tool.active_alarms.push(alarm.clone());
+        self.transition_to(ToolState::Alarm, at_s, events);
+        events.push(EquipmentEvent::AlarmRaised {
+            alarm: alarm.clone(),
+        });
+        self.push_log(
+            at_s,
+            &format!("alarm {} raised: {}", alarm.code, alarm.message),
+            events,
+        );
+    }
+
+    pub(crate) fn sensor_samples(&self, at_s: u64) -> Vec<SensorSample> {
+        let recipe = self.tool.selected_recipe_details();
+        let running = self.tool.state == ToolState::Running;
+        let elapsed = self.run_elapsed_s as f64;
+        let duration = recipe
+            .map(|recipe| recipe.duration_s)
+            .unwrap_or_else(|| {
+                warn!(
+                    tool_id = %self.tool.id,
+                    "sensor model missing selected recipe details; using 1 second duration"
+                );
+                1
+            })
+            .max(1) as f64;
+        let progress = if running {
+            let raw_progress = elapsed / duration;
+            let progress = raw_progress.clamp(0.0, 1.0);
+            if progress != raw_progress {
+                warn!(
+                    tool_id = %self.tool.id,
+                    raw_progress,
+                    progress,
+                    "tool run progress outside [0, 1]; clamping"
+                );
+            }
+            progress
+        } else {
+            0.0
+        };
+        match self.tool.kind {
+            ToolKind::SpinCoater => {
+                let target_rpm = recipe
+                    .map(|recipe| recipe.number("rpm", 4000.0))
+                    .unwrap_or_else(|| {
+                        warn!(
+                            tool_id = %self.tool.id,
+                            "spin coater has no recipe while sampling sensors; using target rpm 0"
+                        );
+                        0.0
+                    });
+                let rpm = if running {
+                    let raw_spinup = progress * 1.4;
+                    let spinup = raw_spinup.min(1.0);
+                    if spinup != raw_spinup {
+                        warn!(
+                            tool_id = %self.tool.id,
+                            raw_spinup,
+                            spinup,
+                            "spin coater spinup factor exceeded range; clamping"
+                        );
+                    }
+                    target_rpm * spinup + wave(at_s, 1) * 18.0
+                } else {
+                    0.0
+                };
+                let clamped_rpm = rpm.max(0.0);
+                if clamped_rpm != rpm {
+                    warn!(
+                        tool_id = %self.tool.id,
+                        rpm,
+                        clamped_rpm,
+                        "spin coater rpm below zero; clamping"
+                    );
+                }
+                vec![
+                    self.sample(at_s, "chuck_rpm", clamped_rpm, "rpm"),
+                    self.sample(at_s, "exhaust_pressure", -115.0 + wave(at_s, 2) * 2.5, "Pa"),
+                ]
+            }
+            ToolKind::HotPlate => {
+                let target_c = recipe
+                    .map(|recipe| recipe.number("temperature_c", 95.0))
+                    .unwrap_or_else(|| {
+                        warn!(
+                            tool_id = %self.tool.id,
+                            "hot plate has no recipe while sampling sensors; using ambient target temperature"
+                        );
+                        24.0
+                    });
+                let temp = if running {
+                    24.0 + (target_c - 24.0) * (0.25 + progress * 0.75) + wave(at_s, 3) * 0.4
+                } else if self.tool.state == ToolState::RecipeLoaded {
+                    38.0 + wave(at_s, 4) * 0.3
+                } else {
+                    24.0 + wave(at_s, 5) * 0.2
+                };
+                vec![
+                    self.sample(at_s, "surface_temp", temp, "C"),
+                    self.sample(at_s, "zone_delta", 0.7 + wave(at_s, 6) * 0.2, "C"),
+                ]
+            }
+            ToolKind::MaskAligner => {
+                let error = if running {
+                    let raw_decay = 1.0 - progress;
+                    let decay = raw_decay.max(0.08);
+                    if decay != raw_decay {
+                        warn!(
+                            tool_id = %self.tool.id,
+                            raw_decay,
+                            decay,
+                            "mask aligner alignment decay below floor; clamping"
+                        );
+                    }
+                    2.6 * decay + wave(at_s, 7) * 0.03
+                } else {
+                    2.8 + wave(at_s, 8) * 0.08
+                };
+                let clamped_error = error.max(0.0);
+                if clamped_error != error {
+                    warn!(
+                        tool_id = %self.tool.id,
+                        alignment_error = error,
+                        clamped_error,
+                        "mask aligner alignment error below zero; clamping"
+                    );
+                }
+                vec![
+                    self.sample(at_s, "alignment_error", clamped_error, "um"),
+                    self.sample(
+                        at_s,
+                        "lamp_power",
+                        if running { 13.5 } else { 0.0 },
+                        "mW/cm2",
+                    ),
+                ]
+            }
+            ToolKind::Etcher => {
+                let pressure = recipe
+                    .map(|recipe| recipe.number("pressure_mtorr", 80.0))
+                    .unwrap_or_else(|| {
+                        warn!(
+                            tool_id = %self.tool.id,
+                            "etcher has no recipe while sampling sensors; using idle pressure"
+                        );
+                        4.0
+                    });
+                let rf = recipe
+                    .map(|recipe| recipe.number("rf_power_w", 150.0))
+                    .unwrap_or_else(|| {
+                        warn!(
+                            tool_id = %self.tool.id,
+                            "etcher has no recipe while sampling sensors; using RF power 0"
+                        );
+                        0.0
+                    });
+                vec![
+                    self.sample(
+                        at_s,
+                        "chamber_pressure",
+                        if running {
+                            pressure + wave(at_s, 9) * 1.5
+                        } else {
+                            4.0 + wave(at_s, 10) * 0.4
+                        },
+                        "mTorr",
+                    ),
+                    self.sample(
+                        at_s,
+                        "rf_power",
+                        if running {
+                            rf + wave(at_s, 11) * 2.5
+                        } else {
+                            0.0
+                        },
+                        "W",
+                    ),
+                    self.sample(at_s, "endpoint_signal", 18.0 + progress * 64.0, "%"),
+                ]
+            }
+            ToolKind::Microscope => vec![
+                self.sample(at_s, "focus_z", 52.0 + wave(at_s, 12) * 0.15, "um"),
+                self.sample(at_s, "illumination", if running { 72.0 } else { 44.0 }, "%"),
+            ],
+            ToolKind::ProbeStation => vec![
+                self.sample(
+                    at_s,
+                    "contact_resistance",
+                    if running {
+                        0.42 + wave(at_s, 13) * 0.03
+                    } else {
+                        1.6 + wave(at_s, 14) * 0.1
+                    },
+                    "ohm",
+                ),
+                self.sample(at_s, "chuck_temp", 25.0 + wave(at_s, 15) * 0.2, "C"),
+            ],
+        }
+    }
+
+    pub(crate) fn sample(&self, at_s: u64, name: &str, value: f64, unit: &str) -> SensorSample {
+        SensorSample {
+            tool_id: self.tool.id.clone(),
+            at_s,
+            name: name.to_string(),
+            value,
+            unit: unit.to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EquipmentSimulator {
+    pub(crate) tools: BTreeMap<ToolId, SyntheticTool>,
+    pub now_s: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EquipmentValidationSeverity {
+    Error,
+    Warning,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EquipmentValidationFinding {
+    pub severity: EquipmentValidationSeverity,
+    pub message: String,
+}
+
+impl EquipmentValidationFinding {
+    pub(crate) fn error(message: impl Into<String>) -> Self {
+        Self {
+            severity: EquipmentValidationSeverity::Error,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn warning(message: impl Into<String>) -> Self {
+        Self {
+            severity: EquipmentValidationSeverity::Warning,
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EquipmentValidationContext {
+    pub(crate) lot_routes: BTreeMap<String, String>,
+    pub(crate) lot_wafers: BTreeMap<String, BTreeSet<String>>,
+    pub(crate) route_steps: BTreeMap<String, BTreeSet<String>>,
+    pub(crate) route_step_recipes: BTreeMap<(String, String), String>,
+    pub(crate) recipe_versions: BTreeMap<String, BTreeSet<u32>>,
+}
+
+impl EquipmentValidationContext {
+    pub fn from_mes_and_recipe_catalog(mes: &FabMesData, recipes: &RecipeCatalog) -> Self {
+        let mut route_steps = BTreeMap::<String, BTreeSet<String>>::new();
+        let mut route_step_recipes = BTreeMap::new();
+        for route in mes.routes.values() {
+            let route_id = route.id.as_str().to_string();
+            let steps = route_steps.entry(route_id.clone()).or_default();
+            for step in &route.steps {
+                let step_id = step.id.as_str().to_string();
+                steps.insert(step_id.clone());
+                route_step_recipes.insert(
+                    (route_id.clone(), step_id),
+                    step.required_recipe.as_str().to_string(),
+                );
+            }
+        }
+
+        Self {
+            lot_routes: mes
+                .lots
+                .values()
+                .map(|lot| {
+                    (
+                        lot.id.as_str().to_string(),
+                        lot.route_id.as_str().to_string(),
+                    )
+                })
+                .collect(),
+            lot_wafers: mes
+                .lots
+                .values()
+                .map(|lot| {
+                    (
+                        lot.id.as_str().to_string(),
+                        lot.wafers
+                            .iter()
+                            .map(|wafer| wafer.id.as_str().to_string())
+                            .collect(),
+                    )
+                })
+                .collect(),
+            route_steps,
+            route_step_recipes,
+            recipe_versions: recipes
+                .recipes
+                .values()
+                .map(|recipe| {
+                    (
+                        recipe.id.as_str().to_string(),
+                        recipe
+                            .versions
+                            .iter()
+                            .map(|version| version.version.0)
+                            .collect(),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    pub(crate) fn contains_lot(&self, lot_id: &str) -> bool {
+        self.lot_routes.contains_key(lot_id)
+    }
+
+    pub(crate) fn contains_lot_wafer(&self, lot_id: &str, wafer_id: &str) -> bool {
+        self.lot_wafers
+            .get(lot_id)
+            .is_some_and(|wafers| wafers.contains(wafer_id))
+    }
+
+    pub(crate) fn lot_route(&self, lot_id: &str) -> Option<&str> {
+        self.lot_routes.get(lot_id).map(String::as_str)
+    }
+
+    pub(crate) fn contains_step_on_route(&self, route_id: &str, step_id: &str) -> bool {
+        self.route_steps
+            .get(route_id)
+            .is_some_and(|steps| steps.contains(step_id))
+    }
+
+    pub(crate) fn contains_step(&self, step_id: &str) -> bool {
+        self.route_steps
+            .values()
+            .any(|steps| steps.contains(step_id))
+    }
+
+    pub(crate) fn step_required_recipe(&self, route_id: &str, step_id: &str) -> Option<&str> {
+        self.route_step_recipes
+            .get(&(route_id.to_string(), step_id.to_string()))
+            .map(String::as_str)
+    }
+
+    pub(crate) fn contains_recipe(&self, recipe_id: &str) -> bool {
+        self.recipe_versions.contains_key(recipe_id)
+    }
+
+    pub(crate) fn contains_recipe_version(&self, recipe_id: &str, version: u32) -> bool {
+        self.recipe_versions
+            .get(recipe_id)
+            .is_some_and(|versions| versions.contains(&version))
+    }
+}
+
+impl EquipmentSimulator {
+    pub fn new(tools: Vec<SyntheticTool>) -> Self {
+        Self {
+            tools: tools
+                .into_iter()
+                .map(|tool| (tool.tool.id.clone(), tool))
+                .collect(),
+            now_s: 0,
+        }
+    }
+
+    pub fn demo_fab() -> Self {
+        let mut simulator = Self::new(vec![
+            SyntheticTool::spin_coater("COAT-01", "Spin Coater 01"),
+            SyntheticTool::hot_plate("BAKE-01", "Hot Plate 01"),
+            SyntheticTool::mask_aligner("ALIGN-01", "Mask Aligner 01"),
+            SyntheticTool::etcher("ETCH-01", "Reactive Ion Etcher 01"),
+            SyntheticTool::microscope("MET-01", "Inspection Microscope 01"),
+            SyntheticTool::probe_station("PROBE-01", "Probe Station 01"),
+        ]);
+
+        let coat = ToolId::new("COAT-01");
+        let bake = ToolId::new("BAKE-01");
+        let align = ToolId::new("ALIGN-01");
+        let etch = ToolId::new("ETCH-01");
+        let microscope = ToolId::new("MET-01");
+
+        log_demo_command(
+            simulator.command(&coat, HostCommand::BringOnline),
+            "bring coat tool online",
+        );
+        log_demo_command(
+            simulator.command(
+                &coat,
+                HostCommand::LoadRecipe {
+                    selection: simulator.selection_for(&coat, "SPIN_PR_3000"),
+                },
+            ),
+            "load coat recipe",
+        );
+        log_demo_command(
+            simulator.command(&coat, HostCommand::Start),
+            "start coat tool",
+        );
+        log_demo_command(
+            simulator.command(&bake, HostCommand::BringOnline),
+            "bring bake tool online",
+        );
+        log_demo_command(
+            simulator.command(
+                &bake,
+                HostCommand::LoadRecipe {
+                    selection: simulator.selection_for(&bake, "BAKE_SOFT_095C"),
+                },
+            ),
+            "load bake recipe",
+        );
+        log_demo_command(
+            simulator.command(&align, HostCommand::BringOnline),
+            "bring aligner online",
+        );
+        log_demo_command(
+            simulator.command(&etch, HostCommand::BringOnline),
+            "bring etch tool online",
+        );
+        log_demo_command(
+            simulator.command(
+                &etch,
+                HostCommand::TriggerAlarm {
+                    code: "VAC-LOW".to_string(),
+                    message: "foreline pressure below simulated threshold".to_string(),
+                    severity: AlarmSeverity::Warning,
+                },
+            ),
+            "trigger demo etch alarm",
+        );
+        log_demo_command(
+            simulator.command(&microscope, HostCommand::BringOnline),
+            "bring microscope online",
+        );
+        simulator.tick(5);
+        simulator
+    }
+
+    pub fn tools(&self) -> impl Iterator<Item = &Tool> {
+        self.tools.values().map(|tool| &tool.tool)
+    }
+
+    pub fn tool(&self, id: &ToolId) -> Option<&Tool> {
+        self.tools.get(id).map(|tool| &tool.tool)
+    }
+
+    pub fn tool_mut(&mut self, id: &ToolId) -> Option<&mut Tool> {
+        self.tools.get_mut(id).map(|tool| &mut tool.tool)
+    }
+
+    pub fn command(
+        &mut self,
+        id: &ToolId,
+        command: HostCommand,
+    ) -> Result<Vec<EquipmentEvent>, ToolTransitionError> {
+        let Some(tool) = self.tools.get_mut(id) else {
+            return Err(ToolTransitionError {
+                tool_id: id.clone(),
+                state: ToolState::Offline,
+                command: command.label().to_string(),
+                message: "unknown tool id".to_string(),
+            });
+        };
+        tool.command(command, self.now_s)
+    }
+
+    pub fn tick(&mut self, seconds: u64) -> Vec<EquipmentEvent> {
+        let mut events = Vec::new();
+        for _ in 0..seconds {
+            self.now_s += 1;
+            for tool in self.tools.values_mut() {
+                events.extend(tool.tick_one(self.now_s));
+            }
+        }
+        events
+    }
+
+    pub fn active_alarms(&self) -> Vec<&Alarm> {
+        self.tools()
+            .flat_map(|tool| tool.active_alarms.iter())
+            .filter(|alarm| alarm.active)
+            .collect()
+    }
+
+    pub fn recent_runs(&self) -> Vec<&ToolRun> {
+        let mut runs = self
+            .tools()
+            .flat_map(|tool| tool.recent_runs.iter())
+            .collect::<Vec<_>>();
+        runs.sort_by(|left, right| right.started_at_s.cmp(&left.started_at_s));
+        runs
+    }
+
+    pub fn selection_for(&self, id: &ToolId, recipe: impl Into<RecipeId>) -> RecipeSelection {
+        let recipe_id = recipe.into();
+        let version = self
+            .tool(id)
+            .and_then(|tool| tool.recipe(&recipe_id))
+            .map(|recipe| recipe.version)
+            .unwrap_or_else(|| {
+                warn!(
+                    tool_id = %id,
+                    recipe_id = %recipe_id,
+                    "equipment recipe missing for selection; using version 1"
+                );
+                1
+            });
+        let step = self
+            .tool(id)
+            .and_then(|tool| process_step_for_kind(tool.kind).map(str::to_string));
+        RecipeSelection {
+            recipe_id,
+            recipe_version: version,
+            lot_id: Some("L-00042".to_string()),
+            wafer_id: Some(format!("L-00042-W{:02}", (self.now_s % 25) + 1)),
+            process_step_id: step,
+            operator: Some("sim-host".to_string()),
+        }
+    }
+
+    pub fn validate(&self) -> Vec<EquipmentValidationFinding> {
+        let mut findings = Vec::new();
+        for (tool_id, synthetic) in &self.tools {
+            let tool = &synthetic.tool;
+            if tool_id != &tool.id {
+                findings.push(EquipmentValidationFinding::error(format!(
+                    "equipment tool map key {tool_id} does not match tool id {}",
+                    tool.id
+                )));
+            }
+            validate_tool(tool, self.now_s, &mut findings);
+        }
+        findings
+    }
+
+    pub fn validate_with_context(
+        &self,
+        context: &EquipmentValidationContext,
+    ) -> Vec<EquipmentValidationFinding> {
+        let mut findings = self.validate();
+        for tool in self.tools() {
+            validate_tool_context(tool, context, &mut findings);
+        }
+        findings
+    }
+}

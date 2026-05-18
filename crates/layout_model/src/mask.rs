@@ -1064,7 +1064,7 @@ mod tests {
         let route = demo_process_route();
         let prep = ReticlePrep::from_document_and_route(&document, &route);
 
-        assert_eq!(prep.mask_design_id, "FABRICAD-DEMO-INVERTER");
+        assert_eq!(prep.mask_design_id, "GLASSWORKS-DEMO-INVERTER");
         assert_eq!(prep.layout_revision, "layout_model:demo-inverter@rev-5");
         assert_eq!(prep.route_id.as_ref(), Some(&route.id));
         assert!(

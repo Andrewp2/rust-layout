@@ -9,10 +9,10 @@ authors.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-fabricad_app = { package = "native_app", path = "../native_app", default-features = false, features = ["native"] }
+glassworks_studio = { package = "native_app", path = "../native_app", default-features = false, features = ["native"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 console_error_panic_hook = "0.1.7"
-fabricad_app = { package = "native_app", path = "../native_app", default-features = false, features = ["web"] }
+glassworks_studio = { package = "native_app", path = "../native_app", default-features = false, features = ["web"] }
 wasm-bindgen.workspace = true
 web-sys = { workspace = true, features = ["Document", "Element", "HtmlCanvasElement", "Location", "Window"] }

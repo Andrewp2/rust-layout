@@ -1494,9 +1494,9 @@ pub fn sample_fab_data() -> FabMesData {
 pub fn demo_process_route() -> ProcessRoute {
     ProcessRoute {
         id: ProcessRouteId::new("ROUTE-DEMO-INVERTER-POLY-A"),
-        name: "Fabricad demo inverter poly module".to_string(),
+        name: "Glassworks demo inverter poly module".to_string(),
         revision: "A.1".to_string(),
-        mask_design_id: "FABRICAD-DEMO-INVERTER".to_string(),
+        mask_design_id: "GLASSWORKS-DEMO-INVERTER".to_string(),
         layout_revision: "layout_model:demo-inverter@rev-5".to_string(),
         steps: vec![
             ProcessStep {

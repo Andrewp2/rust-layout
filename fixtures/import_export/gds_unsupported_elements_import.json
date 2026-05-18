@@ -28,16 +28,10 @@
   ],
   "expect": {
     "element_count": 4,
-    "generated_layer_count": 0,
-    "visible_shape_count": 1,
-    "skipped_count": 3,
+    "generated_layer_count": 1,
+    "visible_shape_count": 2,
+    "skipped_count": 2,
     "skipped": [
-      {
-        "element_kind": "BOX",
-        "gds_layer": 31,
-        "gds_type": 2,
-        "reason_contains": "unsupported GDSII BOX"
-      },
       {
         "element_kind": "NODE",
         "gds_layer": 32,

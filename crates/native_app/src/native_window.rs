@@ -1,26 +1,27 @@
 use std::time::{Duration, Instant};
 
 #[cfg(test)]
-use fabricad_app::build_layout_3d_batch_with_options;
-use fabricad_app::{
-    FabricadApp, LayoutCanvasResources, StartupOptions, StartupView, ToolMode,
+use glassworks_studio::build_layout_3d_batch_with_options;
+use glassworks_studio::{
+    GlassworksApp, LayoutCanvasResources, StartupOptions, StartupView, ToolMode,
     Viewport3dCanvasResources, render_layout_2d_canvas_with_size, render_layout_3d_canvas,
 };
 #[cfg(test)]
 use geometry_core::{Point, Rect};
 #[cfg(test)]
 use layout_model::Document;
-use operad::{
-    CanvasRenderOutput, CursorGrabMode, CursorRequest, KeyCode, KeyModifiers, NativeCanvasInput,
-    NativeKeyboardInput, NativeRawMouseMotion, NativeWgpuCanvasRenderContext,
+use operad::input::{RawInputEvent, RawPointerEvent};
+use operad::native::{
+    NativeCanvasInput, NativeKeyboardInput, NativeRawMouseMotion, NativeWgpuCanvasRenderContext,
     NativeWgpuCanvasRenderRegistry, NativeWindowHooks, NativeWindowMetrics, NativeWindowOptions,
-    PlatformRequest, PointerButton, PointerEventKind, RawInputEvent, RenderError, UiContent,
-    UiDocument, UiInputEvent, UiNodeId, UiPoint, UiRect, UiSize, WidgetAction, WidgetActionBinding,
-    WidgetActionKind,
+    run_app_with_canvas_renderers_and_hooks,
 };
-#[cfg(test)]
-use operad::{RawPointerEvent, platform::PixelSize};
-
+use operad::platform::{CursorGrabMode, CursorRequest, PixelSize, PlatformRequest};
+use operad::renderer::{CanvasRenderOutput, RenderError};
+use operad::{
+    KeyCode, KeyModifiers, PointerButton, PointerEventKind, UiContent, UiDocument, UiInputEvent,
+    UiNodeId, UiPoint, UiRect, UiSize, WidgetAction, WidgetActionBinding, WidgetActionKind,
+};
 const DEFAULT_WIDTH: u32 = 1440;
 const DEFAULT_HEIGHT: u32 = 920;
 const DOUBLE_CLICK_MAX_INTERVAL: Duration = Duration::from_millis(400);
@@ -28,21 +29,21 @@ const DOUBLE_CLICK_MAX_DISTANCE: f32 = 5.0;
 const CANVAS_LINE_SCROLL_POINTS: f32 = 36.0;
 
 pub fn run(options: StartupOptions) -> Result<(), Box<dyn std::error::Error>> {
-    let state = FabricadNativeState::new(options);
-    let native_options = NativeWindowOptions::new("Fabricad")
+    let state = GlassworksNativeState::new(options);
+    let native_options = NativeWindowOptions::new("Glassworks")
         .with_size(DEFAULT_WIDTH as f32, DEFAULT_HEIGHT as f32)
         .with_min_size(720.0, 480.0);
     let mut canvas_renderers = NativeWgpuCanvasRenderRegistry::new();
     canvas_renderers.register(
-        "fabricad.layout.viewport.2d",
+        "glassworks.layout.viewport.2d",
         render_native_layout_2d_canvas,
     );
     canvas_renderers.register(
-        "fabricad.layout.viewport.3d",
+        "glassworks.layout.viewport.3d",
         render_native_layout_3d_canvas,
     );
 
-    operad::run_app_with_canvas_renderers_and_hooks(
+    run_app_with_canvas_renderers_and_hooks(
         native_options,
         state,
         update_native_state,
@@ -53,8 +54,8 @@ pub fn run(options: StartupOptions) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-struct FabricadNativeState {
-    app: FabricadApp,
+struct GlassworksNativeState {
+    app: GlassworksApp,
     layout_canvas: LayoutCanvasResources,
     viewport_3d_canvas: Viewport3dCanvasResources,
     layout_pan_drag: Option<UiPoint>,
@@ -98,10 +99,10 @@ impl FlycamKeyState {
     }
 }
 
-impl FabricadNativeState {
+impl GlassworksNativeState {
     fn new(options: StartupOptions) -> Self {
         Self {
-            app: FabricadApp::new_with_options(options),
+            app: GlassworksApp::new_with_options(options),
             layout_canvas: LayoutCanvasResources::default(),
             viewport_3d_canvas: Viewport3dCanvasResources::default(),
             layout_pan_drag: None,
@@ -117,7 +118,7 @@ impl FabricadNativeState {
         let mut document = self
             .app
             .build_operad_document(viewport)
-            .expect("Fabricad document should build for native window");
+            .expect("Glassworks document should build for native window");
         attach_default_pointer_actions(&mut document);
         document
     }
@@ -140,8 +141,8 @@ impl FabricadNativeState {
 
     fn handle_canvas_input(&mut self, input: NativeCanvasInput) -> bool {
         match input.key.as_str() {
-            "fabricad.layout.viewport.2d" => self.handle_layout_2d_canvas_input(&input),
-            "fabricad.layout.viewport.3d" => self.handle_layout_3d_canvas_input(&input),
+            "glassworks.layout.viewport.2d" => self.handle_layout_2d_canvas_input(&input),
+            "glassworks.layout.viewport.3d" => self.handle_layout_3d_canvas_input(&input),
             _ => false,
         }
     }
@@ -240,6 +241,22 @@ impl FabricadNativeState {
         }
 
         if input.pressed {
+            if self.app.active_view() == StartupView::Layout2d
+                && self.app.layout_browser_search_active()
+                && self
+                    .app
+                    .handle_layout_browser_search_key(key, self.modifiers)
+            {
+                return true;
+            }
+            if self.app.active_view() == StartupView::Layout2d
+                && self.app.layout_browser_replace_active()
+                && self
+                    .app
+                    .handle_layout_browser_replace_key(key, self.modifiers)
+            {
+                return true;
+            }
             self.handle_keyboard_shortcut(key, self.modifiers)
         } else {
             false
@@ -256,7 +273,7 @@ impl FabricadNativeState {
         {
             return self
                 .app
-                .apply_clicked_node_name("fabricad.menu.item.tools.palette");
+                .apply_clicked_node_name("glassworks.menu.item.tools.palette");
         }
 
         if self.handle_view_cycle_shortcut(key, modifiers) {
@@ -267,6 +284,13 @@ impl FabricadNativeState {
             return true;
         }
 
+        if self.app.active_view() == StartupView::Layout2d
+            && primary_shortcut(modifiers)
+            && matches_shortcut_char(key, 'f')
+        {
+            return self.app.begin_layout_browser_search();
+        }
+
         if modifiers.alt
             && !modifiers.ctrl
             && !modifiers.meta
@@ -275,7 +299,7 @@ impl FabricadNativeState {
         {
             return self
                 .app
-                .apply_clicked_node_name(&format!("fabricad.menu.{slug}"));
+                .apply_clicked_node_name(&format!("glassworks.menu.{slug}"));
         }
 
         false
@@ -286,7 +310,7 @@ impl FabricadNativeState {
             return false;
         }
 
-        let views = fabricad_app::StartupView::ALL;
+        let views = glassworks_studio::StartupView::ALL;
         let current = views
             .iter()
             .position(|view| *view == self.app.active_view())
@@ -305,7 +329,7 @@ impl FabricadNativeState {
     fn handle_editor_shortcut(&mut self, key: KeyCode, modifiers: KeyModifiers) -> bool {
         if !matches!(
             self.app.active_view(),
-            fabricad_app::StartupView::Layout2d | fabricad_app::StartupView::Layout3d
+            glassworks_studio::StartupView::Layout2d | glassworks_studio::StartupView::Layout3d
         ) {
             return false;
         }
@@ -313,32 +337,32 @@ impl FabricadNativeState {
         if primary_shortcut(modifiers) && matches_shortcut_char(key, 'c') {
             return self
                 .app
-                .apply_clicked_node_name("fabricad.menu.item.edit.copy");
+                .apply_clicked_node_name("glassworks.menu.item.edit.copy");
         }
         if primary_shortcut(modifiers) && matches_shortcut_char(key, 'v') {
             return self
                 .app
-                .apply_clicked_node_name("fabricad.menu.item.edit.paste");
+                .apply_clicked_node_name("glassworks.menu.item.edit.paste");
         }
         if primary_shortcut(modifiers) && matches_shortcut_char(key, 'd') {
             return self
                 .app
-                .apply_clicked_node_name("fabricad.menu.item.edit.duplicate");
+                .apply_clicked_node_name("glassworks.menu.item.edit.duplicate");
         }
         if primary_shortcut(modifiers) && matches_shortcut_char(key, 'z') {
             let action = if modifiers.shift {
-                "fabricad.menu.item.edit.redo"
+                "glassworks.menu.item.edit.redo"
             } else {
-                "fabricad.menu.item.edit.undo"
+                "glassworks.menu.item.edit.undo"
             };
             return self.app.apply_clicked_node_name(action);
         }
         if primary_shortcut(modifiers) && matches_shortcut_char(key, 'y') {
             return self
                 .app
-                .apply_clicked_node_name("fabricad.menu.item.edit.redo");
+                .apply_clicked_node_name("glassworks.menu.item.edit.redo");
         }
-        if self.app.active_view() == fabricad_app::StartupView::Layout3d
+        if self.app.active_view() == glassworks_studio::StartupView::Layout3d
             && self.app.handle_layout_3d_key(key, modifiers)
         {
             return true;
@@ -350,17 +374,17 @@ impl FabricadNativeState {
             if matches_shortcut_char(key, 'r') {
                 return self
                     .app
-                    .apply_clicked_node_name("fabricad.menu.item.edit.rotate90");
+                    .apply_clicked_node_name("glassworks.menu.item.edit.rotate90");
             }
             if matches_shortcut_char(key, 'h') {
                 return self
                     .app
-                    .apply_clicked_node_name("fabricad.menu.item.edit.mirror_x");
+                    .apply_clicked_node_name("glassworks.menu.item.edit.mirror_x");
             }
             if matches_shortcut_char(key, 'v') {
                 return self
                     .app
-                    .apply_clicked_node_name("fabricad.menu.item.edit.mirror_y");
+                    .apply_clicked_node_name("glassworks.menu.item.edit.mirror_y");
             }
         }
         if self.app.handle_layout_editor_key(key, modifiers) {
@@ -369,7 +393,7 @@ impl FabricadNativeState {
         if key == KeyCode::Delete && !has_command_modifier(modifiers) {
             return self
                 .app
-                .apply_clicked_node_name("fabricad.menu.item.edit.delete");
+                .apply_clicked_node_name("glassworks.menu.item.edit.delete");
         }
 
         false
@@ -508,35 +532,35 @@ impl FabricadNativeState {
     }
 }
 
-fn native_hooks() -> NativeWindowHooks<FabricadNativeState> {
+fn native_hooks() -> NativeWindowHooks<GlassworksNativeState> {
     NativeWindowHooks::new()
-        .with_scale_factor(|_state: &FabricadNativeState, metrics| native_ui_scale(metrics))
-        .with_keyboard_input(|state: &mut FabricadNativeState, input| {
+        .with_scale_factor(|_state: &GlassworksNativeState, metrics| native_ui_scale(metrics))
+        .with_keyboard_input(|state: &mut GlassworksNativeState, input| {
             state.handle_keyboard_input(input)
         })
-        .with_raw_mouse_motion(|state: &mut FabricadNativeState, input| {
+        .with_raw_mouse_motion(|state: &mut GlassworksNativeState, input| {
             state.handle_raw_mouse_motion(input)
         })
-        .with_canvas_input(|state: &mut FabricadNativeState, input| {
+        .with_canvas_input(|state: &mut GlassworksNativeState, input| {
             state.handle_canvas_input(input)
         })
-        .with_platform_requests(|state: &mut FabricadNativeState, _metrics| {
+        .with_platform_requests(|state: &mut GlassworksNativeState, _metrics| {
             state.platform_requests()
         })
-        .with_before_render(|state: &mut FabricadNativeState, _metrics| state.before_render())
-        .with_idle_redraw(|state: &FabricadNativeState| state.idle_redraw())
+        .with_before_render(|state: &mut GlassworksNativeState, _metrics| state.before_render())
+        .with_idle_redraw(|state: &GlassworksNativeState| state.idle_redraw())
 }
 
-fn update_native_state(state: &mut FabricadNativeState, action: WidgetAction) {
+fn update_native_state(state: &mut GlassworksNativeState, action: WidgetAction) {
     state.handle_widget_action(action);
 }
 
-fn view_native_state(state: &FabricadNativeState, viewport: UiSize) -> UiDocument {
+fn view_native_state(state: &GlassworksNativeState, viewport: UiSize) -> UiDocument {
     state.build_document(viewport)
 }
 
 fn render_native_layout_2d_canvas(
-    state: &mut FabricadNativeState,
+    state: &mut GlassworksNativeState,
     context: NativeWgpuCanvasRenderContext<'_>,
 ) -> Result<CanvasRenderOutput, RenderError> {
     render_layout_2d_canvas_with_size(
@@ -552,7 +576,7 @@ fn render_native_layout_2d_canvas(
 }
 
 fn render_native_layout_3d_canvas(
-    state: &mut FabricadNativeState,
+    state: &mut GlassworksNativeState,
     context: NativeWgpuCanvasRenderContext<'_>,
 ) -> Result<CanvasRenderOutput, RenderError> {
     render_layout_3d_canvas(&state.app, &mut state.viewport_3d_canvas, context.surface)
@@ -568,14 +592,15 @@ fn layout_canvas_render_output(live_fps: bool) -> CanvasRenderOutput {
 
 fn attach_default_pointer_actions(document: &mut UiDocument) {
     for index in 0..document.node_count() {
-        let id = UiNodeId(index);
+        let id = UiNodeId::from_index(index);
         let action = {
             let node = document.node(id);
-            let is_canvas = matches!(node.content, UiContent::Canvas(_));
-            (node.action.is_none() && node.input.pointer && !is_canvas).then(|| node.name.clone())
+            let is_canvas = matches!(node.content(), UiContent::Canvas(_));
+            (node.action().is_none() && node.input().pointer && !is_canvas)
+                .then(|| node.name().to_string())
         };
         if let Some(action) = action {
-            document.node_mut(id).action = Some(WidgetActionBinding::action(action));
+            document.set_node_action(id, WidgetActionBinding::action(action));
         }
     }
 }
@@ -597,7 +622,7 @@ fn key_modifiers(modifiers: winit::keyboard::ModifiersState) -> KeyModifiers {
 }
 
 fn native_ui_scale(metrics: NativeWindowMetrics) -> f32 {
-    let env_scale = std::env::var("FABRICAD_UI_SCALE")
+    let env_scale = std::env::var("GLASSWORKS_UI_SCALE")
         .ok()
         .and_then(|value| value.parse::<f32>().ok())
         .unwrap_or(1.0);
@@ -636,12 +661,14 @@ fn layout_tool_shortcut_node(key: KeyCode) -> Option<&'static str> {
         return None;
     };
     match character {
-        '1' => Some("fabricad.tool.select"),
-        '2' => Some("fabricad.tool.rect"),
-        '3' => Some("fabricad.tool.poly"),
-        '4' => Some("fabricad.tool.path"),
-        '5' => Some("fabricad.tool.measure"),
-        '6' => Some("fabricad.tool.route"),
+        '1' => Some("glassworks.tool.select"),
+        '2' => Some("glassworks.tool.rect"),
+        '3' => Some("glassworks.tool.poly"),
+        '4' => Some("glassworks.tool.path"),
+        '5' => Some("glassworks.tool.measure"),
+        '6' => Some("glassworks.tool.route"),
+        '7' => Some("glassworks.tool.label"),
+        '8' => Some("glassworks.tool.trace"),
         _ => None,
     }
 }
@@ -665,6 +692,50 @@ fn menu_slug_for_hotkey(character: char) -> Option<&'static str> {
 mod tests {
     use super::*;
 
+    fn native_key_input(key_code: KeyCode, modifiers: KeyModifiers) -> NativeKeyboardInput {
+        let logical_key = match key_code {
+            KeyCode::Character(character) => {
+                winit::keyboard::Key::Character(character.to_string().into())
+            }
+            KeyCode::Backspace => winit::keyboard::Key::Named(winit::keyboard::NamedKey::Backspace),
+            KeyCode::Delete => winit::keyboard::Key::Named(winit::keyboard::NamedKey::Delete),
+            KeyCode::Enter => winit::keyboard::Key::Named(winit::keyboard::NamedKey::Enter),
+            KeyCode::Escape => winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape),
+            KeyCode::ArrowUp => winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowUp),
+            KeyCode::ArrowDown => winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowDown),
+            KeyCode::ArrowLeft => winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowLeft),
+            KeyCode::ArrowRight => {
+                winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowRight)
+            }
+            _ => winit::keyboard::Key::Unidentified(winit::keyboard::NativeKey::Unidentified),
+        };
+        let mut native_modifiers = winit::keyboard::ModifiersState::empty();
+        if modifiers.shift {
+            native_modifiers |= winit::keyboard::ModifiersState::SHIFT;
+        }
+        if modifiers.ctrl {
+            native_modifiers |= winit::keyboard::ModifiersState::CONTROL;
+        }
+        if modifiers.alt {
+            native_modifiers |= winit::keyboard::ModifiersState::ALT;
+        }
+        if modifiers.meta {
+            native_modifiers |= winit::keyboard::ModifiersState::SUPER;
+        }
+        NativeKeyboardInput {
+            logical_key,
+            physical_key: winit::keyboard::PhysicalKey::Unidentified(
+                winit::keyboard::NativeKeyCode::Unidentified,
+            ),
+            key_code: Some(key_code),
+            modifiers: native_modifiers,
+            state: winit::event::ElementState::Pressed,
+            pressed: true,
+            repeat: false,
+            text: None,
+        }
+    }
+
     #[test]
     fn monitor_scale_uses_readable_4k_fallback() {
         assert_eq!(monitor_ui_scale(PixelSize::new(1920, 1080)), 1.0);
@@ -675,25 +746,25 @@ mod tests {
 
     #[test]
     fn native_document_assigns_button_actions_for_operad_runner() {
-        let state = FabricadNativeState::new(StartupOptions::default());
+        let state = GlassworksNativeState::new(StartupOptions::default());
         let document = state.build_document(UiSize::new(1024.0, 720.0));
         let nav = document
             .nodes()
             .iter()
-            .find(|node| node.name == "fabricad.nav.action.layout2d")
+            .find(|node| node.name() == "glassworks.nav.action.layout2d")
             .expect("layout nav node should be present");
         assert_eq!(
-            nav.action.as_ref().and_then(|action| action.action_id()),
-            Some(&operad::WidgetActionId::new("fabricad.nav.action.layout2d"))
+            nav.action().and_then(|action| action.action_id()),
+            Some(&operad::WidgetActionId::new("glassworks.nav.action.layout2d"))
         );
     }
 
     #[test]
     fn native_widget_actions_route_through_existing_node_names() {
-        let mut state = FabricadNativeState::new(StartupOptions::default());
+        let mut state = GlassworksNativeState::new(StartupOptions::default());
         assert!(state.handle_widget_action(WidgetAction::activate(
-            UiNodeId(0),
-            "fabricad.nav.action.layout2d"
+            UiNodeId::ROOT,
+            "glassworks.nav.action.layout2d"
         )));
         assert_eq!(state.app.active_view(), StartupView::Layout2d);
     }
@@ -706,13 +777,13 @@ mod tests {
 
     #[test]
     fn native_layout_views_idle_redraw_and_tick_fps_without_dirtying_scene() {
-        let workflow = FabricadNativeState::new(StartupOptions::default());
+        let workflow = GlassworksNativeState::new(StartupOptions::default());
         assert!(
             !workflow.idle_redraw(),
             "non-layout views should not redraw only for the layout FPS meter"
         );
 
-        let mut layout = FabricadNativeState::new(StartupOptions {
+        let mut layout = GlassworksNativeState::new(StartupOptions {
             view_mode: Some(StartupView::Layout2d),
             ..Default::default()
         });
@@ -735,12 +806,12 @@ mod tests {
 
     #[test]
     fn native_pointer_events_route_to_layout_canvas_editor() {
-        let mut state = FabricadNativeState::new(StartupOptions {
+        let mut state = GlassworksNativeState::new(StartupOptions {
             view_mode: Some(StartupView::Layout2d),
             zoom: Some(0.1),
             ..Default::default()
         });
-        assert!(state.app.apply_clicked_node_name("fabricad.tool.rect"));
+        assert!(state.app.apply_clicked_node_name("glassworks.tool.rect"));
         let document = state.build_document(UiSize::new(1024.0, 720.0));
         let canvas = layout_canvas_rect(&document).expect("layout canvas should exist");
         let shape_count = state.app.workspace().document.shapes.len();
@@ -748,19 +819,19 @@ mod tests {
         let end = UiPoint::new(canvas.x + canvas.width * 0.5 + 30.0, canvas.y + 140.0);
 
         assert!(state.handle_canvas_input(pointer_canvas_input(
-            "fabricad.layout.viewport.2d",
+            "glassworks.layout.viewport.2d",
             canvas,
             PointerEventKind::Down(PointerButton::Primary),
             start,
         )));
         assert!(state.handle_canvas_input(pointer_canvas_input(
-            "fabricad.layout.viewport.2d",
+            "glassworks.layout.viewport.2d",
             canvas,
             PointerEventKind::Move,
             end,
         )));
         assert!(state.handle_canvas_input(pointer_canvas_input(
-            "fabricad.layout.viewport.2d",
+            "glassworks.layout.viewport.2d",
             canvas,
             PointerEventKind::Up(PointerButton::Primary),
             end,
@@ -775,7 +846,7 @@ mod tests {
 
     #[test]
     fn native_middle_or_right_drag_pans_layout_canvas() {
-        let mut state = FabricadNativeState::new(StartupOptions {
+        let mut state = GlassworksNativeState::new(StartupOptions {
             view_mode: Some(StartupView::Layout2d),
             zoom: Some(0.1),
             ..Default::default()
@@ -790,19 +861,19 @@ mod tests {
 
         let before = state.app.layout_pan();
         assert!(state.handle_canvas_input(pointer_canvas_input(
-            "fabricad.layout.viewport.2d",
+            "glassworks.layout.viewport.2d",
             canvas,
             PointerEventKind::Down(PointerButton::Auxiliary),
             start,
         )));
         assert!(state.handle_canvas_input(pointer_canvas_input(
-            "fabricad.layout.viewport.2d",
+            "glassworks.layout.viewport.2d",
             canvas,
             PointerEventKind::Move,
             end,
         )));
         assert!(state.handle_canvas_input(pointer_canvas_input(
-            "fabricad.layout.viewport.2d",
+            "glassworks.layout.viewport.2d",
             canvas,
             PointerEventKind::Up(PointerButton::Auxiliary),
             end,
@@ -812,7 +883,7 @@ mod tests {
 
     #[test]
     fn native_right_click_finishes_layout_polyline_instead_of_panning() {
-        let mut state = FabricadNativeState::new(StartupOptions {
+        let mut state = GlassworksNativeState::new(StartupOptions {
             view_mode: Some(StartupView::Layout2d),
             zoom: Some(0.1),
             ..Default::default()
@@ -820,7 +891,7 @@ mod tests {
         let document = state.build_document(UiSize::new(1024.0, 720.0));
         let canvas = layout_canvas_rect(&document).expect("layout canvas should exist");
         let shape_count = state.app.workspace().document.shapes.len();
-        assert!(state.app.apply_clicked_node_name("fabricad.tool.poly"));
+        assert!(state.app.apply_clicked_node_name("glassworks.tool.poly"));
 
         for point in [
             UiPoint::new(canvas.x + 220.0, canvas.y + 220.0),
@@ -828,20 +899,20 @@ mod tests {
             UiPoint::new(canvas.x + 280.0, canvas.y + 280.0),
         ] {
             assert!(state.handle_canvas_input(pointer_canvas_input(
-                "fabricad.layout.viewport.2d",
+                "glassworks.layout.viewport.2d",
                 canvas,
                 PointerEventKind::Down(PointerButton::Primary),
                 point,
             )));
             assert!(state.handle_canvas_input(pointer_canvas_input(
-                "fabricad.layout.viewport.2d",
+                "glassworks.layout.viewport.2d",
                 canvas,
                 PointerEventKind::Up(PointerButton::Primary),
                 point,
             )));
         }
         assert!(state.handle_canvas_input(pointer_canvas_input(
-            "fabricad.layout.viewport.2d",
+            "glassworks.layout.viewport.2d",
             canvas,
             PointerEventKind::Down(PointerButton::Secondary),
             UiPoint::new(canvas.x + 280.0, canvas.y + 280.0),
@@ -853,7 +924,7 @@ mod tests {
 
     #[test]
     fn native_3d_canvas_click_captures_flycam_and_wasd_advances() {
-        let mut state = FabricadNativeState::new(StartupOptions {
+        let mut state = GlassworksNativeState::new(StartupOptions {
             view_mode: Some(StartupView::Layout3d),
             ..Default::default()
         });
@@ -865,7 +936,7 @@ mod tests {
         );
 
         assert!(state.handle_canvas_input(pointer_canvas_input(
-            "fabricad.layout.viewport.3d",
+            "glassworks.layout.viewport.3d",
             canvas,
             PointerEventKind::Down(PointerButton::Primary),
             point,
@@ -898,19 +969,19 @@ mod tests {
 
     #[test]
     fn native_alt_hotkeys_open_underlined_top_menus() {
-        let mut state = FabricadNativeState::new(StartupOptions::default());
+        let mut state = GlassworksNativeState::new(StartupOptions::default());
         let alt = KeyModifiers {
             alt: true,
             ..KeyModifiers::NONE
         };
 
         assert!(state.handle_keyboard_shortcut(KeyCode::Character('v'), alt));
-        assert_eq!(state.app.active_menu(), Some(fabricad_app::AppMenu::View));
+        assert_eq!(state.app.active_menu(), Some(glassworks_studio::AppMenu::View));
 
         assert!(state.handle_keyboard_shortcut(KeyCode::Character('D'), alt));
         assert_eq!(
             state.app.active_menu(),
-            Some(fabricad_app::AppMenu::Display)
+            Some(glassworks_studio::AppMenu::Display)
         );
     }
 
@@ -931,22 +1002,72 @@ mod tests {
             (KeyCode::Character('p'), ctrl, "Ctrl/Cmd+P"),
             (KeyCode::Character('P'), ctrl_shift, "Ctrl/Cmd+Shift+P"),
         ] {
-            let mut state = FabricadNativeState::new(StartupOptions::default());
+            let mut state = GlassworksNativeState::new(StartupOptions::default());
             assert!(state.handle_keyboard_shortcut(key, modifiers));
             let document = state.build_document(UiSize::new(1024.0, 720.0));
             assert!(
                 document
                     .nodes()
                     .iter()
-                    .any(|node| node.name == "fabricad.command_palette"),
+                    .any(|node| node.name() == "glassworks.command_palette"),
                 "{label} should expose the command palette"
             );
         }
     }
 
     #[test]
+    fn native_layout_browser_search_shortcut_captures_text_before_tool_shortcuts() {
+        let mut state = GlassworksNativeState::new(StartupOptions {
+            view_mode: Some(StartupView::Layout2d),
+            ..Default::default()
+        });
+        let ctrl = KeyModifiers {
+            ctrl: true,
+            ..KeyModifiers::NONE
+        };
+        assert!(state.handle_keyboard_shortcut(KeyCode::Character('f'), ctrl));
+        assert!(state.app.layout_browser_search_active());
+
+        assert!(state.handle_keyboard_input(native_key_input(
+            KeyCode::Character('2'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(state.app.layout_browser_search(), "2");
+        assert_eq!(
+            state.app.active_tool(),
+            ToolMode::Select,
+            "active browser search should capture numeric keys before tool shortcuts"
+        );
+
+        assert!(
+            state.handle_keyboard_input(native_key_input(KeyCode::Backspace, KeyModifiers::NONE,))
+        );
+        assert_eq!(state.app.layout_browser_search(), "");
+        assert!(
+            state.handle_keyboard_input(native_key_input(KeyCode::Escape, KeyModifiers::NONE,))
+        );
+        assert!(!state.app.layout_browser_search_active());
+
+        assert!(state.app.begin_layout_browser_replace());
+        assert!(state.handle_keyboard_input(native_key_input(
+            KeyCode::Character('3'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(state.app.layout_browser_replace(), "3");
+        assert_eq!(
+            state.app.active_tool(),
+            ToolMode::Select,
+            "active browser replace should capture numeric keys before tool shortcuts"
+        );
+        assert!(
+            state.handle_keyboard_input(native_key_input(KeyCode::Escape, KeyModifiers::NONE,))
+        );
+        assert!(!state.app.layout_browser_replace_active());
+    }
+
+    #[test]
     fn native_escape_closes_keyboard_opened_shell_ui() {
-        let mut state = FabricadNativeState::new(StartupOptions::default());
+        let mut state = GlassworksNativeState::new(StartupOptions::default());
         let alt = KeyModifiers {
             alt: true,
             ..KeyModifiers::NONE
@@ -957,7 +1078,7 @@ mod tests {
         };
 
         assert!(state.handle_keyboard_shortcut(KeyCode::Character('f'), alt));
-        assert_eq!(state.app.active_menu(), Some(fabricad_app::AppMenu::File));
+        assert_eq!(state.app.active_menu(), Some(glassworks_studio::AppMenu::File));
         assert!(state.handle_keyboard_shortcut(KeyCode::Escape, KeyModifiers::NONE));
         assert_eq!(state.app.active_menu(), None);
 
@@ -968,14 +1089,14 @@ mod tests {
             !document
                 .nodes()
                 .iter()
-                .any(|node| node.name == "fabricad.command_palette"),
+                .any(|node| node.name() == "glassworks.command_palette"),
             "Escape should close the command palette"
         );
     }
 
     #[test]
     fn native_primary_tab_cycles_between_apps() {
-        let mut state = FabricadNativeState::new(StartupOptions::default());
+        let mut state = GlassworksNativeState::new(StartupOptions::default());
         let ctrl = KeyModifiers {
             ctrl: true,
             ..KeyModifiers::NONE
@@ -996,7 +1117,7 @@ mod tests {
 
     #[test]
     fn native_editor_shortcuts_route_to_layout_actions() {
-        let mut state = FabricadNativeState::new(StartupOptions {
+        let mut state = GlassworksNativeState::new(StartupOptions {
             view_mode: Some(StartupView::Layout2d),
             ..Default::default()
         });
@@ -1016,7 +1137,7 @@ mod tests {
         assert!(
             state
                 .app
-                .apply_clicked_node_name(&format!("fabricad.viewctl.layout.shape.{}", shape_id.0))
+                .apply_clicked_node_name(&format!("glassworks.viewctl.layout.shape.{}", shape_id.0))
         );
 
         assert!(state.handle_keyboard_shortcut(KeyCode::Character('c'), ctrl));
@@ -1034,7 +1155,7 @@ mod tests {
 
     #[test]
     fn native_editor_shortcuts_route_undo_and_redo() {
-        let mut state = FabricadNativeState::new(StartupOptions {
+        let mut state = GlassworksNativeState::new(StartupOptions {
             view_mode: Some(StartupView::Layout2d),
             ..Default::default()
         });
@@ -1059,7 +1180,7 @@ mod tests {
         assert!(
             state
                 .app
-                .apply_clicked_node_name(&format!("fabricad.viewctl.layout.shape.{}", shape_id.0))
+                .apply_clicked_node_name(&format!("glassworks.viewctl.layout.shape.{}", shape_id.0))
         );
         let shape_count = state.app.workspace().document.shapes.len();
 
@@ -1081,7 +1202,7 @@ mod tests {
 
     #[test]
     fn native_layout_single_key_shortcuts_switch_tools_and_transform() {
-        let mut state = FabricadNativeState::new(StartupOptions {
+        let mut state = GlassworksNativeState::new(StartupOptions {
             view_mode: Some(StartupView::Layout2d),
             ..Default::default()
         });
@@ -1097,13 +1218,17 @@ mod tests {
         assert!(
             state
                 .app
-                .apply_clicked_node_name(&format!("fabricad.viewctl.layout.shape.{}", shape_id.0))
+                .apply_clicked_node_name(&format!("glassworks.viewctl.layout.shape.{}", shape_id.0))
         );
 
         assert!(state.handle_keyboard_shortcut(KeyCode::Character('2'), KeyModifiers::NONE));
         assert_eq!(state.app.active_tool(), ToolMode::Rect);
         assert!(state.handle_keyboard_shortcut(KeyCode::Character('6'), KeyModifiers::NONE));
         assert_eq!(state.app.active_tool(), ToolMode::Route);
+        assert!(state.handle_keyboard_shortcut(KeyCode::Character('7'), KeyModifiers::NONE));
+        assert_eq!(state.app.active_tool(), ToolMode::Label);
+        assert!(state.handle_keyboard_shortcut(KeyCode::Character('8'), KeyModifiers::NONE));
+        assert_eq!(state.app.active_tool(), ToolMode::Trace);
         assert!(state.handle_keyboard_shortcut(KeyCode::Character('1'), KeyModifiers::NONE));
         assert_eq!(state.app.active_tool(), ToolMode::Select);
 
@@ -1128,7 +1253,7 @@ mod tests {
 
     #[test]
     fn fitted_layout_viewport_tracks_canvas_aspect() {
-        let viewport = fabricad_app::fitted_layout_viewport(
+        let viewport = glassworks_studio::fitted_layout_viewport(
             Some(Rect::from_min_size(Point::new(0, 0), 1_000, 500)),
             PixelSize::new(1600, 800),
         );
@@ -1141,8 +1266,8 @@ mod tests {
         document
             .nodes()
             .iter()
-            .find(|node| node.name == "fabricad.layout.preview")
-            .map(|node| node.layout.rect)
+            .find(|node| node.name() == "glassworks.layout.preview")
+            .map(|node| node.layout().rect)
     }
 
     fn pointer_canvas_input(
@@ -1152,7 +1277,7 @@ mod tests {
         position: UiPoint,
     ) -> NativeCanvasInput {
         NativeCanvasInput {
-            node: UiNodeId(0),
+            node: UiNodeId::ROOT,
             key: key.to_string(),
             rect,
             local_position: Some(UiPoint::new(position.x - rect.x, position.y - rect.y)),

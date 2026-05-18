@@ -48,66 +48,66 @@ QUICK_SIZES = {"narrow", "laptop", "wide"}
 SUMMARY_COUNT_PATTERN = re.compile(r"\b(paint_items|layout_warnings)=(\d+)\b")
 PRESET_CLICKS = {
     "bookmarks-menu": [
-        "fabricad.menu.bookmarks",
+        "glassworks.menu.bookmarks",
     ],
     "canvas-2d": [],
     "canvas-3d": [],
     "command-palette": [
-        "fabricad.menu.view",
-        "fabricad.menu.item.view.command_palette",
+        "glassworks.menu.view",
+        "glassworks.menu.item.view.command_palette",
     ],
     "file-menu": [
-        "fabricad.menu.file",
+        "glassworks.menu.file",
     ],
     "help-menu": [
-        "fabricad.menu.help",
+        "glassworks.menu.help",
     ],
     "edit-menu": [
-        "fabricad.menu.edit",
+        "glassworks.menu.edit",
     ],
     "display-menu": [
-        "fabricad.menu.display",
+        "glassworks.menu.display",
     ],
     "details-panel": [
-        "fabricad.menu.display",
-        "fabricad.menu.item.display.inspector",
+        "glassworks.menu.display",
+        "glassworks.menu.item.display.inspector",
     ],
     "macros-menu": [
-        "fabricad.menu.macros",
+        "glassworks.menu.macros",
     ],
     "more-menu": [
-        "fabricad.menu.more",
+        "glassworks.menu.more",
     ],
     "options-panel": [
-        "fabricad.menu.options",
-        "fabricad.menu.item.display.options",
+        "glassworks.menu.options",
+        "glassworks.menu.item.display.options",
     ],
     "secondary-panel": [
-        "fabricad.menu.display",
-        "fabricad.menu.item.display.secondary_panel",
+        "glassworks.menu.display",
+        "glassworks.menu.item.display.secondary_panel",
     ],
     "sidebar-modules": [
-        "fabricad.menu.view",
-        "fabricad.menu.item.view.sidebar_modules",
+        "glassworks.menu.view",
+        "glassworks.menu.item.view.sidebar_modules",
     ],
     "tools-menu": [
-        "fabricad.menu.tools",
+        "glassworks.menu.tools",
     ],
     "view-analysis": [
-        "fabricad.menu.view",
-        "fabricad.menu.item.view.group.analysis",
+        "glassworks.menu.view",
+        "glassworks.menu.item.view.group.analysis",
     ],
     "view-design": [
-        "fabricad.menu.view",
-        "fabricad.menu.item.view.group.design",
+        "glassworks.menu.view",
+        "glassworks.menu.item.view.group.design",
     ],
     "view-engineering": [
-        "fabricad.menu.view",
-        "fabricad.menu.item.view.group.engineering",
+        "glassworks.menu.view",
+        "glassworks.menu.item.view.group.engineering",
     ],
     "view-operations": [
-        "fabricad.menu.view",
-        "fabricad.menu.item.view.group.operations",
+        "glassworks.menu.view",
+        "glassworks.menu.item.view.group.operations",
     ],
 }
 PRESET_DEFAULT_VIEWS = {
@@ -125,11 +125,11 @@ def preset_default_views(name: str) -> list[str]:
 
 def native_binary() -> Path:
     subprocess.run(
-        ["cargo", "build", "-p", "native_app", "--bin", "fabricad"],
+        ["cargo", "build", "-p", "native_app", "--bin", "glassworks"],
         cwd=ROOT,
         check=True,
     )
-    binary = ROOT / "target" / "debug" / "fabricad"
+    binary = ROOT / "target" / "debug" / "glassworks"
     if not binary.exists():
         raise RuntimeError(f"native binary was not built: {binary}")
     return binary
@@ -173,8 +173,8 @@ def click_suffix(clicks: list[str]) -> str:
     parts = []
     for click in clicks:
         part = re.sub(r"[^A-Za-z0-9]+", "-", click).strip("-").lower()
-        part = re.sub(r"^(fabricad-)?menu-item-", "", part)
-        part = re.sub(r"^(fabricad-)?menu-", "menu-", part)
+        part = re.sub(r"^(glassworks-)?menu-item-", "", part)
+        part = re.sub(r"^(glassworks-)?menu-", "menu-", part)
         parts.append(part[:48] or "click")
     return "__" + "__".join(parts)[:120]
 

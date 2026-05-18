@@ -1,6 +1,6 @@
-# Fabricad Collaboration Model
+# Glassworks Collaboration Model
 
-Fabricad collaboration is moving toward a local-first CRDT design. The current implementation uses [Loro](https://loro.dev/) as the replicated update log while keeping Fabricad's own semantic CAD commands as the editor-facing operation language.
+Glassworks collaboration is moving toward a local-first CRDT design. The current implementation uses [Loro](https://loro.dev/) as the replicated update log while keeping Glassworks's own semantic CAD commands as the editor-facing operation language.
 
 ## Current Slice
 
@@ -23,9 +23,9 @@ Loro owns the replicated transport and object-store state:
 
 - Native clients append each semantic operation to a Loro list as JSON.
 - The same update writes object state into Loro maps:
-  - `fabricad_shapes`: one child map per `ShapeId`.
-  - `fabricad_cells`: one child map per `CellId`.
-  - `fabricad_instances`: one child map per `(parent CellId, InstanceId)`.
+  - `glassworks_shapes`: one child map per `ShapeId`.
+  - `glassworks_cells`: one child map per `CellId`.
+  - `glassworks_instances`: one child map per `(parent CellId, InstanceId)`.
 - Object maps use LWW register fields for IDs, names, layers, net IDs, shape-kind JSON, and transforms.
 - Object deletion is represented as a `deleted` tombstone register instead of removing the map entry.
 - Clients export incremental Loro update bytes and send those over WebSocket.
@@ -49,7 +49,7 @@ This matches the direction we want for collaborative CAD: users undo their own s
 
 ## What This Does Not Solve Yet
 
-This is not yet a full CAD object CRDT. Loro handles replication, update encoding, duplicate update import, snapshots, object-map registers, and tombstone storage. Fabricad still needs more domain-specific merge semantics for layout objects. The current slice does not provide:
+This is not yet a full CAD object CRDT. Loro handles replication, update encoding, duplicate update import, snapshots, object-map registers, and tombstone storage. Glassworks still needs more domain-specific merge semantics for layout objects. The current slice does not provide:
 
 - Geometry-level CRDT lists for polygon/path vertices.
 - Multi-value conflict display for fields such as names, layers, and transforms.

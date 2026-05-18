@@ -136,12 +136,12 @@ For collaboration:
 
 1. Host `sync_server` as a small Rust service on a platform such as Fly.io, Render,
    Railway, a VPS, or a container host.
-2. Bind it externally with `FABRICAD_SYNC_ADDR=0.0.0.0:4141`, or adapt startup to
+2. Bind it externally with `GLASSWORKS_SYNC_ADDR=0.0.0.0:4141`, or adapt startup to
    consume a platform-provided `PORT`.
 3. Put it behind TLS and expose `wss://sync.<domain>/ws`.
 4. Launch the static app with `?sync=wss://sync.<domain>/ws`, or add a small runtime
    config/default URL so users do not need a query string.
-5. Set `FABRICAD_SYNC_STATE=/data/state.json` if persistent collaboration state is
+5. Set `GLASSWORKS_SYNC_STATE=/data/state.json` if persistent collaboration state is
    needed; otherwise use ephemeral state for demos.
 
 This can be a second phase. The first public demo should ship without collaboration
@@ -166,7 +166,7 @@ work in WebAssembly.
 - Collaboration default URL: the current browser default assumes the sync server is
   on the same hostname at port `4141`, which is not how most static hosts expose TLS.
 - Shader build reproducibility: CI can either allow the current best-effort shader
-  build hook, install `slangc`, or set `FABRICAD_SKIP_SHADER_COMPILE=1` while relying
+  build hook, install `slangc`, or set `GLASSWORKS_SKIP_SHADER_COMPILE=1` while relying
   on checked-in compiled WGSL assets.
 - Repository publishing: this local worktree currently has no git remote configured,
   so hosting starts by creating or connecting a remote repository.

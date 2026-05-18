@@ -20,15 +20,15 @@ fn main() {
     println!("cargo:rerun-if-changed={}", slang_root.display());
     println!("cargo:rerun-if-changed={}", script.display());
 
-    if std::env::var_os("FABRICAD_SKIP_SHADER_COMPILE").is_some() {
+    if std::env::var_os("GLASSWORKS_SKIP_SHADER_COMPILE").is_some() {
         println!(
-            "cargo:warning=Skipping Slang shader compilation because FABRICAD_SKIP_SHADER_COMPILE is set"
+            "cargo:warning=Skipping Slang shader compilation because GLASSWORKS_SKIP_SHADER_COMPILE is set"
         );
         return;
     }
 
     let current = fingerprint_inputs(&slang_root, &script);
-    let stamp_path = workspace_root.join("target/fabricad_shader_inputs.fingerprint");
+    let stamp_path = workspace_root.join("target/glassworks_shader_inputs.fingerprint");
     let previous = read_to_string(&stamp_path).unwrap_or_default();
     let outputs_missing = compiled_outputs_missing(&workspace_root);
     if previous == current && !outputs_missing {
@@ -51,7 +51,7 @@ fn main() {
             Ok(status) => {
                 let message =
                     format!("Slang shader compile failed for {format} with status {status}");
-                if std::env::var_os("FABRICAD_REQUIRE_SHADER_COMPILE").is_some() {
+                if std::env::var_os("GLASSWORKS_REQUIRE_SHADER_COMPILE").is_some() {
                     panic!("{message}");
                 }
                 println!("cargo:warning={message}");
@@ -59,7 +59,7 @@ fn main() {
             }
             Err(err) => {
                 let message = format!("failed to launch scripts/compile_shaders.py: {err}");
-                if std::env::var_os("FABRICAD_REQUIRE_SHADER_COMPILE").is_some() {
+                if std::env::var_os("GLASSWORKS_REQUIRE_SHADER_COMPILE").is_some() {
                     panic!("{message}");
                 }
                 println!("cargo:warning={message}");

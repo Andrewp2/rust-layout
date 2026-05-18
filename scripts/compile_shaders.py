@@ -12,7 +12,7 @@ OUT_ROOT = ROOT / "assets" / "shaders" / "compiled_shaders"
 
 
 def find_slangc() -> str:
-    override = os.environ.get("FABRICAD_SLANGC")
+    override = os.environ.get("GLASSWORKS_SLANGC")
     if override:
         return override
     path_slangc = shutil.which("slangc")
@@ -27,7 +27,7 @@ def find_slangc() -> str:
     for candidate in candidates:
         if candidate.is_file():
             return str(candidate)
-    raise SystemExit("Could not locate slangc. Set FABRICAD_SLANGC or add slangc to PATH.")
+    raise SystemExit("Could not locate slangc. Set GLASSWORKS_SLANGC or add slangc to PATH.")
 
 
 def modules() -> list[Path]:

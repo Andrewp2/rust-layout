@@ -10,6 +10,7 @@ members = [
 	"crates/sync_server",
 	"crates/wasm_app",
 ]
+default-members = ["crates/native_app"]
 
 [workspace.package]
 version = "0.1.0"
@@ -21,10 +22,11 @@ authors = ["Andrew Peterson"]
 anyhow = "1.0"
 axum = { version = "0.8.6", features = ["ws"] }
 futures-util = "0.3"
+flate2 = "1.1"
 glam = { version = "0.30.4", features = ["serde"] }
 log = "0.4"
 loro = "1.12.0"
-operad = { git = "https://github.com/Andrewp2/Operad.git", rev = "bb7ac5f4d1fb2cf05f07a9b762622227ef9d99cc", default-features = false, features = [
+operad = { version = "8.0.1", default-features = false, features = [
 	"widgets",
 	"wgpu",
 ] }

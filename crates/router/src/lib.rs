@@ -4,7 +4,7 @@ use std::{
 };
 
 use geometry_core::{Coord, Point, Rect, manhattan};
-use layout_model::{Document, LayerId, ShapeKind};
+use layout_model::{Document, LayerId, NetId, ShapeId, ShapeKind};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -26,13 +26,17 @@ impl Default for RouterConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RouteRequest {
     pub start: Point,
     pub goal: Point,
     pub layer: LayerId,
     pub wire_width: Coord,
     pub bounds: Option<Rect>,
+    #[serde(default)]
+    pub allowed_net: Option<NetId>,
+    #[serde(default)]
+    pub ignored_shape_ids: Vec<ShapeId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -103,11 +107,18 @@ pub fn route(
     });
     let min_cell = world_to_cell(route_bounds.min, config.grid);
     let max_cell = world_to_cell(route_bounds.max, config.grid);
+    let ignored_shape_ids = request
+        .ignored_shape_ids
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
     let blocked = build_blocked_cells(
         document,
         request.layer,
         config.grid,
         request.wire_width + config.obstacle_margin,
+        request.allowed_net,
+        &ignored_shape_ids,
     );
 
     let mut open = BinaryHeap::new();
@@ -210,10 +221,19 @@ fn build_blocked_cells(
     route_layer: LayerId,
     grid: Coord,
     margin: Coord,
+    allowed_net: Option<NetId>,
+    ignored_shape_ids: &HashSet<ShapeId>,
 ) -> HashSet<(i64, i64)> {
     let mut blocked = HashSet::new();
-    for shape in document.visible_shapes() {
+    for flattened in document.flattened_shapes() {
+        if ignored_shape_ids.contains(&flattened.source_shape_id()) {
+            continue;
+        }
+        let shape = flattened.transformed_shape();
         if shape.layer != route_layer {
+            continue;
+        }
+        if allowed_net.is_some() && shape.net == allowed_net {
             continue;
         }
         if matches!(
@@ -279,7 +299,7 @@ fn simplify_orthogonal_route(points: &mut Vec<Point>) {
 mod tests {
     use super::*;
     use geometry_core::Rect;
-    use layout_model::{Document, ProcessLayer, ShapeKind};
+    use layout_model::{Document, NetId, Operation, ProcessLayer, ShapeKind, Transform};
 
     #[test]
     fn routes_around_blocker() {
@@ -297,10 +317,80 @@ mod tests {
                 layer,
                 wire_width: 80,
                 bounds: Some(Rect::from_min_size(Point::new(-200, -600), 1400, 1200)),
+                allowed_net: None,
+                ignored_shape_ids: Vec::new(),
             },
             RouterConfig::default(),
         )
         .unwrap();
         assert!(route.points.len() > 2);
+    }
+
+    #[test]
+    fn routes_around_hidden_flattened_instance_blocker() {
+        let mut doc = Document::new("route hierarchy");
+        let layer = doc.layer_by_process(ProcessLayer::Metal1).unwrap();
+        let child = doc.create_cell("blocker");
+        doc.insert_shape_in_cell(
+            child,
+            layer,
+            ShapeKind::Rectangle(Rect::from_min_size(Point::new(0, -100), 400, 200)),
+        )
+        .unwrap();
+        doc.insert_instance_in_top(child, Transform::translate(200, 0))
+            .unwrap();
+        doc.apply_operation_without_log(&Operation::SetLayerVisibility {
+            layer,
+            visible: false,
+        });
+
+        let route = route(
+            &doc,
+            RouteRequest {
+                start: Point::new(0, 0),
+                goal: Point::new(900, 0),
+                layer,
+                wire_width: 80,
+                bounds: Some(Rect::from_min_size(Point::new(-200, -600), 1400, 1200)),
+                allowed_net: None,
+                ignored_shape_ids: Vec::new(),
+            },
+            RouterConfig::default(),
+        )
+        .unwrap();
+
+        assert!(route.points.len() > 2);
+    }
+
+    #[test]
+    fn allowed_net_shapes_do_not_block_route() {
+        let mut doc = Document::new("route same net");
+        let layer = doc.layer_by_process(ProcessLayer::Metal1).unwrap();
+        let blocker = doc.insert_shape(
+            layer,
+            ShapeKind::Rectangle(Rect::from_min_size(Point::new(200, -100), 400, 200)),
+        );
+        doc.shapes.get_mut(&blocker).unwrap().net = Some(NetId(7));
+
+        let route = route(
+            &doc,
+            RouteRequest {
+                start: Point::new(0, 0),
+                goal: Point::new(900, 0),
+                layer,
+                wire_width: 80,
+                bounds: Some(Rect::from_min_size(Point::new(-200, -600), 1400, 1200)),
+                allowed_net: Some(NetId(7)),
+                ignored_shape_ids: Vec::new(),
+            },
+            RouterConfig::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            route.points,
+            vec![Point::new(0, 0), Point::new(880, 0)],
+            "same-net geometry should be treated as usable route context"
+        );
     }
 }

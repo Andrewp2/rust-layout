@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "metadata": {
-    "producer": "future-fabricad",
+    "producer": "future-glassworks",
     "producer_version": "999.0.0",
     "workspace_schema_version": 1,
     "document_schema_version": 999,

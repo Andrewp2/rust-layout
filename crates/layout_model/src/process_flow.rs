@@ -727,7 +727,7 @@ pub fn sample_process_flow_model() -> ProcessFlowModel {
         name: "Demo inverter poly module".to_string(),
         owner: "process.engineer".to_string(),
         mes_route_id: "ROUTE-DEMO-INVERTER-POLY-A".to_string(),
-        mask_design_id: "FABRICAD-DEMO-INVERTER".to_string(),
+        mask_design_id: "GLASSWORKS-DEMO-INVERTER".to_string(),
         layout_revision: "layout_model:demo-inverter@rev-5".to_string(),
         nodes: vec![
             ProcessFlowNode {

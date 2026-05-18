@@ -1,19 +1,32 @@
-# Fabricad
+# Glassworks
 
-Fabricad is a Rust/WASM mask-layout editor for simplified semiconductor fabrication geometry. It is scoped as a portfolio-grade technical CAD tool: layered polygon editing, grid snapping, measurement, design-rule checking, obstacle-aware routing, large-layout stress generation, and WebSocket operation sync.
+Glassworks is the current working name for a Rust native/WebAssembly semiconductor layout workbench. The project is closer to a small EDA/layout environment than a general drawing or modeling app: it focuses on mask-layout geometry, hierarchy, process technology data, DRC, routing, connectivity extraction, import/export, rendering, and collaboration.
 
-The workspace intentionally mirrors the shader structure from `~/code/game`: Slang source lives in `assets/shaders/slang`, and Cargo drives `scripts/compile_shaders.py` to emit WGSL and SPIR-V under `assets/shaders/compiled_shaders`.
+This is not an industrial signoff tool. The point is to build a credible, inspectable implementation of the core workflows around semiconductor physical layout.
+
+## What It Does
+
+- Edits 2D mask-layout geometry with layers, snapping, measurements, selections, vertex editing, shape transforms, hierarchy, cells, instances, arrays, and a small reusable via-array macro flow.
+- Loads built-in technology files for layer definitions, purposes, display order, grid, connectivity, GDS mapping, and DRC rule data.
+- Runs DRC explicitly across the full layout, the active layout cell, or a selected region. DRC uses the document/hierarchy rather than the current view filter.
+- Runs routing explicitly from placed route points. Routing treats same-net or same-component geometry as route context instead of generic obstacles.
+- Extracts connected nets across the active technology stack, reports opens/shorts, recognizes a few simple devices, exports SPICE-style netlists, and compares supported devices/nets against a SPICE `.subckt`.
+- Imports and exports workspace/layout/session JSON plus GDSII, CIF, DXF, DEF, LEF, DRC reports/decks, reference-image metadata, extracted netlists, trace state, and L2N database JSON.
+- Renders native UI and layout previews through an Operad retained UI document and winit/wgpu, with snapshot/audit/offscreen paths for deterministic checks.
+- Syncs edits, cursors, and selections through a Rust WebSocket server with Loro-backed update exchange.
+
+Display filters are intentionally separated from analysis scope. Layer visibility, hierarchy display depth, and view-only hidden cells affect the 2D view and picking, while DRC, routing, connectivity, and 3D layout bounds operate on the underlying physical document/hierarchy.
 
 ## Workspace
 
 ```text
 crates/
   geometry_core/  Integer DBU coordinates, rects, polygons, snapping, distance helpers
-  layout_model/   Document/layer/shape schema, operation log, R-tree spatial index
-  drc/            Simplified semiconductor rule deck and violation reporting
-  router/         A* maze router over layout obstacles
-  renderer/       GPU vertex batching, 3D viewport targets, and Slang WGSL/SPIR-V build hook
-  native_app/     Native window, audit, and snapshot entry points
+  layout_model/   Document schema, technology files, hierarchy, formats, connectivity
+  drc/            Data-driven DRC rules, derived layers, marker/report state
+  router/         A* maze router over layout obstacles and route context
+  renderer/       GPU batching, tile/cache logic, 3D viewport targets, shader build hook
+  native_app/     Native window, retained UI shell, snapshots, audits, app behavior
   sync_server/    Axum WebSocket collaboration server
   wasm_app/       wasm-bindgen web validation entry point
 ```
@@ -24,194 +37,42 @@ flowchart LR
   ops --> model["Layout model"]
   model --> index["R-tree spatial index"]
   model --> drc["DRC"]
-  model --> router["A* router"]
+  model --> router["Router"]
+  model --> connectivity["Connectivity"]
   model --> renderer["Renderer batches"]
   ops --> sync["WebSocket sync server"]
-  sync --> remote["Remote clients"]
+  sync --> clients["Native/Web clients"]
 ```
 
 ## Run
 
-```bash
-cargo run -p native_app --bin fabricad
-```
+Run the native app:
 
 ```bash
-cargo run -p sync_server --bin fabricad-sync
+cargo run
 ```
 
-The editor saves and loads a JSON layout at `examples/fabricad_layout.json`.
-It also exports and imports a GDSII subset at `examples/fabricad_layout.gds`.
-For collaboration, start `fabricad-sync`, open multiple native or browser clients, and click `Connect` in each editor. Browser clients default to `ws://<page-host>:4141/ws`; override with `?sync=ws://127.0.0.1:4141/ws` when needed.
+The workspace defaults to the native app, and `native_app` defaults to the `glassworks` binary.
 
-## Shader Pipeline
+Run the sync server:
 
 ```bash
-python3 scripts/compile_shaders.py all
+cargo run -p sync_server --bin glassworks-sync
 ```
 
-The script discovers `*.slang` files under `assets/shaders/slang` and writes:
+For collaboration, start `glassworks-sync`, open multiple native or browser clients, and click `Connect` in each editor. Browser clients default to `ws://<page-host>:4141/ws`; override with `?sync=ws://127.0.0.1:4141/ws` when needed.
 
-```text
-assets/shaders/compiled_shaders/wgsl/*.wgsl
-assets/shaders/compiled_shaders/spirv/*.spv
-assets/shaders/compiled_shaders/reflection/*.json
-```
+## Native Utility Modes
 
-Cargo also runs this through `crates/renderer/build.rs`. Set `FABRICAD_SLANGC=/path/to/slangc` if `slangc` is not on `PATH`; set `FABRICAD_SKIP_SHADER_COMPILE=1` to skip the build hook.
-
-## Rendering Architecture
-
-The native shell builds the retained UI document and opens it in a winit/wgpu
-window by default. Use `fabricad --audit` to print the UI summary and exit, or
-`fabricad --snapshot` to render a deterministic snapshot. Snapshot and audit
-runs accept `--ui-scale <factor>` for checking HiDPI layouts without opening a
-window.
-The domain renderer crate remains responsible for layout GPU batches, 3D viewport targets,
-offscreen document rendering, and the Slang WGSL/SPIR-V shader build hook.
-
-## Technology Files
-
-Built-in process definitions live in `assets/technology/`. The default demo technology is loaded at startup and drives:
-
-```text
-layers + colors + purposes + display order
-manufacturing grid
-connectivity stack
-min width / spacing / enclosure / forbidden-overlap DRC rules
-```
-
-The native app exposes a technology picker in the side panel. Switching technology reapplies layer definitions and rebuilds the active DRC rule deck.
-
-## GDSII Import And Export
-
-The shared layout model includes a minimal binary GDSII reader/writer for interoperability tests and KLayout inspection:
-
-```text
-Fabricad cells     -> GDS structures
-Cell instances     -> SREF / AREF records
-Rectangles/polys   -> BOUNDARY records
-Paths              -> PATH records
-Labels             -> TEXT records
-Technology mapping -> GDS layer/datatype/texttype
-```
-
-Imported AREF arrays become first-class Fabricad instance arrays. Measurement annotations export as a path plus text label because GDSII has no native measurement object.
-
-## Current Demo
-
-- Pan and zoom an infinite mask canvas.
-- Read a bottom-left nm/um scale bar while zooming.
-- Toggle named fabrication layers.
-- Switch JSON technology files for layers, grid, connectivity, and DRC thresholds.
-- Draw rectangles, polygons, paths, vias, and measurements.
-- Select and drag shapes with grid snapping.
-- Drag selected rectangle, polygon, and path vertices with visible handles.
-- Double-click selected edges to insert vertices, hover vertices and press Delete to remove them, and drag rectilinear polygon edges.
-- Copy, paste, duplicate, delete, rotate 90 degrees, and mirror selected top-level shapes.
-- Edit selected shape layer, name, net, coordinates, path width, label text, and measurement endpoints in the side panel.
-- Create a cell from selected top-level shapes, place cell instances, and drag instance occurrences.
-- Rename cells and selected instances with commit-on-Enter/focus-loss editing.
-- Edit selected instance translation, rotate/mirror transforms, and array rows/columns/pitch from the side panel.
-- Undo and redo local edits.
-- Run simplified DRC for min width, spacing, enclosure, forbidden overlap, and off-grid vertices.
-- Browse DRC markers, click a marker to focus and select its shapes, and persist marker hide/waive state through JSON save/load.
-- Extract connected nets across metal/contact/via stacks from the active technology file.
-- Select a connected shape to highlight its inferred net and inspect labels, opens, and shorts.
-- Place two route points to create an A* metal route around obstacles.
-- Route output inherits the endpoint net ID or label when the selected endpoints imply one.
-- Generate 10k, 100k, or 1M rectangle stress layouts.
-- Generate a hierarchy demo with repeated cell instances.
-- Export and import the current layout through the GDSII subset.
-- Sync edits, cursors, and selections between native and WebAssembly clients.
-- See live FPS-adjacent frame timing, visible shape count, spatial query time, pick-build time, DRC time, route time, and batch memory estimate.
-- Track resident GPU geometry buffers, per-frame upload bytes, and upload/skip counts in the performance panel.
-- Track resident and evicted tiles, tile-cache memory budget, over-budget bytes, shape-batch cache hits/misses, indirect draw ranges, and pick candidates.
-
-## Verification
-
-The step-by-step implementation plan lives in [`docs/ROADMAP.md`](docs/ROADMAP.md).
+The native binary can build the UI document without opening the normal window:
 
 ```bash
-cargo check --workspace
-cargo test --workspace
-cargo run -p native_app --bin fabricad -- --offscreen
+cargo run -- --audit
+cargo run -- --snapshot
+cargo run -- --offscreen
 ```
 
-The offscreen native mode renders through the same wgpu layout pipeline, reads
-back pixels, prints a one-line render summary, and exits without opening a
-window. You can also enable it with `FABRICAD_OFFSCREEN=1`.
-
-Screenshot-based render E2E checks drive the native snapshot renderer,
-capture deterministic workflow, layout, hierarchy, stress-layout, 3D, and process-flow
-screenshots, and assert targeted visual invariants such as nonblank coverage,
-accent/chrome visibility, and expected layout-preview colors:
-
-```bash
-./scripts/render_e2e.py
-```
-
-Artifacts are written to `target/render-e2e/`. Broad whole-UI pixel baselines are quarantined
-because the UI is still moving; compare them explicitly only when investigating visual drift:
-
-```bash
-./scripts/render_e2e.py --check-baseline
-```
-
-When an intentional rendering change updates the quarantined expected output, regenerate baselines with:
-
-```bash
-./scripts/render_e2e.py --update-baselines
-```
-
-Whole-app layout audits capture every module through the native
-snapshot renderer across a fixed viewport matrix, including a scaled HiDPI case,
-and write raw screenshots plus contact sheets for manual review of clipped labels,
-crowded margins, awkward wrapping, and missing content:
-
-```bash
-./scripts/ui_layout_audit.py
-```
-
-Artifacts are written to `target/ui-layout-audit/`; open
-`target/ui-layout-audit/index.html` or the PNGs under `contact-sheets/`. For a faster
-smoke pass while iterating on chrome/layout changes, run:
-
-```bash
-./scripts/ui_layout_audit.py --quick
-```
-
-Interactive UI states can be captured with named presets. These apply the same
-startup click path used by snapshot tests, so dropdowns and modal panels can be
-reviewed without opening the native window:
-
-```bash
-./scripts/ui_layout_audit.py --all-presets --size desktop --out target/ui-menu-audit
-./scripts/ui_layout_audit.py --preset canvas-2d --size desktop --out target/ui-canvas-2d-audit
-./scripts/ui_layout_audit.py --preset canvas-3d --size desktop --out target/ui-canvas-3d-audit
-./scripts/ui_layout_audit.py --preset file-menu --size desktop --out target/ui-menu-audit-file
-./scripts/ui_layout_audit.py --preset edit-menu --size desktop --out target/ui-menu-audit-edit
-./scripts/ui_layout_audit.py --preset bookmarks-menu --size desktop --out target/ui-menu-audit-bookmarks
-./scripts/ui_layout_audit.py --preset display-menu --size desktop --out target/ui-menu-audit-display
-./scripts/ui_layout_audit.py --preset details-panel --size desktop --out target/ui-details-panel-audit
-./scripts/ui_layout_audit.py --preset secondary-panel --size desktop --out target/ui-secondary-panel-audit
-./scripts/ui_layout_audit.py --preset tools-menu --size desktop --out target/ui-menu-audit-tools
-./scripts/ui_layout_audit.py --preset macros-menu --size desktop --out target/ui-menu-audit-macros
-./scripts/ui_layout_audit.py --preset help-menu --size desktop --out target/ui-menu-audit-help
-./scripts/ui_layout_audit.py --preset more-menu --size desktop --out target/ui-menu-audit-more
-./scripts/ui_layout_audit.py --preset view-design --size desktop --out target/ui-menu-audit-view-design
-./scripts/ui_layout_audit.py --preset view-operations --size desktop --out target/ui-menu-audit-view-operations
-./scripts/ui_layout_audit.py --preset view-analysis --size desktop --out target/ui-menu-audit-view-analysis
-./scripts/ui_layout_audit.py --preset view-engineering --size desktop --out target/ui-menu-audit-view
-./scripts/ui_layout_audit.py --preset command-palette --size desktop --out target/ui-menu-audit-command-palette
-./scripts/ui_layout_audit.py --preset sidebar-modules --size desktop --out target/ui-menu-audit-sidebar
-./scripts/ui_layout_audit.py --preset options-panel --size desktop --out target/ui-menu-audit-options
-```
-
-Use `--all-presets` for a single review index of every named state. Presets
-choose the view needed for their interaction by default, such as the Layout
-Editor for the Edit menu. Use repeated `--click NODE_NAME` arguments when a new
-interactive state does not yet have a preset.
+Snapshot and audit runs accept `--ui-scale <factor>` for HiDPI layout checks. Offscreen mode renders through the same wgpu layout pipeline, reads back pixels, prints a one-line render summary, and exits. It can also be enabled with `GLASSWORKS_OFFSCREEN=1`.
 
 ## Web Build
 
@@ -222,31 +83,113 @@ rustup target add wasm32-unknown-unknown
 env -u NO_COLOR trunk serve
 ```
 
-The native window is the primary demo path. The WebAssembly target shares the same core
-crates and exposes validation through wasm-bindgen.
+The native window is the primary demo path. The WebAssembly target shares the core crates and exposes validation through wasm-bindgen.
 
-## Collaboration Protocol
+## Files And Exchange Paths
 
-The sync server keeps an authoritative `Document`, assigns monotonically increasing sequence numbers for legacy commands, applies incoming Loro updates, and broadcasts ordered updates plus cursor and selection presence.
-Native and WebAssembly clients share the same collaboration handler.
+The native app uses deterministic target paths for its built-in File-menu exchange actions:
 
-Loro is used for replicated update exchange and object-map recovery:
+```text
+target/glassworks-session.json
+target/glassworks-workspace.json
+target/glassworks-layout.json
+target/glassworks-layout.gds
+target/glassworks-layout.cif
+target/glassworks-layout.dxf
+target/glassworks-layout.def
+target/glassworks-layout.lef
+target/glassworks-drc-deck.json
+target/glassworks-drc-report.json
+target/glassworks-drc-reports.json
+target/glassworks-reference-images.json
+```
 
-- semantic editor commands are wrapped in CRDT operation envelopes with stable actor/counter IDs;
-- Loro carries the operation stream between clients and server;
-- shape, cell, and instance object maps mirror the latest registers plus tombstones;
-- reconnect and server startup recover from persisted Loro snapshots, then materialize object maps back into the layout document.
+Native file operations also track recent session, workspace, layout, GDS, CIF, DXF, DEF, LEF, reference-image, DRC deck/report/database, Calibre/RVE marker, and L2N database paths in app options.
 
-The sync server persists state to `target/fabricad-sync/state.json` by default. Set `FABRICAD_SYNC_STATE=/path/to/state.json` to choose a file, or `FABRICAD_SYNC_STATE=off` to keep it in memory only.
+## Technology Files
 
-Conflict behavior in this MVP is deterministic and simple:
+Built-in process definitions live in `assets/technology/`. They drive:
+
+```text
+layers + colors + purposes + display order
+manufacturing grid and DBU scale
+connectivity stack
+GDS layer/datatype/texttype mapping
+min/max width, min/max area, spacing, edge-spacing, enclosure, forbidden-overlap DRC rules
+```
+
+Switching technology reapplies layer definitions, rebuilds the built-in DRC deck, and changes connectivity extraction behavior while preserving imported/custom extra layers.
+
+## Layout Formats
+
+The shared `layout_model` crate includes lightweight import/export support for:
+
+- GDSII structures, references, AREF arrays, boundaries, paths, labels, BOX records, layer mapping, and selected properties.
+- Flat CIF boxes, polygons, paths, labels, and layers.
+- Flat ASCII DXF lines, polylines, polygons, text, and approximated circles/arcs.
+- Flat DEF fills, routed special nets/nets, pins, and layers.
+- Flat LEF macro `OBS` geometry, obstruction paths, pin ports, and layers.
+
+These are practical interoperability subsets, not complete format implementations. See [`docs/klayout_2d_feature_gaps.md`](docs/klayout_2d_feature_gaps.md) for the remaining KLayout-grade gaps.
+
+## Shader Pipeline
+
+Slang source lives in `assets/shaders/slang`. Compile all shader outputs with:
+
+```bash
+python3 scripts/compile_shaders.py all
+```
+
+The script writes:
+
+```text
+assets/shaders/compiled_shaders/wgsl/*.wgsl
+assets/shaders/compiled_shaders/spirv/*.spv
+assets/shaders/compiled_shaders/reflection/*.json
+```
+
+Cargo also runs this through `crates/renderer/build.rs`. Set `GLASSWORKS_SLANGC=/path/to/slangc` if `slangc` is not on `PATH`; set `GLASSWORKS_SKIP_SHADER_COMPILE=1` to skip the build hook.
+
+## Verification
+
+Prefer focused checks for the crate or behavior you changed. Use broad workspace or screenshot sweeps when the change is cross-cutting or visual by nature.
+
+Common focused checks:
+
+```bash
+cargo test -p layout_model
+cargo test -p drc
+cargo test -p router
+cargo test -p renderer
+cargo test -p native_app <test_name> --lib -- --test-threads=1
+cargo check -p wasm_app --target wasm32-unknown-unknown
+```
+
+Render and UI snapshot tools are available when a rendering or layout change specifically needs visual evidence:
+
+```bash
+./scripts/render_e2e.py
+./scripts/ui_layout_audit.py --quick
+```
+
+Artifacts are written under `target/render-e2e/` and `target/ui-layout-audit/`.
+
+## Collaboration State
+
+The sync server keeps an authoritative `Document`, assigns ordered sequence numbers for legacy commands, applies incoming Loro updates, and broadcasts ordered updates plus cursor/selection presence.
+
+State persists to `target/glassworks-sync/state.json` by default. Set `GLASSWORKS_SYNC_STATE=/path/to/state.json` to choose a file, or `GLASSWORKS_SYNC_STATE=off` to keep it in memory only.
+
+Conflict behavior is intentionally simple for now:
 
 - Server order wins.
-- Delete wins over later moves because moves against missing shapes are ignored by the model.
-- Delete wins over later vertex replacements because replacements against missing shapes are ignored.
+- Deletes win over later moves or vertex replacements because operations against missing objects are ignored.
 - Duplicate CRDT operation IDs are ignored.
-- Concurrent layer changes converge according to the server's accepted order.
-- Remote shape IDs advance the receiver's allocator so later local inserts do not collide.
+- Remote shape IDs advance the receiver allocator so later local inserts do not collide.
 - Clients can request a full snapshot to recover from missed messages.
 
-This is still semantic-command based rather than geometry-specific CRDT merging. The next collaboration layer should add per-object merge policies for richer shape editing.
+## Project Notes
+
+- Roadmap: [`docs/ROADMAP.md`](docs/ROADMAP.md)
+- KLayout 2D feature gaps: [`docs/klayout_2d_feature_gaps.md`](docs/klayout_2d_feature_gaps.md)
+- Collaboration notes: [`docs/COLLABORATION.md`](docs/COLLABORATION.md)

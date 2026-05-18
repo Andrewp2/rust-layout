@@ -70,11 +70,11 @@ class DiffMetrics:
 
 def native_binary() -> Path:
     subprocess.run(
-        ["cargo", "build", "-p", "native_app", "--bin", "fabricad"],
+        ["cargo", "build", "-p", "native_app", "--bin", "glassworks"],
         cwd=ROOT,
         check=True,
     )
-    binary = ROOT / "target" / "debug" / "fabricad"
+    binary = ROOT / "target" / "debug" / "glassworks"
     if not binary.exists():
         raise RuntimeError(f"native binary was not built: {binary}")
     return binary

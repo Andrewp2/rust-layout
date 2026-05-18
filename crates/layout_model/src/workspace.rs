@@ -31,7 +31,7 @@ use crate::{
 };
 
 pub const WORKSPACE_DATASET_SCHEMA_VERSION: u32 = 1;
-pub const WORKSPACE_PRODUCER: &str = "fabricad_native_app";
+pub const WORKSPACE_PRODUCER: &str = "glassworks_native_app";
 pub const WORKSPACE_FEATURE_FLAGS: &[&str] = &[
     "layout_document",
     "loro_crdt_log",
@@ -586,6 +586,7 @@ fn validate_document_integrity(document: &Document, report: &mut WorkspaceValida
         &document.connectivity_issue_states,
         report,
     );
+    validate_reference_images(document, report);
 }
 
 fn validate_issue_state_keys(
@@ -608,6 +609,87 @@ fn validate_issue_state_keys(
             .is_some_and(|note| note.trim().is_empty())
         {
             report.push_error(format!("{label} state {key:?} has an empty note"));
+        }
+        if state
+            .owner
+            .as_deref()
+            .is_some_and(|owner| owner.trim().is_empty())
+        {
+            report.push_error(format!("{label} state {key:?} has an empty owner"));
+        }
+        if state
+            .signoff
+            .as_deref()
+            .is_some_and(|signoff| signoff.trim().is_empty())
+        {
+            report.push_error(format!("{label} state {key:?} has an empty signoff"));
+        }
+        for (tag_key, tag_value) in &state.tags {
+            if tag_key.trim().is_empty() {
+                report.push_error(format!("{label} state {key:?} has an empty tag key"));
+            }
+            if tag_value.trim().is_empty() {
+                report.push_error(format!(
+                    "{label} state {key:?} tag {tag_key:?} has an empty value"
+                ));
+            }
+        }
+    }
+}
+
+fn validate_reference_images(document: &Document, report: &mut WorkspaceValidationReport) {
+    let mut image_ids = BTreeSet::new();
+    for image in &document.reference_images {
+        let id = image.id.trim();
+        if id.is_empty() {
+            report.push_error("reference image has an empty id");
+        } else if !image_ids.insert(id.to_ascii_lowercase()) {
+            report.push_error(format!("reference image {id} is duplicated"));
+        }
+        if image.uri.trim().is_empty() {
+            report.push_error(format!("reference image {id:?} has an empty URI"));
+        }
+        if image.bounds.width() <= 0 || image.bounds.height() <= 0 {
+            report.push_error(format!("reference image {id:?} has empty bounds"));
+        }
+        if let Some(size) = image.pixel_size
+            && (size.width <= 0 || size.height <= 0)
+        {
+            report.push_error(format!("reference image {id:?} has invalid pixel size"));
+        }
+        if image.visible && image.opacity == 0 {
+            report.push_warning(format!(
+                "reference image {id:?} is visible but fully transparent"
+            ));
+        }
+
+        let mut landmark_names = BTreeSet::new();
+        for landmark in &image.landmarks {
+            let name = landmark.name.trim();
+            if name.is_empty() {
+                report.push_warning(format!("reference image {id:?} has an unnamed landmark"));
+            } else if !landmark_names.insert(name.to_ascii_lowercase()) {
+                report.push_warning(format!(
+                    "reference image {id:?} repeats landmark name {name:?}"
+                ));
+            }
+            if let Some(size) = image.pixel_size
+                && (landmark.image.x < 0
+                    || landmark.image.y < 0
+                    || landmark.image.x > size.width
+                    || landmark.image.y > size.height)
+            {
+                report.push_warning(format!(
+                    "reference image {id:?} landmark {name:?} is outside the pixel bounds"
+                ));
+            }
+        }
+        if image.landmarks.len() >= 2
+            && let Err(error) = image.aligned_bounds_from_landmarks()
+        {
+            report.push_warning(format!(
+                "reference image {id:?} landmarks cannot align: {error}"
+            ));
         }
     }
 }
@@ -1700,6 +1782,10 @@ mod tests {
                 hidden: true,
                 waived: true,
                 note: Some("reviewed".to_string()),
+                owner: Some("layout".to_string()),
+                signoff: Some("accepted".to_string()),
+                tags: BTreeMap::from([("action".to_string(), "fix".to_string())]),
+                ..MarkerState::default()
             },
         );
         dataset.document.connectivity_issue_states.insert(
@@ -1708,6 +1794,7 @@ mod tests {
                 hidden: false,
                 waived: true,
                 note: Some("net reviewed".to_string()),
+                ..MarkerState::default()
             },
         );
         let encoded = serde_json::to_string(&dataset).unwrap();
@@ -1718,6 +1805,25 @@ mod tests {
                 .note
                 .as_deref(),
             Some("reviewed")
+        );
+        assert_eq!(
+            restored.document.marker_states["drc|fixture"]
+                .owner
+                .as_deref(),
+            Some("layout")
+        );
+        assert_eq!(
+            restored.document.marker_states["drc|fixture"]
+                .signoff
+                .as_deref(),
+            Some("accepted")
+        );
+        assert_eq!(
+            restored.document.marker_states["drc|fixture"]
+                .tags
+                .get("action")
+                .map(String::as_str),
+            Some("fix")
         );
         assert_eq!(
             restored.document.connectivity_issue_states["short|VDD,VSS|0,0,100,50"]
@@ -1761,6 +1867,13 @@ mod tests {
                 hidden: false,
                 waived: false,
                 note: Some("   ".to_string()),
+                owner: Some(" ".to_string()),
+                signoff: Some(" ".to_string()),
+                tags: BTreeMap::from([
+                    ("".to_string(), "bad".to_string()),
+                    ("valid".to_string(), " ".to_string()),
+                ]),
+                ..MarkerState::default()
             },
         );
 
@@ -1780,6 +1893,22 @@ mod tests {
                 .errors
                 .iter()
                 .any(|error| error.contains("empty note")),
+            "{:?}",
+            validation.errors
+        );
+        assert!(
+            validation
+                .errors
+                .iter()
+                .any(|error| error.contains("empty tag key")),
+            "{:?}",
+            validation.errors
+        );
+        assert!(
+            validation
+                .errors
+                .iter()
+                .any(|error| error.contains("empty value")),
             "{:?}",
             validation.errors
         );

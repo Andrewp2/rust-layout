@@ -129,7 +129,7 @@ pub(crate) fn pad_pre_shell_node_ids(document: &mut UiDocument, parent: UiNodeId
         add_node_marker(
             document,
             parent,
-            format!("fabricad.preshell.id_pad.{index}"),
+            format!("glassworks.preshell.id_pad.{index}"),
         );
     }
 }
