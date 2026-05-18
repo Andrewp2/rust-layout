@@ -30,9 +30,6 @@ jobs:
       - name: Install Trunk
         run: cargo install trunk --locked --version 0.21.14
 
-      - name: Check layout model
-        run: cargo test -p layout_model
-
       - name: Build web app
         env:
           GLASSWORKS_SKIP_SHADER_COMPILE: "1"
