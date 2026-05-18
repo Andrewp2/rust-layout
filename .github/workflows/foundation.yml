@@ -20,14 +20,14 @@ jobs:
 
       - name: Run performance budget fixtures
         env:
-          FABRICAD_PERFORMANCE_REPORT_DIR: ${{ github.workspace }}/target/performance-reports
+          GLASSWORKS_PERFORMANCE_REPORT_DIR: ${{ github.workspace }}/target/performance-reports
         run: cargo test -p native_app performance --lib
 
       - name: Upload observed performance reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: fabricad-performance-reports
+          name: glassworks-performance-reports
           path: ${{ github.workspace }}/target/performance-reports/*.json
           if-no-files-found: error
 
@@ -61,13 +61,13 @@ jobs:
       - name: Run web render smoke
         env:
           CHROME: ${{ steps.chrome.outputs.chrome-path }}
-          FABRICAD_SKIP_SHADER_COMPILE: "1"
+          GLASSWORKS_SKIP_SHADER_COMPILE: "1"
         run: ./scripts/render_e2e.py --skip-baseline
 
       - name: Upload render smoke artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: fabricad-render-e2e
+          name: glassworks-render-e2e
           path: ${{ github.workspace }}/target/render-e2e
           if-no-files-found: error

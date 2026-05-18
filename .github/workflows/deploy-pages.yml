@@ -35,8 +35,8 @@ jobs:
 
       - name: Build web app
         env:
-          FABRICAD_SKIP_SHADER_COMPILE: "1"
-        run: env -u NO_COLOR trunk build --release --public-url /rust-layout/
+          GLASSWORKS_SKIP_SHADER_COMPILE: "1"
+        run: env -u NO_COLOR trunk build --release --public-url /Glassworks/ --no-sri
 
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v6
