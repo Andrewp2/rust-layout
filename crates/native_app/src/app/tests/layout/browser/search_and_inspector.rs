@@ -98,7 +98,9 @@ pub(crate) fn layout_selected_shape_custom_properties_use_browser_fields() {
         Some("process".to_string())
     );
 
-    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.shape_property.remove_selected"));
+    assert!(
+        app.apply_clicked_node_name("glassworks.viewctl.layout.shape_property.remove_selected")
+    );
     assert!(
         app.workspace
             .document
@@ -613,6 +615,7 @@ pub(crate) fn layout_measurement_browser_filters_by_layer_and_mode() {
         .document
         .layer_by_process(ProcessLayer::Metal2)
         .expect("default technology should include metal2");
+    let mut ruler_ids = Vec::new();
     for (layer, mode, label, offset) in [
         (metal1, MeasurementMode::Direct, "direct-ruler", 0),
         (
@@ -624,20 +627,60 @@ pub(crate) fn layout_measurement_browser_filters_by_layer_and_mode() {
         (metal2, MeasurementMode::Vertical, "vertical-ruler", 2_000),
         (metal2, MeasurementMode::Manhattan, "manhattan-ruler", 3_000),
     ] {
-        app.add_layout_shape(
-            layer,
-            ShapeKind::Measurement {
-                a: Point::new(offset, 0),
-                b: Point::new(offset + 300, 400),
-                label: label.to_string(),
-                mode,
-            },
-        )
-        .expect("measurement should be added");
+        let ruler_id = app
+            .add_layout_shape(
+                layer,
+                ShapeKind::Measurement {
+                    a: Point::new(offset, 0),
+                    b: Point::new(offset + 300, 400),
+                    label: label.to_string(),
+                    mode,
+                },
+            )
+            .expect("measurement should be added");
+        ruler_ids.push((ruler_id, layer, mode));
     }
     app.active_layer = metal2;
 
-    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.measurement_filter.active_layer"));
+    let selected_ruler = ruler_ids
+        .iter()
+        .find(|(_, layer, mode)| *layer == metal2 && *mode == MeasurementMode::Vertical)
+        .map(|(id, _, _)| *id)
+        .expect("test should create a selected vertical ruler");
+    app.selected_layout_shape = Some(selected_ruler);
+    app.selected_layout_occurrence = Some(ShapeOccurrenceId::top_level(selected_ruler));
+    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.measurement_filter.selected"));
+    let selected_entries = layout_measurement_entries(&app);
+    assert_eq!(selected_entries.len(), 1);
+    assert_eq!(
+        selected_entries[0].0,
+        ShapeOccurrenceId::top_level(selected_ruler)
+    );
+    assert!(
+        layout_measurement_rows(&app)
+            .iter()
+            .any(|(key, value)| key == "Filter" && value == "Selected")
+    );
+    app.selected_layout_shape = None;
+    app.selected_layout_occurrence = None;
+    assert!(layout_measurement_entries(&app).is_empty());
+
+    let fallback_selected_ruler = ruler_ids
+        .iter()
+        .find(|(_, _, mode)| *mode == MeasurementMode::Direct)
+        .map(|(id, _, _)| *id)
+        .expect("test should create a fallback selected ruler");
+    app.selected_layout_shape = Some(fallback_selected_ruler);
+    let fallback_entries = layout_measurement_entries(&app);
+    assert_eq!(fallback_entries.len(), 1);
+    assert_eq!(
+        fallback_entries[0].0,
+        ShapeOccurrenceId::top_level(fallback_selected_ruler)
+    );
+
+    assert!(
+        app.apply_clicked_node_name("glassworks.viewctl.layout.measurement_filter.active_layer")
+    );
     let active_layer_entries = layout_measurement_entries(&app);
     assert_eq!(active_layer_entries.len(), 2);
     assert!(
@@ -650,6 +693,60 @@ pub(crate) fn layout_measurement_browser_filters_by_layer_and_mode() {
             .iter()
             .any(|(key, value)| key == "Filter" && value == "Active Layer")
     );
+    assert!(
+        app.status_message()
+            .contains("Measurement filter Active Layer (2)"),
+        "{}",
+        app.status_message()
+    );
+
+    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.measurement_filter.all"));
+    assert!(
+        app.status_message().contains("Measurement filter All (4)"),
+        "{}",
+        app.status_message()
+    );
+    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.measurement_sort.length"));
+    assert_eq!(
+        app.layout_measurement_browser_sort,
+        LayoutMeasurementBrowserSort::Length
+    );
+    let length_entries = layout_measurement_entries(&app);
+    let Some((_, _, _, length_mode)) = layout_measurement_geometry(&length_entries[0].2.kind)
+    else {
+        panic!("length-sorted first entry should be a measurement");
+    };
+    assert_eq!(length_mode, MeasurementMode::Manhattan);
+    assert!(
+        layout_measurement_rows(&app)
+            .iter()
+            .any(|(key, value)| key == "Sort" && value == "Length")
+    );
+    app.selected_layout_shape = None;
+    app.selected_layout_occurrence = None;
+    assert!(
+        app.apply_clicked_node_name("glassworks.viewctl.layout.measurement_browser.select_first")
+    );
+    let manhattan_ruler = ruler_ids
+        .iter()
+        .find(|(_, _, mode)| *mode == MeasurementMode::Manhattan)
+        .map(|(id, _, _)| *id)
+        .expect("test should create a manhattan ruler");
+    assert_eq!(app.selected_layout_shape, Some(manhattan_ruler));
+
+    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.measurement_sort.mode"));
+    let mode_entries = layout_measurement_entries(&app);
+    let Some((_, _, _, first_mode)) = layout_measurement_geometry(&mode_entries[0].2.kind) else {
+        panic!("mode-sorted first entry should be a measurement");
+    };
+    assert_eq!(first_mode, MeasurementMode::Direct);
+
+    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.measurement_sort.layer"));
+    let layer_entries = layout_measurement_entries(&app);
+    assert_eq!(layer_entries[0].2.layer, metal1);
+    assert_eq!(layer_entries[1].2.layer, metal1);
+    assert_eq!(layer_entries[2].2.layer, metal2);
+    assert_eq!(layer_entries[3].2.layer, metal2);
 
     for (slug, expected_mode) in [
         ("direct", MeasurementMode::Direct),
@@ -673,17 +770,294 @@ pub(crate) fn layout_measurement_browser_filters_by_layer_and_mode() {
         .expect("layout document with measurement filters should build");
     for node_name in [
         "glassworks.viewctl.layout.measurement_filter.all",
+        "glassworks.viewctl.layout.measurement_filter.selected",
         "glassworks.viewctl.layout.measurement_filter.active_layer",
         "glassworks.viewctl.layout.measurement_filter.direct",
         "glassworks.viewctl.layout.measurement_filter.horizontal",
         "glassworks.viewctl.layout.measurement_filter.vertical",
         "glassworks.viewctl.layout.measurement_filter.manhattan",
+        "glassworks.viewctl.layout.measurement_sort.id",
+        "glassworks.viewctl.layout.measurement_sort.length",
+        "glassworks.viewctl.layout.measurement_sort.angle",
+        "glassworks.viewctl.layout.measurement_sort.mode",
+        "glassworks.viewctl.layout.measurement_sort.layer",
+        "glassworks.viewctl.layout.measurement_sort.source_cell",
     ] {
         assert!(
             document.nodes().iter().any(|node| node.name() == node_name),
             "measurement browser filter should exist: {node_name}"
         );
     }
+    let measurement_title = document
+        .nodes()
+        .iter()
+        .find(|node| node.name() == "glassworks.layout.measurement_browser.title")
+        .unwrap_or_else(|| panic!("measurement browser title should exist"));
+    let UiContent::Text(measurement_title_text) = measurement_title.content() else {
+        panic!("measurement browser title should be text");
+    };
+    assert_eq!(
+        measurement_title_text.text,
+        "Measurements - Manhattan (1 row)"
+    );
+    let filter_button_label = |node_name: &str| -> String {
+        document
+            .nodes()
+            .iter()
+            .find(|node| node.name() == node_name)
+            .and_then(|node| node.accessibility())
+            .and_then(|accessibility| accessibility.label.clone())
+            .unwrap_or_else(|| panic!("{node_name} should expose an accessibility label"))
+    };
+    assert_eq!(
+        filter_button_label("glassworks.viewctl.layout.measurement_filter.all"),
+        "Filter All (4)"
+    );
+    assert_eq!(
+        filter_button_label("glassworks.viewctl.layout.measurement_filter.selected"),
+        "Filter Selected (1)"
+    );
+    assert_eq!(
+        filter_button_label("glassworks.viewctl.layout.measurement_filter.active_layer"),
+        "Filter Active Layer (2)"
+    );
+    assert_eq!(
+        filter_button_label("glassworks.viewctl.layout.measurement_filter.direct"),
+        "Filter Direct (1)"
+    );
+    assert_eq!(
+        filter_button_label("glassworks.viewctl.layout.measurement_filter.horizontal"),
+        "Filter Horizontal (1)"
+    );
+    assert_eq!(
+        filter_button_label("glassworks.viewctl.layout.measurement_filter.vertical"),
+        "Filter Vertical (1)"
+    );
+    assert_eq!(
+        filter_button_label("glassworks.viewctl.layout.measurement_filter.manhattan"),
+        "Filter Manhattan (1)"
+    );
+
+    app.layout_browser_search = "missing".to_string();
+    assert!(
+        app.apply_clicked_node_name("glassworks.viewctl.layout.measurement_browser.select_first")
+    );
+    assert!(
+        app.status_message()
+            .contains("Measurement browser has no matching Manhattan rulers for search missing"),
+        "{}",
+        app.status_message()
+    );
+    let empty_document = app
+        .build_operad_document(UiSize::new(1440.0, 920.0))
+        .expect("layout document with empty measurement search should build");
+    let empty_title = empty_document
+        .nodes()
+        .iter()
+        .find(|node| node.name() == "glassworks.layout.measurement_browser.title")
+        .unwrap_or_else(|| panic!("empty measurement browser title should exist"));
+    let UiContent::Text(empty_title_text) = empty_title.content() else {
+        panic!("empty measurement browser title should be text");
+    };
+    assert_eq!(
+        empty_title_text.text,
+        "Measurements - Manhattan / search missing (0 rows)"
+    );
+}
+
+#[test]
+pub(crate) fn layout_measurement_browser_searches_and_sorts_by_source_cell() {
+    let mut app = GlassworksApp::new_with_options(StartupOptions {
+        view_mode: Some(StartupView::Layout2d),
+        ..Default::default()
+    });
+    app.workspace.document = Document::new("measurement source cell sort test");
+    app.reset_layout_document_state();
+    let top = app.workspace.document.top_cell;
+    let metal1 = app
+        .workspace
+        .document
+        .layer_by_process(ProcessLayer::Metal1)
+        .expect("default technology should include metal1");
+    let zeta = app.workspace.document.create_cell("zeta ruler source");
+    let alpha = app.workspace.document.create_cell("alpha ruler source");
+    let zeta_ruler = app
+        .workspace
+        .document
+        .insert_shape_in_cell(
+            zeta,
+            metal1,
+            ShapeKind::Measurement {
+                a: Point::new(0, 0),
+                b: Point::new(100, 0),
+                label: "zeta-ruler".to_string(),
+                mode: MeasurementMode::Direct,
+            },
+        )
+        .expect("zeta source measurement should be inserted");
+    let alpha_ruler = app
+        .workspace
+        .document
+        .insert_shape_in_cell(
+            alpha,
+            metal1,
+            ShapeKind::Measurement {
+                a: Point::new(0, 0),
+                b: Point::new(200, 0),
+                label: "alpha-ruler".to_string(),
+                mode: MeasurementMode::Direct,
+            },
+        )
+        .expect("alpha source measurement should be inserted");
+    app.workspace
+        .document
+        .insert_instance(top, zeta, Transform::translate(0, 0))
+        .expect("zeta source instance should be inserted");
+    app.workspace
+        .document
+        .insert_instance(top, alpha, Transform::translate(1_000, 0))
+        .expect("alpha source instance should be inserted");
+
+    app.set_layout_browser_search("source_cell=alpha ruler");
+    let searched = layout_measurement_entries(&app);
+    assert_eq!(searched.len(), 1);
+    assert_eq!(searched[0].2.id, alpha_ruler);
+    app.set_layout_browser_search(&format!("source_cell_id={}", zeta.0));
+    let searched = layout_measurement_entries(&app);
+    assert_eq!(searched.len(), 1);
+    assert_eq!(searched[0].2.id, zeta_ruler);
+    app.set_layout_browser_search("length_dbu=200");
+    let searched = layout_measurement_entries(&app);
+    assert_eq!(searched.len(), 1);
+    assert_eq!(
+        searched[0].2.id, alpha_ruler,
+        "measurement selector search should match integer DBU lengths"
+    );
+    app.set_layout_browser_search("end=100,0");
+    let searched = layout_measurement_entries(&app);
+    assert_eq!(searched.len(), 1);
+    assert_eq!(
+        searched[0].2.id, zeta_ruler,
+        "measurement selector search should match endpoint aliases"
+    );
+    app.set_layout_browser_search("x2=100");
+    let searched = layout_measurement_entries(&app);
+    assert_eq!(searched.len(), 1);
+    assert_eq!(
+        searched[0].2.id, zeta_ruler,
+        "measurement selector search should match endpoint coordinate aliases"
+    );
+    app.set_layout_browser_search("dx=200");
+    let searched = layout_measurement_entries(&app);
+    assert_eq!(searched.len(), 1);
+    assert_eq!(
+        searched[0].2.id, alpha_ruler,
+        "measurement selector search should match delta aliases"
+    );
+    app.set_layout_browser_search("");
+
+    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.measurement_sort.source_cell"));
+    assert_eq!(
+        app.layout_measurement_browser_sort,
+        LayoutMeasurementBrowserSort::SourceCell
+    );
+    let sorted = layout_measurement_entries(&app)
+        .into_iter()
+        .map(|(_, source_cell, shape)| (source_cell, shape.id))
+        .collect::<Vec<_>>();
+    assert_eq!(sorted, vec![(alpha, alpha_ruler), (zeta, zeta_ruler)]);
+    assert!(
+        layout_measurement_rows(&app)
+            .iter()
+            .any(|(key, value)| key == "Sort" && value == "Source Cell"),
+        "measurement browser rows should expose source-cell sort"
+    );
+
+    let document = app
+        .build_operad_document(UiSize::new(1440.0, 920.0))
+        .expect("layout document with source-cell measurement sort should build");
+    assert!(
+        document.nodes().iter().any(|node| {
+            node.name() == "glassworks.viewctl.layout.measurement_sort.source_cell"
+        }),
+        "measurement browser sort surface should expose source-cell sort"
+    );
+}
+
+#[test]
+pub(crate) fn layout_measurement_browser_sorts_by_angle() {
+    let mut app = GlassworksApp::new_with_options(StartupOptions {
+        view_mode: Some(StartupView::Layout2d),
+        ..Default::default()
+    });
+    app.workspace.document = Document::new("measurement angle sort test");
+    app.reset_layout_document_state();
+    let metal1 = app
+        .workspace
+        .document
+        .layer_by_process(ProcessLayer::Metal1)
+        .expect("default technology should include metal1");
+    let zero = app
+        .add_layout_shape(
+            metal1,
+            ShapeKind::Measurement {
+                a: Point::new(0, 0),
+                b: Point::new(100, 0),
+                label: "zero".to_string(),
+                mode: MeasurementMode::Direct,
+            },
+        )
+        .expect("zero-degree measurement should be added");
+    let positive = app
+        .add_layout_shape(
+            metal1,
+            ShapeKind::Measurement {
+                a: Point::new(200, 0),
+                b: Point::new(200, 100),
+                label: "positive".to_string(),
+                mode: MeasurementMode::Direct,
+            },
+        )
+        .expect("positive-angle measurement should be added");
+    let negative = app
+        .add_layout_shape(
+            metal1,
+            ShapeKind::Measurement {
+                a: Point::new(400, 0),
+                b: Point::new(400, -100),
+                label: "negative".to_string(),
+                mode: MeasurementMode::Direct,
+            },
+        )
+        .expect("negative-angle measurement should be added");
+
+    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.measurement_sort.angle"));
+    assert_eq!(
+        app.layout_measurement_browser_sort,
+        LayoutMeasurementBrowserSort::Angle
+    );
+    let sorted = layout_measurement_entries(&app)
+        .into_iter()
+        .map(|(occurrence, _, _)| occurrence.source_shape_id())
+        .collect::<Vec<_>>();
+    assert_eq!(sorted, vec![negative, zero, positive]);
+    assert!(
+        layout_measurement_rows(&app)
+            .iter()
+            .any(|(key, value)| key == "Sort" && value == "Angle"),
+        "measurement browser rows should expose angle sort"
+    );
+
+    let document = app
+        .build_operad_document(UiSize::new(1440.0, 920.0))
+        .expect("layout document with angle sort should build");
+    assert!(
+        document
+            .nodes()
+            .iter()
+            .any(|node| node.name() == "glassworks.viewctl.layout.measurement_sort.angle"),
+        "measurement browser sort surface should expose angle sort"
+    );
 }
 
 #[test]
@@ -864,6 +1238,10 @@ pub(crate) fn layout_net_browser_filters_short_and_open_components() {
     .collect::<Vec<_>>();
     assert_eq!(shorted, vec![1]);
     assert_eq!(layout_net_component_issue_label(&report, 1), "1 short");
+    assert_eq!(
+        layout_net_component_issue_summary(&report, 1).as_deref(),
+        Some("Short DATA/VSS")
+    );
     assert_eq!(layout_net_component_device_count(&report, 1), 0);
 
     let devices = layout_net_browser_entries_from_report(
@@ -878,16 +1256,42 @@ pub(crate) fn layout_net_browser_filters_short_and_open_components() {
     assert_eq!(devices, vec![2]);
     assert_eq!(layout_net_component_device_count(&report, 2), 1);
     assert_eq!(layout_net_component_device_summary(&report, 2), "#1 nmos D");
+    assert_eq!(
+        layout_net_component_device_peer_summary(&report, 2).as_deref(),
+        Some("#1 nmos D -> G GATE")
+    );
     let mut app = GlassworksApp::new_with_options(StartupOptions {
         view_mode: Some(StartupView::Layout2d),
         ..Default::default()
     });
     app.layout_browser_columns = LayoutBrowserColumnSet::Summary;
+    let short_rows = layout_net_browser_property_rows(&app, &report, &[(1, "DATA".to_string())]);
+    assert!(
+        short_rows
+            .iter()
+            .any(|(key, value)| key == "Issue Detail" && value == "Short DATA/VSS"),
+        "net browser selected-component rows should expose short details: {short_rows:?}"
+    );
     let rows = layout_net_browser_property_rows(&app, &report, &[(2, "CLK".to_string())]);
     assert!(
         rows.iter()
             .any(|(key, value)| key == "Device Detail" && value == "#1 nmos D"),
         "net browser selected-component rows should expose device terminals: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|(key, value)| key == "Issue Detail" && value == "Open CLK"),
+        "net browser selected-component rows should expose open details: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|(key, value)| key == "Open Peers" && value == "Open CLK -> #3 CLK"),
+        "net browser selected-component rows should expose open peer nets: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|(key, value)| key == "Device Peers" && value == "#1 nmos D -> G GATE"),
+        "net browser selected-component rows should expose peer device terminals: {rows:?}"
     );
 
     let history = layout_net_browser_entries_from_report_with_history(
@@ -914,6 +1318,134 @@ pub(crate) fn layout_net_browser_filters_short_and_open_components() {
     .collect::<Vec<_>>();
     assert_eq!(open, vec![2, 3]);
     assert_eq!(layout_net_component_issue_label(&report, 2), "1 open");
+    assert_eq!(
+        layout_net_component_issue_summary(&report, 2).as_deref(),
+        Some("Open CLK")
+    );
+    assert_eq!(
+        layout_net_component_open_peer_summary(&report, 2).as_deref(),
+        Some("Open CLK -> #3 CLK")
+    );
+
+    let device_search = layout_net_browser_entries_from_report(
+        &report,
+        LayoutNetBrowserFilter::All,
+        LayoutNetBrowserSort::Id,
+        Some("nmos"),
+    )
+    .into_iter()
+    .map(|(id, _)| id)
+    .collect::<Vec<_>>();
+    assert_eq!(
+        device_search,
+        vec![2],
+        "net browser search should match connected device model names"
+    );
+
+    let short_search = layout_net_browser_entries_from_report(
+        &report,
+        LayoutNetBrowserFilter::All,
+        LayoutNetBrowserSort::Id,
+        Some("short DATA"),
+    )
+    .into_iter()
+    .map(|(id, _)| id)
+    .collect::<Vec<_>>();
+    assert_eq!(
+        short_search,
+        vec![1],
+        "net browser search should match selected-component short details"
+    );
+
+    let open_search = layout_net_browser_entries_from_report(
+        &report,
+        LayoutNetBrowserFilter::All,
+        LayoutNetBrowserSort::Id,
+        Some("open CLK"),
+    )
+    .into_iter()
+    .map(|(id, _)| id)
+    .collect::<Vec<_>>();
+    assert_eq!(
+        open_search,
+        vec![2, 3],
+        "net browser search should match selected-component open details"
+    );
+
+    let component_selector_search = layout_net_browser_entries_from_report(
+        &report,
+        LayoutNetBrowserFilter::All,
+        LayoutNetBrowserSort::Id,
+        Some("component_id=1"),
+    )
+    .into_iter()
+    .map(|(id, _)| id)
+    .collect::<Vec<_>>();
+    assert_eq!(
+        component_selector_search,
+        vec![1],
+        "net browser selector search should match component ids"
+    );
+
+    let name_selector_search = layout_net_browser_entries_from_report(
+        &report,
+        LayoutNetBrowserFilter::All,
+        LayoutNetBrowserSort::Id,
+        Some("net_name=CLK"),
+    )
+    .into_iter()
+    .map(|(id, _)| id)
+    .collect::<Vec<_>>();
+    assert_eq!(
+        name_selector_search,
+        vec![2, 3],
+        "net browser selector search should match net names"
+    );
+
+    let device_selector_search = layout_net_browser_entries_from_report(
+        &report,
+        LayoutNetBrowserFilter::All,
+        LayoutNetBrowserSort::Id,
+        Some("device_model=nmos"),
+    )
+    .into_iter()
+    .map(|(id, _)| id)
+    .collect::<Vec<_>>();
+    assert_eq!(
+        device_selector_search,
+        vec![2],
+        "net browser selector search should match connected device metadata"
+    );
+
+    let issue_selector_search = layout_net_browser_entries_from_report(
+        &report,
+        LayoutNetBrowserFilter::All,
+        LayoutNetBrowserSort::Id,
+        Some("issue=Short DATA/VSS"),
+    )
+    .into_iter()
+    .map(|(id, _)| id)
+    .collect::<Vec<_>>();
+    assert_eq!(
+        issue_selector_search,
+        vec![1],
+        "net browser selector search should match component issue summaries"
+    );
+
+    let bounds_selector_search = layout_net_browser_entries_from_report(
+        &report,
+        LayoutNetBrowserFilter::All,
+        LayoutNetBrowserSort::Id,
+        Some("bounds=2000,0 200x100"),
+    )
+    .into_iter()
+    .map(|(id, _)| id)
+    .collect::<Vec<_>>();
+    assert_eq!(
+        bounds_selector_search,
+        vec![2],
+        "net browser selector search should match component bounds"
+    );
 }
 
 #[test]
@@ -1129,7 +1661,9 @@ pub(crate) fn layout_instance_browser_filters_named_and_array_instances() {
         .collect::<Vec<_>>();
     assert_eq!(named_entries, vec![named]);
 
-    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.instance_browser_filter.arrays"));
+    assert!(
+        app.apply_clicked_node_name("glassworks.viewctl.layout.instance_browser_filter.arrays")
+    );
     assert_eq!(
         app.layout_instance_browser_filter,
         LayoutInstanceBrowserFilter::Arrays
@@ -1196,11 +1730,19 @@ pub(crate) fn layout_instance_browser_filters_named_and_array_instances() {
     );
 
     assert!(
-        app.apply_clicked_node_name("glassworks.viewctl.layout.instance_browser_filter.transformed")
+        app.apply_clicked_node_name(
+            "glassworks.viewctl.layout.instance_browser_filter.transformed"
+        )
     );
     assert_eq!(
         app.layout_instance_browser_filter,
         LayoutInstanceBrowserFilter::Transformed
+    );
+    assert!(
+        app.status_message()
+            .contains("Instance browser filter Transformed (2)"),
+        "{}",
+        app.status_message()
     );
     let transformed_entries = layout_instance_browser_entries(&app)
         .into_iter()
@@ -1234,6 +1776,48 @@ pub(crate) fn layout_instance_browser_filters_named_and_array_instances() {
             "instance browser filter surface should expose {node_name}"
         );
     }
+    let title = document
+        .nodes()
+        .iter()
+        .find(|node| node.name() == "glassworks.layout.instance_browser.title")
+        .unwrap_or_else(|| panic!("instance browser title should exist"));
+    let UiContent::Text(title_text) = title.content() else {
+        panic!("instance browser title should be text");
+    };
+    assert_eq!(title_text.text, "Instance Browser - Transformed (2 rows)");
+    let filter_button_label = |node_name: &str| -> String {
+        document
+            .nodes()
+            .iter()
+            .find(|node| node.name() == node_name)
+            .and_then(|node| node.accessibility())
+            .and_then(|accessibility| accessibility.label.clone())
+            .unwrap_or_else(|| panic!("{node_name} should expose an accessibility label"))
+    };
+    assert_eq!(
+        filter_button_label("glassworks.viewctl.layout.instance_browser_filter.all"),
+        "All (3)"
+    );
+    assert_eq!(
+        filter_button_label("glassworks.viewctl.layout.instance_browser_filter.named"),
+        "Named (1)"
+    );
+    assert_eq!(
+        filter_button_label("glassworks.viewctl.layout.instance_browser_filter.properties"),
+        "Properties (1)"
+    );
+    assert_eq!(
+        filter_button_label("glassworks.viewctl.layout.instance_browser_filter.arrays"),
+        "Arrays (1)"
+    );
+    assert_eq!(
+        filter_button_label("glassworks.viewctl.layout.instance_browser_filter.identity"),
+        "Identity (1)"
+    );
+    assert_eq!(
+        filter_button_label("glassworks.viewctl.layout.instance_browser_filter.transformed"),
+        "Transformed (2)"
+    );
     assert!(
         !document.nodes().iter().any(|node| {
             node.name()
@@ -1244,6 +1828,343 @@ pub(crate) fn layout_instance_browser_filters_named_and_array_instances() {
         }),
         "transformed filter should hide identity instances"
     );
+
+    app.layout_browser_search = "missing".to_string();
+    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.instance_browser.select_first"));
+    assert!(
+        app.status_message()
+            .contains("Instance browser has no matching transformed instances for search missing"),
+        "{}",
+        app.status_message()
+    );
+    let empty_document = app
+        .build_operad_document(UiSize::new(1440.0, 920.0))
+        .expect("layout document with empty instance search should build");
+    let empty_title = empty_document
+        .nodes()
+        .iter()
+        .find(|node| node.name() == "glassworks.layout.instance_browser.title")
+        .unwrap_or_else(|| panic!("empty instance browser title should exist"));
+    let UiContent::Text(empty_title_text) = empty_title.content() else {
+        panic!("empty instance browser title should be text");
+    };
+    assert_eq!(
+        empty_title_text.text,
+        "Instance Browser - Transformed / search missing (0 rows)"
+    );
+}
+
+#[test]
+pub(crate) fn layout_instance_browser_searches_by_selector_metadata() {
+    let mut app = GlassworksApp::new_with_options(StartupOptions {
+        view_mode: Some(StartupView::Layout2d),
+        ..Default::default()
+    });
+    app.workspace.document = Document::new("instance selector search test");
+    app.reset_layout_document_state();
+    let top = app.workspace.document.top_cell;
+    let metal1 = app
+        .workspace
+        .document
+        .layer_by_process(ProcessLayer::Metal1)
+        .expect("default technology should include metal1");
+    let parent_cell = app.workspace.document.create_cell("alpha parent cell");
+    let alpha_target = app.workspace.document.create_cell("alpha instance target");
+    let zeta_target = app.workspace.document.create_cell("zeta instance target");
+    app.workspace
+        .document
+        .insert_shape_in_cell(
+            alpha_target,
+            metal1,
+            ShapeKind::Rectangle(Rect::from_min_size(Point::new(10, 20), 30, 40)),
+        )
+        .expect("alpha target should have local geometry");
+    app.workspace
+        .document
+        .insert_shape_in_cell(
+            zeta_target,
+            metal1,
+            ShapeKind::Rectangle(Rect::from_min_size(Point::new(100, 200), 60, 70)),
+        )
+        .expect("zeta target should have local geometry");
+    let parent_placement = app
+        .workspace
+        .document
+        .insert_instance(top, parent_cell, Transform::translate(1_000, 0))
+        .expect("parent cell should be placed under top");
+    let alpha_instance = app
+        .workspace
+        .document
+        .insert_instance(parent_cell, alpha_target, Transform::translate(300, 40))
+        .expect("alpha target instance should be inserted");
+    {
+        let mut instance = app
+            .workspace
+            .document
+            .instance_mut(parent_cell, alpha_instance)
+            .expect("alpha target instance should be mutable");
+        instance.name = Some("alpha_inst".to_string());
+        instance.array = InstanceArray {
+            columns: 2,
+            rows: 1,
+            column_pitch: Vector::new(40, 0),
+            row_pitch: Vector::new(0, 40),
+        };
+        instance
+            .properties
+            .insert("review.owner".to_string(), "layout".to_string());
+    }
+    let zeta_instance = app
+        .workspace
+        .document
+        .insert_instance(top, zeta_target, Transform::translate(700, 0))
+        .expect("zeta target instance should be inserted");
+
+    app.layout_instance_browser_scope = LayoutInstanceBrowserScope::Hierarchy;
+    let listed_instances = |app: &GlassworksApp| {
+        layout_instance_browser_entries_with_filter(
+            app,
+            LayoutInstanceBrowserFilter::All,
+            true,
+            usize::MAX,
+        )
+        .into_iter()
+        .map(|(parent, id, _)| (parent, id))
+        .collect::<Vec<_>>()
+    };
+
+    app.set_layout_browser_search("parent_cell=alpha parent");
+    assert_eq!(listed_instances(&app), vec![(parent_cell, alpha_instance)]);
+    app.set_layout_browser_search("target_cell=alpha instance target");
+    assert_eq!(listed_instances(&app), vec![(parent_cell, alpha_instance)]);
+    app.set_layout_browser_search(&format!("target_cell_id={}", zeta_target.0));
+    assert_eq!(listed_instances(&app), vec![(top, zeta_instance)]);
+    app.set_layout_browser_search("name=alpha_inst");
+    assert_eq!(listed_instances(&app), vec![(parent_cell, alpha_instance)]);
+    app.set_layout_browser_search("array=2x1");
+    assert_eq!(listed_instances(&app), vec![(parent_cell, alpha_instance)]);
+    app.set_layout_browser_search("translation=300,40");
+    assert_eq!(listed_instances(&app), vec![(parent_cell, alpha_instance)]);
+    app.set_layout_browser_search("target_bounds=10,20 30x40");
+    assert_eq!(listed_instances(&app), vec![(parent_cell, alpha_instance)]);
+    app.set_layout_browser_search("review.owner=layout");
+    assert_eq!(listed_instances(&app), vec![(parent_cell, alpha_instance)]);
+
+    app.set_layout_browser_search("target_cell=alpha instance target");
+    let document = app
+        .build_operad_document(UiSize::new(1440.0, 920.0))
+        .expect("layout document with target-cell instance search should build");
+    assert!(
+        document.nodes().iter().any(|node| {
+            node.name() == "glassworks.viewctl.layout.instance_browser.select_first"
+        }),
+        "instance browser should expose select-first control for target-cell selector search"
+    );
+    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.instance_browser.select_first"));
+    assert_eq!(
+        app.selected_layout_instance_context()
+            .map(|(parent, id, _)| (parent, id)),
+        Some((parent_cell, alpha_instance))
+    );
+    assert_ne!(
+        app.selected_layout_instance_context()
+            .map(|(parent, id, _)| (parent, id)),
+        Some((top, parent_placement)),
+        "selector search should select the matching nested instance, not its parent placement"
+    );
+}
+
+#[test]
+pub(crate) fn layout_instance_browser_filters_hidden_and_visible_target_cells() {
+    let mut app = GlassworksApp::new_with_options(StartupOptions {
+        view_mode: Some(StartupView::Layout2d),
+        ..Default::default()
+    });
+    app.workspace.document = Document::new("instance browser hidden filter test");
+    app.reset_layout_document_state();
+    let top = app.workspace.document.top_cell;
+    let hidden_child = app.workspace.document.create_cell("hidden child");
+    let visible_child = app.workspace.document.create_cell("visible child");
+    let hidden_instance = app
+        .workspace
+        .document
+        .insert_instance(top, hidden_child, Transform::translate(100, 0))
+        .expect("hidden-target instance should be inserted");
+    let visible_instance = app
+        .workspace
+        .document
+        .insert_instance(top, visible_child, Transform::translate(200, 0))
+        .expect("visible-target instance should be inserted");
+    app.layout_hidden_cells.insert(hidden_child);
+
+    assert!(
+        app.apply_clicked_node_name("glassworks.viewctl.layout.instance_browser_filter.hidden")
+    );
+    assert_eq!(
+        app.layout_instance_browser_filter,
+        LayoutInstanceBrowserFilter::Hidden
+    );
+    let hidden_entries = layout_instance_browser_entries(&app)
+        .into_iter()
+        .map(|(_, id, _)| id)
+        .collect::<Vec<_>>();
+    assert_eq!(hidden_entries, vec![hidden_instance]);
+
+    assert!(
+        app.apply_clicked_node_name("glassworks.viewctl.layout.instance_browser_filter.visible")
+    );
+    assert_eq!(
+        app.layout_instance_browser_filter,
+        LayoutInstanceBrowserFilter::Visible
+    );
+    let visible_entries = layout_instance_browser_entries(&app)
+        .into_iter()
+        .map(|(_, id, _)| id)
+        .collect::<Vec<_>>();
+    assert_eq!(visible_entries, vec![visible_instance]);
+
+    let document = app
+        .build_operad_document(UiSize::new(1440.0, 920.0))
+        .expect("layout document should build");
+    for node_name in [
+        "glassworks.viewctl.layout.instance_browser_filter.hidden",
+        "glassworks.viewctl.layout.instance_browser_filter.visible",
+    ] {
+        assert!(
+            document.nodes().iter().any(|node| node.name() == node_name),
+            "instance browser filter surface should expose {node_name}"
+        );
+    }
+}
+
+#[test]
+pub(crate) fn layout_instance_browser_filters_leaf_and_branch_target_cells() {
+    let mut app = GlassworksApp::new_with_options(StartupOptions {
+        view_mode: Some(StartupView::Layout2d),
+        ..Default::default()
+    });
+    app.workspace.document = Document::new("instance browser target role filter test");
+    app.reset_layout_document_state();
+    let top = app.workspace.document.top_cell;
+    let metal1 = app
+        .workspace
+        .document
+        .layer_by_process(ProcessLayer::Metal1)
+        .expect("default technology should include metal1");
+    let leaf_target = app.workspace.document.create_cell("leaf target");
+    let branch_target = app.workspace.document.create_cell("branch target");
+    let nested_leaf = app.workspace.document.create_cell("nested leaf");
+    app.workspace
+        .document
+        .insert_shape_in_cell(
+            leaf_target,
+            metal1,
+            ShapeKind::Rectangle(Rect::from_min_size(Point::new(10, 20), 30, 40)),
+        )
+        .expect("leaf target should have local geometry");
+    app.workspace
+        .document
+        .insert_shape_in_cell(
+            branch_target,
+            metal1,
+            ShapeKind::Rectangle(Rect::from_min_size(Point::new(100, 200), 60, 70)),
+        )
+        .expect("branch target should have local geometry");
+    app.workspace
+        .document
+        .insert_instance(branch_target, nested_leaf, Transform::IDENTITY)
+        .expect("branch target should contain a child placement");
+    let leaf_instance = app
+        .workspace
+        .document
+        .insert_instance(top, leaf_target, Transform::translate(100, 0))
+        .expect("leaf-target instance should be inserted");
+    let branch_instance = app
+        .workspace
+        .document
+        .insert_instance(top, branch_target, Transform::translate(200, 0))
+        .expect("branch-target instance should be inserted");
+
+    assert!(
+        app.apply_clicked_node_name(
+            "glassworks.viewctl.layout.instance_browser_filter.leaf_targets"
+        )
+    );
+    assert_eq!(
+        app.layout_instance_browser_filter,
+        LayoutInstanceBrowserFilter::LeafTargets
+    );
+    let leaf_entries = layout_instance_browser_entries(&app)
+        .into_iter()
+        .map(|(_, id, _)| id)
+        .collect::<Vec<_>>();
+    assert_eq!(leaf_entries, vec![leaf_instance]);
+    let leaf_rows = layout_instance_browser_rows(&app);
+    assert!(
+        leaf_rows
+            .iter()
+            .any(|(key, value)| key == "Filter" && value == "Leaf Targets"),
+        "instance browser rows should show the leaf-target filter"
+    );
+    for (key, value) in [
+        ("Target role", "leaf"),
+        ("Target shapes", "1"),
+        ("Target child instances", "0"),
+        ("Target local bounds", "10,20 30x40"),
+    ] {
+        assert!(
+            leaf_rows
+                .iter()
+                .any(|(row_key, row_value)| row_key == key && row_value == value),
+            "leaf-target instance rows should include {key}={value}: {leaf_rows:?}"
+        );
+    }
+
+    assert!(app.apply_clicked_node_name(
+        "glassworks.viewctl.layout.instance_browser_filter.branch_targets"
+    ));
+    assert_eq!(
+        app.layout_instance_browser_filter,
+        LayoutInstanceBrowserFilter::BranchTargets
+    );
+    let branch_entries = layout_instance_browser_entries(&app)
+        .into_iter()
+        .map(|(_, id, _)| id)
+        .collect::<Vec<_>>();
+    assert_eq!(branch_entries, vec![branch_instance]);
+    let branch_rows = layout_instance_browser_rows(&app);
+    assert!(
+        branch_rows
+            .iter()
+            .any(|(key, value)| key == "Filter" && value == "Branch Targets"),
+        "instance browser rows should show the branch-target filter"
+    );
+    for (key, value) in [
+        ("Target role", "branch"),
+        ("Target shapes", "1"),
+        ("Target child instances", "1"),
+        ("Target local bounds", "100,200 60x70"),
+    ] {
+        assert!(
+            branch_rows
+                .iter()
+                .any(|(row_key, row_value)| row_key == key && row_value == value),
+            "branch-target instance rows should include {key}={value}: {branch_rows:?}"
+        );
+    }
+
+    let document = app
+        .build_operad_document(UiSize::new(1440.0, 920.0))
+        .expect("layout document should build");
+    for node_name in [
+        "glassworks.viewctl.layout.instance_browser_filter.leaf_targets",
+        "glassworks.viewctl.layout.instance_browser_filter.branch_targets",
+    ] {
+        assert!(
+            document.nodes().iter().any(|node| node.name() == node_name),
+            "instance browser target-role filter surface should expose {node_name}"
+        );
+    }
 }
 
 #[test]
@@ -1300,10 +2221,9 @@ pub(crate) fn layout_instance_browser_select_first_uses_property_selector_search
         .build_operad_document(UiSize::new(1440.0, 920.0))
         .expect("layout document with property-filtered instance browser should build");
     assert!(
-        document
-            .nodes()
-            .iter()
-            .any(|node| { node.name() == "glassworks.viewctl.layout.instance_browser.select_first" }),
+        document.nodes().iter().any(|node| {
+            node.name() == "glassworks.viewctl.layout.instance_browser.select_first"
+        }),
         "instance browser should expose select-first control when property matches exist"
     );
 

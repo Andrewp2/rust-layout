@@ -1,8 +1,8 @@
 use std::{collections::BTreeMap, error::Error, fmt};
 
-use geometry_core::{Coord, Point, Polygon, Rect};
+use geometry_core::{Coord, Point, Polygon, Rect, Vector};
 
-use crate::{Document, LayerId, ProcessLayer, ShapeKind};
+use crate::{CellId, Document, LayerId, ProcessLayer, ShapeKind, Transform};
 
 #[derive(Debug)]
 pub enum DefError {
@@ -31,6 +31,7 @@ impl Error for DefError {}
 pub struct DefExportReport {
     pub layer_count: usize,
     pub shape_count: usize,
+    pub component_count: usize,
     pub fill_count: usize,
     pub route_count: usize,
     pub pin_count: usize,
@@ -40,7 +41,7 @@ pub struct DefExportReport {
 
 impl DefExportReport {
     pub fn object_count(&self) -> usize {
-        self.fill_count + self.route_count + self.pin_count
+        self.component_count + self.fill_count + self.route_count + self.pin_count
     }
 }
 
@@ -60,6 +61,7 @@ pub struct DefGeneratedLayer {
 pub struct DefImportReport {
     pub section_count: usize,
     pub shape_count: usize,
+    pub component_count: usize,
     pub layer_count: usize,
     pub fill_count: usize,
     pub route_count: usize,
@@ -149,6 +151,7 @@ pub fn export_def_with_report(document: &Document) -> Result<DefExportResult, De
     let mut fills = Vec::new();
     let mut routes = Vec::new();
     let mut pins = Vec::new();
+    let components = collect_def_components(document, &mut report);
     let mut all_bounds = Vec::new();
     for flattened in document.flattened_shapes() {
         let mut shape = flattened.transformed_shape();
@@ -263,6 +266,7 @@ pub fn export_def_with_report(document: &Document) -> Result<DefExportResult, De
         "DIEAREA ( {} {} ) ( {} {} ) ;\n",
         bounds.min.x, bounds.min.y, bounds.max.x, bounds.max.y
     ));
+    write_def_components(&mut text, &components);
     write_def_fills(&mut text, &fills);
     write_def_specialnets(&mut text, &routes);
     write_def_pins(&mut text, &pins, document.grid);
@@ -279,6 +283,7 @@ pub fn import_def_with_report(input: &str) -> Result<DefImportResult, DefError> 
     let mut document = Document::new("DEF import");
     let mut report = DefImportReport::default();
     let mut layer_map = existing_def_layers(&document);
+    let mut component_cells = BTreeMap::new();
 
     while let Some(token) = cursor.next() {
         match token.to_ascii_uppercase().as_str() {
@@ -287,6 +292,15 @@ pub fn import_def_with_report(input: &str) -> Result<DefImportResult, DefError> 
                     document.name = name;
                 }
                 cursor.skip_statement();
+            }
+            "COMPONENTS" => {
+                report.section_count += 1;
+                parse_components_section(
+                    &mut cursor,
+                    &mut document,
+                    &mut component_cells,
+                    &mut report,
+                )?;
             }
             "FILLS" => {
                 report.section_count += 1;
@@ -352,6 +366,110 @@ struct DefPin {
     position: Point,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DefComponent {
+    name: String,
+    master: String,
+    position: Point,
+    orientation: &'static str,
+}
+
+fn collect_def_components(document: &Document, report: &mut DefExportReport) -> Vec<DefComponent> {
+    let mut components = Vec::new();
+    let Some(top) = document.cell(document.top_cell) else {
+        return components;
+    };
+    for instance in top.instances.values() {
+        let Some(cell) = document.cell(instance.cell) else {
+            report.skipped_shapes.push(format!(
+                "instance #{} references missing cell {}",
+                instance.id.0, instance.cell.0
+            ));
+            continue;
+        };
+        let array = instance.array.normalized();
+        for row in 0..array.rows {
+            for column in 0..array.columns {
+                let transform = Transform::from_translation(array.element_offset(column, row))
+                    .compose(instance.transform);
+                let Some((position, orientation)) = def_component_placement(transform) else {
+                    report.warnings.push(format!(
+                        "instance #{} has a non-orthogonal transform and was omitted from DEF COMPONENTS",
+                        instance.id.0
+                    ));
+                    continue;
+                };
+                let mut name = instance
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("I{}", instance.id.0));
+                if !array.is_single() {
+                    name = format!("{name}_{column}_{row}");
+                }
+                components.push(DefComponent {
+                    name: sanitize_def_identifier(&name, &format!("I{}", instance.id.0)),
+                    master: sanitize_def_identifier(&cell.name, &format!("cell_{}", cell.id.0)),
+                    position,
+                    orientation,
+                });
+                report.component_count += 1;
+            }
+        }
+    }
+    components
+}
+
+fn def_component_placement(transform: Transform) -> Option<(Point, &'static str)> {
+    let orientation = def_orientation_name(transform.matrix)?;
+    Some((
+        Point::new(transform.translation.dx, transform.translation.dy),
+        orientation,
+    ))
+}
+
+fn def_orientation_name(matrix: [i8; 4]) -> Option<&'static str> {
+    match matrix {
+        [1, 0, 0, 1] => Some("N"),
+        [0, 1, -1, 0] => Some("E"),
+        [-1, 0, 0, -1] => Some("S"),
+        [0, -1, 1, 0] => Some("W"),
+        [-1, 0, 0, 1] => Some("FN"),
+        [0, 1, 1, 0] => Some("FE"),
+        [1, 0, 0, -1] => Some("FS"),
+        [0, -1, -1, 0] => Some("FW"),
+        _ => None,
+    }
+}
+
+fn def_orientation_matrix(orientation: &str) -> Option<[i8; 4]> {
+    match orientation.to_ascii_uppercase().as_str() {
+        "N" => Some([1, 0, 0, 1]),
+        "E" => Some([0, 1, -1, 0]),
+        "S" => Some([-1, 0, 0, -1]),
+        "W" => Some([0, -1, 1, 0]),
+        "FN" => Some([-1, 0, 0, 1]),
+        "FE" => Some([0, 1, 1, 0]),
+        "FS" => Some([1, 0, 0, -1]),
+        "FW" => Some([0, -1, -1, 0]),
+        _ => None,
+    }
+}
+
+fn write_def_components(output: &mut String, components: &[DefComponent]) {
+    output.push_str(&format!("COMPONENTS {} ;\n", components.len()));
+    for component in components {
+        output.push_str(&format!(
+            "  - {} {} + PLACED ( {} {} ) {} ;\n",
+            component.name,
+            component.master,
+            component.position.x,
+            component.position.y,
+            component.orientation
+        ));
+    }
+    output.push_str("END COMPONENTS\n");
+}
+
 fn write_def_fills(output: &mut String, fills: &[DefFill]) {
     output.push_str(&format!("FILLS {} ;\n", fills.len()));
     for fill in fills {
@@ -407,6 +525,129 @@ fn write_def_pins(output: &mut String, pins: &[DefPin], grid: Coord) {
         ));
     }
     output.push_str("END PINS\n");
+}
+
+fn parse_components_section(
+    cursor: &mut TokenCursor,
+    document: &mut Document,
+    component_cells: &mut BTreeMap<String, CellId>,
+    report: &mut DefImportReport,
+) -> Result<(), DefError> {
+    cursor.skip_statement();
+    while let Some(token) = cursor.peek() {
+        if token.eq_ignore_ascii_case("END") {
+            cursor.next();
+            cursor.eat_keyword("COMPONENTS");
+            break;
+        }
+        if !cursor.eat("-") {
+            cursor.next();
+            continue;
+        }
+        let component_name = cursor.next_required("DEF component name")?;
+        let master_name = cursor.next_required("DEF component master")?;
+        parse_component_statement(
+            cursor,
+            document,
+            component_cells,
+            report,
+            component_name,
+            master_name,
+        )?;
+    }
+    Ok(())
+}
+
+fn parse_component_statement(
+    cursor: &mut TokenCursor,
+    document: &mut Document,
+    component_cells: &mut BTreeMap<String, CellId>,
+    report: &mut DefImportReport,
+    component_name: String,
+    master_name: String,
+) -> Result<(), DefError> {
+    let mut placement = None;
+    while let Some(token) = cursor.peek() {
+        if token == ";" {
+            cursor.next();
+            break;
+        }
+        if cursor.eat("+") {
+            let keyword = cursor.next_required("DEF component attribute")?;
+            match keyword.to_ascii_uppercase().as_str() {
+                "PLACED" | "FIXED" | "COVER" => {
+                    let position = parse_def_point(cursor, "DEF component placement", None)?;
+                    let orientation = if cursor
+                        .peek()
+                        .is_some_and(|token| token != ";" && token != "+")
+                    {
+                        cursor.next_required("DEF component orientation")?
+                    } else {
+                        "N".to_string()
+                    };
+                    placement = Some((position, orientation));
+                }
+                "UNPLACED" => {}
+                _ => {}
+            }
+        } else {
+            cursor.next();
+        }
+    }
+    let Some((position, orientation)) = placement else {
+        report
+            .skipped_items
+            .push(format!("ignored unplaced DEF component {component_name}"));
+        return Ok(());
+    };
+    let Some(transform) = def_component_transform(position, &orientation) else {
+        report.skipped_items.push(format!(
+            "ignored DEF component {component_name} with unsupported orientation {orientation}"
+        ));
+        return Ok(());
+    };
+    let cell = cell_for_def_component_master(document, component_cells, &master_name);
+    let Some(instance) = document.insert_instance_in_top(cell, transform) else {
+        report.skipped_items.push(format!(
+            "ignored DEF component {component_name} because its master cell could not be inserted"
+        ));
+        return Ok(());
+    };
+    if let Some(mut instance) = document.instance_mut(document.top_cell, instance) {
+        instance.name = Some(component_name);
+    }
+    report.component_count += 1;
+    Ok(())
+}
+
+fn def_component_transform(position: Point, orientation: &str) -> Option<Transform> {
+    let matrix = def_orientation_matrix(orientation)?;
+    Some(Transform {
+        matrix,
+        translation: Vector::new(position.x, position.y),
+    })
+}
+
+fn cell_for_def_component_master(
+    document: &mut Document,
+    component_cells: &mut BTreeMap<String, CellId>,
+    master_name: &str,
+) -> CellId {
+    let key = normalize_def_identifier(master_name);
+    if let Some(cell) = component_cells.get(&key) {
+        return *cell;
+    }
+    if let Some(existing) = document
+        .cells
+        .values()
+        .find(|cell| normalize_def_identifier(&cell.name) == key)
+    {
+        component_cells.insert(key, existing.id);
+        return existing.id;
+    }
+    let cell = document.create_cell(sanitize_def_identifier(master_name, "def_component"));
+    component_cells.insert(key, cell);
+    cell
 }
 
 fn parse_fills_section(
@@ -902,20 +1143,16 @@ mod tests {
         assert!(imported.document.shapes.values().any(|shape| {
             matches!(shape.kind, ShapeKind::Rectangle(rect) if rect.width() == 1_000 && rect.height() == 600)
         }));
-        assert!(
-            imported
-                .document
-                .shapes
-                .values()
-                .any(|shape| matches!(shape.kind, ShapeKind::Polygon(_)))
-        );
-        assert!(
-            imported
-                .document
-                .shapes
-                .values()
-                .any(|shape| matches!(shape.kind, ShapeKind::Path { width: 120, .. }))
-        );
+        assert!(imported
+            .document
+            .shapes
+            .values()
+            .any(|shape| matches!(shape.kind, ShapeKind::Polygon(_))));
+        assert!(imported
+            .document
+            .shapes
+            .values()
+            .any(|shape| matches!(shape.kind, ShapeKind::Path { width: 120, .. })));
         assert!(imported.document.shapes.values().any(
             |shape| matches!(&shape.kind, ShapeKind::Label { text, .. } if text == "pad_label")
         ));
@@ -941,20 +1178,157 @@ END DESIGN
         assert_eq!(imported.report.fill_count, 1);
         assert_eq!(imported.report.route_count, 1);
         assert_eq!(imported.report.shape_count, 2);
-        assert!(
+        assert!(imported
+            .document
+            .layers
+            .values()
+            .any(|layer| layer.name == "CUSTOM"));
+        assert!(imported
+            .document
+            .shapes
+            .values()
+            .any(|shape| matches!(shape.kind, ShapeKind::Path { width: 12, .. })));
+    }
+
+    #[test]
+    fn def_import_reads_component_placements_as_instances() {
+        let input = "\
+VERSION 5.8 ;
+DESIGN placed ;
+UNITS DISTANCE MICRONS 1000 ;
+COMPONENTS 1 ;
+  - U1 NAND2 + PLACED ( 100 200 ) N ;
+END COMPONENTS
+END DESIGN
+";
+        let imported = import_def_with_report(input).expect("DEF component import should succeed");
+        assert_eq!(imported.report.section_count, 1);
+        assert_eq!(imported.report.component_count, 1);
+        let master = imported
+            .document
+            .cells
+            .values()
+            .find(|cell| cell.name == "NAND2")
+            .expect("component master should become a placeholder cell");
+        let top = imported
+            .document
+            .cell(imported.document.top_cell)
+            .expect("top cell should exist");
+        let instance = top
+            .instances
+            .values()
+            .find(|instance| instance.cell == master.id)
+            .expect("component should become a top-level instance");
+        assert_eq!(instance.name.as_deref(), Some("U1"));
+        assert_eq!(instance.transform, Transform::translate(100, 200));
+    }
+
+    #[test]
+    fn def_component_orientations_round_trip() {
+        let orientations = [
+            ("N", [1, 0, 0, 1]),
+            ("E", [0, 1, -1, 0]),
+            ("S", [-1, 0, 0, -1]),
+            ("W", [0, -1, 1, 0]),
+            ("FN", [-1, 0, 0, 1]),
+            ("FE", [0, 1, 1, 0]),
+            ("FS", [1, 0, 0, -1]),
+            ("FW", [0, -1, -1, 0]),
+        ];
+        let mut input = String::from(
+            "\
+VERSION 5.8 ;
+DESIGN oriented ;
+UNITS DISTANCE MICRONS 1000 ;
+COMPONENTS 8 ;
+",
+        );
+        for (index, (orientation, _)) in orientations.iter().enumerate() {
+            input.push_str(&format!(
+                "  - U_{orientation} INV + PLACED ( {} {} ) {orientation} ;\n",
+                100 + index as Coord,
+                200 + index as Coord
+            ));
+        }
+        input.push_str("END COMPONENTS\nEND DESIGN\n");
+
+        let imported =
+            import_def_with_report(&input).expect("DEF oriented component import should succeed");
+        assert_eq!(imported.report.component_count, orientations.len());
+        let top = imported
+            .document
+            .cell(imported.document.top_cell)
+            .expect("top cell should exist");
+        for (index, (orientation, matrix)) in orientations.iter().enumerate() {
+            let name = format!("U_{orientation}");
+            let instance = top
+                .instances
+                .values()
+                .find(|instance| instance.name.as_deref() == Some(name.as_str()))
+                .expect("oriented component instance should be present");
+            assert_eq!(instance.transform.matrix, *matrix);
+            assert_eq!(
+                instance.transform.translation,
+                Vector::new(100 + index as Coord, 200 + index as Coord)
+            );
+        }
+
+        let exported =
+            export_def_with_report(&imported.document).expect("DEF export should succeed");
+        assert_eq!(exported.report.component_count, orientations.len());
+        for (index, (orientation, _)) in orientations.iter().enumerate() {
+            assert!(exported.text.contains(&format!(
+                "- U_{orientation} INV + PLACED ( {} {} ) {orientation} ;",
+                100 + index as Coord,
+                200 + index as Coord
+            )));
+        }
+    }
+
+    #[test]
+    fn def_export_includes_components_without_dropping_flat_geometry() {
+        let mut document = Document::new("def hierarchy");
+        let metal1 = document.layer_by_process(ProcessLayer::Metal1).unwrap();
+        let child = document.create_cell("nand cell");
+        document.insert_shape_in_cell(
+            child,
+            metal1,
+            ShapeKind::Rectangle(Rect::new(Point::new(0, 0), Point::new(100, 100))),
+        );
+        let instance = document
+            .insert_instance_in_top(child, Transform::translate(1_000, 2_000))
+            .expect("component instance should be inserted");
+        if let Some(mut instance) = document.instance_mut(document.top_cell, instance) {
+            instance.name = Some("U1".to_string());
+        }
+
+        let exported = export_def_with_report(&document).expect("DEF export should succeed");
+        assert!(exported.text.contains("COMPONENTS 1 ;"));
+        assert!(exported
+            .text
+            .contains("- U1 nand_cell + PLACED ( 1000 2000 ) N ;"));
+        assert!(exported.text.contains("FILLS 1 ;"));
+        assert_eq!(exported.report.component_count, 1);
+        assert_eq!(exported.report.fill_count, 1);
+
+        let imported = import_def_with_report(&exported.text).expect("DEF import should succeed");
+        assert_eq!(imported.report.component_count, 1);
+        assert_eq!(imported.report.fill_count, 1);
+        assert_eq!(
             imported
                 .document
-                .layers
+                .cell(imported.document.top_cell)
+                .expect("top cell should exist")
+                .instances
                 .values()
-                .any(|layer| layer.name == "CUSTOM")
+                .count(),
+            1
         );
-        assert!(
-            imported
-                .document
-                .shapes
-                .values()
-                .any(|shape| matches!(shape.kind, ShapeKind::Path { width: 12, .. }))
-        );
+        assert!(imported.document.shapes.values().any(
+            |shape| matches!(shape.kind, ShapeKind::Rectangle(rect)
+                    if rect.min == Point::new(1_000, 2_000)
+                        && rect.max == Point::new(1_100, 2_100))
+        ));
     }
 
     #[test]

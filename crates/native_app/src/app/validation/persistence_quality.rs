@@ -437,11 +437,98 @@ pub(crate) fn read_native_text_file_maybe_gzip(path: &Path) -> std::io::Result<S
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn read_native_bytes_file_maybe_gzip(path: &Path) -> std::io::Result<Vec<u8>> {
     let bytes = fs::read(path)?;
-    if !bytes.starts_with(&[0x1f, 0x8b]) {
-        return Ok(bytes);
+    if bytes.starts_with(&[0x1f, 0x8b]) {
+        let mut decoded = Vec::new();
+        GzDecoder::new(&bytes[..]).read_to_end(&mut decoded)?;
+        return Ok(decoded);
     }
+    if bytes.starts_with(&[0x50, 0x4b, 0x03, 0x04]) {
+        return read_native_single_file_zip(&bytes);
+    }
+    Ok(bytes)
+}
 
-    let mut decoded = Vec::new();
-    GzDecoder::new(&bytes[..]).read_to_end(&mut decoded)?;
-    Ok(decoded)
+#[cfg(not(target_arch = "wasm32"))]
+fn read_native_single_file_zip(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut index = 0usize;
+    while index + 30 <= bytes.len() {
+        let signature = read_le_u32(bytes, index)?;
+        match signature {
+            0x0403_4b50 => {}
+            0x0201_4b50 | 0x0605_4b50 => break,
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "ZIP archive has an invalid local file header",
+                ));
+            }
+        }
+        let flags = read_le_u16(bytes, index + 6)?;
+        let method = read_le_u16(bytes, index + 8)?;
+        let compressed_size = read_le_u32(bytes, index + 18)? as usize;
+        let name_len = read_le_u16(bytes, index + 26)? as usize;
+        let extra_len = read_le_u16(bytes, index + 28)? as usize;
+        if flags & 0x0008 != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "ZIP archive uses a data descriptor, which is not supported",
+            ));
+        }
+        let data_start = index
+            .checked_add(30)
+            .and_then(|value| value.checked_add(name_len))
+            .and_then(|value| value.checked_add(extra_len))
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "ZIP header is too large")
+            })?;
+        let data_end = data_start.checked_add(compressed_size).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "ZIP entry is too large")
+        })?;
+        if data_end > bytes.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "ZIP entry is truncated",
+            ));
+        }
+        let name_start = index + 30;
+        let name_end = name_start + name_len;
+        let name = std::str::from_utf8(&bytes[name_start..name_end]).unwrap_or_default();
+        index = data_end;
+        if name.ends_with('/') {
+            continue;
+        }
+        let data = &bytes[data_start..data_end];
+        return match method {
+            0 => Ok(data.to_vec()),
+            8 => {
+                let mut decoded = Vec::new();
+                DeflateDecoder::new(data).read_to_end(&mut decoded)?;
+                Ok(decoded)
+            }
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("ZIP compression method {method} is not supported"),
+            )),
+        };
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "ZIP archive does not contain a readable file entry",
+    ))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn read_le_u16(bytes: &[u8], offset: usize) -> std::io::Result<u16> {
+    let slice = bytes.get(offset..offset + 2).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "ZIP header is truncated")
+    })?;
+    Ok(u16::from_le_bytes([slice[0], slice[1]]))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn read_le_u32(bytes: &[u8], offset: usize) -> std::io::Result<u32> {
+    let slice = bytes.get(offset..offset + 4).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "ZIP header is truncated")
+    })?;
+    Ok(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
 }

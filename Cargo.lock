@@ -709,6 +709,7 @@ version = "0.1.0"
 dependencies = [
  "geometry_core",
  "layout_model",
+ "roxmltree",
  "serde",
  "serde_json",
 ]
@@ -1968,11 +1969,13 @@ dependencies = [
 name = "native_app"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "drc",
  "flate2",
  "geometry_core",
  "layout_model",
  "operad",
+ "png",
  "pollster",
  "renderer",
  "router",

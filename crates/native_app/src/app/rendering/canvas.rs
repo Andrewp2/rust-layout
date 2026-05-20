@@ -81,6 +81,7 @@ pub fn render_layout_canvas_requests(
             layout_canvas,
             viewport_3d_canvas,
             canvas_request.canvas.key.as_str(),
+            canvas_request.canvas.surface_key(),
             surface,
             UiSize::new(canvas_request.rect.width, canvas_request.rect.height),
         )?;
@@ -94,6 +95,7 @@ pub fn render_layout_canvas_context(
     layout_canvas: &mut LayoutCanvasResources,
     viewport_3d_canvas: &mut Viewport3dCanvasResources,
     canvas_key: &str,
+    surface_key: &str,
     surface: WgpuCanvasContext<'_>,
     logical_size: UiSize,
 ) -> Result<(), String> {
@@ -101,9 +103,51 @@ pub fn render_layout_canvas_context(
         "glassworks.layout.viewport.2d" => {
             render_layout_2d_canvas_with_size(app, layout_canvas, surface, logical_size)
         }
-        "glassworks.layout.viewport.3d" => render_layout_3d_canvas(app, viewport_3d_canvas, surface),
+        "glassworks.layout.viewport.3d" => {
+            render_layout_3d_canvas(app, viewport_3d_canvas, surface)
+        }
+        LAYOUT_DRC_MARKER_SNAPSHOT_CANVAS_KEY => {
+            render_layout_drc_marker_snapshot_canvas(app, surface_key, surface)
+        }
         _ => Ok(()),
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn render_layout_drc_marker_snapshot_canvas(
+    app: &GlassworksApp,
+    image_key: &str,
+    surface: WgpuCanvasContext<'_>,
+) -> Result<(), String> {
+    let size = surface.size();
+    let Some(rgba) = layout_drc_marker_snapshot_canvas_rgba(app, image_key, size) else {
+        surface.clear(ColorRgba::new(18, 24, 32, 255));
+        return Ok(());
+    };
+    let bytes_per_row = size
+        .width
+        .checked_mul(4)
+        .ok_or_else(|| "DRC marker snapshot canvas row overflow".to_string())?;
+    surface.queue().write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: surface.texture(),
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &rgba,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(bytes_per_row),
+            rows_per_image: Some(size.height),
+        },
+        wgpu::Extent3d {
+            width: size.width,
+            height: size.height,
+            depth_or_array_layers: 1,
+        },
+    );
+    Ok(())
 }
 
 #[cfg(not(target_arch = "wasm32"))]

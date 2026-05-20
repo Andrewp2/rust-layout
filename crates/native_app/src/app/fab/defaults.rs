@@ -1013,7 +1013,10 @@ pub(crate) fn selected_control_action<'a>(
         })
 }
 
-pub(crate) fn process_control_action_count(app: &GlassworksApp, state: ControlActionState) -> usize {
+pub(crate) fn process_control_action_count(
+    app: &GlassworksApp,
+    state: ControlActionState,
+) -> usize {
     app.workspace
         .process_control
         .actions

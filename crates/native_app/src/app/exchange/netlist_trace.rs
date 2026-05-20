@@ -76,6 +76,8 @@ pub(crate) struct LayoutTraceStateExchange {
     pub(crate) selected_component: Option<usize>,
     pub(crate) history: Vec<usize>,
     pub(crate) route_points: Vec<Point>,
+    #[serde(default = "default_layout_trace_highlight_mode_slug")]
+    pub(crate) highlight_mode: String,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -321,11 +323,10 @@ impl LayoutExtractedNetOpen {
 
 impl LayoutTraceStateExchange {
     pub(crate) fn from_app(app: &GlassworksApp) -> Self {
-        let selected_component = app.connectivity_report().ok().and_then(|report| {
-            app.selected_layout_occurrence
-                .as_ref()
-                .and_then(|occurrence| report.component_for_occurrence(occurrence))
-        });
+        let selected_component = app
+            .connectivity_report()
+            .ok()
+            .and_then(|report| selected_layout_net_component_id(app, &report));
         let mut history = Vec::new();
         for component_id in &app.layout_trace_history {
             if !history.contains(component_id) {
@@ -343,6 +344,11 @@ impl LayoutTraceStateExchange {
             selected_component,
             history,
             route_points: app.route_points.clone(),
+            highlight_mode: app.layout_trace_highlight_mode.slug().to_string(),
         }
     }
+}
+
+fn default_layout_trace_highlight_mode_slug() -> String {
+    LayoutTraceHighlightMode::Selected.slug().to_string()
 }

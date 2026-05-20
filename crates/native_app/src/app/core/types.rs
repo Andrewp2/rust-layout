@@ -1639,3 +1639,101 @@ pub fn write_operad_snapshot_ppm(path: &Path, report: &OperadSnapshotReport) -> 
     }
     Ok(())
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn write_operad_snapshot_png(path: &Path, report: &OperadSnapshotReport) -> Result<(), String> {
+    let image = report
+        .render
+        .snapshot
+        .as_ref()
+        .ok_or_else(|| "snapshot render did not produce image pixels".to_string())?;
+    if image.format != ResourceFormat::Rgba8 {
+        return Err(format!(
+            "unsupported snapshot format {:?}; expected Rgba8",
+            image.format
+        ));
+    }
+    let width = image.size.width;
+    let height = image.size.height;
+    if width == 0 || height == 0 {
+        return Err("snapshot PNG export requires non-zero dimensions".to_string());
+    }
+    let row_stride = width as usize * 4;
+    let expected_len = row_stride * height as usize;
+    if image.pixels.len() != expected_len {
+        return Err(format!(
+            "snapshot pixel buffer has {} bytes; expected {expected_len}",
+            image.pixels.len()
+        ));
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("create snapshot directory {}: {err}", parent.display()))?;
+    }
+
+    let mut filtered = Vec::with_capacity((row_stride + 1) * height as usize);
+    for row in 0..height as usize {
+        filtered.push(0);
+        let start = row * row_stride;
+        filtered.extend_from_slice(&image.pixels[start..start + row_stride]);
+    }
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+    encoder
+        .write_all(&filtered)
+        .map_err(|err| format!("compress PNG snapshot rows: {err}"))?;
+    let compressed = encoder
+        .finish()
+        .map_err(|err| format!("finish PNG snapshot compression: {err}"))?;
+
+    let mut file = fs::File::create(path)
+        .map_err(|err| format!("create snapshot file {}: {err}", path.display()))?;
+    file.write_all(b"\x89PNG\r\n\x1a\n")
+        .map_err(|err| format!("write snapshot file {}: {err}", path.display()))?;
+
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&width.to_be_bytes());
+    ihdr.extend_from_slice(&height.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+    write_png_chunk(&mut file, b"IHDR", &ihdr, path)?;
+    write_png_chunk(&mut file, b"IDAT", &compressed, path)?;
+    write_png_chunk(&mut file, b"IEND", &[], path)?;
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn write_png_chunk(
+    file: &mut fs::File,
+    chunk_type: &[u8; 4],
+    data: &[u8],
+    path: &Path,
+) -> Result<(), String> {
+    let length = u32::try_from(data.len()).map_err(|_| {
+        format!(
+            "PNG chunk {:?} is too large",
+            String::from_utf8_lossy(chunk_type)
+        )
+    })?;
+    file.write_all(&length.to_be_bytes())
+        .map_err(|err| format!("write snapshot file {}: {err}", path.display()))?;
+    file.write_all(chunk_type)
+        .map_err(|err| format!("write snapshot file {}: {err}", path.display()))?;
+    file.write_all(data)
+        .map_err(|err| format!("write snapshot file {}: {err}", path.display()))?;
+    let checksum = png_crc32(chunk_type, data);
+    file.write_all(&checksum.to_be_bytes())
+        .map_err(|err| format!("write snapshot file {}: {err}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn png_crc32(chunk_type: &[u8; 4], data: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for byte in chunk_type.iter().chain(data.iter()) {
+        crc ^= *byte as u32;
+        for _ in 0..8 {
+            let mask = 0u32.wrapping_sub(crc & 1);
+            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+        }
+    }
+    !crc
+}

@@ -14,6 +14,8 @@ pub(crate) const UI_SCREENSHOT_EXPORT_PATH: &str = "target/glassworks-ui-snapsho
 #[cfg(all(not(test), not(target_arch = "wasm32")))]
 pub(crate) const UI_SCREENSHOT_PPM_EXPORT_PATH: &str = "target/glassworks-ui-snapshot.ppm";
 #[cfg(all(not(test), not(target_arch = "wasm32")))]
+pub(crate) const UI_SCREENSHOT_PNG_EXPORT_PATH: &str = "target/glassworks-ui-snapshot.png";
+#[cfg(all(not(test), not(target_arch = "wasm32")))]
 pub(crate) const UI_GDS_EXCHANGE_PATH: &str = "target/glassworks-layout.gds";
 #[cfg(all(not(test), not(target_arch = "wasm32")))]
 pub(crate) const UI_CIF_EXCHANGE_PATH: &str = "target/glassworks-layout.cif";
@@ -30,9 +32,14 @@ pub(crate) const UI_DRC_REPORT_EXCHANGE_PATH: &str = "target/glassworks-drc-repo
 #[cfg(all(not(test), not(target_arch = "wasm32")))]
 pub(crate) const UI_DRC_REPORT_DATABASE_EXCHANGE_PATH: &str = "target/glassworks-drc-reports.json";
 #[cfg(all(not(test), not(target_arch = "wasm32")))]
+pub(crate) const UI_KLAYOUT_RDB_EXCHANGE_PATH: &str = "target/glassworks-drc-reports.lyrdb";
+#[cfg(all(not(test), not(target_arch = "wasm32")))]
 pub(crate) const UI_DRC_DECK_EXCHANGE_PATH: &str = "target/glassworks-drc-deck.json";
 #[cfg(all(not(test), not(target_arch = "wasm32")))]
 pub(crate) const UI_DRC_MARKER_SNAPSHOT_PATH: &str = "target/glassworks-drc-marker-snapshot.rgba";
+#[cfg(all(not(test), not(target_arch = "wasm32")))]
+pub(crate) const UI_DRC_MARKER_SNAPSHOT_PNG_PATH: &str =
+    "target/glassworks-drc-marker-snapshot.png";
 #[cfg(all(not(test), not(target_arch = "wasm32")))]
 pub(crate) const UI_CALIBRE_RVE_EXCHANGE_PATH: &str = "target/glassworks-calibre-rve.txt";
 #[cfg(all(not(test), not(target_arch = "wasm32")))]
@@ -106,7 +113,7 @@ pub(crate) const LAYOUT_DRC_MARKER_SIGNOFF_PRESETS: [(&str, &str, &str); 3] = [
     ("accepted", "Signoff Accepted", "accepted"),
     ("rejected", "Signoff Rejected", "rejected"),
 ];
-pub(crate) const LAYOUT_DRC_MARKER_TAG_PRESETS: [(&str, &str, &str, &str); 3] = [
+pub(crate) const LAYOUT_DRC_MARKER_TAG_PRESETS: [(&str, &str, &str, &str); 4] = [
     ("fix", "Tag Needs Fix", "action", "fix"),
     (
         "false_positive",
@@ -115,18 +122,32 @@ pub(crate) const LAYOUT_DRC_MARKER_TAG_PRESETS: [(&str, &str, &str, &str); 3] = 
         "false_positive",
     ),
     ("source_external", "Tag External", "source", "external"),
+    (
+        "category_litho",
+        "Tag Category Litho",
+        "category",
+        "Litho/Hotspots",
+    ),
 ];
 pub(crate) const INVENTORY_DEMO_TODAY: u32 = 20260508;
 pub(crate) const MASK_ISSUE_PAGE_SIZE: usize = 50;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) fn default_ui_screenshot_export_path() -> PathBuf {
-    std::env::temp_dir().join(format!("glassworks-ui-snapshot-{}.rgba", std::process::id()))
+    std::env::temp_dir().join(format!(
+        "glassworks-ui-snapshot-{}.rgba",
+        std::process::id()
+    ))
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) fn default_ui_screenshot_ppm_export_path() -> PathBuf {
     std::env::temp_dir().join(format!("glassworks-ui-snapshot-{}.ppm", std::process::id()))
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) fn default_ui_screenshot_png_export_path() -> PathBuf {
+    std::env::temp_dir().join(format!("glassworks-ui-snapshot-{}.png", std::process::id()))
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -166,7 +187,18 @@ pub(crate) fn default_ui_drc_report_exchange_path() -> PathBuf {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) fn default_ui_drc_report_database_exchange_path() -> PathBuf {
-    std::env::temp_dir().join(format!("glassworks-drc-reports-{}.json", std::process::id()))
+    std::env::temp_dir().join(format!(
+        "glassworks-drc-reports-{}.json",
+        std::process::id()
+    ))
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) fn default_ui_klayout_rdb_exchange_path() -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "glassworks-drc-reports-{}.lyrdb",
+        std::process::id()
+    ))
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -178,6 +210,14 @@ pub(crate) fn default_ui_drc_deck_exchange_path() -> PathBuf {
 pub(crate) fn default_ui_drc_marker_snapshot_path() -> PathBuf {
     std::env::temp_dir().join(format!(
         "glassworks-drc-marker-snapshot-{}.rgba",
+        std::process::id()
+    ))
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) fn default_ui_drc_marker_snapshot_png_path() -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "glassworks-drc-marker-snapshot-{}.png",
         std::process::id()
     ))
 }
@@ -204,12 +244,18 @@ pub(crate) fn default_ui_schematic_spice_exchange_path() -> PathBuf {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) fn default_ui_trace_state_exchange_path() -> PathBuf {
-    std::env::temp_dir().join(format!("glassworks-trace-state-{}.json", std::process::id()))
+    std::env::temp_dir().join(format!(
+        "glassworks-trace-state-{}.json",
+        std::process::id()
+    ))
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) fn default_ui_l2n_database_exchange_path() -> PathBuf {
-    std::env::temp_dir().join(format!("glassworks-l2n-database-{}.json", std::process::id()))
+    std::env::temp_dir().join(format!(
+        "glassworks-l2n-database-{}.json",
+        std::process::id()
+    ))
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -262,6 +308,11 @@ pub(crate) fn default_ui_screenshot_ppm_export_path() -> PathBuf {
 }
 
 #[cfg(all(not(test), not(target_arch = "wasm32")))]
+pub(crate) fn default_ui_screenshot_png_export_path() -> PathBuf {
+    PathBuf::from(UI_SCREENSHOT_PNG_EXPORT_PATH)
+}
+
+#[cfg(all(not(test), not(target_arch = "wasm32")))]
 pub(crate) fn default_ui_gds_exchange_path() -> PathBuf {
     PathBuf::from(UI_GDS_EXCHANGE_PATH)
 }
@@ -302,6 +353,11 @@ pub(crate) fn default_ui_drc_report_database_exchange_path() -> PathBuf {
 }
 
 #[cfg(all(not(test), not(target_arch = "wasm32")))]
+pub(crate) fn default_ui_klayout_rdb_exchange_path() -> PathBuf {
+    PathBuf::from(UI_KLAYOUT_RDB_EXCHANGE_PATH)
+}
+
+#[cfg(all(not(test), not(target_arch = "wasm32")))]
 pub(crate) fn default_ui_drc_deck_exchange_path() -> PathBuf {
     PathBuf::from(UI_DRC_DECK_EXCHANGE_PATH)
 }
@@ -309,6 +365,11 @@ pub(crate) fn default_ui_drc_deck_exchange_path() -> PathBuf {
 #[cfg(all(not(test), not(target_arch = "wasm32")))]
 pub(crate) fn default_ui_drc_marker_snapshot_path() -> PathBuf {
     PathBuf::from(UI_DRC_MARKER_SNAPSHOT_PATH)
+}
+
+#[cfg(all(not(test), not(target_arch = "wasm32")))]
+pub(crate) fn default_ui_drc_marker_snapshot_png_path() -> PathBuf {
+    PathBuf::from(UI_DRC_MARKER_SNAPSHOT_PNG_PATH)
 }
 
 #[cfg(all(not(test), not(target_arch = "wasm32")))]

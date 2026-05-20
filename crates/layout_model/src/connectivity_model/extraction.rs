@@ -1169,6 +1169,20 @@ pub(crate) fn layout_spice_device_signatures(
     report: &ConnectivityReport,
     mos_dimension_keys: &[&'static str],
 ) -> Vec<String> {
+    let mut signatures = report
+        .devices
+        .iter()
+        .filter_map(|device| layout_spice_device_signature(report, device, mos_dimension_keys))
+        .collect::<Vec<_>>();
+    signatures.sort();
+    signatures
+}
+
+pub fn layout_spice_device_signature(
+    report: &ConnectivityReport,
+    device: &ExtractedDevice,
+    mos_dimension_keys: &[&'static str],
+) -> Option<String> {
     let component_nets = report
         .components
         .iter()
@@ -1177,56 +1191,48 @@ pub(crate) fn layout_spice_device_signatures(
             (component.id, net_name)
         })
         .collect::<BTreeMap<_, _>>();
-    let mut signatures = report
-        .devices
-        .iter()
-        .filter_map(|device| {
-            if device.kind.eq_ignore_ascii_case("mos") {
-                let params = mos_dimension_keys
-                    .iter()
-                    .filter_map(|key| match *key {
-                        "L" => Some(("L".to_string(), device.length.to_string())),
-                        "W" => Some(("W".to_string(), device.width.to_string())),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>();
-                return Some(spice_device_signature(
-                    "M",
-                    &sanitize_spice_identifier(&device.model, "NMOS"),
-                    &[
-                        spice_device_terminal_net(device, "D", &component_nets),
-                        spice_device_terminal_net(device, "G", &component_nets),
-                        spice_device_terminal_net(device, "S", &component_nets),
-                        spice_device_terminal_net(device, "B", &component_nets),
-                    ],
-                    &params,
-                ));
-            }
-            if device.kind.eq_ignore_ascii_case("resistor") {
-                return Some(spice_passive_device_signature(
-                    "R",
-                    "RES",
-                    &[
-                        spice_device_terminal_net(device, "A", &component_nets),
-                        spice_device_terminal_net(device, "B", &component_nets),
-                    ],
-                ));
-            }
-            if device.kind.eq_ignore_ascii_case("capacitor") {
-                return Some(spice_passive_device_signature(
-                    "C",
-                    "CAP",
-                    &[
-                        spice_device_terminal_net(device, "A", &component_nets),
-                        spice_device_terminal_net(device, "B", &component_nets),
-                    ],
-                ));
-            }
-            None
-        })
-        .collect::<Vec<_>>();
-    signatures.sort();
-    signatures
+    if device.kind.eq_ignore_ascii_case("mos") {
+        let params = mos_dimension_keys
+            .iter()
+            .filter_map(|key| match *key {
+                "L" => Some(("L".to_string(), device.length.to_string())),
+                "W" => Some(("W".to_string(), device.width.to_string())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        return Some(spice_device_signature(
+            "M",
+            &sanitize_spice_identifier(&device.model, "NMOS"),
+            &[
+                spice_device_terminal_net(device, "D", &component_nets),
+                spice_device_terminal_net(device, "G", &component_nets),
+                spice_device_terminal_net(device, "S", &component_nets),
+                spice_device_terminal_net(device, "B", &component_nets),
+            ],
+            &params,
+        ));
+    }
+    if device.kind.eq_ignore_ascii_case("resistor") {
+        return Some(spice_passive_device_signature(
+            "R",
+            "RES",
+            &[
+                spice_device_terminal_net(device, "A", &component_nets),
+                spice_device_terminal_net(device, "B", &component_nets),
+            ],
+        ));
+    }
+    if device.kind.eq_ignore_ascii_case("capacitor") {
+        return Some(spice_passive_device_signature(
+            "C",
+            "CAP",
+            &[
+                spice_device_terminal_net(device, "A", &component_nets),
+                spice_device_terminal_net(device, "B", &component_nets),
+            ],
+        ));
+    }
+    None
 }
 
 pub(crate) fn schematic_spice_device_signatures(schematic: &SpiceSchematicNetlist) -> Vec<String> {

@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use geometry_core::{Coord, Point, Rect};
 use layout_model::{
-    Document, LayerId, Shape, ShapeId, ShapeKind, ShapeOccurrenceId, TechnologyError,
+    Document, LayerId, MarkerState, Shape, ShapeId, ShapeKind, ShapeOccurrenceId, TechnologyError,
     TechnologyFile, default_technology,
 };
 use serde::{Deserialize, Serialize};

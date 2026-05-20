@@ -194,6 +194,7 @@ impl GlassworksApp {
             layout_layer_depth_overrides,
             layout_measurement_mode,
             layout_measurement_filter: LayoutMeasurementFilter::All,
+            layout_measurement_browser_sort: LayoutMeasurementBrowserSort::Id,
             layout_active_technology_index,
             layout_active_technology,
             layout_disabled_connectivity_links,
@@ -239,6 +240,7 @@ impl GlassworksApp {
             layout_drc_marker_filter: LayoutDrcMarkerFilter::Active,
             layout_drc_marker_sort: LayoutDrcMarkerSort::Id,
             layout_drc_marker_category_filter: None,
+            layout_drc_marker_directory_filter: None,
             layout_selected_drc_marker_key: None,
             layout_trace_history: Vec::new(),
             layout_clipboard_shapes: Vec::new(),
@@ -708,6 +710,22 @@ impl GlassworksApp {
         true
     }
 
+    pub(crate) fn clear_all_layout_view_bookmarks(&mut self) -> bool {
+        let count = self.layout_view_bookmarks.len();
+        if count == 0 {
+            self.layout_view_bookmark_names.clear();
+            self.status_message = "No layout view bookmarks saved".to_string();
+            return true;
+        }
+        self.layout_view_bookmarks.clear();
+        self.layout_view_bookmark_names.clear();
+        self.status_message = format!(
+            "Cleared {count} layout view bookmark{}",
+            if count == 1 { "" } else { "s" }
+        );
+        true
+    }
+
     pub(crate) fn export_layout_view_bookmarks(&mut self) -> bool {
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -842,6 +860,37 @@ impl GlassworksApp {
         self.layout_layer_set_names.insert(slot, name.clone());
         self.status_message = format!(
             "Saved {name} with {visible_count} visible layer(s), {layer_group} group, {usage_filter} rows, {depth_count} layer depth override(s)"
+        );
+        true
+    }
+
+    pub(crate) fn clear_layout_layer_set(&mut self, value: &str) -> bool {
+        let Some(slot) = parse_layout_layer_set_slot(value) else {
+            return false;
+        };
+        let name = self.layout_layer_set_name(slot);
+        let removed_set = self.layout_layer_sets.remove(&slot).is_some();
+        let removed_name = self.layout_layer_set_names.remove(&slot).is_some();
+        if removed_set || removed_name {
+            self.status_message = format!("Cleared {name}");
+        } else {
+            self.status_message = format!("No {name} saved");
+        }
+        true
+    }
+
+    pub(crate) fn clear_all_layout_layer_sets(&mut self) -> bool {
+        let count = self.layout_layer_sets.len();
+        if count == 0 {
+            self.layout_layer_set_names.clear();
+            self.status_message = "No layer sets saved".to_string();
+            return true;
+        }
+        self.layout_layer_sets.clear();
+        self.layout_layer_set_names.clear();
+        self.status_message = format!(
+            "Cleared {count} layer set{}",
+            if count == 1 { "" } else { "s" }
         );
         true
     }

@@ -15,6 +15,15 @@ pub(crate) struct LayoutIndexCacheValue {
 pub(crate) struct ConnectivityReportCacheValue {
     pub(crate) revision: u64,
     pub(crate) report: Result<ConnectivityReport, String>,
+    pub(crate) source: Option<LayoutConnectivityReportSource>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct LayoutConnectivityReportSource {
+    pub(crate) label: String,
+    pub(crate) document_name: String,
+    pub(crate) layout_revision: u64,
+    pub(crate) technology_name: String,
 }
 
 #[derive(Clone, Debug)]
@@ -28,6 +37,7 @@ pub(crate) struct DrcReportHistoryEntry {
     pub(crate) id: u64,
     pub(crate) revision: u64,
     pub(crate) label: String,
+    pub(crate) source: Option<String>,
     pub(crate) value: DrcReportCacheValue,
 }
 
@@ -68,6 +78,8 @@ pub(crate) enum LayoutLayerUsageFilter {
     All,
     Used,
     Empty,
+    Visible,
+    Hidden,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -245,13 +257,21 @@ impl LayoutLayerGroupFilter {
 }
 
 impl LayoutLayerUsageFilter {
-    pub(crate) const ALL: [Self; 3] = [Self::All, Self::Used, Self::Empty];
+    pub(crate) const ALL: [Self; 5] = [
+        Self::All,
+        Self::Used,
+        Self::Empty,
+        Self::Visible,
+        Self::Hidden,
+    ];
 
     pub(crate) fn from_slug(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "all" => Some(Self::All),
             "used" | "populated" | "non_empty" | "non-empty" => Some(Self::Used),
             "empty" | "unused" => Some(Self::Empty),
+            "visible" | "shown" | "visible_layers" | "visible-layers" => Some(Self::Visible),
+            "hidden" | "invisible" | "hidden_layers" | "hidden-layers" => Some(Self::Hidden),
             _ => None,
         }
     }
@@ -261,6 +281,8 @@ impl LayoutLayerUsageFilter {
             Self::All => "all",
             Self::Used => "used",
             Self::Empty => "empty",
+            Self::Visible => "visible",
+            Self::Hidden => "hidden",
         }
     }
 
@@ -269,14 +291,18 @@ impl LayoutLayerUsageFilter {
             Self::All => "All",
             Self::Used => "Used",
             Self::Empty => "Empty",
+            Self::Visible => "Visible",
+            Self::Hidden => "Hidden",
         }
     }
 
-    pub(crate) fn matches(self, usage_count: usize) -> bool {
+    pub(crate) fn matches(self, usage_count: usize, visible: bool) -> bool {
         match self {
             Self::All => true,
             Self::Used => usage_count > 0,
             Self::Empty => usage_count == 0,
+            Self::Visible => visible,
+            Self::Hidden => !visible,
         }
     }
 }
@@ -634,10 +660,11 @@ pub(crate) enum LayoutShapeBrowserSort {
     Layer,
     Cell,
     Kind,
+    Area,
 }
 
 impl LayoutShapeBrowserSort {
-    pub(crate) const ALL: [Self; 4] = [Self::Id, Self::Layer, Self::Cell, Self::Kind];
+    pub(crate) const ALL: [Self; 5] = [Self::Id, Self::Layer, Self::Cell, Self::Kind, Self::Area];
 
     pub(crate) fn from_slug(value: &str) -> Option<Self> {
         match value {
@@ -645,6 +672,7 @@ impl LayoutShapeBrowserSort {
             "layer" => Some(Self::Layer),
             "cell" | "source_cell" | "source-cell" => Some(Self::Cell),
             "kind" | "type" => Some(Self::Kind),
+            "area" | "size" | "bounds_area" | "bounds-area" => Some(Self::Area),
             _ => None,
         }
     }
@@ -655,6 +683,7 @@ impl LayoutShapeBrowserSort {
             Self::Layer => "layer",
             Self::Cell => "cell",
             Self::Kind => "kind",
+            Self::Area => "area",
         }
     }
 
@@ -664,6 +693,7 @@ impl LayoutShapeBrowserSort {
             Self::Layer => "Layer",
             Self::Cell => "Cell",
             Self::Kind => "Kind",
+            Self::Area => "Area",
         }
     }
 }
@@ -674,6 +704,8 @@ pub(crate) enum LayoutCellBrowserFilter {
     Current,
     Used,
     Unused,
+    Hidden,
+    Visible,
     Library,
     Properties,
     Empty,
@@ -681,14 +713,19 @@ pub(crate) enum LayoutCellBrowserFilter {
     Branches,
     Parents,
     Children,
+    Siblings,
+    Ancestors,
+    Descendants,
 }
 
 impl LayoutCellBrowserFilter {
-    pub(crate) const ALL: [Self; 11] = [
+    pub(crate) const ALL: [Self; 16] = [
         Self::All,
         Self::Current,
         Self::Used,
         Self::Unused,
+        Self::Hidden,
+        Self::Visible,
         Self::Library,
         Self::Properties,
         Self::Empty,
@@ -696,6 +733,9 @@ impl LayoutCellBrowserFilter {
         Self::Branches,
         Self::Parents,
         Self::Children,
+        Self::Siblings,
+        Self::Ancestors,
+        Self::Descendants,
     ];
 
     pub(crate) fn from_slug(value: &str) -> Option<Self> {
@@ -704,6 +744,8 @@ impl LayoutCellBrowserFilter {
             "current" | "current_cell" | "current-cell" => Some(Self::Current),
             "used" | "referenced" => Some(Self::Used),
             "unused" | "unreferenced" => Some(Self::Unused),
+            "hidden" | "hidden_cells" | "hidden-cells" => Some(Self::Hidden),
+            "visible" | "shown" | "visible_cells" | "visible-cells" => Some(Self::Visible),
             "library" | "macro" | "pcell" => Some(Self::Library),
             "properties" | "property" | "props" | "metadata" | "with_properties" => {
                 Some(Self::Properties)
@@ -713,6 +755,9 @@ impl LayoutCellBrowserFilter {
             "branches" | "branch" | "non_leaf" | "non-leaf" => Some(Self::Branches),
             "parents" | "parent" => Some(Self::Parents),
             "children" | "child" => Some(Self::Children),
+            "siblings" | "sibling" => Some(Self::Siblings),
+            "ancestors" | "ancestor" => Some(Self::Ancestors),
+            "descendants" | "descendant" => Some(Self::Descendants),
             _ => None,
         }
     }
@@ -723,6 +768,8 @@ impl LayoutCellBrowserFilter {
             Self::Current => "current",
             Self::Used => "used",
             Self::Unused => "unused",
+            Self::Hidden => "hidden",
+            Self::Visible => "visible",
             Self::Library => "library",
             Self::Properties => "properties",
             Self::Empty => "empty",
@@ -730,6 +777,9 @@ impl LayoutCellBrowserFilter {
             Self::Branches => "branches",
             Self::Parents => "parents",
             Self::Children => "children",
+            Self::Siblings => "siblings",
+            Self::Ancestors => "ancestors",
+            Self::Descendants => "descendants",
         }
     }
 
@@ -739,6 +789,8 @@ impl LayoutCellBrowserFilter {
             Self::Current => "Current",
             Self::Used => "Used",
             Self::Unused => "Unused",
+            Self::Hidden => "Hidden",
+            Self::Visible => "Visible",
             Self::Library => "Library",
             Self::Properties => "Properties",
             Self::Empty => "Empty",
@@ -746,6 +798,9 @@ impl LayoutCellBrowserFilter {
             Self::Branches => "Branches",
             Self::Parents => "Parents",
             Self::Children => "Children",
+            Self::Siblings => "Siblings",
+            Self::Ancestors => "Ancestors",
+            Self::Descendants => "Descendants",
         }
     }
 }
@@ -754,17 +809,25 @@ impl LayoutCellBrowserFilter {
 pub(crate) enum LayoutCellBrowserSort {
     Name,
     Id,
+    Depth,
     ShapeCount,
     InstanceCount,
 }
 
 impl LayoutCellBrowserSort {
-    pub(crate) const ALL: [Self; 4] = [Self::Name, Self::Id, Self::ShapeCount, Self::InstanceCount];
+    pub(crate) const ALL: [Self; 5] = [
+        Self::Name,
+        Self::Id,
+        Self::Depth,
+        Self::ShapeCount,
+        Self::InstanceCount,
+    ];
 
     pub(crate) fn from_slug(value: &str) -> Option<Self> {
         match value {
             "name" => Some(Self::Name),
             "id" => Some(Self::Id),
+            "depth" | "hierarchy_depth" | "hierarchy-depth" => Some(Self::Depth),
             "shape_count" | "shape-count" | "shapes" => Some(Self::ShapeCount),
             "instance_count" | "instance-count" | "instances" => Some(Self::InstanceCount),
             _ => None,
@@ -775,6 +838,7 @@ impl LayoutCellBrowserSort {
         match self {
             Self::Name => "name",
             Self::Id => "id",
+            Self::Depth => "depth",
             Self::ShapeCount => "shape_count",
             Self::InstanceCount => "instance_count",
         }
@@ -784,6 +848,7 @@ impl LayoutCellBrowserSort {
         match self {
             Self::Name => "Name",
             Self::Id => "ID",
+            Self::Depth => "Depth",
             Self::ShapeCount => "Shapes",
             Self::InstanceCount => "Instances",
         }
@@ -797,19 +862,27 @@ pub(crate) enum LayoutNetBrowserFilter {
     Unlabeled,
     Devices,
     History,
+    SpiceMissing,
     SpiceExtra,
+    SpiceNets,
+    SpiceDevices,
+    SpiceIssues,
     Shorted,
     Open,
 }
 
 impl LayoutNetBrowserFilter {
-    pub(crate) const ALL: [Self; 8] = [
+    pub(crate) const ALL: [Self; 12] = [
         Self::All,
         Self::Labeled,
         Self::Unlabeled,
         Self::Devices,
         Self::History,
+        Self::SpiceMissing,
         Self::SpiceExtra,
+        Self::SpiceNets,
+        Self::SpiceDevices,
+        Self::SpiceIssues,
         Self::Shorted,
         Self::Open,
     ];
@@ -821,8 +894,16 @@ impl LayoutNetBrowserFilter {
             "unlabeled" | "unnamed" => Some(Self::Unlabeled),
             "devices" | "device" | "device_connected" | "device-connected" => Some(Self::Devices),
             "history" | "traced" | "trace_history" | "trace-history" => Some(Self::History),
+            "spice_missing" | "spice-missing" | "missing_layout" | "missing-layout"
+            | "lvs_missing" | "lvs-missing" => Some(Self::SpiceMissing),
             "spice_extra" | "spice-extra" | "extra_layout" | "extra-layout" | "lvs_extra"
             | "lvs-extra" => Some(Self::SpiceExtra),
+            "spice_nets" | "spice-nets" | "spice_net" | "spice-net" | "lvs_nets" | "lvs-nets"
+            | "lvs_net" | "lvs-net" => Some(Self::SpiceNets),
+            "spice_devices" | "spice-devices" | "spice_device" | "spice-device" | "lvs_devices"
+            | "lvs-devices" | "lvs_device" | "lvs-device" => Some(Self::SpiceDevices),
+            "spice_issues" | "spice-issues" | "spice_issue" | "spice-issue" | "lvs_issues"
+            | "lvs-issues" | "lvs_issue" | "lvs-issue" => Some(Self::SpiceIssues),
             "shorted" | "short" | "shorts" => Some(Self::Shorted),
             "open" | "opens" => Some(Self::Open),
             _ => None,
@@ -836,7 +917,11 @@ impl LayoutNetBrowserFilter {
             Self::Unlabeled => "unlabeled",
             Self::Devices => "devices",
             Self::History => "history",
+            Self::SpiceMissing => "spice_missing",
             Self::SpiceExtra => "spice_extra",
+            Self::SpiceNets => "spice_nets",
+            Self::SpiceDevices => "spice_devices",
+            Self::SpiceIssues => "spice_issues",
             Self::Shorted => "shorted",
             Self::Open => "open",
         }
@@ -849,7 +934,11 @@ impl LayoutNetBrowserFilter {
             Self::Unlabeled => "Unlabeled",
             Self::Devices => "Devices",
             Self::History => "History",
+            Self::SpiceMissing => "SPICE Missing",
             Self::SpiceExtra => "SPICE Extra",
+            Self::SpiceNets => "SPICE Nets",
+            Self::SpiceDevices => "SPICE Devices",
+            Self::SpiceIssues => "SPICE Issues",
             Self::Shorted => "Shorted",
             Self::Open => "Open",
         }
@@ -966,16 +1055,24 @@ pub(crate) enum LayoutInstanceBrowserFilter {
     Named,
     Properties,
     Arrays,
+    Hidden,
+    Visible,
+    LeafTargets,
+    BranchTargets,
     Identity,
     Transformed,
 }
 
 impl LayoutInstanceBrowserFilter {
-    pub(crate) const ALL: [Self; 6] = [
+    pub(crate) const ALL: [Self; 10] = [
         Self::All,
         Self::Named,
         Self::Properties,
         Self::Arrays,
+        Self::Hidden,
+        Self::Visible,
+        Self::LeafTargets,
+        Self::BranchTargets,
         Self::Identity,
         Self::Transformed,
     ];
@@ -988,6 +1085,14 @@ impl LayoutInstanceBrowserFilter {
                 Some(Self::Properties)
             }
             "arrays" | "array" | "aref" => Some(Self::Arrays),
+            "hidden" | "hidden_cells" | "hidden-cells" => Some(Self::Hidden),
+            "visible" | "shown" | "visible_cells" | "visible-cells" => Some(Self::Visible),
+            "leaf_targets" | "leaf-targets" | "leaf_target" | "leaf-target" | "leaves" | "leaf"
+            | "target_leaf" | "target-leaf" => Some(Self::LeafTargets),
+            "branch_targets" | "branch-targets" | "branch_target" | "branch-target"
+            | "branches" | "branch" | "target_branch" | "target-branch" => {
+                Some(Self::BranchTargets)
+            }
             "identity" | "untransformed" | "no_transform" | "no-transform" => Some(Self::Identity),
             "transformed" | "transform" | "placed" | "non_identity" | "non-identity" => {
                 Some(Self::Transformed)
@@ -1002,6 +1107,10 @@ impl LayoutInstanceBrowserFilter {
             Self::Named => "named",
             Self::Properties => "properties",
             Self::Arrays => "arrays",
+            Self::Hidden => "hidden",
+            Self::Visible => "visible",
+            Self::LeafTargets => "leaf_targets",
+            Self::BranchTargets => "branch_targets",
             Self::Identity => "identity",
             Self::Transformed => "transformed",
         }
@@ -1013,6 +1122,10 @@ impl LayoutInstanceBrowserFilter {
             Self::Named => "Named",
             Self::Properties => "Properties",
             Self::Arrays => "Arrays",
+            Self::Hidden => "Hidden",
+            Self::Visible => "Visible",
+            Self::LeafTargets => "Leaf Targets",
+            Self::BranchTargets => "Branch Targets",
             Self::Identity => "Identity",
             Self::Transformed => "Transformed",
         }
@@ -1139,6 +1252,7 @@ impl LayoutBrowserReplaceTargets {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LayoutMeasurementFilter {
     All,
+    Selected,
     ActiveLayer,
     Direct,
     Horizontal,
@@ -1147,8 +1261,9 @@ pub(crate) enum LayoutMeasurementFilter {
 }
 
 impl LayoutMeasurementFilter {
-    pub(crate) const ALL: [Self; 6] = [
+    pub(crate) const ALL: [Self; 7] = [
         Self::All,
+        Self::Selected,
         Self::ActiveLayer,
         Self::Direct,
         Self::Horizontal,
@@ -1159,6 +1274,7 @@ impl LayoutMeasurementFilter {
     pub(crate) fn from_slug(value: &str) -> Option<Self> {
         match value {
             "all" => Some(Self::All),
+            "selected" | "selection" => Some(Self::Selected),
             "active_layer" | "active-layer" | "layer" => Some(Self::ActiveLayer),
             "direct" => Some(Self::Direct),
             "horizontal" | "x" => Some(Self::Horizontal),
@@ -1171,6 +1287,7 @@ impl LayoutMeasurementFilter {
     pub(crate) fn slug(self) -> &'static str {
         match self {
             Self::All => "all",
+            Self::Selected => "selected",
             Self::ActiveLayer => "active_layer",
             Self::Direct => "direct",
             Self::Horizontal => "horizontal",
@@ -1182,11 +1299,67 @@ impl LayoutMeasurementFilter {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::All => "All",
+            Self::Selected => "Selected",
             Self::ActiveLayer => "Active Layer",
             Self::Direct => "Direct",
             Self::Horizontal => "Horizontal",
             Self::Vertical => "Vertical",
             Self::Manhattan => "Manhattan",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LayoutMeasurementBrowserSort {
+    Id,
+    Length,
+    Angle,
+    Mode,
+    Layer,
+    SourceCell,
+}
+
+impl LayoutMeasurementBrowserSort {
+    pub(crate) const ALL: [Self; 6] = [
+        Self::Id,
+        Self::Length,
+        Self::Angle,
+        Self::Mode,
+        Self::Layer,
+        Self::SourceCell,
+    ];
+
+    pub(crate) fn from_slug(value: &str) -> Option<Self> {
+        match value {
+            "id" => Some(Self::Id),
+            "length" => Some(Self::Length),
+            "angle" | "heading" => Some(Self::Angle),
+            "mode" | "type" => Some(Self::Mode),
+            "layer" => Some(Self::Layer),
+            "source_cell" | "source-cell" | "cell" => Some(Self::SourceCell),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn slug(self) -> &'static str {
+        match self {
+            Self::Id => "id",
+            Self::Length => "length",
+            Self::Angle => "angle",
+            Self::Mode => "mode",
+            Self::Layer => "layer",
+            Self::SourceCell => "source_cell",
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Id => "ID",
+            Self::Length => "Length",
+            Self::Angle => "Angle",
+            Self::Mode => "Mode",
+            Self::Layer => "Layer",
+            Self::SourceCell => "Source Cell",
         }
     }
 }
@@ -1235,6 +1408,8 @@ impl LayoutBrowserColumnSet {
 pub(crate) enum LayoutDrcMarkerFilter {
     Active,
     All,
+    SelectedShape,
+    ActiveLayer,
     Hidden,
     Waived,
     Visited,
@@ -1242,14 +1417,19 @@ pub(crate) enum LayoutDrcMarkerFilter {
     Noted,
     Owned,
     SignedOff,
+    SignoffNeedsReview,
+    SignoffAccepted,
+    SignoffRejected,
     Tagged,
     Snapshots,
 }
 
 impl LayoutDrcMarkerFilter {
-    pub(crate) const ALL: [Self; 11] = [
+    pub(crate) const ALL: [Self; 16] = [
         Self::Active,
         Self::All,
+        Self::SelectedShape,
+        Self::ActiveLayer,
         Self::Hidden,
         Self::Waived,
         Self::Visited,
@@ -1257,6 +1437,9 @@ impl LayoutDrcMarkerFilter {
         Self::Noted,
         Self::Owned,
         Self::SignedOff,
+        Self::SignoffNeedsReview,
+        Self::SignoffAccepted,
+        Self::SignoffRejected,
         Self::Tagged,
         Self::Snapshots,
     ];
@@ -1265,6 +1448,8 @@ impl LayoutDrcMarkerFilter {
         match value {
             "active" => Some(Self::Active),
             "all" => Some(Self::All),
+            "selected_shape" | "selected-shape" | "selected" | "shape" => Some(Self::SelectedShape),
+            "active_layer" | "active-layer" | "layer" => Some(Self::ActiveLayer),
             "hidden" => Some(Self::Hidden),
             "waived" => Some(Self::Waived),
             "visited" => Some(Self::Visited),
@@ -1272,6 +1457,11 @@ impl LayoutDrcMarkerFilter {
             "noted" => Some(Self::Noted),
             "owned" => Some(Self::Owned),
             "signed_off" | "signed-off" => Some(Self::SignedOff),
+            "signoff_needs_review" | "signoff-needs-review" | "needs_review" | "needs-review" => {
+                Some(Self::SignoffNeedsReview)
+            }
+            "signoff_accepted" | "signoff-accepted" | "accepted" => Some(Self::SignoffAccepted),
+            "signoff_rejected" | "signoff-rejected" | "rejected" => Some(Self::SignoffRejected),
             "tagged" => Some(Self::Tagged),
             "snapshots" | "snapshot" | "screenshots" | "screenshot" => Some(Self::Snapshots),
             _ => None,
@@ -1282,6 +1472,8 @@ impl LayoutDrcMarkerFilter {
         match self {
             Self::Active => "active",
             Self::All => "all",
+            Self::SelectedShape => "selected_shape",
+            Self::ActiveLayer => "active_layer",
             Self::Hidden => "hidden",
             Self::Waived => "waived",
             Self::Visited => "visited",
@@ -1289,6 +1481,9 @@ impl LayoutDrcMarkerFilter {
             Self::Noted => "noted",
             Self::Owned => "owned",
             Self::SignedOff => "signed_off",
+            Self::SignoffNeedsReview => "signoff_needs_review",
+            Self::SignoffAccepted => "signoff_accepted",
+            Self::SignoffRejected => "signoff_rejected",
             Self::Tagged => "tagged",
             Self::Snapshots => "snapshots",
         }
@@ -1298,6 +1493,8 @@ impl LayoutDrcMarkerFilter {
         match self {
             Self::Active => "Active",
             Self::All => "All",
+            Self::SelectedShape => "Selected Shape",
+            Self::ActiveLayer => "Active Layer",
             Self::Hidden => "Hidden",
             Self::Waived => "Waived",
             Self::Visited => "Visited",
@@ -1305,6 +1502,9 @@ impl LayoutDrcMarkerFilter {
             Self::Noted => "Noted",
             Self::Owned => "Owned",
             Self::SignedOff => "Signed Off",
+            Self::SignoffNeedsReview => "Needs Review",
+            Self::SignoffAccepted => "Accepted",
+            Self::SignoffRejected => "Rejected",
             Self::Tagged => "Tagged",
             Self::Snapshots => "Snapshots",
         }
@@ -1316,16 +1516,67 @@ pub(crate) enum LayoutDrcMarkerSort {
     Id,
     Rule,
     State,
+    Category,
+    Directory,
+    SourceCell,
+    SourceObject,
+    SourceLayer,
+    SourceKind,
+    SourceBounds,
+    Signoff,
+    SignoffRole,
+    SignoffStamp,
+    Size,
+    Area,
+    Required,
+    Actual,
 }
 
 impl LayoutDrcMarkerSort {
-    pub(crate) const ALL: [Self; 3] = [Self::Id, Self::Rule, Self::State];
+    pub(crate) const ALL: [Self; 17] = [
+        Self::Id,
+        Self::Rule,
+        Self::State,
+        Self::Category,
+        Self::Directory,
+        Self::SourceCell,
+        Self::SourceObject,
+        Self::SourceLayer,
+        Self::SourceKind,
+        Self::SourceBounds,
+        Self::Signoff,
+        Self::SignoffRole,
+        Self::SignoffStamp,
+        Self::Size,
+        Self::Area,
+        Self::Required,
+        Self::Actual,
+    ];
 
     pub(crate) fn from_slug(value: &str) -> Option<Self> {
         match value {
             "id" => Some(Self::Id),
             "rule" => Some(Self::Rule),
             "state" => Some(Self::State),
+            "category" | "family" => Some(Self::Category),
+            "directory" | "path" => Some(Self::Directory),
+            "source_cell" | "source-cell" | "cell" => Some(Self::SourceCell),
+            "source_object" | "source-object" | "source_shape" | "source-shape" | "object" => {
+                Some(Self::SourceObject)
+            }
+            "source_layer" | "source-layer" => Some(Self::SourceLayer),
+            "source_kind" | "source-kind" | "source_type" | "source-type" => Some(Self::SourceKind),
+            "source_bounds" | "source-bounds" => Some(Self::SourceBounds),
+            "signoff" | "signoff_status" | "signoff-status" => Some(Self::Signoff),
+            "signoff_role" | "signoff-role" | "review_role" | "review-role" => {
+                Some(Self::SignoffRole)
+            }
+            "signoff_stamp" | "signoff-stamp" | "signoff_at" | "signoff-at" | "review_stamp"
+            | "review-stamp" => Some(Self::SignoffStamp),
+            "size" | "extent" => Some(Self::Size),
+            "area" => Some(Self::Area),
+            "required" | "limit" => Some(Self::Required),
+            "actual" | "measured" => Some(Self::Actual),
             _ => None,
         }
     }
@@ -1335,6 +1586,20 @@ impl LayoutDrcMarkerSort {
             Self::Id => "id",
             Self::Rule => "rule",
             Self::State => "state",
+            Self::Category => "category",
+            Self::Directory => "directory",
+            Self::SourceCell => "source_cell",
+            Self::SourceObject => "source_object",
+            Self::SourceLayer => "source_layer",
+            Self::SourceKind => "source_kind",
+            Self::SourceBounds => "source_bounds",
+            Self::Signoff => "signoff",
+            Self::SignoffRole => "signoff_role",
+            Self::SignoffStamp => "signoff_stamp",
+            Self::Size => "size",
+            Self::Area => "area",
+            Self::Required => "required",
+            Self::Actual => "actual",
         }
     }
 
@@ -1343,6 +1608,20 @@ impl LayoutDrcMarkerSort {
             Self::Id => "ID",
             Self::Rule => "Rule",
             Self::State => "State",
+            Self::Category => "Category",
+            Self::Directory => "Directory",
+            Self::SourceCell => "Source Cell",
+            Self::SourceObject => "Source Object",
+            Self::SourceLayer => "Source Layer",
+            Self::SourceKind => "Source Kind",
+            Self::SourceBounds => "Source Bounds",
+            Self::Signoff => "Signoff",
+            Self::SignoffRole => "Signoff Role",
+            Self::SignoffStamp => "Signoff Stamp",
+            Self::Size => "Size",
+            Self::Area => "Area",
+            Self::Required => "Required",
+            Self::Actual => "Actual",
         }
     }
 }
@@ -1445,6 +1724,14 @@ pub(crate) struct LayoutDrcMarkerDirectoryEntry {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LayoutDrcMarkerSnapshotEntry {
+    pub(crate) id: usize,
+    pub(crate) key: String,
+    pub(crate) image_key: String,
+    pub(crate) label: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LayoutViaArrayLibraryPreset {
     pub(crate) name: String,
     pub(crate) columns: u8,
@@ -1473,14 +1760,26 @@ pub(crate) struct LayoutJsonMergeImportPlan {
     pub(crate) added_layers: usize,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) struct LayoutJsonHierarchyMergeImportPlan {
+    pub(crate) redo_operations: Vec<Operation>,
+    pub(crate) undo_operations: Vec<Operation>,
+    pub(crate) first_shape: Option<ShapeId>,
+    pub(crate) imported_shapes: usize,
+    pub(crate) added_cells: usize,
+    pub(crate) added_layers: usize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LayoutVertexHit {
+    pub(crate) source_cell: CellId,
     pub(crate) shape_id: ShapeId,
     pub(crate) vertex: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LayoutEdgeHit {
+    pub(crate) source_cell: CellId,
     pub(crate) shape_id: ShapeId,
     pub(crate) edge: usize,
 }

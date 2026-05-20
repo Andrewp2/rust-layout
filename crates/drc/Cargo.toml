@@ -8,6 +8,7 @@ authors.workspace = true
 [dependencies]
 geometry_core = { path = "../geometry_core" }
 layout_model = { path = "../layout_model" }
+roxmltree.workspace = true
 serde.workspace = true
 
 [dev-dependencies]

@@ -2,6 +2,14 @@
 use super::*;
 use crate::*;
 
+fn assert_browser_row(rows: &[(String, String)], key: &str, value: &str) {
+    assert!(
+        rows.iter()
+            .any(|(row_key, row_value)| row_key == key && row_value == value),
+        "browser rows should include {key}={value}: {rows:?}"
+    );
+}
+
 #[test]
 pub(crate) fn layout_cell_browser_filters_used_and_unused_cells() {
     let mut app = GlassworksApp::new_with_options(StartupOptions {
@@ -99,7 +107,9 @@ pub(crate) fn layout_cell_browser_filters_used_and_unused_cells() {
         .collect::<Vec<_>>();
     assert_eq!(unused_cells, vec![empty, unused]);
 
-    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.cell_browser_filter.properties"));
+    assert!(
+        app.apply_clicked_node_name("glassworks.viewctl.layout.cell_browser_filter.properties")
+    );
     assert_eq!(
         app.layout_cell_browser_filter,
         LayoutCellBrowserFilter::Properties
@@ -172,6 +182,12 @@ pub(crate) fn layout_cell_browser_filters_used_and_unused_cells() {
     assert_eq!(shape_sorted, vec![top, used, unused, empty]);
 
     assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.cell_browser_filter.unused"));
+    assert!(
+        app.status_message()
+            .contains("Cell browser filter Unused (2)"),
+        "{}",
+        app.status_message()
+    );
     let document = app
         .build_operad_document(UiSize::new(1440.0, 920.0))
         .expect("layout document should build");
@@ -185,6 +201,7 @@ pub(crate) fn layout_cell_browser_filters_used_and_unused_cells() {
         "glassworks.viewctl.layout.cell_browser_filter.empty".to_string(),
         "glassworks.viewctl.layout.cell_browser_sort.name".to_string(),
         "glassworks.viewctl.layout.cell_browser_sort.id".to_string(),
+        "glassworks.viewctl.layout.cell_browser_sort.depth".to_string(),
         "glassworks.viewctl.layout.cell_browser_sort.shape_count".to_string(),
         "glassworks.viewctl.layout.cell_browser_sort.instance_count".to_string(),
         format!("glassworks.viewctl.layout.top_cell.{}", empty.0),
@@ -195,12 +212,78 @@ pub(crate) fn layout_cell_browser_filters_used_and_unused_cells() {
             "cell browser filter surface should expose {node_name}"
         );
     }
+    let title = document
+        .nodes()
+        .iter()
+        .find(|node| node.name() == "glassworks.layout.cell_browser.title")
+        .unwrap_or_else(|| panic!("cell browser title should exist"));
+    let UiContent::Text(title_text) = title.content() else {
+        panic!("cell browser title should be text");
+    };
+    assert_eq!(title_text.text, "Cell Browser - Unused (2 rows)");
+    let filter_button_label = |node_name: &str| -> String {
+        document
+            .nodes()
+            .iter()
+            .find(|node| node.name() == node_name)
+            .and_then(|node| node.accessibility())
+            .and_then(|accessibility| accessibility.label.clone())
+            .unwrap_or_else(|| panic!("{node_name} should expose an accessibility label"))
+    };
+    assert_eq!(
+        filter_button_label("glassworks.viewctl.layout.cell_browser_filter.all"),
+        "All (4)"
+    );
+    assert_eq!(
+        filter_button_label("glassworks.viewctl.layout.cell_browser_filter.current"),
+        "Current (1)"
+    );
+    assert_eq!(
+        filter_button_label("glassworks.viewctl.layout.cell_browser_filter.used"),
+        "Used (2)"
+    );
+    assert_eq!(
+        filter_button_label("glassworks.viewctl.layout.cell_browser_filter.unused"),
+        "Unused (2)"
+    );
+    assert_eq!(
+        filter_button_label("glassworks.viewctl.layout.cell_browser_filter.properties"),
+        "Properties (1)"
+    );
+    assert_eq!(
+        filter_button_label("glassworks.viewctl.layout.cell_browser_filter.empty"),
+        "Empty (1)"
+    );
     assert!(
         !document
             .nodes()
             .iter()
             .any(|node| node.name() == format!("glassworks.viewctl.layout.top_cell.{}", used.0)),
         "unused filter should hide used cells"
+    );
+
+    app.layout_browser_search = "missing".to_string();
+    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.cell_browser.select_first"));
+    assert!(
+        app.status_message()
+            .contains("Cell browser has no matching unused cells for search missing"),
+        "{}",
+        app.status_message()
+    );
+    let empty_document = app
+        .build_operad_document(UiSize::new(1440.0, 920.0))
+        .expect("layout document with empty cell search should build");
+    let empty_title = empty_document
+        .nodes()
+        .iter()
+        .find(|node| node.name() == "glassworks.layout.cell_browser.title")
+        .unwrap_or_else(|| panic!("empty cell browser title should exist"));
+    let UiContent::Text(empty_title_text) = empty_title.content() else {
+        panic!("empty cell browser title should be text");
+    };
+    assert_eq!(
+        empty_title_text.text,
+        "Cell Browser - Unused / search missing (0 rows)"
     );
 }
 
@@ -240,7 +323,9 @@ pub(crate) fn layout_cell_browser_select_first_uses_property_selector_search() {
         .properties
         .insert("purpose".to_string(), "reticle".to_string());
 
-    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.cell_browser_filter.properties"));
+    assert!(
+        app.apply_clicked_node_name("glassworks.viewctl.layout.cell_browser_filter.properties")
+    );
     app.set_layout_browser_search("purpose=scratch");
     let document = app
         .build_operad_document(UiSize::new(1440.0, 920.0))
@@ -327,6 +412,13 @@ pub(crate) fn layout_cell_browser_filters_hierarchy_context_cells() {
         vec![mid]
     );
 
+    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.cell_browser_filter.ancestors"));
+    let ancestor_cells = layout_cell_browser_cells(&app)
+        .into_iter()
+        .map(|cell| cell.id)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(ancestor_cells, BTreeSet::from([top, mid]));
+
     assert!(app.apply_clicked_node_name(&format!("glassworks.viewctl.layout.top_cell.{}", top.0)));
     assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.cell_browser_filter.children"));
     let child_cells = layout_cell_browser_cells(&app)
@@ -335,10 +427,35 @@ pub(crate) fn layout_cell_browser_filters_hierarchy_context_cells() {
         .collect::<BTreeSet<_>>();
     assert_eq!(child_cells, BTreeSet::from([mid, sibling]));
 
+    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.cell_browser_filter.siblings"));
+    let sibling_cells = layout_cell_browser_cells(&app)
+        .into_iter()
+        .map(|cell| cell.id)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(sibling_cells, BTreeSet::new());
+
+    assert!(app.apply_clicked_node_name(&format!("glassworks.viewctl.layout.top_cell.{}", mid.0)));
+    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.cell_browser_filter.siblings"));
+    let sibling_cells = layout_cell_browser_cells(&app)
+        .into_iter()
+        .map(|cell| cell.id)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(sibling_cells, BTreeSet::from([sibling]));
+
+    assert!(app.apply_clicked_node_name(&format!("glassworks.viewctl.layout.top_cell.{}", top.0)));
+    assert!(
+        app.apply_clicked_node_name("glassworks.viewctl.layout.cell_browser_filter.descendants")
+    );
+    let descendant_cells = layout_cell_browser_cells(&app)
+        .into_iter()
+        .map(|cell| cell.id)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(descendant_cells, BTreeSet::from([mid, leaf, sibling]));
+
     let rows = layout_cell_browser_rows(&app);
     assert!(
         rows.iter()
-            .any(|(key, value)| key == "Filter" && value == "Children"),
+            .any(|(key, value)| key == "Filter" && value == "Descendants"),
         "cell browser rows should expose the active hierarchy filter: {rows:?}"
     );
     let document = app
@@ -349,12 +466,97 @@ pub(crate) fn layout_cell_browser_filters_hierarchy_context_cells() {
         "glassworks.viewctl.layout.cell_browser_filter.branches",
         "glassworks.viewctl.layout.cell_browser_filter.parents",
         "glassworks.viewctl.layout.cell_browser_filter.children",
+        "glassworks.viewctl.layout.cell_browser_filter.siblings",
+        "glassworks.viewctl.layout.cell_browser_filter.ancestors",
+        "glassworks.viewctl.layout.cell_browser_filter.descendants",
     ] {
         assert!(
             document.nodes().iter().any(|node| node.name() == node_name),
             "cell browser hierarchy filter control should exist: {node_name}"
         );
     }
+}
+
+#[test]
+pub(crate) fn layout_library_macro_creates_via_array_in_current_cell() {
+    let mut app = GlassworksApp::new_with_options(StartupOptions {
+        view_mode: Some(StartupView::Layout2d),
+        ..Default::default()
+    });
+    app.workspace.document = Document::new("library macro current-cell create test");
+    app.reset_layout_document_state();
+    let top = app.workspace.document.top_cell;
+    let child = app.workspace.document.create_cell("macro_create_child");
+    app.workspace
+        .document
+        .insert_instance_in_top(child, Transform::translate(20_000, 0))
+        .expect("child should be placed");
+    app.layout_view_top_cell = child;
+    let cells_before = app.workspace.document.cells.len();
+    let child_instances_before = app
+        .workspace
+        .document
+        .cell(child)
+        .expect("child cell should exist")
+        .instances
+        .len();
+
+    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.library_macro.via_array_3x3"));
+
+    assert_eq!(app.workspace.document.cells.len(), cells_before + 1);
+    let created_cell = app
+        .workspace
+        .document
+        .cells
+        .values()
+        .find(|cell| cell.name.contains("lib via array 3x3"))
+        .expect("current-cell macro should create a named library cell")
+        .clone();
+    assert_eq!(created_cell.shapes.len(), 9);
+    let child_cell = app
+        .workspace
+        .document
+        .cell(child)
+        .expect("child cell should still exist");
+    assert_eq!(child_cell.instances.len(), child_instances_before + 1);
+    let created_instance = child_cell
+        .instances
+        .values()
+        .find(|instance| instance.cell == created_cell.id)
+        .expect("macro cell should be placed in the current child cell");
+    assert!(
+        app.workspace
+            .document
+            .cell(top)
+            .expect("top cell should still exist")
+            .instances
+            .values()
+            .all(|instance| instance.cell != created_cell.id),
+        "current-cell macro creation should not place the generated cell under the document top"
+    );
+    assert_eq!(app.layout_view_top_cell, child);
+    assert!(
+        app.selected_layout_occurrence
+            .as_ref()
+            .is_some_and(|occurrence| occurrence.instance_path == vec![created_instance.id]),
+        "current-cell macro creation should select a shape occurrence inside the placed instance"
+    );
+    assert!(app.status_message().contains("Created"));
+
+    assert!(app.apply_clicked_node_name("glassworks.menu.item.edit.undo"));
+    assert!(
+        app.workspace.document.cell(created_cell.id).is_none(),
+        "undo should remove the generated current-cell macro cell"
+    );
+    assert_eq!(
+        app.workspace
+            .document
+            .cell(child)
+            .expect("child cell should remain after undo")
+            .instances
+            .len(),
+        child_instances_before
+    );
 }
 
 #[test]
@@ -503,7 +705,9 @@ pub(crate) fn layout_library_macro_parameter_controls_shape_generated_via_array(
     }
 
     assert!(
-        app.apply_clicked_node_name("glassworks.viewctl.layout.library_macro.via_array.columns.inc")
+        app.apply_clicked_node_name(
+            "glassworks.viewctl.layout.library_macro.via_array.columns.inc"
+        )
     );
     assert!(
         app.apply_clicked_node_name("glassworks.viewctl.layout.library_macro.via_array.rows.inc")
@@ -525,7 +729,9 @@ pub(crate) fn layout_library_macro_parameter_controls_shape_generated_via_array(
         "cell browser details should expose current library parameters"
     );
 
-    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.library_macro.via_array.create"));
+    assert!(
+        app.apply_clicked_node_name("glassworks.viewctl.layout.library_macro.via_array.create")
+    );
     let created_cell = app
         .workspace
         .document
@@ -603,18 +809,18 @@ pub(crate) fn layout_library_macro_parameter_controls_shape_generated_via_array(
         .len();
 
     assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.library_macro.via_array.reset"));
-    assert!(
-        app.apply_clicked_node_name(
-            "glassworks.viewctl.layout.library_macro.via_array.load_selected"
-        )
-    );
+    assert!(app.apply_clicked_node_name(
+        "glassworks.viewctl.layout.library_macro.via_array.load_selected"
+    ));
     assert_eq!(app.layout_library_via_array_columns, 4);
     assert_eq!(app.layout_library_via_array_rows, 4);
     assert_eq!(app.layout_library_via_array_size_grids, 20);
     assert_eq!(app.layout_library_via_array_pitch_grids, 32);
 
     assert!(
-        app.apply_clicked_node_name("glassworks.viewctl.layout.library_macro.via_array.columns.inc")
+        app.apply_clicked_node_name(
+            "glassworks.viewctl.layout.library_macro.via_array.columns.inc"
+        )
     );
     assert!(app.apply_clicked_node_name(
         "glassworks.viewctl.layout.library_macro.via_array.update_selected"
@@ -682,7 +888,9 @@ pub(crate) fn layout_library_macro_presets_persist_and_place_reusable_cells() {
     let top = app.workspace.document.top_cell;
 
     assert!(
-        app.apply_clicked_node_name("glassworks.viewctl.layout.library_macro.via_array.columns.inc")
+        app.apply_clicked_node_name(
+            "glassworks.viewctl.layout.library_macro.via_array.columns.inc"
+        )
     );
     assert!(
         app.apply_clicked_node_name("glassworks.viewctl.layout.library_macro.via_array.rows.inc")
@@ -810,7 +1018,9 @@ pub(crate) fn layout_library_macro_catalog_exchange_round_trips_presets() {
     }
 
     assert!(
-        app.apply_clicked_node_name("glassworks.viewctl.layout.library_macro.via_array.columns.inc")
+        app.apply_clicked_node_name(
+            "glassworks.viewctl.layout.library_macro.via_array.columns.inc"
+        )
     );
     assert!(
         app.apply_clicked_node_name("glassworks.viewctl.layout.library_macro.via_array.rows.inc")
@@ -998,6 +1208,113 @@ pub(crate) fn layout_library_macro_can_be_detached_to_static_cell() {
 }
 
 #[test]
+pub(crate) fn layout_library_macro_converts_current_cell_rectangle_guide() {
+    let mut app = GlassworksApp::new_with_options(StartupOptions {
+        view_mode: Some(StartupView::Layout2d),
+        ..Default::default()
+    });
+    app.workspace.document = Document::new("library macro current-cell guide test");
+    app.reset_layout_document_state();
+    let top = app.workspace.document.top_cell;
+    let metal1 = app
+        .workspace
+        .document
+        .layer_by_process(ProcessLayer::Metal1)
+        .expect("default technology should include metal1");
+    let child = app.workspace.document.create_cell("guide_child");
+    let guide_bounds = Rect::from_min_size(Point::new(1_000, 2_000), 1_200, 900);
+    let guide_id = app
+        .workspace
+        .document
+        .insert_shape_in_cell(child, metal1, ShapeKind::Rectangle(guide_bounds))
+        .expect("current-cell guide rectangle should be added");
+    app.workspace
+        .document
+        .insert_instance_in_top(child, Transform::translate(10_000, 0))
+        .expect("child should be placed");
+    app.layout_view_top_cell = child;
+    app.selected_layout_shape = Some(guide_id);
+    app.selected_layout_occurrence = Some(ShapeOccurrenceId::top_level(guide_id));
+    let cells_before = app.workspace.document.cells.len();
+    let child_instances_before = app
+        .workspace
+        .document
+        .cell(child)
+        .expect("child cell should exist")
+        .instances
+        .len();
+
+    assert!(app.apply_clicked_node_name(
+        "glassworks.viewctl.layout.library_macro.via_array.from_selection"
+    ));
+    let child_cell = app
+        .workspace
+        .document
+        .cell(child)
+        .expect("child cell should remain after conversion");
+    assert!(
+        !child_cell.shapes.contains_key(&guide_id),
+        "current-cell guide rectangle should be replaced by a macro instance"
+    );
+    assert_eq!(app.workspace.document.cells.len(), cells_before + 1);
+    assert_eq!(app.layout_library_via_array_columns, 4);
+    assert_eq!(app.layout_library_via_array_rows, 3);
+    let created_cell = app
+        .workspace
+        .document
+        .cells
+        .values()
+        .find(|cell| cell.name.contains("lib via array 4x3"))
+        .expect("current-cell guide conversion should create a named via-array cell")
+        .clone();
+    assert_eq!(created_cell.shapes.len(), 12);
+    assert_eq!(child_cell.instances.len(), child_instances_before + 1);
+    let created_instance = child_cell
+        .instances
+        .values()
+        .find(|instance| instance.cell == created_cell.id)
+        .expect("converted cell should be placed in the current child cell");
+    assert_eq!(
+        created_instance.transform,
+        Transform::translate(1_600, 2_450)
+    );
+    assert!(
+        app.workspace
+            .document
+            .cell(top)
+            .expect("top cell should remain after conversion")
+            .instances
+            .values()
+            .all(|instance| instance.cell != created_cell.id),
+        "current-cell guide conversion should not place the macro under the document top"
+    );
+    assert_eq!(app.layout_view_top_cell, child);
+    assert!(
+        app.selected_layout_occurrence
+            .as_ref()
+            .is_some_and(|occurrence| occurrence.instance_path == vec![created_instance.id]),
+        "conversion should select a shape occurrence inside the placed current-cell macro instance"
+    );
+    assert!(app.status_message().contains("Converted"));
+
+    assert!(app.apply_clicked_node_name("glassworks.menu.item.edit.undo"));
+    let child_cell = app
+        .workspace
+        .document
+        .cell(child)
+        .expect("child cell should remain after undo");
+    assert!(
+        child_cell.shapes.contains_key(&guide_id),
+        "undo should restore the current-cell guide rectangle"
+    );
+    assert!(
+        app.workspace.document.cell(created_cell.id).is_none(),
+        "undo should remove the generated macro cell"
+    );
+    assert_eq!(child_cell.instances.len(), child_instances_before);
+}
+
+#[test]
 pub(crate) fn layout_library_macro_converts_selected_rectangle_guide() {
     let mut app = GlassworksApp::new_with_options(StartupOptions {
         view_mode: Some(StartupView::Layout2d),
@@ -1034,11 +1351,9 @@ pub(crate) fn layout_library_macro_converts_selected_rectangle_guide() {
         "library controls should expose guide-shape conversion"
     );
 
-    assert!(
-        app.apply_clicked_node_name(
-            "glassworks.viewctl.layout.library_macro.via_array.from_selection"
-        )
-    );
+    assert!(app.apply_clicked_node_name(
+        "glassworks.viewctl.layout.library_macro.via_array.from_selection"
+    ));
     assert!(
         !app.workspace.document.shapes.contains_key(&guide_id),
         "guide rectangle should be replaced by a macro instance"
@@ -1146,11 +1461,9 @@ pub(crate) fn layout_library_macro_converts_selected_polygon_guide() {
         .instances
         .len();
 
-    assert!(
-        app.apply_clicked_node_name(
-            "glassworks.viewctl.layout.library_macro.via_array.from_selection"
-        )
-    );
+    assert!(app.apply_clicked_node_name(
+        "glassworks.viewctl.layout.library_macro.via_array.from_selection"
+    ));
 
     assert!(
         !app.workspace.document.shapes.contains_key(&guide_id),
@@ -1259,6 +1572,127 @@ pub(crate) fn layout_shape_browser_selects_visible_occurrences() {
 
     assert!(app.apply_clicked_node_name(&action));
     assert_eq!(app.selected_layout_occurrence, Some(occurrence));
+}
+
+#[test]
+pub(crate) fn layout_shape_browser_searches_by_selector_metadata() {
+    let mut app = GlassworksApp::new_with_options(StartupOptions {
+        view_mode: Some(StartupView::Layout2d),
+        ..Default::default()
+    });
+    app.workspace.document = Document::new("shape selector search test");
+    app.reset_layout_document_state();
+    let top = app.workspace.document.top_cell;
+    let metal1 = app
+        .workspace
+        .document
+        .layer_by_process(ProcessLayer::Metal1)
+        .expect("default technology should include metal1");
+    let metal2 = app
+        .workspace
+        .document
+        .layer_by_process(ProcessLayer::Metal2)
+        .expect("default technology should include metal2");
+    app.workspace
+        .document
+        .layers
+        .get_mut(&metal2)
+        .expect("metal2 layer should be mutable")
+        .name = "selector metal2".to_string();
+    let zeta = app.workspace.document.create_cell("zeta shape source");
+    let alpha = app.workspace.document.create_cell("alpha shape source");
+    let zeta_shape = app
+        .workspace
+        .document
+        .insert_shape_in_cell(
+            zeta,
+            metal1,
+            ShapeKind::Label {
+                position: Point::new(0, 0),
+                text: "zeta_pin".to_string(),
+            },
+        )
+        .expect("zeta source shape should be inserted");
+    let alpha_shape = app
+        .workspace
+        .document
+        .insert_shape_in_cell(
+            alpha,
+            metal2,
+            ShapeKind::Rectangle(Rect::from_min_size(Point::new(0, 0), 80, 80)),
+        )
+        .expect("alpha source shape should be inserted");
+    {
+        let mut shape = app
+            .workspace
+            .document
+            .cell_mut(alpha)
+            .expect("alpha cell should be mutable")
+            .shapes
+            .get_mut(&alpha_shape)
+            .expect("alpha shape should be mutable");
+        shape.name = Some("alpha_contact".to_string());
+        shape.net = Some(NetId(9));
+    }
+    app.workspace
+        .document
+        .insert_instance(top, zeta, Transform::translate(0, 0))
+        .expect("zeta source instance should be inserted");
+    app.workspace
+        .document
+        .insert_instance(top, alpha, Transform::translate(1_000, 0))
+        .expect("alpha source instance should be inserted");
+
+    let listed_shapes = |app: &GlassworksApp| {
+        layout_shape_browser_entry_shapes_for_filter(
+            app,
+            LayoutShapeBrowserFilter::All,
+            true,
+            usize::MAX,
+        )
+        .into_iter()
+        .map(|(_, source_cell, shape)| (source_cell, shape.id))
+        .collect::<Vec<_>>()
+    };
+
+    app.set_layout_browser_search("source_cell=alpha shape");
+    assert_eq!(listed_shapes(&app), vec![(alpha, alpha_shape)]);
+    app.set_layout_browser_search(&format!("source_cell_id={}", zeta.0));
+    assert_eq!(listed_shapes(&app), vec![(zeta, zeta_shape)]);
+    app.set_layout_browser_search("layer=selector metal2");
+    assert_eq!(listed_shapes(&app), vec![(alpha, alpha_shape)]);
+    app.set_layout_browser_search("kind=label");
+    assert_eq!(listed_shapes(&app), vec![(zeta, zeta_shape)]);
+    app.set_layout_browser_search("name=alpha_contact");
+    assert_eq!(listed_shapes(&app), vec![(alpha, alpha_shape)]);
+    app.set_layout_browser_search("text=zeta_pin");
+    assert_eq!(listed_shapes(&app), vec![(zeta, zeta_shape)]);
+    app.set_layout_browser_search("net=N9");
+    assert_eq!(listed_shapes(&app), vec![(alpha, alpha_shape)]);
+
+    app.set_layout_browser_search("source_cell=alpha shape");
+    let document = app
+        .build_operad_document(UiSize::new(1440.0, 920.0))
+        .expect("layout document with source-cell shape search should build");
+    assert!(
+        document
+            .nodes()
+            .iter()
+            .any(|node| node.name() == "glassworks.viewctl.layout.shape_browser.select_first"),
+        "shape browser should expose select-first control for source-cell selector search"
+    );
+    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.shape_browser.select_first"));
+    assert_eq!(app.selected_layout_shape, Some(alpha_shape));
+    let selected = app
+        .selected_layout_occurrence
+        .as_ref()
+        .expect("source-cell selector should select a visible occurrence");
+    let view = app
+        .workspace
+        .document
+        .shape_view_for_occurrence_from_cell(app.layout_view_top_cell, selected)
+        .expect("selected source-cell occurrence should resolve");
+    assert_eq!(view.source_cell, alpha);
 }
 
 #[test]
@@ -1399,7 +1833,9 @@ pub(crate) fn layout_shape_browser_filters_by_shape_kind() {
         );
     }
 
-    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.shape_browser_filter.properties"));
+    assert!(
+        app.apply_clicked_node_name("glassworks.viewctl.layout.shape_browser_filter.properties")
+    );
     let property_entries = layout_shape_browser_entries(&app);
     assert_eq!(
         property_entries.len(),
@@ -1431,6 +1867,131 @@ pub(crate) fn layout_shape_browser_filters_by_shape_kind() {
             "shape browser kind filter control should exist: {node_name}"
         );
     }
+    let title = document
+        .nodes()
+        .iter()
+        .find(|node| node.name() == "glassworks.layout.shape_browser.title")
+        .unwrap_or_else(|| panic!("shape browser title should exist"));
+    let UiContent::Text(title_text) = title.content() else {
+        panic!("shape browser title should be text");
+    };
+    assert_eq!(title_text.text, "Shape Browser - Properties (2 rows)");
+    let filter_button_label = |node_name: &str| -> String {
+        document
+            .nodes()
+            .iter()
+            .find(|node| node.name() == node_name)
+            .and_then(|node| node.accessibility())
+            .and_then(|accessibility| accessibility.label.clone())
+            .unwrap_or_else(|| panic!("{node_name} should expose an accessibility label"))
+    };
+    assert_eq!(
+        filter_button_label("glassworks.viewctl.layout.shape_browser_filter.all"),
+        "All (6)"
+    );
+    assert_eq!(
+        filter_button_label("glassworks.viewctl.layout.shape_browser_filter.selected"),
+        "Selected (1)"
+    );
+    assert_eq!(
+        filter_button_label("glassworks.viewctl.layout.shape_browser_filter.properties"),
+        "Properties (2)"
+    );
+    assert_eq!(
+        filter_button_label("glassworks.viewctl.layout.shape_browser_filter.rectangles"),
+        "Rectangles (1)"
+    );
+    assert_eq!(
+        filter_button_label("glassworks.viewctl.layout.shape_browser_filter.measurements"),
+        "Measurements (1)"
+    );
+
+    app.layout_browser_search = "missing".to_string();
+    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.shape_browser.select_first"));
+    assert!(
+        app.status_message()
+            .contains("Shape browser has no matching property-bearing shapes for search missing"),
+        "{}",
+        app.status_message()
+    );
+    let empty_document = app
+        .build_operad_document(UiSize::new(1440.0, 920.0))
+        .expect("layout document with empty shape search should build");
+    let empty_title = empty_document
+        .nodes()
+        .iter()
+        .find(|node| node.name() == "glassworks.layout.shape_browser.title")
+        .unwrap_or_else(|| panic!("empty shape browser title should exist"));
+    let UiContent::Text(empty_title_text) = empty_title.content() else {
+        panic!("empty shape browser title should be text");
+    };
+    assert_eq!(
+        empty_title_text.text,
+        "Shape Browser - Properties / search missing (0 rows)"
+    );
+}
+
+#[test]
+pub(crate) fn layout_shape_browser_sorts_by_area() {
+    let mut app = GlassworksApp::new_with_options(StartupOptions {
+        view_mode: Some(StartupView::Layout2d),
+        ..Default::default()
+    });
+    app.workspace.document = Document::new("shape browser area sort");
+    app.reset_layout_document_state();
+    let metal1 = app
+        .workspace
+        .document
+        .layer_by_process(ProcessLayer::Metal1)
+        .expect("default technology should include metal1");
+    let small = app
+        .add_layout_shape(
+            metal1,
+            ShapeKind::Rectangle(Rect::from_min_size(Point::new(0, 0), 20, 20)),
+        )
+        .expect("small shape should be added");
+    let large = app
+        .add_layout_shape(
+            metal1,
+            ShapeKind::Polygon(Polygon::new(vec![
+                Point::new(100, 0),
+                Point::new(200, 0),
+                Point::new(200, 80),
+                Point::new(100, 80),
+            ])),
+        )
+        .expect("large shape should be added");
+    let medium = app
+        .add_layout_shape(
+            metal1,
+            ShapeKind::Rectangle(Rect::from_min_size(Point::new(300, 0), 60, 40)),
+        )
+        .expect("medium shape should be added");
+
+    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.shape_browser_sort.area"));
+    assert_eq!(app.layout_shape_browser_sort, LayoutShapeBrowserSort::Area);
+    let sorted = layout_shape_browser_entries(&app)
+        .into_iter()
+        .map(|(occurrence, _)| occurrence.source_shape_id())
+        .collect::<Vec<_>>();
+    assert_eq!(sorted, vec![large, medium, small]);
+    assert!(
+        layout_shape_browser_rows(&app)
+            .iter()
+            .any(|(key, value)| key == "Sort" && value == "Area"),
+        "shape browser rows should show area sort"
+    );
+
+    let document = app
+        .build_operad_document(UiSize::new(1440.0, 920.0))
+        .expect("layout document with area sort should build");
+    assert!(
+        document
+            .nodes()
+            .iter()
+            .any(|node| node.name() == "glassworks.viewctl.layout.shape_browser_sort.area"),
+        "shape browser sort surface should expose area sort"
+    );
 }
 
 #[test]
@@ -1493,7 +2054,9 @@ pub(crate) fn layout_shape_browser_exposes_stored_shape_properties() {
     app.selected_layout_shape = Some(shape_id);
     app.selected_layout_occurrence = Some(ShapeOccurrenceId::top_level(shape_id));
 
-    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.shape_browser_filter.properties"));
+    assert!(
+        app.apply_clicked_node_name("glassworks.viewctl.layout.shape_browser_filter.properties")
+    );
     let property_entries = layout_shape_browser_entries(&app);
     assert_eq!(
         property_entries.len(),
@@ -1561,6 +2124,118 @@ pub(crate) fn layout_shape_browser_exposes_stored_shape_properties() {
 }
 
 #[test]
+pub(crate) fn layout_shape_browser_exposes_kind_specific_object_rows() {
+    let mut app = GlassworksApp::new_with_options(StartupOptions {
+        view_mode: Some(StartupView::Layout2d),
+        ..Default::default()
+    });
+    app.workspace.document = Document::new("shape browser object rows");
+    app.reset_layout_document_state();
+    app.layout_browser_columns = LayoutBrowserColumnSet::All;
+    let metal1 = app
+        .workspace
+        .document
+        .layer_by_process(ProcessLayer::Metal1)
+        .expect("default technology should include metal1");
+    let metal2 = app
+        .workspace
+        .document
+        .layer_by_process(ProcessLayer::Metal2)
+        .expect("default technology should include metal2");
+    let via1 = app
+        .workspace
+        .document
+        .layer_by_process(ProcessLayer::Via1)
+        .expect("default technology should include via1");
+    let annotation = app
+        .workspace
+        .document
+        .layer_by_process(ProcessLayer::Annotation)
+        .unwrap_or(metal1);
+
+    let rectangle = app
+        .add_layout_shape(
+            metal1,
+            ShapeKind::Rectangle(Rect::from_min_size(Point::new(0, 0), 160, 80)),
+        )
+        .expect("rectangle should be added");
+    let polygon = app
+        .add_layout_shape(
+            metal1,
+            ShapeKind::Polygon(Polygon::new(vec![
+                Point::new(0, 0),
+                Point::new(100, 0),
+                Point::new(100, 50),
+                Point::new(0, 50),
+            ])),
+        )
+        .expect("polygon should be added");
+    let path = app
+        .add_layout_shape(
+            metal2,
+            ShapeKind::Path {
+                points: vec![Point::new(0, 0), Point::new(300, 400)],
+                width: 120,
+            },
+        )
+        .expect("path should be added");
+    let via = app
+        .add_layout_shape(
+            via1,
+            ShapeKind::Via {
+                center: Point::new(900, 120),
+                size: 180,
+                lower: metal1,
+                upper: metal2,
+            },
+        )
+        .expect("via should be added");
+    let label = app
+        .add_layout_shape(
+            annotation,
+            ShapeKind::Label {
+                position: Point::new(1_400, 50),
+                text: "pin_a".to_string(),
+            },
+        )
+        .expect("label should be added");
+
+    app.selected_layout_occurrence = Some(ShapeOccurrenceId::top_level(rectangle));
+    let rows = layout_shape_browser_rows(&app);
+    assert_browser_row(&rows, "Area", "12800 dbu^2");
+
+    app.selected_layout_occurrence = Some(ShapeOccurrenceId::top_level(polygon));
+    let rows = layout_shape_browser_rows(&app);
+    assert_browser_row(&rows, "Points", "4");
+    assert_browser_row(&rows, "Area", "5000 dbu^2");
+
+    app.selected_layout_occurrence = Some(ShapeOccurrenceId::top_level(path));
+    let rows = layout_shape_browser_rows(&app);
+    assert_browser_row(&rows, "Points", "2");
+    assert_browser_row(&rows, "Width", &app.format_layout_length(120.0));
+    assert_browser_row(&rows, "Length", &app.format_layout_length(500.0));
+
+    app.selected_layout_occurrence = Some(ShapeOccurrenceId::top_level(via));
+    let rows = layout_shape_browser_rows(&app);
+    assert_browser_row(&rows, "Center", "900,120");
+    assert_browser_row(&rows, "Size", &app.format_layout_length(180.0));
+    assert_browser_row(
+        &rows,
+        "Layers",
+        &format!(
+            "{} -> {}",
+            layout_layer_display_name(&app.workspace.document, metal1),
+            layout_layer_display_name(&app.workspace.document, metal2)
+        ),
+    );
+
+    app.selected_layout_occurrence = Some(ShapeOccurrenceId::top_level(label));
+    let rows = layout_shape_browser_rows(&app);
+    assert_browser_row(&rows, "Position", "1400,50");
+    assert_browser_row(&rows, "Text", "pin_a");
+}
+
+#[test]
 pub(crate) fn layout_shape_browser_select_first_uses_property_selector_search() {
     let mut app = GlassworksApp::new_with_options(StartupOptions {
         view_mode: Some(StartupView::Layout2d),
@@ -1599,7 +2274,9 @@ pub(crate) fn layout_shape_browser_select_first_uses_property_selector_search() 
         .properties
         .insert("mask.owner".to_string(), "opc".to_string());
 
-    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.shape_browser_filter.properties"));
+    assert!(
+        app.apply_clicked_node_name("glassworks.viewctl.layout.shape_browser_filter.properties")
+    );
     app.set_layout_browser_search("mask.owner=opc");
     let document = app
         .build_operad_document(UiSize::new(1440.0, 920.0))

@@ -21,6 +21,7 @@ authors = ["Andrew Peterson"]
 [workspace.dependencies]
 anyhow = "1.0"
 axum = { version = "0.8.6", features = ["ws"] }
+base64 = "0.22.1"
 futures-util = "0.3"
 flate2 = "1.1"
 glam = { version = "0.30.4", features = ["serde"] }
@@ -31,7 +32,9 @@ operad = { version = "8.0.1", default-features = false, features = [
 	"wgpu",
 ] }
 pollster = "0.4"
+png = "0.18.1"
 rand = "0.9"
+roxmltree = "0.20.0"
 rstar = "0.12.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

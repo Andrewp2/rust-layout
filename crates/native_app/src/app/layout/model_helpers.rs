@@ -202,6 +202,118 @@ pub(crate) fn layout_layer_usage_counts(document: &Document) -> BTreeMap<LayerId
     counts
 }
 
+pub(crate) fn layout_layer_row_filter_count(
+    document: &Document,
+    group_filter: LayoutLayerGroupFilter,
+    usage_filter: LayoutLayerUsageFilter,
+) -> usize {
+    let usage = layout_layer_usage_counts(document);
+    document
+        .layers
+        .values()
+        .filter(|layer| group_filter.matches(layer.process))
+        .filter(|layer| {
+            usage_filter.matches(usage.get(&layer.id).copied().unwrap_or(0), layer.visible)
+        })
+        .count()
+}
+
+pub(crate) fn layout_layer_usage_filter_button_label(
+    document: &Document,
+    group_filter: LayoutLayerGroupFilter,
+    usage_filter: LayoutLayerUsageFilter,
+) -> String {
+    format!(
+        "{} ({})",
+        usage_filter.label(),
+        layout_layer_row_filter_count(document, group_filter, usage_filter)
+    )
+}
+
+pub(crate) fn layout_layer_group_filter_button_label(
+    document: &Document,
+    group_filter: LayoutLayerGroupFilter,
+    usage_filter: LayoutLayerUsageFilter,
+    label: &str,
+) -> String {
+    format!(
+        "{label} ({})",
+        layout_layer_row_filter_count(document, group_filter, usage_filter)
+    )
+}
+
+pub(crate) fn layout_layer_visibility_preset_target_visible(
+    mode: &str,
+    layer: &Layer,
+    usage_count: usize,
+    active_layer: LayerId,
+) -> Option<bool> {
+    let used = usage_count > 0;
+    match mode {
+        "show_all" => Some(true),
+        "show_used" => Some(used),
+        "isolate_active" => Some(layer.id == active_layer),
+        "invert" => Some(!layer.visible),
+        "hide_empty" => Some(if used { layer.visible } else { false }),
+        _ => None,
+    }
+}
+
+pub(crate) fn layout_layer_visibility_preset_change_count(
+    document: &Document,
+    active_layer: LayerId,
+    mode: &str,
+) -> Option<usize> {
+    let usage = layout_layer_usage_counts(document);
+    let mut count = 0usize;
+    for layer in document.layers.values() {
+        let visible = layout_layer_visibility_preset_target_visible(
+            mode,
+            layer,
+            usage.get(&layer.id).copied().unwrap_or(0),
+            active_layer,
+        )?;
+        if layer.visible != visible {
+            count += 1;
+        }
+    }
+    Some(count)
+}
+
+pub(crate) fn layout_layer_visibility_preset_button_label(
+    document: &Document,
+    active_layer: LayerId,
+    mode: &str,
+    label: &str,
+) -> String {
+    format!(
+        "{label} ({})",
+        layout_layer_visibility_preset_change_count(document, active_layer, mode).unwrap_or(0)
+    )
+}
+
+pub(crate) fn layout_inactive_empty_layer_count(
+    document: &Document,
+    active_layer: LayerId,
+) -> usize {
+    let usage = layout_layer_usage_counts(document);
+    document
+        .layers
+        .values()
+        .filter(|layer| layer.id != active_layer && usage.get(&layer.id).copied().unwrap_or(0) == 0)
+        .count()
+}
+
+pub(crate) fn layout_inactive_empty_layer_cleanup_button_label(
+    document: &Document,
+    active_layer: LayerId,
+) -> String {
+    format!(
+        "Prune Empty ({})",
+        layout_inactive_empty_layer_count(document, active_layer)
+    )
+}
+
 pub(crate) fn layout_occurrence_action_key(occurrence: &ShapeOccurrenceId) -> String {
     let instance_path = if occurrence.instance_path.is_empty() {
         "-".to_string()

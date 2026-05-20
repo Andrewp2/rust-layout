@@ -1154,7 +1154,10 @@ pub(crate) fn add_domain_options_sections(
             .iter()
             .map(|filter| {
                 (
-                    format!("glassworks.viewctl.process_control.filter.{}", filter.slug()),
+                    format!(
+                        "glassworks.viewctl.process_control.filter.{}",
+                        filter.slug()
+                    ),
                     filter.label().to_string(),
                     app.process_control_loop_filter == *filter,
                 )

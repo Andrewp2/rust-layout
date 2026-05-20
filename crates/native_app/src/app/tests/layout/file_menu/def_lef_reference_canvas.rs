@@ -251,6 +251,7 @@ pub(crate) fn layout_file_menu_exports_and_imports_def() {
         "glassworks.menu.item.file.import_def_cell",
         "glassworks.menu.item.file.import_def_top_cell",
         "glassworks.menu.item.file.merge_def",
+        "glassworks.menu.item.file.merge_def_hierarchy",
     ] {
         let node = document
             .nodes()
@@ -338,6 +339,8 @@ pub(crate) fn layout_file_menu_exports_and_imports_lef() {
         imported.workspace.document.flattened_shape_count_estimate() >= 3,
         "LEF import should load layout geometry and pins"
     );
+    let expected_lef_shapes = imported.workspace.document.flattened_shape_count_estimate();
+    let expected_lef_cells = imported.workspace.document.cells.len();
     let mut imported_gz = GlassworksApp::new_with_options(StartupOptions {
         view_mode: Some(StartupView::Workflow),
         ..Default::default()
@@ -351,6 +354,164 @@ pub(crate) fn layout_file_menu_exports_and_imports_lef() {
         "{}",
         imported_gz.status_message()
     );
+
+    let mut imported_cell = GlassworksApp::new_with_options(StartupOptions {
+        view_mode: Some(StartupView::Workflow),
+        ..Default::default()
+    });
+    imported_cell.workspace.document = Document::new("target before LEF cell import");
+    imported_cell.reset_layout_document_state();
+    let import_top = imported_cell.workspace.document.top_cell;
+    let import_target_layer = imported_cell
+        .workspace
+        .document
+        .layer_by_process(ProcessLayer::Metal1)
+        .expect("target should include metal1");
+    let target_shape = imported_cell
+        .add_layout_shape(
+            import_target_layer,
+            ShapeKind::Rectangle(Rect::new(Point::new(2_000, 0), Point::new(2_400, 400))),
+        )
+        .expect("target rectangle should be added");
+    let target_top_shapes_before = imported_cell.workspace.document.shapes.len();
+    let target_cells_before = imported_cell.workspace.document.cells.len();
+    let target_instances_before = imported_cell
+        .workspace
+        .document
+        .cell(import_top)
+        .expect("target top cell should exist")
+        .instances
+        .len();
+    assert!(imported_cell.import_layout_lef_as_cell_from_path(&path));
+    assert_eq!(imported_cell.active_view, StartupView::Layout2d);
+    assert!(
+        imported_cell
+            .workspace
+            .document
+            .shapes
+            .contains_key(&target_shape),
+        "LEF import-as-cell should preserve existing top-level geometry"
+    );
+    assert_eq!(
+        imported_cell.workspace.document.shapes.len(),
+        target_top_shapes_before,
+        "LEF imported geometry should live inside the imported cell"
+    );
+    assert_eq!(
+        imported_cell.workspace.document.cells.len(),
+        target_cells_before + expected_lef_cells
+    );
+    assert_eq!(
+        imported_cell
+            .workspace
+            .document
+            .cell(import_top)
+            .expect("target top cell should exist")
+            .instances
+            .len(),
+        target_instances_before + 1
+    );
+    assert!(
+        imported_cell.status_message().contains("as cell"),
+        "{}",
+        imported_cell.status_message()
+    );
+    assert!(imported_cell.apply_clicked_node_name("glassworks.menu.item.edit.undo"));
+    assert_eq!(
+        imported_cell.workspace.document.cells.len(),
+        target_cells_before
+    );
+
+    let mut top_imported = GlassworksApp::new_with_options(StartupOptions {
+        view_mode: Some(StartupView::Workflow),
+        ..Default::default()
+    });
+    top_imported.workspace.document = Document::new("target before LEF top-cell import");
+    top_imported.reset_layout_document_state();
+    let original_top = top_imported.workspace.document.top_cell;
+    let top_cells_before = top_imported.workspace.document.cells.len();
+    let top_instances_before = top_imported
+        .workspace
+        .document
+        .cell(original_top)
+        .expect("original top cell should exist")
+        .instances
+        .len();
+    assert!(top_imported.import_layout_lef_as_top_cell_from_path(&path));
+    assert_eq!(top_imported.active_view, StartupView::Layout2d);
+    assert_eq!(top_imported.workspace.document.top_cell, original_top);
+    assert_ne!(top_imported.layout_view_top_cell, original_top);
+    assert_eq!(
+        top_imported.workspace.document.cells.len(),
+        top_cells_before + expected_lef_cells
+    );
+    assert_eq!(
+        top_imported
+            .workspace
+            .document
+            .cell(original_top)
+            .expect("original top cell should still exist")
+            .instances
+            .len(),
+        top_instances_before
+    );
+    assert!(
+        top_imported.status_message().contains("extra top cell"),
+        "{}",
+        top_imported.status_message()
+    );
+    assert!(top_imported.apply_clicked_node_name("glassworks.menu.item.edit.undo"));
+    assert_eq!(
+        top_imported.workspace.document.cells.len(),
+        top_cells_before
+    );
+    assert_eq!(top_imported.layout_view_top_cell, original_top);
+
+    let mut merged = GlassworksApp::new_with_options(StartupOptions {
+        view_mode: Some(StartupView::Workflow),
+        ..Default::default()
+    });
+    merged.workspace.document = Document::new("target before LEF merge");
+    merged.reset_layout_document_state();
+    let merge_target_layer = merged
+        .workspace
+        .document
+        .layer_by_process(ProcessLayer::Metal1)
+        .expect("target should include metal1");
+    let merge_target_shape = merged
+        .add_layout_shape(
+            merge_target_layer,
+            ShapeKind::Rectangle(Rect::new(Point::new(4_000, 0), Point::new(4_400, 400))),
+        )
+        .expect("merge target rectangle should be added");
+    let merge_top_shapes_before = merged.workspace.document.shapes.len();
+    let merge_cells_before = merged.workspace.document.cells.len();
+    assert!(merged.merge_layout_lef_from_path(&path));
+    assert_eq!(merged.active_view, StartupView::Layout2d);
+    assert!(
+        merged
+            .workspace
+            .document
+            .shapes
+            .contains_key(&merge_target_shape),
+        "LEF merge should preserve existing top-level geometry"
+    );
+    assert_eq!(
+        merged.workspace.document.shapes.len(),
+        merge_top_shapes_before + expected_lef_shapes,
+        "LEF merge should add flattened imported geometry to the top level"
+    );
+    assert_eq!(merged.workspace.document.cells.len(), merge_cells_before);
+    assert!(
+        merged.status_message().contains("Merged LEF"),
+        "{}",
+        merged.status_message()
+    );
+    assert!(merged.apply_clicked_node_name("glassworks.menu.item.edit.undo"));
+    assert_eq!(
+        merged.workspace.document.shapes.len(),
+        merge_top_shapes_before
+    );
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(&gz_path);
 
@@ -361,6 +522,10 @@ pub(crate) fn layout_file_menu_exports_and_imports_lef() {
     for node_name in [
         "glassworks.menu.item.file.export_lef",
         "glassworks.menu.item.file.import_lef",
+        "glassworks.menu.item.file.import_lef_cell",
+        "glassworks.menu.item.file.import_lef_top_cell",
+        "glassworks.menu.item.file.merge_lef",
+        "glassworks.menu.item.file.merge_lef_hierarchy",
     ] {
         let node = document
             .nodes()
@@ -471,6 +636,14 @@ pub(crate) fn layout_reference_image_landmark_controls_seed_fit_and_clear() {
     );
     image.pixel_size = Some(ReferenceImageSize::new(100, 50));
     app.workspace.document.reference_images.push(image);
+    let mut image = ReferenceImageOverlay::new(
+        "sem-b",
+        "SEM B",
+        "images/sem-b.png",
+        Rect::from_min_size(Point::new(20, 10), 80, 40),
+    );
+    image.pixel_size = Some(ReferenceImageSize::new(80, 40));
+    app.workspace.document.reference_images.push(image);
     let metal1 = app
         .workspace
         .document
@@ -493,10 +666,21 @@ pub(crate) fn layout_reference_image_landmark_controls_seed_fit_and_clear() {
         "glassworks.viewctl.layout.reference_images.landmarks.seed",
         "glassworks.viewctl.layout.reference_images.landmarks.clear",
         "glassworks.viewctl.layout.reference_image.toggle.0",
+        "glassworks.viewctl.layout.reference_image.landmarks.fit_selection.0",
+        "glassworks.viewctl.layout.reference_image.landmarks.seed.0",
+        "glassworks.viewctl.layout.reference_image.landmarks.align.0",
+        "glassworks.viewctl.layout.reference_image.landmarks.clear.0",
         "glassworks.viewctl.layout.reference_image.opacity_less.0",
         "glassworks.viewctl.layout.reference_image.opacity_more.0",
         "glassworks.viewctl.layout.reference_image.focus.0",
         "glassworks.viewctl.layout.reference_image.remove.0",
+        "glassworks.viewctl.layout.reference_image.toggle.1",
+        "glassworks.viewctl.layout.reference_image.landmarks.fit_selection.1",
+        "glassworks.viewctl.layout.reference_image.landmarks.seed.1",
+        "glassworks.viewctl.layout.reference_image.landmarks.align.1",
+        "glassworks.viewctl.layout.reference_image.landmarks.clear.1",
+        "glassworks.viewctl.layout.reference_image.focus.1",
+        "glassworks.viewctl.layout.reference_image.remove.1",
     ] {
         assert!(
             control_names.iter().any(|name| name == node_name),
@@ -510,7 +694,43 @@ pub(crate) fn layout_reference_image_landmark_controls_seed_fit_and_clear() {
             .any(|(_, value)| value.contains("opacity 38%")),
         "reference image rows should expose per-image opacity"
     );
-    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.reference_image.opacity_more.0"));
+    let reference_rows = layout_reference_image_rows(&app);
+    assert!(
+        reference_rows
+            .iter()
+            .any(|(_, value)| value == "images/sem-fit.png"),
+        "reference image rows should expose per-image source: {reference_rows:?}"
+    );
+    assert!(
+        reference_rows.iter().any(|(_, value)| value == "100x50 px"),
+        "reference image rows should expose per-image pixel size: {reference_rows:?}"
+    );
+    app.set_layout_browser_search("pixel_width=80");
+    let reference_rows = layout_reference_image_rows(&app);
+    assert!(
+        reference_rows
+            .iter()
+            .any(|(key, value)| key == "Listed images" && value == "1 / 2 total"),
+        "reference image rows should summarize filtered images: {reference_rows:?}"
+    );
+    assert!(
+        reference_rows.iter().any(|(key, _)| key == "SEM B"),
+        "reference image selector search should keep the matching image: {reference_rows:?}"
+    );
+    assert!(
+        !reference_rows.iter().any(|(key, _)| key == "SEM fit"),
+        "reference image selector search should hide non-matching images: {reference_rows:?}"
+    );
+    app.set_layout_browser_search("source=sem-fit.png");
+    let reference_rows = layout_reference_image_rows(&app);
+    assert!(
+        reference_rows.iter().any(|(key, _)| key == "SEM fit"),
+        "reference image selector search should match source paths: {reference_rows:?}"
+    );
+    app.set_layout_browser_search("");
+    assert!(
+        app.apply_clicked_node_name("glassworks.viewctl.layout.reference_image.opacity_more.0")
+    );
     assert_eq!(app.workspace.document.reference_images[0].opacity, 128);
     assert!(app.status_message().contains("opacity 50%"));
     assert!(
@@ -519,7 +739,9 @@ pub(crate) fn layout_reference_image_landmark_controls_seed_fit_and_clear() {
             .any(|(_, value)| value.contains("opacity 50%")),
         "reference image rows should update per-image opacity"
     );
-    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.reference_image.opacity_less.0"));
+    assert!(
+        app.apply_clicked_node_name("glassworks.viewctl.layout.reference_image.opacity_less.0")
+    );
     assert_eq!(app.workspace.document.reference_images[0].opacity, 96);
 
     assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.reference_image.toggle.0"));
@@ -531,9 +753,60 @@ pub(crate) fn layout_reference_image_landmark_controls_seed_fit_and_clear() {
         "reference image rows should expose per-image visibility"
     );
 
-    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.reference_images.landmarks.seed"));
+    assert!(
+        app.apply_clicked_node_name("glassworks.viewctl.layout.reference_image.landmarks.seed.1")
+    );
+    assert!(
+        app.workspace.document.reference_images[0]
+            .landmarks
+            .is_empty()
+    );
+    assert_eq!(
+        app.workspace.document.reference_images[1].landmarks.len(),
+        2
+    );
+    assert!(app.status_message().contains("SEM B"));
+    app.workspace.document.reference_images[1].landmarks = vec![
+        ReferenceImageLandmark::new("lower_left", Point::new(0, 40), target_bounds.min),
+        ReferenceImageLandmark::new("upper_right", Point::new(80, 0), target_bounds.max),
+    ];
+    assert_ne!(
+        app.workspace.document.reference_images[1].bounds,
+        target_bounds
+    );
+    assert!(
+        app.apply_clicked_node_name("glassworks.viewctl.layout.reference_image.landmarks.align.1")
+    );
+    assert_eq!(
+        app.workspace.document.reference_images[1].bounds,
+        target_bounds
+    );
+    assert!(app.workspace.document.reference_images[1].visible);
+    assert!(app.show_reference_images);
+    assert!(
+        app.status_message()
+            .contains("Aligned reference image SEM B")
+    );
+
+    assert!(
+        app.apply_clicked_node_name("glassworks.viewctl.layout.reference_image.landmarks.clear.1")
+    );
+    assert!(
+        app.workspace.document.reference_images[1]
+            .landmarks
+            .is_empty()
+    );
+    assert!(app.status_message().contains("SEM B"));
+
+    assert!(
+        app.apply_clicked_node_name("glassworks.viewctl.layout.reference_images.landmarks.seed")
+    );
     assert_eq!(
         app.workspace.document.reference_images[0].landmarks.len(),
+        2
+    );
+    assert_eq!(
+        app.workspace.document.reference_images[1].landmarks.len(),
         2
     );
     assert!(
@@ -551,6 +824,26 @@ pub(crate) fn layout_reference_image_landmark_controls_seed_fit_and_clear() {
             .landmarks
             .is_empty()
     );
+    assert!(
+        app.workspace.document.reference_images[1]
+            .landmarks
+            .is_empty()
+    );
+
+    let first_bounds = app.workspace.document.reference_images[0].bounds;
+    assert!(app.apply_clicked_node_name(
+        "glassworks.viewctl.layout.reference_image.landmarks.fit_selection.1"
+    ));
+    assert_eq!(
+        app.workspace.document.reference_images[0].bounds,
+        first_bounds
+    );
+    let image = &app.workspace.document.reference_images[1];
+    assert_eq!(image.bounds, target_bounds);
+    assert!(image.visible);
+    assert_eq!(image.landmarks.len(), 2);
+    assert!(app.show_reference_images);
+    assert!(app.status_message().contains("SEM B"));
 
     assert!(app.apply_clicked_node_name(
         "glassworks.viewctl.layout.reference_images.landmarks.fit_selection"
@@ -581,6 +874,8 @@ pub(crate) fn layout_reference_image_landmark_controls_seed_fit_and_clear() {
     assert_eq!(app.layout_previous_view, Some(previous_view));
     assert!(app.status_message().contains("Focused reference image"));
 
+    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.reference_image.remove.0"));
+    assert_eq!(app.workspace.document.reference_images.len(), 1);
     assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.reference_image.remove.0"));
     assert!(app.workspace.document.reference_images.is_empty());
     assert!(app.status_message().contains("Removed reference image"));
@@ -622,6 +917,9 @@ pub(crate) fn layout_reference_image_order_controls_reorder_overlays() {
         "glassworks.viewctl.layout.reference_image.move_down.0",
         "glassworks.viewctl.layout.reference_image.move_up.1",
         "glassworks.viewctl.layout.reference_image.move_down.1",
+        "glassworks.viewctl.layout.reference_images.show_all",
+        "glassworks.viewctl.layout.reference_images.hide_all",
+        "glassworks.viewctl.layout.reference_images.clear",
     ] {
         assert!(
             control_names.iter().any(|name| name == node_name),
@@ -642,6 +940,34 @@ pub(crate) fn layout_reference_image_order_controls_reorder_overlays() {
     assert_eq!(app.workspace.document.reference_images[0].id, "sem-a");
     assert_eq!(app.workspace.document.reference_images[1].id, "sem-b");
     assert!(app.status_message().contains("slot 1"));
+
+    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.reference_images.hide_all"));
+    assert!(!app.show_reference_images);
+    assert!(
+        app.workspace
+            .document
+            .reference_images
+            .iter()
+            .all(|image| !image.visible)
+    );
+    assert!(app.status_message().contains("Hid 2 of 2"));
+
+    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.reference_images.show_all"));
+    assert!(app.show_reference_images);
+    assert!(
+        app.workspace
+            .document
+            .reference_images
+            .iter()
+            .all(|image| image.visible)
+    );
+    assert!(app.status_message().contains("Showed 2 of 2"));
+
+    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.reference_images.clear"));
+    assert!(app.workspace.document.reference_images.is_empty());
+    assert!(app.status_message().contains("Cleared 2 reference images"));
+    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.reference_images.clear"));
+    assert!(app.status_message().contains("No reference images"));
 }
 
 #[test]
@@ -900,6 +1226,88 @@ pub(crate) fn layout_view_bookmark_and_previous_restore_view_state() {
     assert_eq!(app.layout_hierarchy_depth, LayoutHierarchyDepth::Numeric(4));
     assert_eq!(app.layout_hierarchy_min_depth, 1);
     assert_eq!(app.layout_previous_view, Some(changed_view));
+    let bookmark_section = layout_editor_inspector_sections(&app)
+        .into_iter()
+        .find(|section| section.title == "View Bookmarks")
+        .expect("layout inspector should expose view bookmark summaries");
+    let bookmark_rows = bookmark_section
+        .rows
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(
+        bookmark_rows.get("Saved").map(String::as_str),
+        Some("1 / 8")
+    );
+    let saved_view = bookmark_rows
+        .get("View 2")
+        .expect("saved view bookmark row should exist");
+    assert!(
+        saved_view.contains("0.050x")
+            && saved_view.contains("pan 12,-8")
+            && saved_view.contains("4 hierarchy levels")
+            && saved_view.contains("active"),
+        "saved bookmark row should summarize the active saved view: {saved_view}"
+    );
+    assert_eq!(
+        bookmark_rows.get("View 8").map(String::as_str),
+        Some("empty")
+    );
+    let previous_view = bookmark_rows
+        .get("Previous")
+        .expect("previous view row should exist");
+    assert!(
+        previous_view.contains("0.200x") && previous_view.contains("child cell boxes"),
+        "previous view row should summarize the last view: {previous_view}"
+    );
+
+    app.set_layout_browser_search("slot=2");
+    let bookmark_section = layout_editor_inspector_sections(&app)
+        .into_iter()
+        .find(|section| section.title == "View Bookmarks")
+        .expect("layout inspector should expose searched bookmark summaries");
+    let bookmark_rows = bookmark_section
+        .rows
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(
+        bookmark_rows.get("Listed views").map(String::as_str),
+        Some("1 / 10 views")
+    );
+    assert!(
+        bookmark_rows.contains_key("View 2"),
+        "slot selector search should keep the matching bookmark row: {bookmark_rows:?}"
+    );
+    assert!(
+        !bookmark_rows.contains_key("View 8"),
+        "slot selector search should hide non-matching bookmark slots: {bookmark_rows:?}"
+    );
+    assert!(
+        !bookmark_rows.contains_key("Current"),
+        "slot selector search should hide non-matching current view: {bookmark_rows:?}"
+    );
+
+    app.set_layout_browser_search("state=previous");
+    let bookmark_section = layout_editor_inspector_sections(&app)
+        .into_iter()
+        .find(|section| section.title == "View Bookmarks")
+        .expect("layout inspector should expose searched previous-view summaries");
+    let bookmark_rows = bookmark_section
+        .rows
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(
+        bookmark_rows.get("Listed views").map(String::as_str),
+        Some("1 / 10 views")
+    );
+    assert!(
+        bookmark_rows.contains_key("Previous"),
+        "state selector search should keep the previous-view row: {bookmark_rows:?}"
+    );
+    assert!(
+        !bookmark_rows.contains_key("View 2"),
+        "state selector search should hide saved bookmark slots: {bookmark_rows:?}"
+    );
+    app.set_layout_browser_search("");
 
     assert!(app.apply_clicked_node_name("glassworks.menu.item.bookmarks.previous_layout_view"));
     assert_eq!(app.current_layout_view_state(), changed_view);
@@ -907,6 +1315,31 @@ pub(crate) fn layout_view_bookmark_and_previous_restore_view_state() {
     assert!(app.apply_clicked_node_name("glassworks.menu.item.bookmarks.clear_layout_view.2"));
     assert!(!app.layout_view_bookmarks.contains_key(&2));
     assert_eq!(app.layout_view_bookmark_name(2), "View 2");
+
+    assert!(app.apply_clicked_node_name("glassworks.menu.item.bookmarks.save_layout_view.2"));
+    assert!(app.apply_clicked_node_name("glassworks.menu.item.bookmarks.save_layout_view.4"));
+    assert_eq!(app.layout_view_bookmarks.len(), 2);
+    assert!(app.apply_clicked_node_name("glassworks.menu.item.bookmarks.clear_layout_views"));
+    assert!(app.layout_view_bookmarks.is_empty());
+    assert_eq!(app.layout_view_bookmark_name(2), "View 2");
+    assert_eq!(app.layout_view_bookmark_name(4), "View 4");
+    assert!(
+        app.app_options().layout.view_bookmarks.is_empty(),
+        "clearing all bookmarks should persist to app options"
+    );
+    assert!(
+        app.status_message()
+            .contains("Cleared 2 layout view bookmarks"),
+        "{}",
+        app.status_message()
+    );
+    assert!(app.apply_clicked_node_name("glassworks.menu.item.bookmarks.clear_layout_views"));
+    assert!(
+        app.status_message()
+            .contains("No layout view bookmarks saved"),
+        "{}",
+        app.status_message()
+    );
 }
 
 #[test]
@@ -926,6 +1359,7 @@ pub(crate) fn layout_bookmark_menu_exposes_view_actions() {
         "glassworks.menu.item.bookmarks.bounds",
         "glassworks.menu.item.bookmarks.export_layout_views",
         "glassworks.menu.item.bookmarks.import_layout_views",
+        "glassworks.menu.item.bookmarks.clear_layout_views",
         "glassworks.menu.item.bookmarks.clear_layout_view.8",
     ] {
         let node = document
@@ -936,6 +1370,7 @@ pub(crate) fn layout_bookmark_menu_exposes_view_actions() {
         assert!(
             node.input().pointer
                 || node_name.ends_with("clear_layout_view.8")
+                || node_name.ends_with("clear_layout_views")
                 || node_name.ends_with("export_layout_views"),
             "{node_name} should be enabled in layout view unless the slot is empty"
         );
@@ -998,6 +1433,12 @@ pub(crate) fn layout_bookmark_menu_exposes_view_actions() {
         .find(|node| node.name() == "glassworks.menu.item.bookmarks.export_layout_views")
         .expect("export action should be visible");
     assert!(export.input().pointer);
+    let clear_all = document
+        .nodes()
+        .iter()
+        .find(|node| node.name() == "glassworks.menu.item.bookmarks.clear_layout_views")
+        .expect("clear-all action should be visible");
+    assert!(clear_all.input().pointer);
     let empty_restore = document
         .nodes()
         .iter()

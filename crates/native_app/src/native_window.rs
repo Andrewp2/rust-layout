@@ -1,22 +1,27 @@
 use std::time::{Duration, Instant};
 
 #[cfg(test)]
-use glassworks_studio::build_layout_3d_batch_with_options;
-use glassworks_studio::{
-    GlassworksApp, LayoutCanvasResources, StartupOptions, StartupView, ToolMode,
-    Viewport3dCanvasResources, render_layout_2d_canvas_with_size, render_layout_3d_canvas,
-};
-#[cfg(test)]
 use geometry_core::{Point, Rect};
 #[cfg(test)]
+use glassworks_studio::build_layout_3d_batch_with_options;
+use glassworks_studio::{
+    GlassworksApp, LAYOUT_DRC_MARKER_SNAPSHOT_CANVAS_KEY, LayoutCanvasResources, StartupOptions,
+    StartupView, ToolMode, Viewport3dCanvasResources, render_layout_2d_canvas_with_size,
+    render_layout_3d_canvas, render_layout_drc_marker_snapshot_canvas,
+};
+#[cfg(test)]
 use layout_model::Document;
-use operad::input::{RawInputEvent, RawPointerEvent};
+use operad::input::RawInputEvent;
+#[cfg(test)]
+use operad::input::RawPointerEvent;
 use operad::native::{
     NativeCanvasInput, NativeKeyboardInput, NativeRawMouseMotion, NativeWgpuCanvasRenderContext,
     NativeWgpuCanvasRenderRegistry, NativeWindowHooks, NativeWindowMetrics, NativeWindowOptions,
     run_app_with_canvas_renderers_and_hooks,
 };
-use operad::platform::{CursorGrabMode, CursorRequest, PixelSize, PlatformRequest};
+#[cfg(test)]
+use operad::platform::PixelSize;
+use operad::platform::{CursorGrabMode, CursorRequest, PlatformRequest};
 use operad::renderer::{CanvasRenderOutput, RenderError};
 use operad::{
     KeyCode, KeyModifiers, PointerButton, PointerEventKind, UiContent, UiDocument, UiInputEvent,
@@ -41,6 +46,10 @@ pub fn run(options: StartupOptions) -> Result<(), Box<dyn std::error::Error>> {
     canvas_renderers.register(
         "glassworks.layout.viewport.3d",
         render_native_layout_3d_canvas,
+    );
+    canvas_renderers.register(
+        LAYOUT_DRC_MARKER_SNAPSHOT_CANVAS_KEY,
+        render_native_layout_drc_marker_snapshot_canvas,
     );
 
     run_app_with_canvas_renderers_and_hooks(
@@ -586,6 +595,19 @@ fn render_native_layout_3d_canvas(
     ))
 }
 
+fn render_native_layout_drc_marker_snapshot_canvas(
+    state: &mut GlassworksNativeState,
+    context: NativeWgpuCanvasRenderContext<'_>,
+) -> Result<CanvasRenderOutput, RenderError> {
+    render_layout_drc_marker_snapshot_canvas(
+        &state.app,
+        context.request.canvas.surface_key(),
+        context.surface,
+    )
+    .map_err(RenderError::Backend)?;
+    Ok(CanvasRenderOutput::new())
+}
+
 fn layout_canvas_render_output(live_fps: bool) -> CanvasRenderOutput {
     CanvasRenderOutput::new().repaint_requested(live_fps)
 }
@@ -755,7 +777,9 @@ mod tests {
             .expect("layout nav node should be present");
         assert_eq!(
             nav.action().and_then(|action| action.action_id()),
-            Some(&operad::WidgetActionId::new("glassworks.nav.action.layout2d"))
+            Some(&operad::WidgetActionId::new(
+                "glassworks.nav.action.layout2d"
+            ))
         );
     }
 
@@ -976,7 +1000,10 @@ mod tests {
         };
 
         assert!(state.handle_keyboard_shortcut(KeyCode::Character('v'), alt));
-        assert_eq!(state.app.active_menu(), Some(glassworks_studio::AppMenu::View));
+        assert_eq!(
+            state.app.active_menu(),
+            Some(glassworks_studio::AppMenu::View)
+        );
 
         assert!(state.handle_keyboard_shortcut(KeyCode::Character('D'), alt));
         assert_eq!(
@@ -1078,7 +1105,10 @@ mod tests {
         };
 
         assert!(state.handle_keyboard_shortcut(KeyCode::Character('f'), alt));
-        assert_eq!(state.app.active_menu(), Some(glassworks_studio::AppMenu::File));
+        assert_eq!(
+            state.app.active_menu(),
+            Some(glassworks_studio::AppMenu::File)
+        );
         assert!(state.handle_keyboard_shortcut(KeyCode::Escape, KeyModifiers::NONE));
         assert_eq!(state.app.active_menu(), None);
 
@@ -1135,9 +1165,10 @@ mod tests {
             .copied()
             .expect("demo document should have shapes");
         assert!(
-            state
-                .app
-                .apply_clicked_node_name(&format!("glassworks.viewctl.layout.shape.{}", shape_id.0))
+            state.app.apply_clicked_node_name(&format!(
+                "glassworks.viewctl.layout.shape.{}",
+                shape_id.0
+            ))
         );
 
         assert!(state.handle_keyboard_shortcut(KeyCode::Character('c'), ctrl));
@@ -1178,9 +1209,10 @@ mod tests {
             .copied()
             .expect("demo document should have shapes");
         assert!(
-            state
-                .app
-                .apply_clicked_node_name(&format!("glassworks.viewctl.layout.shape.{}", shape_id.0))
+            state.app.apply_clicked_node_name(&format!(
+                "glassworks.viewctl.layout.shape.{}",
+                shape_id.0
+            ))
         );
         let shape_count = state.app.workspace().document.shapes.len();
 
@@ -1216,9 +1248,10 @@ mod tests {
             .copied()
             .expect("demo document should have shapes");
         assert!(
-            state
-                .app
-                .apply_clicked_node_name(&format!("glassworks.viewctl.layout.shape.{}", shape_id.0))
+            state.app.apply_clicked_node_name(&format!(
+                "glassworks.viewctl.layout.shape.{}",
+                shape_id.0
+            ))
         );
 
         assert!(state.handle_keyboard_shortcut(KeyCode::Character('2'), KeyModifiers::NONE));

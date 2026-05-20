@@ -12,7 +12,11 @@ pub(crate) fn workflow_control_rows(app: &GlassworksApp) -> Vec<Vec<ViewControlB
             ),
         ],
         vec![
-            ViewControlButton::new("glassworks.viewctl.workflow.open.fab-control", "Tools", false),
+            ViewControlButton::new(
+                "glassworks.viewctl.workflow.open.fab-control",
+                "Tools",
+                false,
+            ),
             ViewControlButton::new(
                 "glassworks.viewctl.workflow.open.scheduler",
                 "Dispatch",
@@ -53,7 +57,11 @@ pub(crate) fn workflow_control_rows(app: &GlassworksApp) -> Vec<Vec<ViewControlB
                 "Trace",
                 false,
             ),
-            ViewControlButton::new("glassworks.viewctl.workflow.open.notebook", "Notebook", false),
+            ViewControlButton::new(
+                "glassworks.viewctl.workflow.open.notebook",
+                "Notebook",
+                false,
+            ),
         ],
         vec![ViewControlButton::new(
             "glassworks.viewctl.workflow.load_demo",

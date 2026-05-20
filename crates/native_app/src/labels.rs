@@ -246,7 +246,10 @@ mod tests {
 
     #[test]
     fn display_helpers_remove_demo_prefixes() {
-        assert_eq!(display_mask_identifier("GLASSWORKS-DEMO-POLY-M1"), "Poly m1");
+        assert_eq!(
+            display_mask_identifier("GLASSWORKS-DEMO-POLY-M1"),
+            "Poly m1"
+        );
         assert_eq!(display_route_identifier("ROUTE-DEMO-FLOW"), "Flow");
         assert_eq!(
             display_layout_revision_identifier("layout_model:demo-poly@r3"),

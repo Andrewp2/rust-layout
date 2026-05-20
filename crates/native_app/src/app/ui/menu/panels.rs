@@ -177,6 +177,7 @@ pub(crate) fn add_menu_panel(
             menu_action_enabled("edit.redo", "Redo", editing_mode),
             MenuPanelItem::Separator,
             menu_action_enabled("edit.copy", "Copy", editing_mode),
+            menu_action_enabled("edit.copy_active_layer", "Copy Active Layer", editing_mode),
             menu_action_enabled("edit.paste", "Paste", editing_mode),
             menu_action_enabled("edit.duplicate", "Duplicate", editing_mode),
             menu_action_enabled("edit.delete", "Delete", can_delete),
@@ -184,21 +185,97 @@ pub(crate) fn add_menu_panel(
             menu_action_enabled("edit.make_cell", "Make Cell", editing_mode),
             menu_action_enabled("edit.duplicate_cell", "Duplicate Cell", editing_mode),
             menu_action_enabled(
+                "edit.delete_unused_cells",
+                "Delete Unused Cells",
+                editing_mode,
+            ),
+            menu_action_enabled(
                 "edit.delete_cell_shallow",
                 "Shallow Delete Cell",
                 editing_mode,
             ),
+            menu_action_enabled("edit.delete_cell_deep", "Deep Delete Cell", editing_mode),
+            menu_action_enabled(
+                "edit.delete_cell_complete",
+                "Complete Delete Cell",
+                editing_mode,
+            ),
             menu_action_enabled("edit.make_variant", "Make Variant", editing_mode),
+            menu_action_enabled(
+                "edit.make_child_variants",
+                "Make Child Variants",
+                editing_mode,
+            ),
+            menu_action_enabled(
+                "edit.make_descendant_child_variants",
+                "Make Descendant Variants",
+                editing_mode,
+            ),
+            menu_action_enabled(
+                "edit.make_document_child_variants",
+                "Make Document Variants",
+                editing_mode,
+            ),
             menu_action_enabled("edit.flatten_instance", "Flatten Instance", editing_mode),
+            menu_action_enabled(
+                "edit.flatten_instance_one",
+                "Flatten Instance 1 Level",
+                editing_mode,
+            ),
             menu_action_enabled("edit.flatten_cell", "Flatten Cell", editing_mode),
+            menu_action_enabled(
+                "edit.flatten_cell_one",
+                "Flatten Cell 1 Level",
+                editing_mode,
+            ),
+            menu_action_enabled(
+                "edit.flatten_descendant_cells",
+                "Flatten Descendant Cells",
+                editing_mode,
+            ),
+            menu_action_enabled(
+                "edit.flatten_descendant_cells_one",
+                "Flatten Descendant Cells 1 Level",
+                editing_mode,
+            ),
+            menu_action_enabled(
+                "edit.flatten_document_cells",
+                "Flatten Document Cells",
+                editing_mode,
+            ),
+            menu_action_enabled(
+                "edit.flatten_document_cells_one",
+                "Flatten Document Cells 1 Level",
+                editing_mode,
+            ),
             menu_action_enabled(
                 "edit.cell_origin_selection",
                 "Origin to Selection",
                 editing_mode,
             ),
+            menu_action_enabled(
+                "edit.cell_origin_descendant_leaves",
+                "Origin Descendant Leaves",
+                editing_mode,
+            ),
             menu_action_enabled("edit.move_shape_up", "Move Shape Up", editing_mode),
             menu_action_enabled("edit.move_instance_up", "Move Instance Up", editing_mode),
             menu_action_enabled("edit.resolve_array", "Resolve Array", editing_mode),
+            menu_action_enabled(
+                "edit.resolve_cell_arrays",
+                "Resolve Cell Arrays",
+                editing_mode,
+            ),
+            menu_action_enabled(
+                "edit.resolve_descendant_cell_arrays",
+                "Resolve Descendant Arrays",
+                editing_mode,
+            ),
+            menu_action_enabled(
+                "edit.resolve_document_arrays",
+                "Resolve Document Arrays",
+                editing_mode,
+            ),
             menu_action_enabled("edit.merge_layer_rects", "Merge Layer Rects", editing_mode),
             menu_action_enabled(
                 "edit.layer_and_selection",
@@ -226,6 +303,26 @@ pub(crate) fn add_menu_panel(
                 editing_mode,
             ),
             menu_action_enabled(
+                "edit.layer_and_clipboard",
+                "Layer AND Clipboard",
+                editing_mode,
+            ),
+            menu_action_enabled(
+                "edit.layer_or_clipboard",
+                "Layer OR Clipboard",
+                editing_mode,
+            ),
+            menu_action_enabled(
+                "edit.layer_not_clipboard",
+                "Layer NOT Clipboard",
+                editing_mode,
+            ),
+            menu_action_enabled(
+                "edit.layer_xor_clipboard",
+                "Layer XOR Clipboard",
+                editing_mode,
+            ),
+            menu_action_enabled(
                 "edit.shape_and_clipboard",
                 "Shape AND Clipboard",
                 editing_mode,
@@ -246,15 +343,30 @@ pub(crate) fn add_menu_panel(
                 editing_mode,
             ),
             menu_action_enabled("edit.create_clip_cell", "Create Clip Cell", editing_mode),
+            menu_action_enabled(
+                "edit.create_clip_cell_clipboard",
+                "Clip Cell Clipboard",
+                editing_mode,
+            ),
             menu_action_enabled("edit.rotate90", "Rotate 90", editing_mode),
             menu_action_enabled("edit.mirror_x", "Mirror X", editing_mode),
             menu_action_enabled("edit.mirror_y", "Mirror Y", editing_mode),
             menu_action_enabled("edit.grow", "Grow Shape", editing_mode),
             menu_action_enabled("edit.shrink", "Shrink Shape", editing_mode),
+            menu_action_enabled("edit.grow_x", "Grow Shape X", editing_mode),
+            menu_action_enabled("edit.shrink_x", "Shrink Shape X", editing_mode),
+            menu_action_enabled("edit.grow_y", "Grow Shape Y", editing_mode),
+            menu_action_enabled("edit.shrink_y", "Shrink Shape Y", editing_mode),
             menu_action_enabled("edit.chamfer_corners", "Chamfer Corners", editing_mode),
             menu_action_enabled("edit.round_corners", "Round Corners", editing_mode),
+            menu_action_enabled("edit.chamfer_layer_corners", "Chamfer Layer", editing_mode),
+            menu_action_enabled("edit.round_layer_corners", "Round Layer", editing_mode),
             menu_action_enabled("edit.grow_layer", "Grow Layer", editing_mode),
             menu_action_enabled("edit.shrink_layer", "Shrink Layer", editing_mode),
+            menu_action_enabled("edit.grow_layer_x", "Grow Layer X", editing_mode),
+            menu_action_enabled("edit.shrink_layer_x", "Shrink Layer X", editing_mode),
+            menu_action_enabled("edit.grow_layer_y", "Grow Layer Y", editing_mode),
+            menu_action_enabled("edit.shrink_layer_y", "Shrink Layer Y", editing_mode),
             menu_action_enabled("edit.align_left", "Align Left", editing_mode),
             menu_action_enabled("edit.align_right", "Align Right", editing_mode),
             menu_action_enabled("edit.align_top", "Align Top", editing_mode),
@@ -263,6 +375,24 @@ pub(crate) fn add_menu_panel(
             menu_action_enabled("edit.align_center_y", "Align Center Y", editing_mode),
             menu_action_enabled("edit.align_origin_x", "Align Origin X", editing_mode),
             menu_action_enabled("edit.align_origin_y", "Align Origin Y", editing_mode),
+            menu_action_enabled("edit.align_layer_left", "Align Layer Left", editing_mode),
+            menu_action_enabled("edit.align_layer_right", "Align Layer Right", editing_mode),
+            menu_action_enabled("edit.align_layer_top", "Align Layer Top", editing_mode),
+            menu_action_enabled(
+                "edit.align_layer_bottom",
+                "Align Layer Bottom",
+                editing_mode,
+            ),
+            menu_action_enabled(
+                "edit.align_layer_center_x",
+                "Align Layer Center X",
+                editing_mode,
+            ),
+            menu_action_enabled(
+                "edit.align_layer_center_y",
+                "Align Layer Center Y",
+                editing_mode,
+            ),
         ],
         AppMenu::View => unreachable!("view menu is handled by add_view_menu_panel"),
         AppMenu::Bookmarks => {
@@ -289,6 +419,11 @@ pub(crate) fn add_menu_panel(
                     "bookmarks.import_layout_views",
                     "Import Views",
                     editing_mode,
+                ),
+                menu_action_enabled(
+                    "bookmarks.clear_layout_views",
+                    "Clear All Views",
+                    editing_mode && !app.layout_view_bookmarks.is_empty(),
                 ),
                 MenuPanelItem::Separator,
                 MenuPanelItem::Label("Save View".to_string()),
@@ -440,6 +575,22 @@ pub(crate) fn add_menu_panel(
                 "Import DRC Report Database",
             ));
             items.push(MenuPanelItem::action(
+                "layout.drc_report_database_append",
+                "Append DRC Report Database",
+            ));
+            items.push(MenuPanelItem::action(
+                "layout.klayout_rdb_export",
+                "Export KLayout RDB",
+            ));
+            items.push(MenuPanelItem::action(
+                "layout.klayout_rdb_import",
+                "Import KLayout RDB",
+            ));
+            items.push(MenuPanelItem::action(
+                "layout.klayout_rdb_append",
+                "Append KLayout RDB",
+            ));
+            items.push(MenuPanelItem::action(
                 "layout.calibre_rve_import",
                 "Import Calibre/RVE Markers",
             ));
@@ -451,6 +602,11 @@ pub(crate) fn add_menu_panel(
             items.push(menu_action_enabled(
                 "layout.drc_marker_snapshot",
                 "Export DRC Marker Snapshot",
+                editing_mode && app.layout_selected_drc_marker_key.is_some(),
+            ));
+            items.push(menu_action_enabled(
+                "layout.drc_marker_snapshot_png",
+                "Export DRC Marker PNG",
                 editing_mode && app.layout_selected_drc_marker_key.is_some(),
             ));
             items.push(MenuPanelItem::action(
@@ -549,6 +705,89 @@ pub(crate) fn add_menu_panel(
     let panel_height =
         menu_panel_items_height(&items, ui_scale, item_height, gap) + ui_scale.value(12.0);
     let left = menu_popup_left(menu, panel_width, viewport_width, ui_scale);
+
+    if matches!(menu, AppMenu::Edit | AppMenu::Bookmarks | AppMenu::Tools) {
+        let column_item_width = if menu == AppMenu::Tools {
+            item_width.min(ui_scale.value(204.0))
+        } else {
+            item_width
+        };
+        let split_at = (items.len() + 1) / 2;
+        let first_column = &items[..split_at];
+        let second_column = &items[split_at..];
+        let first_column_height = menu_panel_items_height(first_column, ui_scale, item_height, gap);
+        let second_column_height =
+            menu_panel_items_height(second_column, ui_scale, item_height, gap);
+        let panel_width = column_item_width * 2.0 + gap + ui_scale.value(12.0);
+        let panel_height = first_column_height.max(second_column_height) + ui_scale.value(12.0);
+        let left = menu_popup_left(menu, panel_width, viewport_width, ui_scale);
+        let panel = document.add_child(
+            parent,
+            UiNode::container(
+                format!("glassworks.menu_panel.{}", menu.slug()),
+                layout::with_padding_all(
+                    layout::with_gap_all(
+                        layout::with_absolute_position(
+                            layout::with_size(
+                                layout::row(),
+                                layout::px(panel_width),
+                                layout::px(panel_height),
+                            ),
+                            left,
+                            ui_scale.value(30.0),
+                        ),
+                        gap,
+                    ),
+                    ui_scale.value(6.0),
+                ),
+            )
+            .with_visual(UiVisual::panel(
+                COLOR_CHROME_BG,
+                Some(StrokeStyle::new(COLOR_PANEL_STROKE, ui_scale.value(1.0))),
+                0.0,
+            )),
+        );
+        document.node_mut(panel).style_mut().set_z_index(80);
+
+        for (column_index, column_items) in [first_column, second_column].into_iter().enumerate() {
+            let column_height = if column_index == 0 {
+                first_column_height
+            } else {
+                second_column_height
+            };
+            let column = document.add_child(
+                panel,
+                UiNode::container(
+                    format!(
+                        "glassworks.menu_panel.{}.column.{column_index}",
+                        menu.slug()
+                    ),
+                    layout::with_gap_all(
+                        layout::with_size(
+                            layout::column(),
+                            layout::px(column_item_width),
+                            layout::px(column_height),
+                        ),
+                        gap,
+                    ),
+                ),
+            );
+            let index_offset = if column_index == 0 { 0 } else { split_at };
+            for (index, item) in column_items.iter().enumerate() {
+                add_menu_panel_item(
+                    document,
+                    column,
+                    menu.slug(),
+                    index_offset + index,
+                    item,
+                    column_item_width,
+                    item_height,
+                    ui_scale,
+                );
+            }
+        }
+        return;
+    }
 
     let panel = document.add_child(
         parent,

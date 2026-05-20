@@ -596,6 +596,7 @@ mod tests {
             net: None,
             kind: ShapeKind::Rectangle(Rect::from_min_size(Point::new(10, 20), 100, 80)),
             name: None,
+            properties: BTreeMap::new(),
         };
         let mut log = LoroCrdtLog::new(client_actor).unwrap();
         log.append_operation(
@@ -780,6 +781,7 @@ mod tests {
             net: None,
             kind: ShapeKind::Rectangle(Rect::from_min_size(Point::new(100, 200), 300, 120)),
             name: Some("shared_m1".to_string()),
+            properties: BTreeMap::new(),
         };
         let mut client_log = LoroCrdtLog::new(user_a).unwrap();
         let add_update = client_log

@@ -45,6 +45,36 @@ pub(crate) fn layout_descendant_cell_ids(
     descendants
 }
 
+pub(crate) fn layout_ancestor_cell_ids(document: &Document, root_cell: CellId) -> BTreeSet<CellId> {
+    let mut ancestors = BTreeSet::new();
+    let mut stack = layout_cell_instance_refs(document, root_cell)
+        .into_iter()
+        .map(|(parent, _)| parent)
+        .collect::<Vec<_>>();
+    while let Some(cell_id) = stack.pop() {
+        if !ancestors.insert(cell_id) {
+            continue;
+        }
+        stack.extend(
+            layout_cell_instance_refs(document, cell_id)
+                .into_iter()
+                .map(|(parent, _)| parent),
+        );
+    }
+    ancestors.remove(&root_cell);
+    ancestors
+}
+
+pub(crate) fn layout_unused_cell_ids(document: &Document) -> BTreeSet<CellId> {
+    let used_cells = layout_descendant_cell_ids(document, document.top_cell);
+    document
+        .cells
+        .keys()
+        .copied()
+        .filter(|cell_id| *cell_id != document.top_cell && !used_cells.contains(cell_id))
+        .collect()
+}
+
 pub(crate) fn layout_deep_delete_cell_ids(
     document: &Document,
     root_cell: CellId,
@@ -114,6 +144,26 @@ pub(crate) fn layout_child_cells(document: &Document, parent_cell: CellId) -> Ve
         .into_iter()
         .filter(|cell| child_ids.contains(&cell.id))
         .collect()
+}
+
+pub(crate) fn layout_sibling_cell_ids(document: &Document, cell_id: CellId) -> BTreeSet<CellId> {
+    let parent_ids = layout_cell_instance_refs(document, cell_id)
+        .into_iter()
+        .map(|(parent, _)| parent)
+        .collect::<BTreeSet<_>>();
+    let mut siblings = BTreeSet::new();
+    for parent_id in parent_ids {
+        if let Some(parent) = document.cell(parent_id) {
+            siblings.extend(
+                parent
+                    .instances
+                    .values()
+                    .map(|instance| instance.cell)
+                    .filter(|sibling| *sibling != cell_id && *sibling != document.top_cell),
+            );
+        }
+    }
+    siblings
 }
 
 pub(crate) fn layout_cell_browser_label(cell: &Cell, document_top_cell: CellId) -> String {

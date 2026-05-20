@@ -76,6 +76,45 @@ impl GlassworksApp {
         true
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn merge_layout_def_hierarchy_from_path(&mut self, path: &Path) -> bool {
+        let contents = match read_native_text_file_maybe_gzip(path) {
+            Ok(contents) => contents,
+            Err(error) => {
+                self.status_message = format!("DEF hierarchy merge failed: {error}");
+                return true;
+            }
+        };
+        let result = match import_def_with_report(&contents) {
+            Ok(result) => result,
+            Err(error) => {
+                self.status_message = format!("DEF hierarchy merge failed: {error}");
+                return true;
+            }
+        };
+        let mut document = result.document;
+        document.ensure_hierarchy();
+        if let Err(error) = Self::validate_layout_document_snapshot(&document) {
+            self.status_message = format!("DEF hierarchy merge failed: {error}");
+            return true;
+        }
+        let import_name = document.name.trim().to_string().if_empty_then(|| {
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("layout")
+                .to_string()
+        });
+        let report = result.report;
+        self.apply_layout_hierarchy_merge_document(
+            &document,
+            &import_name,
+            path,
+            "DEF",
+            "def",
+            format!(", {} skipped", report.skipped_items.len()),
+        )
+    }
+
     pub(crate) fn import_layout_def_as_cell(&mut self) -> bool {
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -359,6 +398,342 @@ impl GlassworksApp {
         true
     }
 
+    pub(crate) fn import_layout_lef_as_cell(&mut self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let path = default_ui_lef_exchange_path();
+            return self.import_layout_lef_as_cell_from_path(&path);
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.status_message = "LEF cell import is available in the native app".to_string();
+            true
+        }
+    }
+
+    pub(crate) fn import_layout_lef_as_top_cell(&mut self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let path = default_ui_lef_exchange_path();
+            return self.import_layout_lef_as_top_cell_from_path(&path);
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.status_message = "LEF top-cell import is available in the native app".to_string();
+            true
+        }
+    }
+
+    pub(crate) fn merge_layout_lef(&mut self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let path = default_ui_lef_exchange_path();
+            return self.merge_layout_lef_from_path(&path);
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.status_message = "LEF merge is available in the native app".to_string();
+            true
+        }
+    }
+
+    pub(crate) fn merge_layout_lef_hierarchy(&mut self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let path = default_ui_lef_exchange_path();
+            return self.merge_layout_lef_hierarchy_from_path(&path);
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.status_message = "LEF hierarchy merge is available in the native app".to_string();
+            true
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn import_layout_lef_as_cell_from_path(&mut self, path: &Path) -> bool {
+        let contents = match read_native_text_file_maybe_gzip(path) {
+            Ok(contents) => contents,
+            Err(error) => {
+                self.status_message = format!("LEF cell import failed: {error}");
+                return true;
+            }
+        };
+        let result = match import_lef_with_report(&contents) {
+            Ok(result) => result,
+            Err(error) => {
+                self.status_message = format!("LEF cell import failed: {error}");
+                return true;
+            }
+        };
+        let mut document = result.document;
+        document.ensure_hierarchy();
+        if let Err(error) = Self::validate_layout_document_snapshot(&document) {
+            self.status_message = format!("LEF cell import failed: {error}");
+            return true;
+        }
+        let import_name = document.name.trim().to_string().if_empty_then(|| {
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("layout")
+                .to_string()
+        });
+        let report = result.report;
+        let shape_count = document.flattened_shape_count_estimate();
+        let source_cell_count = document.cells.len();
+        let import = match self.prepare_layout_json_cell_import(&document, &import_name) {
+            Ok(import) => import,
+            Err(error) => {
+                self.status_message = format!("LEF cell import failed: {error}");
+                return true;
+            }
+        };
+        let mut validation_document = self.workspace.document.clone();
+        validation_document.apply_operation_without_log(&Operation::Batch {
+            operations: import.redo_operations.clone(),
+        });
+        if let Err(error) = Self::validate_layout_document_snapshot(&validation_document) {
+            self.status_message = format!("LEF cell import failed: {error}");
+            return true;
+        }
+
+        self.apply_layout_operation_with_history(
+            Operation::Batch {
+                operations: import.redo_operations,
+            },
+            Operation::Batch {
+                operations: import.undo_operations,
+            },
+        );
+        self.layout_view_top_cell = self.workspace.document.top_cell;
+        self.layout_hierarchy_depth = LayoutHierarchyDepth::Full;
+        self.layout_hierarchy_min_depth = 0;
+        self.selected_layout_shape = import.first_shape;
+        self.selected_layout_occurrence = import
+            .first_shape
+            .map(|id| ShapeOccurrenceId::from_instance_path(id, &[import.instance_id]));
+        self.active_view = StartupView::Layout2d;
+        self.record_recent_layout_file("lef", path);
+        self.status_message = format!(
+            "Imported LEF {} as cell {} ({} shape(s), {} source cell(s), {} layer(s), {} skipped)",
+            path.display(),
+            import.root_cell_name,
+            shape_count,
+            source_cell_count,
+            import.added_layers,
+            report.skipped_items.len()
+        );
+        true
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn import_layout_lef_as_top_cell_from_path(&mut self, path: &Path) -> bool {
+        let contents = match read_native_text_file_maybe_gzip(path) {
+            Ok(contents) => contents,
+            Err(error) => {
+                self.status_message = format!("LEF top-cell import failed: {error}");
+                return true;
+            }
+        };
+        let result = match import_lef_with_report(&contents) {
+            Ok(result) => result,
+            Err(error) => {
+                self.status_message = format!("LEF top-cell import failed: {error}");
+                return true;
+            }
+        };
+        let mut document = result.document;
+        document.ensure_hierarchy();
+        if let Err(error) = Self::validate_layout_document_snapshot(&document) {
+            self.status_message = format!("LEF top-cell import failed: {error}");
+            return true;
+        }
+        let import_name = document.name.trim().to_string().if_empty_then(|| {
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("layout")
+                .to_string()
+        });
+        let report = result.report;
+        let shape_count = document.flattened_shape_count_estimate();
+        let source_cell_count = document.cells.len();
+        let import = match self.prepare_layout_json_cell_import(&document, &import_name) {
+            Ok(import) => import,
+            Err(error) => {
+                self.status_message = format!("LEF top-cell import failed: {error}");
+                return true;
+            }
+        };
+        let LayoutJsonCellImportPlan {
+            redo_operations,
+            undo_operations,
+            first_shape,
+            instance_id,
+            root_cell,
+            root_cell_name,
+            added_layers,
+        } = import;
+        let redo_operations = redo_operations
+            .into_iter()
+            .filter(|operation| {
+                !matches!(operation, Operation::AddInstance { instance, .. } if instance.id == instance_id)
+            })
+            .collect::<Vec<_>>();
+        let undo_operations = undo_operations
+            .into_iter()
+            .filter(|operation| {
+                !matches!(operation, Operation::DeleteInstance { id, .. } if *id == instance_id)
+            })
+            .collect::<Vec<_>>();
+        let mut validation_document = self.workspace.document.clone();
+        validation_document.apply_operation_without_log(&Operation::Batch {
+            operations: redo_operations.clone(),
+        });
+        if let Err(error) = Self::validate_layout_document_snapshot(&validation_document) {
+            self.status_message = format!("LEF top-cell import failed: {error}");
+            return true;
+        }
+
+        self.apply_layout_operation_with_history(
+            Operation::Batch {
+                operations: redo_operations,
+            },
+            Operation::Batch {
+                operations: undo_operations,
+            },
+        );
+        self.layout_view_top_cell = root_cell;
+        self.layout_hierarchy_depth = LayoutHierarchyDepth::Full;
+        self.layout_hierarchy_min_depth = 0;
+        self.selected_layout_shape = first_shape;
+        self.selected_layout_occurrence = first_shape.map(ShapeOccurrenceId::top_level);
+        self.active_view = StartupView::Layout2d;
+        self.record_recent_layout_file("lef", path);
+        self.status_message = format!(
+            "Imported LEF {} as extra top cell {} ({} shape(s), {} source cell(s), {} layer(s), {} skipped)",
+            path.display(),
+            root_cell_name,
+            shape_count,
+            source_cell_count,
+            added_layers,
+            report.skipped_items.len()
+        );
+        true
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn merge_layout_lef_from_path(&mut self, path: &Path) -> bool {
+        let contents = match read_native_text_file_maybe_gzip(path) {
+            Ok(contents) => contents,
+            Err(error) => {
+                self.status_message = format!("LEF merge failed: {error}");
+                return true;
+            }
+        };
+        let result = match import_lef_with_report(&contents) {
+            Ok(result) => result,
+            Err(error) => {
+                self.status_message = format!("LEF merge failed: {error}");
+                return true;
+            }
+        };
+        let mut document = result.document;
+        document.ensure_hierarchy();
+        if let Err(error) = Self::validate_layout_document_snapshot(&document) {
+            self.status_message = format!("LEF merge failed: {error}");
+            return true;
+        }
+        let import_name = document.name.trim().to_string().if_empty_then(|| {
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("layout")
+                .to_string()
+        });
+        let report = result.report;
+        let import = match self.prepare_layout_json_merge_import(&document) {
+            Ok(import) => import,
+            Err(error) => {
+                self.status_message = format!("LEF merge failed: {error}");
+                return true;
+            }
+        };
+        if import.imported_shapes == 0 {
+            self.status_message = format!("LEF merge found no shapes in {import_name}");
+            return true;
+        }
+        let mut validation_document = self.workspace.document.clone();
+        validation_document.apply_operation_without_log(&Operation::Batch {
+            operations: import.redo_operations.clone(),
+        });
+        if let Err(error) = Self::validate_layout_document_snapshot(&validation_document) {
+            self.status_message = format!("LEF merge failed: {error}");
+            return true;
+        }
+
+        self.apply_layout_operation_with_history(
+            Operation::Batch {
+                operations: import.redo_operations,
+            },
+            Operation::Batch {
+                operations: import.undo_operations,
+            },
+        );
+        self.layout_view_top_cell = self.workspace.document.top_cell;
+        self.layout_hierarchy_depth = LayoutHierarchyDepth::Full;
+        self.layout_hierarchy_min_depth = 0;
+        self.selected_layout_shape = import.first_shape;
+        self.selected_layout_occurrence = import.first_shape.map(ShapeOccurrenceId::top_level);
+        self.active_view = StartupView::Layout2d;
+        self.record_recent_layout_file("lef", path);
+        self.status_message = format!(
+            "Merged LEF {} into top cell ({} shape(s), {} layer(s), {} skipped)",
+            path.display(),
+            import.imported_shapes,
+            import.added_layers,
+            report.skipped_items.len()
+        );
+        true
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn merge_layout_lef_hierarchy_from_path(&mut self, path: &Path) -> bool {
+        let contents = match read_native_text_file_maybe_gzip(path) {
+            Ok(contents) => contents,
+            Err(error) => {
+                self.status_message = format!("LEF hierarchy merge failed: {error}");
+                return true;
+            }
+        };
+        let result = match import_lef_with_report(&contents) {
+            Ok(result) => result,
+            Err(error) => {
+                self.status_message = format!("LEF hierarchy merge failed: {error}");
+                return true;
+            }
+        };
+        let mut document = result.document;
+        document.ensure_hierarchy();
+        if let Err(error) = Self::validate_layout_document_snapshot(&document) {
+            self.status_message = format!("LEF hierarchy merge failed: {error}");
+            return true;
+        }
+        let import_name = document.name.trim().to_string().if_empty_then(|| {
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("layout")
+                .to_string()
+        });
+        let report = result.report;
+        self.apply_layout_hierarchy_merge_document(
+            &document,
+            &import_name,
+            path,
+            "LEF",
+            "lef",
+            format!(", {} skipped", report.skipped_items.len()),
+        )
+    }
+
     pub(crate) fn export_ui_screenshot(&mut self) -> bool {
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -449,6 +824,53 @@ impl GlassworksApp {
             .map(|image| format!("{}x{}", image.size.width, image.size.height))
             .unwrap_or_else(|| format!("{width}x{height}"));
         self.status_message = format!("Exported screenshot {} ({snapshot} PPM)", path.display());
+        true
+    }
+
+    pub(crate) fn export_ui_screenshot_png(&mut self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let path = default_ui_screenshot_png_export_path();
+            return self.export_ui_screenshot_png_to_path(
+                &path,
+                UI_SCREENSHOT_EXPORT_WIDTH,
+                UI_SCREENSHOT_EXPORT_HEIGHT,
+            );
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.status_message =
+                "Screenshot PNG export is available in the native app".to_string();
+            true
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn export_ui_screenshot_png_to_path(
+        &mut self,
+        path: &Path,
+        width: u32,
+        height: u32,
+    ) -> bool {
+        let ui_scale = UiScale::new(self.app_options.appearance.ui_scale);
+        let report = match self.render_operad_snapshot_scaled(width, height, ui_scale) {
+            Ok(report) => report,
+            Err(error) => {
+                self.status_message = format!("Screenshot PNG export failed: {error}");
+                return true;
+            }
+        };
+        if let Err(error) = write_operad_snapshot_png(path, &report) {
+            self.status_message = format!("Screenshot PNG export failed: {error}");
+            return true;
+        }
+        let snapshot = report
+            .render
+            .snapshot
+            .as_ref()
+            .map(|image| format!("{}x{}", image.size.width, image.size.height))
+            .unwrap_or_else(|| format!("{width}x{height}"));
+        self.status_message = format!("Exported screenshot {} ({snapshot} PNG)", path.display());
         true
     }
 

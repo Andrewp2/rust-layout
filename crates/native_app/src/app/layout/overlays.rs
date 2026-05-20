@@ -42,7 +42,23 @@ pub(crate) fn layout_overlay_primitives(
         add_overlay_rect_outline(&mut primitives, app, size, shape.kind.bounds(), highlight);
     }
 
-    if matches!(app.active_tool, ToolMode::Route) {
+    if app.route_points.len() >= 2 {
+        for pair in app.route_points.windows(2) {
+            let color = if app.route_points.len() == 2 {
+                layout_route_point_path_color(app)
+            } else {
+                layout_route_point_segment_color(app, pair[0], pair[1])
+            };
+            let stroke = StrokeStyle::new(color, ui_scale.value(1.8));
+            primitives.push(ScenePrimitive::Line {
+                from: app.layout_world_to_canvas(pair[0], size),
+                to: app.layout_world_to_canvas(pair[1], size),
+                stroke,
+            });
+        }
+    }
+
+    if layout_should_show_route_point_markers(app) {
         let fill = ColorRgba::new(250, 210, 80, 255);
         for point in &app.route_points {
             primitives.push(ScenePrimitive::Circle {
@@ -98,6 +114,31 @@ pub(crate) fn layout_overlay_primitives(
     }
 
     primitives
+}
+
+pub(crate) fn layout_should_show_route_point_markers(app: &GlassworksApp) -> bool {
+    matches!(app.active_tool, ToolMode::Route) || app.route_points.len() >= 2
+}
+
+pub(crate) fn layout_route_point_path_color(app: &GlassworksApp) -> ColorRgba {
+    if app.route_points.len() < 2 {
+        return ColorRgba::new(250, 210, 80, 210);
+    }
+    let start = app.route_points[0];
+    let goal = *app.route_points.last().unwrap_or(&start);
+    layout_route_point_segment_color(app, start, goal)
+}
+
+pub(crate) fn layout_route_point_segment_color(
+    app: &GlassworksApp,
+    start: Point,
+    goal: Point,
+) -> ColorRgba {
+    match layout_trace_path_segment_status(app, start, goal) {
+        LayoutTracePathSegmentStatus::Connected { .. } => ColorRgba::new(105, 201, 135, 220),
+        LayoutTracePathSegmentStatus::Disconnected { .. } => ColorRgba::new(236, 91, 88, 220),
+        _ => ColorRgba::new(250, 210, 80, 210),
+    }
 }
 
 pub(crate) fn add_layout_reference_image_primitives(
@@ -183,10 +224,7 @@ pub(crate) fn layout_trace_highlight_occurrences(
     let Ok(report) = app.connectivity_report() else {
         return Vec::new();
     };
-    let selected_component = app
-        .selected_layout_occurrence
-        .as_ref()
-        .and_then(|occurrence| report.component_for_occurrence(occurrence));
+    let selected_component = selected_layout_net_component_id(app, &report);
     let mut component_ids = Vec::new();
     match app.layout_trace_highlight_mode {
         LayoutTraceHighlightMode::Selected => {

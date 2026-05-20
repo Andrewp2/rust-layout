@@ -618,6 +618,62 @@ impl GlassworksApp {
         true
     }
 
+    pub(crate) fn merge_layout_gds_hierarchy(&mut self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let path = default_ui_gds_exchange_path();
+            return self.merge_layout_gds_hierarchy_from_path(&path);
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.status_message = "GDS hierarchy merge is available in the native app".to_string();
+            true
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn merge_layout_gds_hierarchy_from_path(&mut self, path: &Path) -> bool {
+        let bytes = match read_native_bytes_file_maybe_gzip(path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.status_message = format!("GDS hierarchy merge failed: {error}");
+                return true;
+            }
+        };
+        let result = match import_gdsii_with_report(&bytes, self.active_layout_technology()) {
+            Ok(result) => result,
+            Err(error) => {
+                self.status_message = format!("GDS hierarchy merge failed: {error}");
+                return true;
+            }
+        };
+        let mut document = result.document;
+        document.ensure_hierarchy();
+        if let Err(error) = Self::validate_layout_document_snapshot(&document) {
+            self.status_message = format!("GDS hierarchy merge failed: {error}");
+            return true;
+        }
+        let import_name = document.name.trim().to_string().if_empty_then(|| {
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("layout")
+                .to_string()
+        });
+        let report = result.report;
+        self.apply_layout_hierarchy_merge_document(
+            &document,
+            &import_name,
+            path,
+            "GDS",
+            "gds",
+            format!(
+                ", {} warning(s), {} skipped",
+                report.warnings.len(),
+                report.skipped_elements.len()
+            ),
+        )
+    }
+
     pub(crate) fn import_layout_gds_as_cell(&mut self) -> bool {
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -990,6 +1046,58 @@ impl GlassworksApp {
         true
     }
 
+    pub(crate) fn merge_layout_cif_hierarchy(&mut self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let path = default_ui_cif_exchange_path();
+            return self.merge_layout_cif_hierarchy_from_path(&path);
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.status_message = "CIF hierarchy merge is available in the native app".to_string();
+            true
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn merge_layout_cif_hierarchy_from_path(&mut self, path: &Path) -> bool {
+        let contents = match read_native_text_file_maybe_gzip(path) {
+            Ok(contents) => contents,
+            Err(error) => {
+                self.status_message = format!("CIF hierarchy merge failed: {error}");
+                return true;
+            }
+        };
+        let result = match import_cif_with_report(&contents) {
+            Ok(result) => result,
+            Err(error) => {
+                self.status_message = format!("CIF hierarchy merge failed: {error}");
+                return true;
+            }
+        };
+        let mut document = result.document;
+        document.ensure_hierarchy();
+        if let Err(error) = Self::validate_layout_document_snapshot(&document) {
+            self.status_message = format!("CIF hierarchy merge failed: {error}");
+            return true;
+        }
+        let import_name = document.name.trim().to_string().if_empty_then(|| {
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("layout")
+                .to_string()
+        });
+        let report = result.report;
+        self.apply_layout_hierarchy_merge_document(
+            &document,
+            &import_name,
+            path,
+            "CIF",
+            "cif",
+            format!(", {} skipped", report.skipped_commands.len()),
+        )
+    }
+
     pub(crate) fn import_layout_cif_as_cell(&mut self) -> bool {
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -1360,6 +1468,58 @@ impl GlassworksApp {
         true
     }
 
+    pub(crate) fn merge_layout_dxf_hierarchy(&mut self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let path = default_ui_dxf_exchange_path();
+            return self.merge_layout_dxf_hierarchy_from_path(&path);
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.status_message = "DXF hierarchy merge is available in the native app".to_string();
+            true
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn merge_layout_dxf_hierarchy_from_path(&mut self, path: &Path) -> bool {
+        let contents = match read_native_text_file_maybe_gzip(path) {
+            Ok(contents) => contents,
+            Err(error) => {
+                self.status_message = format!("DXF hierarchy merge failed: {error}");
+                return true;
+            }
+        };
+        let result = match import_dxf_with_report(&contents) {
+            Ok(result) => result,
+            Err(error) => {
+                self.status_message = format!("DXF hierarchy merge failed: {error}");
+                return true;
+            }
+        };
+        let mut document = result.document;
+        document.ensure_hierarchy();
+        if let Err(error) = Self::validate_layout_document_snapshot(&document) {
+            self.status_message = format!("DXF hierarchy merge failed: {error}");
+            return true;
+        }
+        let import_name = document.name.trim().to_string().if_empty_then(|| {
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("layout")
+                .to_string()
+        });
+        let report = result.report;
+        self.apply_layout_hierarchy_merge_document(
+            &document,
+            &import_name,
+            path,
+            "DXF",
+            "dxf",
+            format!(", {} skipped", report.skipped_entities.len()),
+        )
+    }
+
     pub(crate) fn import_layout_dxf_as_cell(&mut self) -> bool {
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -1652,6 +1812,19 @@ impl GlassworksApp {
         #[cfg(target_arch = "wasm32")]
         {
             self.status_message = "DEF merge is available in the native app".to_string();
+            true
+        }
+    }
+
+    pub(crate) fn merge_layout_def_hierarchy(&mut self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let path = default_ui_def_exchange_path();
+            return self.merge_layout_def_hierarchy_from_path(&path);
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.status_message = "DEF hierarchy merge is available in the native app".to_string();
             true
         }
     }

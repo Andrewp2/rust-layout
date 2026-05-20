@@ -3,9 +3,9 @@ use super::*;
 
 impl GlassworksApp {
     pub(crate) fn subtract_selection_from_active_layer_rectangles(&mut self) -> bool {
-        let Some(cut_shape) = self.selected_top_level_layout_shape() else {
+        let Some((cell_id, _, cut_shape)) = self.selected_current_cell_layout_shape() else {
             self.status_message =
-                "Select a top-level rectangle or polygon before subtracting from a layer"
+                "Select a current-cell rectangle or polygon before subtracting from a layer"
                     .to_string();
             return true;
         };
@@ -15,10 +15,8 @@ impl GlassworksApp {
         };
 
         let mut old_shapes = self
-            .workspace
-            .document
-            .shapes
-            .values()
+            .layout_cell_shapes(cell_id)
+            .into_iter()
             .filter(|shape| {
                 shape.layer == self.active_layer
                     && convex_region_points_for_shape_kind(&shape.kind).is_some()
@@ -27,7 +25,7 @@ impl GlassworksApp {
         old_shapes.sort_by_key(|shape| shape.id);
         if old_shapes.is_empty() {
             self.status_message =
-                "Active layer has no top-level rectangles or convex polygons to subtract from"
+                "Active layer has no current-cell rectangles or convex polygons to subtract from"
                     .to_string();
             return true;
         }
@@ -68,12 +66,12 @@ impl GlassworksApp {
             Operation::Batch {
                 operations: old_shapes
                     .iter()
-                    .map(|shape| Operation::DeleteShape { id: shape.id })
+                    .map(|shape| self.shape_delete_operation(cell_id, shape.id))
                     .chain(
                         fragments
                             .iter()
                             .cloned()
-                            .map(|shape| Operation::AddShape { shape }),
+                            .map(|shape| self.shape_add_operation(cell_id, shape)),
                     )
                     .collect(),
             },
@@ -81,12 +79,12 @@ impl GlassworksApp {
                 operations: fragments
                     .iter()
                     .rev()
-                    .map(|shape| Operation::DeleteShape { id: shape.id })
+                    .map(|shape| self.shape_delete_operation(cell_id, shape.id))
                     .chain(
                         old_shapes
                             .iter()
                             .cloned()
-                            .map(|shape| Operation::AddShape { shape }),
+                            .map(|shape| self.shape_add_operation(cell_id, shape)),
                     )
                     .collect(),
             },
@@ -104,9 +102,9 @@ impl GlassworksApp {
     }
 
     pub(crate) fn subtract_active_layer_rectangles_from_selection(&mut self) -> bool {
-        let Some(source_shape) = self.selected_top_level_layout_shape() else {
+        let Some((cell_id, _, source_shape)) = self.selected_current_cell_layout_shape() else {
             self.status_message =
-                "Select a top-level rectangle or polygon before subtracting a layer".to_string();
+                "Select a current-cell rectangle or polygon before subtracting a layer".to_string();
             return true;
         };
         if convex_region_parts_for_shape_kind(&source_shape.kind).is_none() {
@@ -115,10 +113,8 @@ impl GlassworksApp {
         }
 
         let mut old_shapes = self
-            .workspace
-            .document
-            .shapes
-            .values()
+            .layout_cell_shapes(cell_id)
+            .into_iter()
             .filter(|shape| {
                 shape.layer == self.active_layer
                     && convex_region_points_for_shape_kind(&shape.kind).is_some()
@@ -158,12 +154,12 @@ impl GlassworksApp {
             Operation::Batch {
                 operations: old_shapes
                     .iter()
-                    .map(|shape| Operation::DeleteShape { id: shape.id })
+                    .map(|shape| self.shape_delete_operation(cell_id, shape.id))
                     .chain(
                         fragments
                             .iter()
                             .cloned()
-                            .map(|shape| Operation::AddShape { shape }),
+                            .map(|shape| self.shape_add_operation(cell_id, shape)),
                     )
                     .collect(),
             },
@@ -171,12 +167,12 @@ impl GlassworksApp {
                 operations: fragments
                     .iter()
                     .rev()
-                    .map(|shape| Operation::DeleteShape { id: shape.id })
+                    .map(|shape| self.shape_delete_operation(cell_id, shape.id))
                     .chain(
                         old_shapes
                             .iter()
                             .cloned()
-                            .map(|shape| Operation::AddShape { shape }),
+                            .map(|shape| self.shape_add_operation(cell_id, shape)),
                     )
                     .collect(),
             },
@@ -194,9 +190,9 @@ impl GlassworksApp {
     }
 
     pub(crate) fn xor_active_layer_rectangles_with_selection(&mut self) -> bool {
-        let Some(cut_shape) = self.selected_top_level_layout_shape() else {
+        let Some((cell_id, _, cut_shape)) = self.selected_current_cell_layout_shape() else {
             self.status_message =
-                "Select a top-level rectangle or polygon before XORing a layer".to_string();
+                "Select a current-cell rectangle or polygon before XORing a layer".to_string();
             return true;
         };
         let Some(cut_regions) = convex_region_parts_for_shape_kind(&cut_shape.kind) else {
@@ -205,10 +201,8 @@ impl GlassworksApp {
         };
 
         let mut old_shapes = self
-            .workspace
-            .document
-            .shapes
-            .values()
+            .layout_cell_shapes(cell_id)
+            .into_iter()
             .filter(|shape| {
                 shape.layer == self.active_layer
                     && convex_region_points_for_shape_kind(&shape.kind).is_some()
@@ -264,12 +258,12 @@ impl GlassworksApp {
             Operation::Batch {
                 operations: old_shapes
                     .iter()
-                    .map(|shape| Operation::DeleteShape { id: shape.id })
+                    .map(|shape| self.shape_delete_operation(cell_id, shape.id))
                     .chain(
                         fragments
                             .iter()
                             .cloned()
-                            .map(|shape| Operation::AddShape { shape }),
+                            .map(|shape| self.shape_add_operation(cell_id, shape)),
                     )
                     .collect(),
             },
@@ -277,12 +271,12 @@ impl GlassworksApp {
                 operations: fragments
                     .iter()
                     .rev()
-                    .map(|shape| Operation::DeleteShape { id: shape.id })
+                    .map(|shape| self.shape_delete_operation(cell_id, shape.id))
                     .chain(
                         old_shapes
                             .iter()
                             .cloned()
-                            .map(|shape| Operation::AddShape { shape }),
+                            .map(|shape| self.shape_add_operation(cell_id, shape)),
                     )
                     .collect(),
             },
@@ -299,13 +293,239 @@ impl GlassworksApp {
         true
     }
 
+    pub(crate) fn boolean_active_layer_with_clipboard(
+        &mut self,
+        op: LayoutShapeClipboardBoolean,
+    ) -> bool {
+        if self.layout_clipboard_shapes.is_empty() {
+            self.status_message =
+                "Copy a rectangle or polygon before running layer clipboard boolean".to_string();
+            return true;
+        }
+
+        let cell_id = self.layout_view_top_cell;
+        let mut clipboard_shapes = Vec::with_capacity(self.layout_clipboard_shapes.len());
+        let mut clipboard_regions = Vec::new();
+        for shape in &self.layout_clipboard_shapes {
+            let Some(regions) = convex_region_parts_for_shape_kind(&shape.kind) else {
+                self.status_message = format!(
+                    "Layer boolean clipboard shape #{} must be a rectangle or polygon",
+                    shape.id.0
+                );
+                return true;
+            };
+            clipboard_shapes.push(shape.clone());
+            clipboard_regions.extend(regions);
+        }
+
+        let mut old_shapes = self
+            .layout_cell_shapes(cell_id)
+            .into_iter()
+            .filter(|shape| {
+                shape.layer == self.active_layer
+                    && convex_region_parts_for_shape_kind(&shape.kind).is_some()
+            })
+            .collect::<Vec<_>>();
+        old_shapes.sort_by_key(|shape| shape.id);
+        if old_shapes.is_empty()
+            && !matches!(
+                op,
+                LayoutShapeClipboardBoolean::Or | LayoutShapeClipboardBoolean::Xor
+            )
+        {
+            self.status_message =
+                "Active layer has no current-cell rectangles or polygons for clipboard boolean"
+                    .to_string();
+            return true;
+        }
+
+        let active_regions = old_shapes
+            .iter()
+            .filter_map(|shape| convex_region_parts_for_shape_kind(&shape.kind))
+            .flatten()
+            .collect::<Vec<_>>();
+        let active_net = same_optional_net(&old_shapes);
+        let mut fragments = Vec::new();
+        match op {
+            LayoutShapeClipboardBoolean::And => {
+                for shape in &old_shapes {
+                    let source_regions =
+                        convex_region_parts_for_shape_kind(&shape.kind).unwrap_or_default();
+                    let output_net = if clipboard_shapes
+                        .iter()
+                        .all(|clip| clip.net.is_none_or(|net| shape.net == Some(net)))
+                    {
+                        shape.net
+                    } else {
+                        None
+                    };
+                    for points in source_regions {
+                        let Some(source_kind) = shape_kind_from_region_points(points) else {
+                            continue;
+                        };
+                        for clip_points in &clipboard_regions {
+                            if let Some(kind) = clip_shape_kind_to_region(&source_kind, clip_points)
+                            {
+                                fragments.push(Shape {
+                                    id: self.workspace.document.allocate_shape_id(),
+                                    layer: self.active_layer,
+                                    net: output_net,
+                                    kind,
+                                    name: None,
+                                    properties: shape.properties.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            LayoutShapeClipboardBoolean::Or => {
+                for shape in &old_shapes {
+                    for kind in subtract_convex_regions_from_region_parts(
+                        &shape.kind,
+                        clipboard_regions.iter().map(Vec::as_slice),
+                    ) {
+                        fragments.push(Shape {
+                            id: self.workspace.document.allocate_shape_id(),
+                            layer: self.active_layer,
+                            net: shape.net,
+                            kind,
+                            name: None,
+                            properties: shape.properties.clone(),
+                        });
+                    }
+                }
+                for shape in &clipboard_shapes {
+                    fragments.push(Shape {
+                        id: self.workspace.document.allocate_shape_id(),
+                        layer: self.active_layer,
+                        net: if shape.net == active_net {
+                            shape.net
+                        } else {
+                            None
+                        },
+                        kind: shape.kind.clone(),
+                        name: None,
+                        properties: shape.properties.clone(),
+                    });
+                }
+            }
+            LayoutShapeClipboardBoolean::Not => {
+                for shape in &old_shapes {
+                    for kind in subtract_convex_regions_from_region_parts(
+                        &shape.kind,
+                        clipboard_regions.iter().map(Vec::as_slice),
+                    ) {
+                        fragments.push(Shape {
+                            id: self.workspace.document.allocate_shape_id(),
+                            layer: self.active_layer,
+                            net: shape.net,
+                            kind,
+                            name: None,
+                            properties: shape.properties.clone(),
+                        });
+                    }
+                }
+            }
+            LayoutShapeClipboardBoolean::Xor => {
+                for shape in &old_shapes {
+                    for kind in subtract_convex_regions_from_region_parts(
+                        &shape.kind,
+                        clipboard_regions.iter().map(Vec::as_slice),
+                    ) {
+                        fragments.push(Shape {
+                            id: self.workspace.document.allocate_shape_id(),
+                            layer: self.active_layer,
+                            net: shape.net,
+                            kind,
+                            name: None,
+                            properties: shape.properties.clone(),
+                        });
+                    }
+                }
+                for shape in &clipboard_shapes {
+                    for kind in subtract_convex_regions_from_region_parts(
+                        &shape.kind,
+                        active_regions.iter().map(Vec::as_slice),
+                    ) {
+                        fragments.push(Shape {
+                            id: self.workspace.document.allocate_shape_id(),
+                            layer: self.active_layer,
+                            net: if shape.net == active_net {
+                                shape.net
+                            } else {
+                                None
+                            },
+                            kind,
+                            name: None,
+                            properties: shape.properties.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        fragments.sort_by_key(|shape| shape.id);
+
+        if old_shapes.is_empty() && fragments.is_empty() {
+            self.status_message =
+                format!("Layer {} clipboard found no shapes to write", op.label());
+            return true;
+        }
+
+        let selected = fragments.first().map(|shape| shape.id);
+        let old_count = old_shapes.len();
+        let fragment_count = fragments.len();
+        let clipboard_count = clipboard_shapes.len();
+        self.apply_layout_operation_with_history(
+            Operation::Batch {
+                operations: old_shapes
+                    .iter()
+                    .map(|shape| self.shape_delete_operation(cell_id, shape.id))
+                    .chain(
+                        fragments
+                            .iter()
+                            .cloned()
+                            .map(|shape| self.shape_add_operation(cell_id, shape)),
+                    )
+                    .collect(),
+            },
+            Operation::Batch {
+                operations: fragments
+                    .iter()
+                    .rev()
+                    .map(|shape| self.shape_delete_operation(cell_id, shape.id))
+                    .chain(
+                        old_shapes
+                            .iter()
+                            .cloned()
+                            .map(|shape| self.shape_add_operation(cell_id, shape)),
+                    )
+                    .collect(),
+            },
+        );
+        self.selected_layout_shape = selected;
+        self.selected_layout_occurrence = selected.map(ShapeOccurrenceId::top_level);
+        self.status_message = format!(
+            "Layer {} clipboard replaced {} active-layer shape{} with {} fragment{} from {} clipboard shape{}",
+            op.label(),
+            old_count,
+            if old_count == 1 { "" } else { "s" },
+            fragment_count,
+            if fragment_count == 1 { "" } else { "s" },
+            clipboard_count,
+            if clipboard_count == 1 { "" } else { "s" }
+        );
+        true
+    }
+
     pub(crate) fn boolean_selected_shape_with_clipboard(
         &mut self,
         op: LayoutShapeClipboardBoolean,
     ) -> bool {
-        let Some(source_shape) = self.selected_top_level_layout_shape() else {
+        let Some((source_cell, _, source_shape)) = self.selected_current_cell_layout_shape() else {
             self.status_message =
-                "Select a top-level rectangle or polygon before running shape boolean".to_string();
+                "Select a current-cell rectangle or polygon before running shape boolean"
+                    .to_string();
             return true;
         };
         let Some(source_regions) = convex_region_parts_for_shape_kind(&source_shape.kind) else {
@@ -313,34 +533,48 @@ impl GlassworksApp {
                 "Shape boolean currently supports selected rectangles and polygons".to_string();
             return true;
         };
-        let Some(clipboard_shape) = self.layout_clipboard_shapes.first().cloned() else {
+        if self.layout_clipboard_shapes.is_empty() {
             self.status_message =
                 "Copy a rectangle or polygon before running shape boolean".to_string();
             return true;
-        };
-        let Some(clipboard_regions) = convex_region_parts_for_shape_kind(&clipboard_shape.kind)
-        else {
-            self.status_message =
-                "Shape boolean clipboard must be a rectangle or polygon".to_string();
-            return true;
-        };
+        }
+
+        let mut clipboard_shapes = Vec::with_capacity(self.layout_clipboard_shapes.len());
+        let mut clipboard_regions = Vec::new();
+        for shape in &self.layout_clipboard_shapes {
+            let Some(regions) = convex_region_parts_for_shape_kind(&shape.kind) else {
+                self.status_message = format!(
+                    "Shape boolean clipboard shape #{} must be a rectangle or polygon",
+                    shape.id.0
+                );
+                return true;
+            };
+            clipboard_shapes.push(shape.clone());
+            clipboard_regions.extend(regions);
+        }
 
         let fragment_kinds = match op {
-            LayoutShapeClipboardBoolean::And => source_regions
-                .iter()
-                .filter_map(|points| shape_kind_from_region_points(points.clone()))
-                .flat_map(|source_kind| {
-                    clipboard_regions.iter().filter_map(move |clip_points| {
-                        clip_shape_kind_to_region(&source_kind, clip_points)
-                    })
-                })
-                .collect::<Vec<_>>(),
+            LayoutShapeClipboardBoolean::And => {
+                let mut fragments = Vec::new();
+                for points in &source_regions {
+                    let Some(source_kind) = shape_kind_from_region_points(points.clone()) else {
+                        continue;
+                    };
+                    for clip_points in &clipboard_regions {
+                        if let Some(fragment) = clip_shape_kind_to_region(&source_kind, clip_points)
+                        {
+                            fragments.push(fragment);
+                        }
+                    }
+                }
+                fragments
+            }
             LayoutShapeClipboardBoolean::Or => {
                 let mut fragments = subtract_convex_regions_from_region_parts(
                     &source_shape.kind,
                     clipboard_regions.iter().map(Vec::as_slice),
                 );
-                fragments.push(clipboard_shape.kind.clone());
+                fragments.extend(clipboard_shapes.iter().map(|shape| shape.kind.clone()));
                 fragments
             }
             LayoutShapeClipboardBoolean::Not => subtract_convex_regions_from_region_parts(
@@ -352,28 +586,29 @@ impl GlassworksApp {
                     &source_shape.kind,
                     clipboard_regions.iter().map(Vec::as_slice),
                 );
-                fragments.extend(subtract_convex_regions_from_region_parts(
-                    &clipboard_shape.kind,
-                    source_regions.iter().map(Vec::as_slice),
-                ));
+                for shape in &clipboard_shapes {
+                    fragments.extend(subtract_convex_regions_from_region_parts(
+                        &shape.kind,
+                        source_regions.iter().map(Vec::as_slice),
+                    ));
+                }
                 fragments
             }
         };
+        let clipboard_count = clipboard_shapes.len();
+        let clipboard_nets_are_none_or_source = clipboard_shapes
+            .iter()
+            .all(|shape| shape.net.is_none_or(|net| source_shape.net == Some(net)));
+        let clipboard_nets_match_source = clipboard_shapes
+            .iter()
+            .all(|shape| shape.net == source_shape.net);
         let output_net = match op {
-            LayoutShapeClipboardBoolean::And
-                if clipboard_shape
-                    .net
-                    .is_none_or(|net| source_shape.net == Some(net)) =>
-            {
+            LayoutShapeClipboardBoolean::And if clipboard_nets_are_none_or_source => {
                 source_shape.net
             }
-            LayoutShapeClipboardBoolean::Or if clipboard_shape.net == source_shape.net => {
-                source_shape.net
-            }
+            LayoutShapeClipboardBoolean::Or if clipboard_nets_match_source => source_shape.net,
             LayoutShapeClipboardBoolean::Not => source_shape.net,
-            LayoutShapeClipboardBoolean::Xor if clipboard_shape.net == source_shape.net => {
-                source_shape.net
-            }
+            LayoutShapeClipboardBoolean::Xor if clipboard_nets_match_source => source_shape.net,
             _ => None,
         };
         if fragment_kinds.len() == 1
@@ -405,14 +640,14 @@ impl GlassworksApp {
 
         self.apply_layout_operation_with_history(
             Operation::Batch {
-                operations: std::iter::once(Operation::DeleteShape {
-                    id: source_shape.id,
-                })
+                operations: std::iter::once(
+                    self.shape_delete_operation(source_cell, source_shape.id),
+                )
                 .chain(
                     fragments
                         .iter()
                         .cloned()
-                        .map(|shape| Operation::AddShape { shape }),
+                        .map(|shape| self.shape_add_operation(source_cell, shape)),
                 )
                 .collect(),
             },
@@ -420,29 +655,33 @@ impl GlassworksApp {
                 operations: fragments
                     .iter()
                     .rev()
-                    .map(|shape| Operation::DeleteShape { id: shape.id })
-                    .chain(std::iter::once(Operation::AddShape {
-                        shape: source_shape.clone(),
-                    }))
+                    .map(|shape| self.shape_delete_operation(source_cell, shape.id))
+                    .chain(std::iter::once(
+                        self.shape_add_operation(source_cell, source_shape.clone()),
+                    ))
                     .collect(),
             },
         );
         self.selected_layout_shape = selected;
         self.selected_layout_occurrence = selected.map(ShapeOccurrenceId::top_level);
         self.status_message = format!(
-            "Shape {} clipboard replaced shape #{} with {} fragment{}",
+            "Shape {} clipboard replaced shape #{} with {} fragment{} from {} clipboard shape{}",
             op.label(),
             source_shape.id.0,
             fragment_count,
-            if fragment_count == 1 { "" } else { "s" }
+            if fragment_count == 1 { "" } else { "s" },
+            clipboard_count,
+            if clipboard_count == 1 { "" } else { "s" }
         );
         true
     }
 
     pub(crate) fn create_clip_cell_from_selected_region(&mut self) -> bool {
-        let Some(clip_shape) = self.selected_top_level_layout_shape() else {
+        let Some((source_cell_id, _, clip_shape)) = self.selected_current_cell_layout_shape()
+        else {
             self.status_message =
-                "Select a top-level rectangle or polygon before creating a clip cell".to_string();
+                "Select a current-cell rectangle or polygon before creating a clip cell"
+                    .to_string();
             return true;
         };
         let Some(clip_regions) = convex_region_parts_for_shape_kind(&clip_shape.kind) else {
@@ -456,14 +695,86 @@ impl GlassworksApp {
             return true;
         };
 
+        self.create_clip_cell_from_regions(
+            source_cell_id,
+            clip_regions,
+            clip_bounds,
+            BTreeSet::from([clip_shape.id]),
+            "Active layer has no current-cell rectangles or polygons inside the selected clip region",
+            None,
+        )
+    }
+
+    pub(crate) fn create_clip_cell_from_clipboard(&mut self) -> bool {
+        if self.layout_clipboard_shapes.is_empty() {
+            self.status_message =
+                "Copy a rectangle or polygon before creating a clipboard clip cell".to_string();
+            return true;
+        }
+
+        let mut clip_regions = Vec::new();
+        let mut clip_bounds = None::<Rect>;
+        let mut excluded_shape_ids = BTreeSet::new();
+        for shape in &self.layout_clipboard_shapes {
+            let Some(regions) = convex_region_parts_for_shape_kind(&shape.kind) else {
+                self.status_message = format!(
+                    "Clip-cell clipboard shape #{} must be a rectangle or polygon",
+                    shape.id.0
+                );
+                return true;
+            };
+            let Some(bounds) = region_points_for_shape_kind(&shape.kind)
+                .and_then(|points| Rect::from_points(&points))
+            else {
+                self.status_message = format!(
+                    "Clip-cell clipboard shape #{} has no usable bounds",
+                    shape.id.0
+                );
+                return true;
+            };
+            clip_bounds = Some(
+                clip_bounds
+                    .map(|existing| existing.union(bounds))
+                    .unwrap_or(bounds),
+            );
+            excluded_shape_ids.insert(shape.id);
+            clip_regions.extend(regions);
+        }
+        let Some(clip_bounds) = clip_bounds else {
+            self.status_message = "Clipboard clip cell has no usable bounds".to_string();
+            return true;
+        };
+        let clipboard_count = self.layout_clipboard_shapes.len();
+
+        self.create_clip_cell_from_regions(
+            self.layout_view_top_cell,
+            clip_regions,
+            clip_bounds,
+            excluded_shape_ids,
+            "Active layer has no current-cell rectangles or polygons inside the clipboard clip regions",
+            Some(format!(
+                " from {} clipboard shape{}",
+                clipboard_count,
+                if clipboard_count == 1 { "" } else { "s" }
+            )),
+        )
+    }
+
+    fn create_clip_cell_from_regions(
+        &mut self,
+        source_cell_id: CellId,
+        clip_regions: Vec<Vec<Point>>,
+        clip_bounds: Rect,
+        excluded_shape_ids: BTreeSet<ShapeId>,
+        empty_message: &str,
+        status_detail: Option<String>,
+    ) -> bool {
         let mut source_shapes = self
-            .workspace
-            .document
-            .shapes
-            .values()
+            .layout_cell_shapes(source_cell_id)
+            .into_iter()
             .filter(|shape| {
                 shape.layer == self.active_layer
-                    && shape.id != clip_shape.id
+                    && !excluded_shape_ids.contains(&shape.id)
                     && region_points_for_shape_kind(&shape.kind).is_some()
             })
             .collect::<Vec<_>>();
@@ -490,22 +801,20 @@ impl GlassworksApp {
         }
 
         if clipped_shapes.is_empty() {
-            self.status_message =
-                "Active layer has no top-level rectangles or polygons inside the selected clip region"
-                    .to_string();
+            self.status_message = empty_message.to_string();
             return true;
         }
 
-        let cell_id = self.workspace.document.allocate_cell_id();
+        let clip_cell_id = self.workspace.document.allocate_cell_id();
         let instance_id = self.workspace.document.allocate_instance_id();
-        let mut cell = Cell::new(cell_id, format!("clip {}", cell_id.0));
+        let mut cell = Cell::new(clip_cell_id, format!("clip {}", clip_cell_id.0));
         for shape in &clipped_shapes {
             cell.shapes.insert(shape.id, shape.clone());
         }
         let instance = CellInstance {
             id: instance_id,
             name: Some(format!("{} inst", cell.name)),
-            cell: cell_id,
+            cell: clip_cell_id,
             transform: Transform::translate(origin.x, origin.y),
             array: InstanceArray::single(),
             properties: BTreeMap::new(),
@@ -518,7 +827,7 @@ impl GlassworksApp {
                 operations: vec![
                     Operation::AddCell { cell: cell.clone() },
                     Operation::AddInstance {
-                        parent: self.workspace.document.top_cell,
+                        parent: source_cell_id,
                         instance: instance.clone(),
                     },
                 ],
@@ -526,7 +835,7 @@ impl GlassworksApp {
             Operation::Batch {
                 operations: vec![
                     Operation::DeleteInstance {
-                        parent: self.workspace.document.top_cell,
+                        parent: source_cell_id,
                         id: instance.id,
                     },
                     Operation::DeleteCell { id: cell.id },
@@ -537,10 +846,11 @@ impl GlassworksApp {
         self.selected_layout_occurrence =
             selected.map(|id| ShapeOccurrenceId::from_instance_path(id, &[instance_id]));
         self.status_message = format!(
-            "Created {} from {} clipped shape{}",
+            "Created {} from {} clipped shape{}{}",
             cell.name,
             clipped_count,
-            if clipped_count == 1 { "" } else { "s" }
+            if clipped_count == 1 { "" } else { "s" },
+            status_detail.unwrap_or_default()
         );
         true
     }
@@ -585,8 +895,8 @@ impl GlassworksApp {
         transform: ShapeTransform,
         label: &str,
     ) -> bool {
-        let Some(old_shape) = self.selected_top_level_layout_shape() else {
-            self.status_message = "Select a top-level shape to transform".to_string();
+        let Some((source_cell, _, old_shape)) = self.selected_current_cell_layout_shape() else {
+            self.status_message = "Select a current-cell shape to transform".to_string();
             return true;
         };
         let center = old_shape.kind.bounds().center();
@@ -596,16 +906,35 @@ impl GlassworksApp {
             self.status_message = format!("{label} shape #{}", old_shape.id.0);
             return true;
         }
-        self.apply_layout_operation_with_history(
-            Operation::ReplaceShape {
-                id: old_shape.id,
-                shape: new_shape,
-            },
-            Operation::ReplaceShape {
-                id: old_shape.id,
-                shape: old_shape.clone(),
-            },
-        );
+        if source_cell == self.workspace.document.top_cell {
+            self.apply_layout_operation_with_history(
+                Operation::ReplaceShape {
+                    id: old_shape.id,
+                    shape: new_shape,
+                },
+                Operation::ReplaceShape {
+                    id: old_shape.id,
+                    shape: old_shape.clone(),
+                },
+            );
+        } else {
+            self.apply_layout_operation_with_history(
+                Operation::Batch {
+                    operations: vec![
+                        self.shape_delete_operation(source_cell, old_shape.id),
+                        self.shape_add_operation(source_cell, new_shape),
+                    ],
+                },
+                Operation::Batch {
+                    operations: vec![
+                        self.shape_delete_operation(source_cell, old_shape.id),
+                        self.shape_add_operation(source_cell, old_shape.clone()),
+                    ],
+                },
+            );
+            self.layout_view_top_cell = source_cell;
+            self.layout_hidden_cells.remove(&source_cell);
+        }
         self.selected_layout_shape = Some(old_shape.id);
         self.selected_layout_occurrence = Some(ShapeOccurrenceId::top_level(old_shape.id));
         self.status_message = format!("{label} shape #{}", old_shape.id.0);
@@ -853,12 +1182,28 @@ impl GlassworksApp {
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
+        let marker_state_replacements = self
+            .drc_report()
+            .map(|report| {
+                report
+                    .violations
+                    .iter()
+                    .filter_map(|violation| {
+                        let key = violation.stable_key();
+                        let state = self.workspace.document.marker_states.get(&key)?;
+                        marker_state_with_layout_search_replacement(state, &query, &replacement)
+                            .map(|new_state| (key, state.clone(), new_state))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let replacement_count = top_replacements.len()
             + cell_shape_replacements.len()
             + cell_name_replacements.len()
             + cell_property_replacements.len()
             + layer_name_replacements.len()
-            + instance_replacements.len();
+            + instance_replacements.len()
+            + marker_state_replacements.len();
         if replacement_count == 0 {
             self.status_message = format!(
                 "No layout objects matched {}",
@@ -873,7 +1218,8 @@ impl GlassworksApp {
                 + cell_name_replacements.len()
                 + cell_property_replacements.len()
                 + layer_name_replacements.len()
-                + instance_replacements.len(),
+                + instance_replacements.len()
+                + marker_state_replacements.len(),
         );
         let mut undo = Vec::with_capacity(redo.capacity());
         for (shape_id, old_shape, new_shape) in &top_replacements {
@@ -926,6 +1272,16 @@ impl GlassworksApp {
                 parent: *parent,
                 id: *instance_id,
                 instance: old_instance.clone(),
+            });
+        }
+        for (key, old_state, new_state) in &marker_state_replacements {
+            redo.push(Operation::SetMarkerState {
+                key: key.clone(),
+                state: (new_state != &MarkerState::default()).then(|| new_state.clone()),
+            });
+            undo.push(Operation::SetMarkerState {
+                key: key.clone(),
+                state: (old_state != &MarkerState::default()).then(|| old_state.clone()),
             });
         }
         for (cell, old_shape, new_shape) in &cell_shape_replacements {
@@ -1010,6 +1366,7 @@ impl GlassworksApp {
             self.status_message = format!("Netlist export failed: {error}");
             return true;
         }
+        self.record_recent_layout_file("netlist", path);
         self.status_message = format!(
             "Exported netlist {} ({} component(s), {} device(s), {} short(s), {} open(s))",
             path.display(),
@@ -1114,26 +1471,32 @@ impl GlassworksApp {
         let layout_issues = comparison.layout_issue_count();
         let devices = comparison.schematic_device_count;
         let named_nets = comparison.layout_named_nets.len();
+        let net_browser_filter = if layout_spice_issue_net_count(&report, &comparison) > 0 {
+            LayoutNetBrowserFilter::SpiceIssues
+        } else {
+            LayoutNetBrowserFilter::All
+        };
         self.layout_spice_comparison = Some(comparison);
-        self.layout_net_browser_filter = LayoutNetBrowserFilter::All;
+        self.record_recent_layout_file("spice_schematic", path);
+        self.layout_net_browser_filter = net_browser_filter;
         self.layout_net_browser_sort = LayoutNetBrowserSort::Name;
         self.layout_browser_search.clear();
-        self.status_message = if missing == 0 && extra == 0 && layout_issues == 0 {
-            format!(
+        if missing == 0 && extra == 0 && device_mismatches == 0 && layout_issues == 0 {
+            self.status_message = format!(
                 "SPICE schematic {} matches layout connectivity ({} named net(s), {} device(s))",
                 path.display(),
                 named_nets,
                 devices
-            )
+            );
         } else {
-            format!(
+            self.status_message = format!(
                 "SPICE schematic compare {status}: {} missing, {} extra, {} problem(s) in {}",
                 missing,
                 extra,
                 layout_issues + device_mismatches,
                 path.display()
-            )
-        };
+            );
+        }
         true
     }
 
@@ -1177,6 +1540,12 @@ impl GlassworksApp {
         let device_count = exchange.devices.len();
         let short_count = exchange.shorts.len();
         let open_count = exchange.opens.len();
+        let source = LayoutConnectivityReportSource {
+            label: "Imported netlist".to_string(),
+            document_name: exchange.document_name.clone(),
+            layout_revision: exchange.layout_revision,
+            technology_name: exchange.technology_name.clone(),
+        };
         let report = exchange.into_report();
         if let Err(error) = Self::validate_connectivity_report(&report) {
             self.status_message = format!("Netlist import failed: {error}");
@@ -1185,6 +1554,7 @@ impl GlassworksApp {
         *self.connectivity_report_cache.borrow_mut() = Some(ConnectivityReportCacheValue {
             revision: self.layout_revision,
             report: Ok(report),
+            source: Some(source),
         });
         self.layout_spice_comparison = None;
         self.layout_net_browser_filter = LayoutNetBrowserFilter::All;
@@ -1198,6 +1568,7 @@ impl GlassworksApp {
             short_count,
             open_count
         );
+        self.record_recent_layout_file("netlist", path);
         true
     }
 
@@ -1228,6 +1599,7 @@ impl GlassworksApp {
             self.status_message = format!("Trace state export failed: {error}");
             return true;
         }
+        self.record_recent_layout_file("trace_state", path);
         self.status_message = format!(
             "Exported trace state {} ({} trace(s), {} route point(s))",
             path.display(),
@@ -1289,6 +1661,7 @@ impl GlassworksApp {
             route_point_count,
             skipped_components
         );
+        self.record_recent_layout_file("trace_state", path);
         true
     }
 
@@ -1329,7 +1702,14 @@ impl GlassworksApp {
         let route_point_count = exchange.route_points.len();
         self.route_points = exchange.route_points;
         self.layout_trace_history = history.clone();
-        self.layout_net_browser_filter = LayoutNetBrowserFilter::All;
+        self.layout_trace_highlight_mode =
+            LayoutTraceHighlightMode::from_slug(&exchange.highlight_mode)
+                .unwrap_or(LayoutTraceHighlightMode::Selected);
+        self.layout_net_browser_filter = if history.is_empty() {
+            LayoutNetBrowserFilter::All
+        } else {
+            LayoutNetBrowserFilter::History
+        };
         self.layout_browser_search.clear();
         self.layout_browser_search_active = false;
 
@@ -1470,6 +1850,12 @@ impl GlassworksApp {
         let device_count = exchange.netlist.devices.len();
         let short_count = exchange.netlist.shorts.len();
         let open_count = exchange.netlist.opens.len();
+        let source = LayoutConnectivityReportSource {
+            label: "Imported L2N DB".to_string(),
+            document_name: exchange.document_name.clone(),
+            layout_revision: exchange.layout_revision,
+            technology_name: exchange.netlist.technology_name.clone(),
+        };
         let report = exchange.netlist.into_report();
         if let Err(error) = Self::validate_connectivity_report(&report) {
             self.status_message = format!("L2N database import failed: {error}");
@@ -1478,6 +1864,7 @@ impl GlassworksApp {
         *self.connectivity_report_cache.borrow_mut() = Some(ConnectivityReportCacheValue {
             revision: self.layout_revision,
             report: Ok(report),
+            source: Some(source),
         });
         self.layout_spice_comparison = None;
         let (trace_count, route_point_count, skipped_components) =
@@ -1538,6 +1925,7 @@ impl GlassworksApp {
         self.selected_layout_shape = None;
         self.selected_layout_occurrence = None;
         self.layout_drc_marker_category_filter = None;
+        self.layout_drc_marker_directory_filter = None;
         self.layout_drc_report_history.clear();
         self.layout_selected_drc_report_id = None;
         self.layout_next_drc_report_id = 1;

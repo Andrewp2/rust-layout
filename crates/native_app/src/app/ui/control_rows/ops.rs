@@ -444,7 +444,11 @@ pub(crate) fn process_flow_control_rows(app: &GlassworksApp) -> Vec<Vec<ViewCont
             "Errors",
             app.process_flow_errors_only,
         ),
-        ViewControlButton::new("glassworks.viewctl.process_flow.validate", "Validate", false),
+        ViewControlButton::new(
+            "glassworks.viewctl.process_flow.validate",
+            "Validate",
+            false,
+        ),
     ]);
     rows.push(vec![ViewControlButton::new(
         "glassworks.viewctl.process_flow.export",

@@ -154,6 +154,30 @@ impl LayoutShapeClipboardBoolean {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LayoutSizeMode {
+    Uniform,
+    X,
+    Y,
+}
+
+impl LayoutSizeMode {
+    pub(crate) fn status_axis_label(self) -> &'static str {
+        match self {
+            Self::Uniform => "",
+            Self::X => " in X",
+            Self::Y => " in Y",
+        }
+    }
+
+    pub(crate) fn supported_shape_label(self) -> &'static str {
+        match self {
+            Self::Uniform => "rectangles, polygons, paths, and vias",
+            Self::X | Self::Y => "rectangles and polygons",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LayoutAlignEdge {
     Left,
     Right,
@@ -186,6 +210,28 @@ pub(crate) fn rect_center_x(rect: Rect) -> Coord {
 
 pub(crate) fn rect_center_y(rect: Rect) -> Coord {
     rect.min.y + (rect.max.y - rect.min.y) / 2
+}
+
+pub(crate) fn layout_align_delta_to_bounds(
+    source_bounds: Rect,
+    target_bounds: Rect,
+    edge: LayoutAlignEdge,
+) -> Vector {
+    match edge {
+        LayoutAlignEdge::Left => Vector::new(target_bounds.min.x - source_bounds.min.x, 0),
+        LayoutAlignEdge::Right => Vector::new(target_bounds.max.x - source_bounds.max.x, 0),
+        LayoutAlignEdge::Top => Vector::new(0, target_bounds.max.y - source_bounds.max.y),
+        LayoutAlignEdge::Bottom => Vector::new(0, target_bounds.min.y - source_bounds.min.y),
+        LayoutAlignEdge::CenterX => Vector::new(
+            rect_center_x(target_bounds) - rect_center_x(source_bounds),
+            0,
+        ),
+        LayoutAlignEdge::CenterY => Vector::new(
+            0,
+            rect_center_y(target_bounds) - rect_center_y(source_bounds),
+        ),
+        LayoutAlignEdge::OriginX | LayoutAlignEdge::OriginY => Vector::ZERO,
+    }
 }
 
 pub(crate) fn transform_shape_kind(
@@ -240,11 +286,19 @@ pub(crate) fn transform_point(point: Point, center: Point, transform: ShapeTrans
     }
 }
 
-pub(crate) fn sized_shape_kind(kind: &ShapeKind, amount: Coord) -> Option<ShapeKind> {
+pub(crate) fn sized_shape_kind_with_mode(
+    kind: &ShapeKind,
+    amount: Coord,
+    mode: LayoutSizeMode,
+) -> Option<ShapeKind> {
     match kind {
-        ShapeKind::Rectangle(rect) => sized_rect(*rect, amount).map(ShapeKind::Rectangle),
-        ShapeKind::Polygon(poly) => sized_polygon(poly, amount).map(ShapeKind::Polygon),
-        ShapeKind::Path { points, width } => {
+        ShapeKind::Rectangle(rect) => {
+            sized_rect_with_mode(*rect, amount, mode).map(ShapeKind::Rectangle)
+        }
+        ShapeKind::Polygon(poly) => {
+            sized_polygon_with_mode(poly, amount, mode).map(ShapeKind::Polygon)
+        }
+        ShapeKind::Path { points, width } if mode == LayoutSizeMode::Uniform => {
             let width = width.checked_add(amount.saturating_mul(2))?;
             (width > 0).then(|| ShapeKind::Path {
                 points: points.clone(),
@@ -256,7 +310,7 @@ pub(crate) fn sized_shape_kind(kind: &ShapeKind, amount: Coord) -> Option<ShapeK
             size,
             lower,
             upper,
-        } => {
+        } if mode == LayoutSizeMode::Uniform => {
             let size = size.checked_add(amount.saturating_mul(2))?;
             (size > 0).then(|| ShapeKind::Via {
                 center: *center,
@@ -265,12 +319,26 @@ pub(crate) fn sized_shape_kind(kind: &ShapeKind, amount: Coord) -> Option<ShapeK
                 upper: *upper,
             })
         }
-        ShapeKind::Label { .. } | ShapeKind::Measurement { .. } => None,
+        _ => None,
     }
 }
 
-pub(crate) fn sized_rect(rect: Rect, amount: Coord) -> Option<Rect> {
-    let rect = rect.expanded(amount);
+pub(crate) fn sized_rect_with_mode(
+    rect: Rect,
+    amount: Coord,
+    mode: LayoutSizeMode,
+) -> Option<Rect> {
+    let rect = match mode {
+        LayoutSizeMode::Uniform => rect.expanded(amount),
+        LayoutSizeMode::X => Rect::new(
+            Point::new(rect.min.x - amount, rect.min.y),
+            Point::new(rect.max.x + amount, rect.max.y),
+        ),
+        LayoutSizeMode::Y => Rect::new(
+            Point::new(rect.min.x, rect.min.y - amount),
+            Point::new(rect.max.x, rect.max.y + amount),
+        ),
+    };
     (rect.width() > 0 && rect.height() > 0).then_some(rect)
 }
 
@@ -280,7 +348,14 @@ pub(crate) struct OffsetLine {
     pub(crate) direction: (f64, f64),
 }
 
-pub(crate) fn sized_polygon(poly: &Polygon, amount: Coord) -> Option<Polygon> {
+pub(crate) fn sized_polygon_with_mode(
+    poly: &Polygon,
+    amount: Coord,
+    mode: LayoutSizeMode,
+) -> Option<Polygon> {
+    if mode != LayoutSizeMode::Uniform {
+        return sized_polygon_axis(poly, amount, mode);
+    }
     let points = region_points_for_shape_kind(&ShapeKind::Polygon(poly.clone()))?;
     if !polygon_is_simple(&points) {
         return None;
@@ -316,6 +391,47 @@ pub(crate) fn sized_polygon(poly: &Polygon, amount: Coord) -> Option<Polygon> {
         let previous = lines[(index + lines.len() - 1) % lines.len()];
         let current = lines[index];
         sized_points.push(intersect_offset_lines(previous, current)?);
+    }
+
+    let sized_points = normalize_polygon_points(sized_points)?;
+    if signed_area2_points(&sized_points).signum() != orientation
+        || !polygon_is_simple(&sized_points)
+    {
+        return None;
+    }
+    Some(Polygon::new(sized_points))
+}
+
+pub(crate) fn sized_polygon_axis(
+    poly: &Polygon,
+    amount: Coord,
+    mode: LayoutSizeMode,
+) -> Option<Polygon> {
+    let points = region_points_for_shape_kind(&ShapeKind::Polygon(poly.clone()))?;
+    if !polygon_is_simple(&points) {
+        return None;
+    }
+    let orientation = signed_area2_points(&points).signum();
+    let bounds = Rect::from_points(&points)?;
+    let mut sized_points = Vec::with_capacity(points.len());
+    for point in points {
+        let sized = match mode {
+            LayoutSizeMode::X if point.x == bounds.min.x => {
+                Point::new(point.x.checked_sub(amount)?, point.y)
+            }
+            LayoutSizeMode::X if point.x == bounds.max.x => {
+                Point::new(point.x.checked_add(amount)?, point.y)
+            }
+            LayoutSizeMode::Y if point.y == bounds.min.y => {
+                Point::new(point.x, point.y.checked_sub(amount)?)
+            }
+            LayoutSizeMode::Y if point.y == bounds.max.y => {
+                Point::new(point.x, point.y.checked_add(amount)?)
+            }
+            LayoutSizeMode::X | LayoutSizeMode::Y => point,
+            LayoutSizeMode::Uniform => return None,
+        };
+        push_unique_polygon_point(&mut sized_points, sized);
     }
 
     let sized_points = normalize_polygon_points(sized_points)?;

@@ -33,6 +33,8 @@ pub(crate) struct LayoutDrcReportExchange {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct LayoutDrcReportDatabaseEntryExchange {
     pub(crate) label: String,
+    #[serde(default)]
+    pub(crate) source: Option<String>,
     pub(crate) layout_revision: u64,
     pub(crate) findings: Vec<DrcValidationFinding>,
     pub(crate) violations: Vec<DrcViolation>,
@@ -522,6 +524,7 @@ impl AppSessionExchange {
                 .map(|report| {
                     vec![LayoutDrcReportDatabaseEntryExchange {
                         label: "Active DRC Report".to_string(),
+                        source: None,
                         layout_revision: app.layout_revision,
                         findings: report.findings,
                         violations: report.violations,
@@ -533,6 +536,7 @@ impl AppSessionExchange {
                 .iter()
                 .map(|entry| LayoutDrcReportDatabaseEntryExchange {
                     label: entry.label.clone(),
+                    source: entry.source.clone(),
                     layout_revision: entry.revision,
                     findings: entry.value.findings.clone(),
                     violations: entry.value.violations.clone(),

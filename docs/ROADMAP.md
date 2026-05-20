@@ -108,7 +108,7 @@ Acceptance checks:
 
 Initial slice completed:
 
-- Selected top-level rectangles, polygons, and paths show screen-space vertex handles.
+- Selected current-cell rectangles, polygons, and paths show screen-space vertex handles.
 - Dragging a handle snaps to the grid and applies an undoable `ReplaceShape` operation.
 - Instance geometry is not edited through occurrences; instance dragging still moves the instance transform.
 - Added tests for polygon and rectangle vertex replacement helpers.
@@ -119,8 +119,8 @@ Completion pass:
 - Added double-click edge insertion for polygons, paths, and rectangles. Rectangle insertion converts the rectangle to a polygon so further vertex editing is explicit.
 - Added hover-delete for polygon/path vertices, with minimum vertex-count guards.
 - Added rectilinear edge dragging for rectangles and Manhattan polygon edges.
-- Added copy, paste, duplicate, and delete commands for top-level shapes, plus delete for selected instances.
-- Added rotate-90, mirror-X, and mirror-Y commands for selected top-level shapes.
+- Added copy, paste, duplicate, and delete commands for selected current-cell shapes, plus delete for selected instances.
+- Added rotate-90, mirror-X, and mirror-Y commands for selected current-cell shapes and selected instances.
 - Added a selected-shape property panel for layer, name, net, coordinates, path width, label text, and measurement endpoints.
 - Kept the new edit flows undoable through `ReplaceShape`, `AddShape`, `DeleteShape`, and `Batch` operations.
 - Tightened delete-vs-vertex-edit semantics so `ReplaceShape` does not resurrect a deleted shape.
@@ -157,18 +157,18 @@ Completion pass:
 
 Format broadening pass:
 
-- Added a flat CIF subset reader/writer in `layout_model` for boxes, polygons, wires, labels, and vias-as-boxes.
-- Added File-menu CIF export/import using a deterministic `target/glassworks-layout.cif` exchange path in the native app, including gzip-aware CIF import and recent-file reload support.
-- Added focused model and native-app coverage for CIF round-tripping, generated unknown layers, skipped unsupported CIF calls, File-menu CIF exchange, and compressed CIF import.
-- Added a flat ASCII DXF subset reader/writer in `layout_model` for closed/open polylines, lines, text labels, generated unknown layers, and skipped unsupported entities.
-- Added File-menu DXF export/import using a deterministic `target/glassworks-layout.dxf` exchange path in the native app, including gzip-aware DXF import and recent-file reload support.
-- Added focused model and native-app coverage for DXF round-tripping, old POLYLINE/VERTEX import, unsupported-entity reporting, File-menu DXF exchange, and compressed DXF import.
-- Added a flat DEF subset reader/writer in `layout_model` for `FILLS` rectangles/polygons, `SPECIALNETS`/`NETS` routed paths, placed `PINS` labels, generated unknown layers, and skipped bad items.
-- Added File-menu DEF export/import using a deterministic `target/glassworks-layout.def` exchange path in the native app, including gzip-aware DEF import and recent-file reload support.
-- Added focused model and native-app coverage for DEF round-tripping, unknown-layer generation, route repeat-coordinate parsing, placed pin labels, File-menu DEF exchange, and compressed DEF import.
-- Added a flat LEF macro subset reader/writer in `layout_model` for `OBS` rectangles/polygons, Manhattan paths as obstruction rectangles, `PIN PORT` labels, generated unknown layers, and skipped bad items.
-- Added File-menu LEF export/import using a deterministic `target/glassworks-layout.lef` exchange path in the native app, including gzip-aware LEF import and recent-file reload support.
-- Added focused model and native-app coverage for LEF round-tripping, unknown-layer generation, pin-port labels, File-menu LEF exchange, and compressed LEF import.
+- Added a CIF subset reader/writer in `layout_model` for boxes, polygons, wires, labels, vias-as-boxes, and basic hierarchical `DS`/translated-`C` import/export.
+- Added File-menu CIF export/import using a deterministic `target/glassworks-layout.cif` exchange path in the native app, including gzip- and single-file-ZIP-aware CIF import and recent-file reload support.
+- Added focused model and native-app coverage for CIF round-tripping, generated unknown layers, basic hierarchy calls, File-menu CIF exchange, and compressed CIF import.
+- Added an ASCII DXF subset reader/writer in `layout_model` for closed/open polylines, lines, text labels, circles/arcs, basic rotated/mirrored `BLOCK`/`INSERT` hierarchy, generated unknown layers, and skipped unsupported entities.
+- Added File-menu DXF export/import using a deterministic `target/glassworks-layout.dxf` exchange path in the native app, including gzip- and single-file-ZIP-aware DXF import and recent-file reload support.
+- Added focused model and native-app coverage for DXF round-tripping, old POLYLINE/VERTEX import, circle/arc import, basic rotated/mirrored block/insert hierarchy, unsupported-entity reporting, File-menu DXF exchange, and compressed DXF import.
+- Added a DEF subset reader/writer in `layout_model` for `FILLS` rectangles/polygons, `SPECIALNETS`/`NETS` routed paths, placed `PINS` labels, basic orthogonal `COMPONENTS` placeholder instances, generated unknown layers, and skipped bad items.
+- Added File-menu DEF export/import using a deterministic `target/glassworks-layout.def` exchange path in the native app, including gzip- and single-file-ZIP-aware DEF import and recent-file reload support.
+- Added focused model and native-app coverage for DEF round-tripping, unknown-layer generation, route repeat-coordinate parsing, placed pin labels, basic oriented component placement metadata, File-menu DEF exchange, and compressed DEF import.
+- Added a basic multi-macro LEF macro-cell subset reader/writer in `layout_model` for `OBS` rectangles/polygons, Manhattan paths as obstruction rectangles, `PIN PORT` labels, generated unknown layers, and skipped bad items.
+- Added File-menu LEF export/import using a deterministic `target/glassworks-layout.lef` exchange path in the native app, including gzip- and single-file-ZIP-aware LEF import and recent-file reload support.
+- Added focused model and native-app coverage for LEF round-tripping, unknown-layer generation, pin-port labels, multi-macro cell preservation, File-menu LEF exchange, and compressed LEF import.
 
 ## Milestone 4: GDSII Import And Export
 
@@ -346,7 +346,7 @@ Completed second slice:
 Completed third slice:
 
 - Added operation-log variants for batches, cells, instances, instance deletion, and instance movement.
-- Added `Make Cell` for factoring selected top-level shapes into a normalized child cell and replacing them with a top-cell instance.
+- Added `Make Cell` for factoring selected current-cell shapes into a normalized child cell and replacing them with a local instance.
 - Added a side-panel cell list with `Place` actions for reusable cells.
 - Added instance occurrence selection and transform dragging.
 - Added model tests for cell/instance add, move, delete, and batch operation behavior.
@@ -380,9 +380,16 @@ Closed the first KLayout 2D hierarchy-display gap:
 
 - Added 2D hierarchy display-depth controls for Top, numeric min/max depth ranges, box-only child instances, and Full hierarchy, plus shallower/deeper step controls.
 - Added root-cell-aware 2D view indexing, rendering, picking, quick top-cell controls, a flat all-cell browser with current/used/unused/library/property-bearing/empty filters and sort controls, parent/child context actions, and selected-instance descend for focused cell inspection without changing the document top cell.
-- Added leaf, branch, parent, and child context filters to the cell browser for faster hierarchy navigation.
-- Added a collapsible hierarchy tree in the 2D inspector for navigating parent/child cell paths, with bulk expand/collapse controls for the visible hierarchy browser.
-- Added view-only individual, immediate child-cell, and full descendant-cell hide/show from the hierarchy controls; hidden cells are filtered from 2D rendering, picking, and shape browsing without changing DRC/routing/connectivity scope.
+- Added hidden/visible, leaf, branch, parent, child, sibling, ancestor, and descendant context filters to the cell browser for faster hierarchy navigation.
+- Added hierarchy-depth rows, parent/child/sibling/ancestor/descendant relation labels, search fields, and sorting to the cell browser plus shared-search `Cells` inspector summaries so hierarchy lists can be inspected and ordered from shallow used cells through deeper descendants, with unused cells after reachable cells.
+- Exposed both one-level and deep selected-instance flatten actions in the hierarchy context controls, matching the Edit menu hierarchy operations.
+- Exposed selected array resolving in the hierarchy context controls, matching the Edit menu selected-array operation for document-top, current-cell, and deeper occurrence arrays.
+- Added Edit-menu and hierarchy-context current-cell, descendant, and document-wide child-instance batch variants that retarget each child placement to its own shallow-copied cell.
+- Added Edit-menu and hierarchy-context descendant-cell and whole-document batch flattening for one-level or deep policies.
+- Added Edit-menu and hierarchy-context current-cell, descendant-cell, and whole-document batch array resolving that replaces matching array instances with individual single instances and remains undoable.
+- Exposed one-level flatten plus deep/complete cell deletion policies directly in the Edit menu, matching the hierarchy context actions.
+- Added a selector-searchable collapsible hierarchy tree in the 2D inspector for navigating parent/child cell paths, with row-count titles, search-revealed matching descendant paths, filtered inspector summaries, empty-search feedback, and bulk expand/collapse controls for the visible hierarchy browser.
+- Added view-only individual, sibling, immediate child-cell, and full descendant-cell hide/show from the hierarchy controls; hidden cells are filtered from 2D rendering, picking, and shape browsing without changing DRC/routing/connectivity scope.
 - Kept DRC, routing, connectivity, and 3D bounds on full physical hierarchy while limiting only the 2D view index, renderer, and hit-testing path.
 - Persisted hierarchy display depth ranges in app options and documented the remaining KLayout cell-management gaps.
 
@@ -391,13 +398,21 @@ Started closing KLayout-style browser gaps:
 - Added a 2D shape browser in the layout inspector that lists visible shape occurrences for the current view root/depth and selects flattened occurrences, including instance-backed shapes.
 - Added shape-browser kind filters for rectangles, polygons, paths, vias, labels, and measurements.
 - Added a 2D instance browser in the layout inspector that lists child instances of the current view root or hierarchy-wide instances owned by reachable child cells, then selects a representative occurrence for the instance.
-- Added named-instance, property-bearing-instance, array-instance, identity-instance, and transformed-instance quick filters for the 2D instance browser.
+- Added named-instance, property-bearing-instance, array-instance, hidden-target, visible-target, leaf-target, branch-target, identity-instance, and transformed-instance quick filters for the 2D instance browser.
+- Added instance-browser target-cell object rows for target role, local shape count, child-instance count, and local bounds.
+- Added live instance-browser filter counts plus active scope/filter/search row-count titles and no-match selection status context.
 - Added quick filters for the shape browser, cell browser, instance browser, and net browser, including active-layer, selected-shape, shape-kind, property-bearing shape/cell/instance, empty-cell, selected-net, labeled-net, unlabeled-net, device-connected-net, trace-history-net, SPICE-extra-net, shorted-net, and open-net views.
 - Added shared 2D browser text search for cell, shape, instance, extracted-net, and DRC marker browser rows, with native Ctrl/Cmd+F capture.
 - Added shared 2D browser column presets for Summary, Geometry, Relations, and All detail rows, including a dedicated cell-browser detail section.
 - Added property rows for stored shape metadata, stored instance metadata, stored cell metadata, net, and DRC marker browsers so compact browser labels have inspectable IDs, layers, cells, scopes, bounds, arrays, connectivity, selected-net device-terminal details, and rule/state details.
+- Added kind-specific shape-browser object rows for rectangle/polygon area, path point/width/length details, via center/size/stack details, and label text/position.
+- Added live cell-browser filter counts plus active filter/search row-count titles and no-match selection status context.
 - Added property-selector semantics to the shape, cell, and instance browser Properties filters, where browser search matches only stored property metadata, with shape name/net included for shape selectors, and supports `key=value` searches.
-- Added sort controls for shape, instance, net, and DRC marker browsers, covering common ID/layer/cell/kind/size/rule/state orderings.
+- Added shape-browser selector search for source cells, layers, shape kind/type, name/net, label text, occurrence/bounds metadata, and stored shape properties.
+- Added instance-browser selector search for parent and target cells, names, transform/array metadata, target role/count/bounds metadata, and stored instance properties.
+- Added cell-browser selector search for cell identity, usage/tree role, hierarchy depth, parent/ancestor/sibling/child/descendant relations, counts, local bounds, and stored cell properties.
+- Added sort controls for shape, instance, net, and DRC marker browsers, covering common ID/layer/cell/kind/area/size/rule/state orderings.
+- Added live shape-browser filter counts plus active filter/search row-count titles and no-match selection status context.
 - Promoted hierarchy depth when instance-browser selection needs child geometry visible for highlight/selection.
 - Added selected-shape, selected-instance, and current-cell custom property set/remove controls using the browser search/replace fields, including instance-backed child-cell shapes.
 - Added focused native-app tests for shape-browser occurrence selection, selected-shape property controls, instance-browser selection, and browser filter behavior.
@@ -406,10 +421,12 @@ Started closing KLayout-style layer display gaps:
 
 - Added layer usage counts across top-level and cell-local shapes.
 - Marked layer rows as used or empty in the layer panel and exposed active-layer shape usage in layer properties.
-- Added layer-panel visibility and cleanup controls to show all layers, show used layers, hide empty layers, isolate the active layer, invert layer visibility, or prune inactive empty layers with undo support.
-- Added options-backed layer-panel filters for All/FEOL/Routing/Text layer groups, fixed FEOL/Routing child groups, layer group tree summaries, and All/Used/Empty layer-row usage.
-- Added eight named options-backed layer setup slots with layer-panel tab, save, and restore controls for visibility, hierarchical layer group filter, layer-row usage filter, and per-layer hierarchy depth overrides.
+- Added layer-panel visibility and cleanup controls to show all layers, show used layers, hide empty layers, isolate the active layer, invert layer visibility, or prune inactive empty layers with undo support, including live affected-layer counts on visibility presets and removable-layer counts on cleanup.
+- Added hierarchy-aware layer deletion from the layer panel, removing and undo-restoring matching top-level and cell-local shapes.
+- Added options-backed layer-panel filters for All/FEOL/Routing/Text layer groups, fixed FEOL/Routing child groups, searchable layer group tree summaries with `key=value` selectors for group/parent/current/count metadata, and All/Used/Empty/Visible/Hidden layer rows, with live counts on both group and row filters.
+- Added eight named options-backed layer setup slots with layer-panel tabs that expose saved/empty status and visible-layer counts, plus save, restore, per-slot clear, and clear-all controls for visibility, hierarchical layer group filter, layer-row usage filter, and per-layer hierarchy depth overrides.
 - Added deterministic layer-set JSON export/import for the saved layer setup slots, including saved setup names.
+- Added searchable layer-set inspector summaries with `key=value` selectors for slot/name/state/visibility/group/usage/depth metadata.
 - Added per-layer fill and line display style fields, active-layer panel controls, undoable style changes, 2D fill-opacity rendering for non-solid fill styles, hatched, cross-hatched, and normal/dense/sparse stippled rectangular fills, and solid/dashed/dotted/dash-dot outline rendering.
 - Added active-layer and current-layer-group hierarchy depth override controls that can cap or expand displayed depth independently of the global hierarchy display, persisted through app options.
 - Added focused layout-model and native-app coverage for used/unused layer display, layer visibility presets including active-layer isolation and inversion, saved layer setup slots, layer-set JSON round-trip, layer display style defaults/controls, and per-layer hierarchy depth display filtering.
@@ -422,76 +439,148 @@ Started closing KLayout-style net tracing gaps:
 - Added a Label tool for placing simple net labels on the active layer, reusing the selected or clicked component name when available.
 - Added an explicit Trace All action that extracts all net components, resets the net browser to all/size order, seeds trace history, and selects the largest component for highlighting.
 - Added a Trace Path action that checks the first and last route points against extracted connectivity, selects the shared component when connected, and reports disconnected endpoints without editing geometry.
+- Added a route-point path preview overlay so Trace Path endpoints remain visually connected even outside the active Route tool.
+- Kept pending route-point markers visible for Trace Path previews outside the active Route tool so endpoints remain inspectable while using other layout tools.
+- Colored the route-point path preview by extracted connectivity so connected endpoints read as valid and disconnected endpoints read as blocked before clearing the points.
+- Updated route-point path preview coloring to evaluate each segment independently for multi-point traces.
+- Updated Trace Path execution to validate every adjacent route-point segment, so bad middle segments fail explicitly even when the first and last route points share a net.
+- Added failing-segment focus for Trace Path execution so disconnected or untraceable route path segments are zoomed when the action cannot complete.
+- Added coordinate-searchable route-point rows and compact route-point summary rows in the net browser so pending trace points can be searched, counted, selected by first match, removed individually, and cross-probed to the actual traceable shape and extracted net under each point.
+- Added length- and coordinate-searchable route-point trace path segment rows in the net browser so connected/disconnected/untraceable preview segments can be inspected, filtered with shared browser search, focused by row or first match, and cross-probed into named connected segment nets or disconnected endpoint nets without clearing route points.
+- Added `key=value` selector search for route-point and trace-path segment rows, including point/segment indices, endpoint coordinates, statuses, component IDs, and segment lengths.
+- Added compact trace path segment summary rows, direct connected-path net selection, path endpoint net selection, first-blocker endpoint net selection, and a focus-blocker control to the net browser so pending route paths show a connected/blocked result, endpoint coordinates/nets, total/listed segment counts, connected/disconnected status, total/connected/blocked path length, and the first blocking segment with coordinates.
+- Added net-browser component selector search for component ids, names/net ids, label/device/issue/count metadata, bounds, and optional SPICE status.
+- Added trace-history selector search for stored trace positions, latest status, component IDs, and component names so the short history list, History net filter, and trace-state summaries can be filtered by recency as well as net metadata.
+- Added a route-point clearing control for clearing pending Trace Path points without dropping trace history.
 - Added trace-highlight controls for selected-component, trace-history, and off modes in the net browser.
-- Added a short in-session trace history list in the 2D inspector so recent traced components can be revisited, filtered with the shared browser search, selected by first matching entry, or cleared explicitly.
+- Added a selected-trace clearing control in the net browser that clears the highlighted net without dropping trace history.
+- Added selected-net source-object, label, connected-device, and short/open issue rows in the net browser so individual shapes, net labels, extracted device objects, and connectivity issue bounds in the highlighted component can be cross-probed without duplicating trace history.
+- Added selected-net device-peer rows so other nets connected through the same extracted device can be selected directly from the current net.
+- Added selected-net open-peer rows so disconnected components participating in the same open can be walked directly from the net browser.
+- Added compact selected-net property summaries for short/open issue details, open peers, and peer device terminals, so net detail rows stay useful before cross-probing into a specific row.
+- Extended net browser search to match connected device models, terminals, peer terminals, and short/open issue details, so filtered net views can find the same objects exposed by selected-net rows.
+- Added a short in-session trace history list in the 2D inspector so recent traced components can be revisited, filtered with the shared browser search, selected by first matching entry, removed individually, or cleared explicitly.
 - Added deterministic extracted-netlist JSON export/import for current connectivity data, reusing the validated connectivity report shape without rerunning extraction on import.
+- Added aggregate netlist summary rows to the net browser so imported or extracted connectivity can be checked without opening the JSON export.
+- Added recent-file and reload-most-recent integration for extracted-netlist JSON exchange, plus recent-menu labels for netlist, trace-state, and L2N database entries.
+- Added global extracted-device rows to the net browser so supported devices can be inspected and cross-probed without selecting one of their connected nets first.
+- Added global short/open issue rows to the net browser so extracted connectivity problems can be inspected and cross-probed before selecting an involved net.
+- Extended the shared net browser search to filter the global extracted-device and short/open issue rows.
+- Added first-matching global netlist item selection for searched extracted-device and connectivity-issue rows.
 - Changed connectivity and simple device extraction to use full flattened layout geometry rather than current display visibility, matching DRC/router analysis scope.
 - Added deterministic SPICE-style `.subckt` export for current connectivity data, including named nets, generated names for unlabeled components, supported MOS/resistor/capacitor device lines, and comments for opens/shorts.
 - Added SPICE `.subckt` schematic comparison for named layout nets and supported extracted MOS/resistor/capacitor device signatures, including exact MOS `L`/`W` dimension checks when the schematic supplies them, with compare status, selected-net SPICE status, missing/extra net summaries, and compact missing/extra device details surfaced in the net browser.
+- Added recent-file and reload-most-recent integration for SPICE schematic compare inputs so the last LVS-style comparison can be rerun without reselecting the schematic file.
+- Added search-aware SPICE compare issue rows to the net browser for missing/extra nets/devices, with first-matching selection and extra-layout-net/device cross-probing.
+- Extended the SPICE Extra net filter to include nets connected through extra layout devices, not only explicitly extra layout nets.
+- Added selected-net SPICE device status rows so nets that match schematics by name still expose connected extra-layout-device mismatches and schematic-only missing-device references.
+- Extended net browser search to match selected-net SPICE/LVS net and device status, including extra-layout-device and missing-device mismatch text.
+- Added missing-device SPICE compare issue cross-probing to jump to the first current layout net referenced by a schematic-only device signature.
+- Added explicit missing-net SPICE compare issue status text for schematic-only nets that have no current layout connectivity to cross-probe.
+- Added a compact SPICE compare summary section to the net browser panel with status, circuit, net/device counts, mismatch counts, and layout issue count.
+- Added a SPICE Issues net-browser filter for nets with any SPICE/LVS net-level or device-level mismatch status.
+- Added a SPICE Missing net-browser filter for browsable layout nets implicated by missing-layout net or device compare issues.
+- Added a SPICE Nets net-browser filter for layout nets with net-level SPICE/LVS compare mismatches, separating net-name issues from device mismatches.
+- Added a SPICE Devices net-browser filter for layout nets implicated by device-level SPICE/LVS compare mismatches.
+- Added SPICE issue-net counts to the net browser and inspector compare summaries, matching the SPICE Issues filter predicate.
+- Added separate SPICE missing-issue and extra-issue net counts to the net browser and inspector summaries, matching the SPICE Missing and SPICE Extra filters.
+- Added separate SPICE net-issue and device-issue net counts to the net browser and inspector summaries, matching the SPICE Nets and SPICE Devices filters.
+- Added live count labels to the SPICE Extra, SPICE Nets, SPICE Devices, and SPICE Issues net-browser filter buttons.
+- Updated SPICE/LVS net-browser filter status messages to include the same live issue-net counts shown on the filter buttons.
+- Made SPICE compare issue action rows honor the active SPICE Extra, SPICE Nets, or SPICE Devices filter while preserving the combined SPICE Issues view.
+- Updated the generic Select First Netlist Item action to honor the active SPICE/LVS issue filter for SPICE compare issue rows.
+- Added active-row counts to the SPICE Compare Issues section title so filtered LVS-style issue lists show how many rows are visible.
+- Added active SPICE/LVS category labels to the SPICE Compare Issues section title for filtered issue lists.
+- Clarified SPICE Compare Issues section titles to label their counts as rows, distinct from SPICE filter button net counts.
+- Updated SPICE compare issue no-match status messages to include the active SPICE/LVS filter category and browser search text.
+- Updated the SPICE Missing issue list to prioritize cross-probeable missing-device rows before schematic-only missing-net rows for select-first actions.
+- Updated the SPICE Nets issue list to prioritize cross-probeable extra-layout-net rows before schematic-only missing-net rows for select-first actions.
+- Changed SPICE schematic mismatch compares to open the SPICE Issues net-browser filter when browsable issue nets exist, while clean matches stay on All.
+- Added a dedicated Select First SPICE Issue action so LVS-style compare issue rows can be cross-probed directly with the current browser search.
+- Added a Clear SPICE Compare action in the net browser to drop the active LVS-style comparison report and reset SPICE-specific net filters.
 - Added deterministic trace-state JSON export/import for the current trace selection, trace history, and route points, validating imported component IDs against current extracted connectivity.
 - Added deterministic L2N database JSON export/import that bundles extracted connectivity, supported extracted devices, current trace selection/history, and route points, with recent-file reload integration.
+- Added searchable Trace State summary rows to the net browser and Connectivity inspector so imported or current L2N state exposes selected trace net, trace-history count, pending route-point count, and highlight mode without opening the JSON.
+- Added a one-shot Clear Trace State net-browser control for clearing the selected trace net, trace history, and pending route points together after tracing or L2N import.
+- Extended trace-state and L2N JSON exchange to persist selected/history/off trace-highlight mode, with older trace-state JSON defaulting to Selected on import.
+- Updated trace-state and L2N imports to switch the net browser to the Trace History filter when restored history is present, so imported traced nets are listed immediately.
+- Added recent-file and reload-most-recent integration for trace-state JSON exchange, matching the L2N database reload workflow.
+- Added imported connectivity source rows to the net browser and searchable Connectivity inspector so imported netlist/L2N data shows its source document, layout revision, and technology metadata.
 - Added route-time known-net context so existing same-net or same-component geometry is treated as usable route context rather than as an obstacle.
-- Added a read-only 2D technology stack browser that surfaces DBU/grid, active layer GDS/text mapping, connectivity stack links, and DRC rule-family counts from the active technology.
+- Added a searchable read-only 2D technology stack browser that surfaces DBU/grid, active layer GDS/text mapping, connectivity stack links, and DRC rule-family counts from the active technology with `key=value` selectors for technology, DRC, layer, mapping, and stack-link metadata.
 - Added focused native-app coverage for selecting a component from the net browser, tracing a net from a canvas click, tracing between route points, trace-history search, netlist JSON round-trip, SPICE netlist export, SPICE schematic comparison, trace-state JSON round-trip, and combined L2N database JSON round-trip.
 - Added first device-aware LVS slices: diffusion/poly crossings are extracted as MOS-like devices with labeled source/drain/gate/body terminals when side labels or overlapping well/body labels are present, isolated labeled-poly geometry is extracted as resistor-like devices, and labeled metal1/metal2 overlap without a via is extracted as a capacitor-like device; all are included in deterministic netlist JSON exchange, emitted as SPICE device lines, and compared against supported schematic device signatures.
 
 Started closing KLayout-style geometry operation gaps:
 
-- Added shapewise grow/shrink actions for selected top-level rectangles, polygons, paths, and vias using a grid-derived sizing step.
-- Added layer-wide grow/shrink actions for active-layer top-level rectangles, polygons, paths, and vias using the same grid-derived sizing step.
-- Added selected rectangle and polygon corner chamfering plus rounded-corner approximation that convert or keep the shape as an editable polygon.
-- Added selected-shape left/right/top/bottom/center-X/center-Y alignment actions against the active layer's top-level shape bounds plus origin-axis centering actions.
-- Added an active-layer rectangle merge action that combines touching top-level rectangles into exact non-overlapping union rectangles.
-- Added a selected rectangle/polygon layer AND action that intersects active-layer top-level rectangles and polygons with the selected region, decomposing non-convex selected regions into convex fragments.
-- Added a selected rectangle/polygon layer OR action that writes active-layer union fragments for selected regions.
-- Added selected rectangle/polygon layer NOT, selection NOT layer, and layer XOR actions that write active-layer rectangular or polygon fragments for selected regions.
-- Added selected-shape versus clipboard-shape AND/OR/NOT/XOR actions for top-level rectangles and polygons, replacing the selected shape with undoable result fragments.
-- Added a selected rectangle/polygon clip-cell action that writes active-layer clipped rectangle and polygon fragments into a new instanced child cell.
+- Added shapewise grow/shrink actions for selected current-view-cell rectangles, polygons, paths, and vias using a grid-derived sizing step.
+- Added layer-wide grow/shrink actions for active-layer current-view-cell rectangles, polygons, paths, and vias using the same grid-derived sizing step.
+- Added X-only and Y-only grow/shrink actions for selected and active-layer current-cell rectangles and polygons.
+- Added selected and active-layer current-cell rectangle and polygon corner chamfering plus rounded-corner approximation that convert or keep shapes as editable polygons.
+- Added selected current-cell shape and selected-instance left/right/top/bottom/center-X/center-Y alignment actions against the active layer's parent-cell shape bounds plus origin-axis centering actions, and active-layer current-cell shape alignment against a selected reference shape.
+- Added an active-layer rectangle merge action that combines touching current-view-cell rectangles into exact non-overlapping union rectangles.
+- Added a selected current-cell rectangle/polygon layer AND action that intersects active-layer current-cell rectangles and polygons with the selected region, decomposing non-convex selected regions into convex fragments.
+- Added a selected current-cell rectangle/polygon layer OR action that writes active-layer current-cell union fragments for selected regions.
+- Added selected current-cell rectangle/polygon layer NOT, selection NOT layer, and layer XOR actions that write active-layer rectangular or polygon fragments for selected regions.
+- Added active-layer current-cell layer AND/OR/NOT/XOR against one-or-more clipboard rectangle/polygon operands, replacing active-layer geometry with undoable fragments while leaving clipboard source shapes intact.
+- Added active-layer current-cell copy into the layout clipboard, plus selected current-cell shape versus one-or-more clipboard-shape AND/OR/NOT/XOR actions for rectangles and polygons, replacing the selected shape with undoable result fragments.
+- Added selected-region and clipboard-region current-cell clip-cell actions that write active-layer clipped rectangle and polygon fragments into a new instanced child cell.
+- Added selected current-cell shape copy, paste, duplicate, delete, rotate-90, mirror-X, and mirror-Y actions that edit geometry in the active viewed cell rather than leaking edits to the document top cell.
+- Added current-cell selected-shape vertex/edge editing, including live drag history and vertex insertion/deletion replacement operations.
+- Added current-cell selected-shape drag and alt-drag duplication, including undoable local shape move and duplicate history.
+- Added current-cell-aware compact shape selection controls, including Next Shape cycling for local shapes in the active viewed cell.
 - Added browser-search-driven replacement for matching shape names, shape property keys/values, layer names, label/ruler text, cell names, cell property keys/values, instance names, and instance property keys/values, with document/current-cell/visible-hierarchy scope controls and undo/redo support.
 - Added shape/cell/instance/net browser select-first support so filtered searches, including property-selector searches such as `key=value`, can directly select or view the first matching browser result.
-- Added focused native-app coverage for selected and active-layer grow/shrink including non-convex polygons, selected rectangle/polygon chamfering/rounding including non-convex polygons, selected-shape alignment, exact rectangle merging without L-shape overfill, selected-region layer OR/AND, selected polygon-region NOT/selection-NOT-layer/XOR clipping including non-convex selected regions, selected-shape clipboard booleans including non-convex selected or clipboard polygons, clip-cell creation, browser search/replace including shape and instance property keys/values, and undoable shape replacement.
+- Added focused native-app coverage for selected and active-layer grow/shrink including current-cell local shapes, axis-specific current-cell rectangle/polygon sizing, and non-convex polygons, selected and active-layer rectangle/polygon chamfering/rounding including current-cell local shapes and non-convex polygons, selected current-cell shape transforms, current-cell vertex/edge editing, current-cell shape drag/alt-drag, current-cell shape control selection, selected-shape, selected-instance, and active-layer-to-reference alignment, current-cell exact rectangle merging without L-shape overfill, selected-region current-cell layer OR/AND/NOT/selection-NOT-layer/XOR clipping including non-convex selected regions, current-cell active-layer clipboard booleans, current-cell selected-shape clipboard booleans including active-layer clipboard capture, multiple clipboard operands, and non-convex selected or clipboard polygons, selected-region and clipboard-region current-cell clip-cell creation, current-cell copy/paste/duplicate/delete, browser search/replace including shape and instance property keys/values, and undoable shape replacement.
 
 Started closing KLayout-style hierarchy editing gaps:
 
-- Added an undoable Flatten Instance action for selected document-top or current-cell instances, replacing the instance with transformed local shapes.
-- Added an undoable Resolve Array action for selected document-top or current-cell instance arrays, replacing them with individual single instances.
-- Added an undoable Make Variant action for selected instances, shallow-copying the target cell with fresh local shape/instance IDs and retargeting only that instance.
+- Added an undoable Flatten Instance action for selected document-top, current-cell, or deeper visible-occurrence instances, replacing the instance with transformed local shapes.
+- Added an undoable Make Cell action for selected current-cell shapes, replacing the local shape with a local instance of a normalized child cell.
+- Added undoable Resolve Array actions for selected document-top, current-cell, or deeper visible-occurrence instance arrays, plus current-cell, descendant-cell, and whole-document batch array resolving, replacing arrays with individual single instances.
+- Added undoable Make Variant actions for selected document-top, current-cell, or deeper visible-occurrence instances, plus current-cell, descendant, and document-wide child-instance batches, shallow-copying target cells with fresh local shape/instance IDs and retargeting only those instance records.
 - Added an undoable Duplicate Cell action for the current 2D view cell, shallow-copying local geometry and child instances into a standalone viewable cell with fresh local IDs.
 - Added a guarded Delete Unused Cell action for the current 2D view cell, protecting the document top cell and cells that are still instanced.
+- Added an undoable Delete Unused Cells batch action that removes cells unreachable from the document top, including unreachable subtrees, while preserving the live top hierarchy.
 - Added an undoable Shallow Delete Cell action for the current 2D view cell, removing its parent references while preserving child cells.
 - Added an undoable Deep Delete Cell action for the current 2D view cell, pruning descendant cells that are no longer referenced while preserving shared child cells.
 - Added an undoable Complete Delete Cell action for the current 2D view cell, removing the full descendant subtree and any external references to deleted child cells.
-- Added an undoable Flatten Cell action for the current 2D view cell, replacing child instances with transformed local geometry while preserving references to that cell.
+- Added undoable Flatten Cell actions for the current 2D view cell, descendant-cell batches, and whole-document batches, replacing child instances with transformed local geometry while preserving references to edited cells.
 - Added undoable Origin to Selection, exact browser-search DBU coordinate, and grid-derived Origin +/-X/Y actions for the current 2D view cell, shifting local geometry and compensating parent instances so placed geometry remains stable.
-- Added an undoable Move Shape Up action for selected current-cell local shapes, materializing transformed copies in parent cell placements.
-- Added an undoable Move Instance Up action for selected current-cell local instances, materializing transformed parent-cell instances while preserving placed geometry.
-- Added focused native-app coverage for flattening and undoing a top-level or current-cell instance, making and undoing a selected-instance variant, flattening the current cell, moving a local shape or instance up, setting top/current cell origins from selection, exact coordinates, or grid-derived nudges, and resolving and undoing top-level/current-cell instance arrays.
+- Added undoable descendant leaf-cell origin-to-local-bounds batching, shifting local leaf geometry and compensating parent instances while preserving placed geometry.
+- Added an undoable Move Shape Up action for selected current-cell local or deeper visible-occurrence source-cell shapes, materializing transformed copies in parent cell placements.
+- Added an undoable Move Instance Up action for selected current-cell local or deeper visible-occurrence instances, materializing transformed parent-cell instances while preserving placed geometry.
+- Added focused native-app coverage for flattening and undoing a top-level, current-cell, or deeper visible-occurrence instance, making and undoing a current-cell shape cell, making and undoing a document-top or deeper visible-occurrence selected-instance variant plus current-cell, descendant, and document-wide child-instance batch variants, flattening the current cell plus descendant-cell and whole-document batches, moving a current-cell or deeper visible-occurrence shape/instance up, setting top/current cell origins from selection, exact coordinates, grid-derived nudges, or descendant leaf-cell bounds, resolving and undoing top-level/current-cell/deeper visible-occurrence instance arrays plus current-cell, descendant-cell, and whole-document batch arrays, and deleting/undoing individual unused cells plus all-unused-cell batches.
 
 Started closing KLayout-style view utility gaps:
 
-- Added Bookmarks menu actions for saving, restoring, naming, and clearing eight options-backed 2D layout view states, including pan, zoom, current view top cell, and hierarchy display depth range.
+- Added Bookmarks menu actions plus inspector summaries for saving, restoring, naming, per-slot clearing, and clear-all management for eight options-backed 2D layout view states, including pan, zoom, current view top cell, and hierarchy display depth range.
 - Added Previous Layout View navigation that toggles back to the prior 2D view state after bookmark restores, pan/zoom changes, top-cell changes, hierarchy-depth changes, origin focus, or bounds focus.
 - Added deterministic layout view bookmark JSON export/import for the eight named 2D bookmark slots.
+- Added searchable view-bookmark inspector summaries with `key=value` selectors for current, previous, saved, and empty view slots by slot/name/state/top cell/zoom/pan/hierarchy metadata.
 - Added Origin, Layout Bounds, and Selection focus actions backed by the current 2D view state rather than placeholder menu labels.
-- Added File-menu deterministic RGBA and portable PPM screenshot export using the existing snapshot renderer.
+- Added File-menu deterministic PNG, RGBA, and portable PPM screenshot export using the existing snapshot renderer.
 - Added File-menu deterministic layout JSON and workspace JSON save/load using the validated model serializers and native `target/glassworks-layout.json` / `target/glassworks-workspace.json` snapshot paths.
 - Added File-menu deterministic app-session JSON save/load at `target/glassworks-session.json`, bundling workspace data, app options, active shell/view state, and the current 2D layout view.
 - Added File-menu layout JSON import-as-cell, remapping an imported document into child cells and placing the imported root as an instance without replacing the current layout.
 - Added File-menu layout JSON import-as-top-cell, remapping an imported document into extra standalone cells and switching the 2D view to the imported root without instantiating it in the document top cell.
 - Added File-menu layout JSON merge, flattening an imported document into current top-level geometry with layer remapping and undo support.
+- Added File-menu layout JSON hierarchy merge, splicing imported root-cell local shapes and child instances into the current top cell while preserving imported child-cell hierarchy.
+- Added the same hierarchy-preserving root merge action for GDS, CIF, DXF, DEF, and LEF import documents through the shared validated import planner.
 - Added File-menu GDS import-as-cell, GDS extra-top-cell import, and GDS merge actions that reuse the same layer mapping, import-offset, validation, and undoable import plans.
 - Added File-menu CIF import-as-cell, CIF extra-top-cell import, and CIF merge actions through the same validated document-import path.
 - Added File-menu DXF import-as-cell, DXF extra-top-cell import, and DXF merge actions through the same validated document-import path.
-- Added gzip-aware loading for native workspace JSON, layout JSON load/import/merge, and GDS import paths.
+- Added gzip- and single-file-ZIP-aware loading for native workspace JSON, layout JSON load/import/merge, and GDS import paths.
 - Added File-menu JSON import layer-mapping policies for preserving matching layer IDs, matching by layer name, or copying every source layer.
 - Added File-menu JSON import layer-ID offset controls so newly imported or copied source layers can prefer shifted target layer IDs.
 - Added File-menu import-offset controls that translate JSON/GDS/CIF/DXF/DEF import-as-cell placement and flattened merge geometry.
 - Added File-menu recent entries for native app-session, workspace, layout JSON, and GDS exchange paths, persisted through app options with a configurable cap.
 - Added File-menu reload for the most recent native app-session/workspace/layout/GDS exchange path, reusing the same validated loaders.
-- Added persisted reference-image overlays with File-menu deterministic JSON exchange at `target/glassworks-reference-images.json`, recent-file tracking, and gzip-aware import.
-- Added global and per-image reference-image visibility controls, per-image focus, per-image opacity/order controls, per-image removal, translucent overlay rendering, landmark crosshairs, inspector rows, landmark seed/fit/clear controls, and two-or-more-landmark axis-aligned alignment.
-- Added a searchable measurement browser with listed-ruler total-length/mode summaries plus endpoint, delta, length, angle, layer, source-cell, and occurrence property rows for ruler annotations.
-- Added measurement-browser filters for active-layer rulers and direct/horizontal/vertical/Manhattan ruler modes.
+- Added persisted reference-image overlays with File-menu deterministic JSON exchange at `target/glassworks-reference-images.json`, recent-file tracking, and gzip-/single-file-ZIP-aware import.
+- Added global, per-image, and bulk reference-image visibility controls, per-image focus, per-image opacity/order controls, per-image removal, searchable source/pixel-size/visibility/opacity/bounds/landmark inspector rows with `key=value` selectors, bulk reference-image clearing, translucent overlay rendering, landmark crosshairs, inspector rows, bulk/per-image landmark align/seed/fit/clear controls, and two-or-more-landmark axis-aligned alignment.
+- Added a searchable measurement browser with live filter counts, active filter/search row-count titles, no-match selection status context, listed-ruler total-length/mode summaries, and endpoint, delta, length, angle, layer, source-cell, and occurrence property rows for ruler annotations.
+- Added measurement-browser filters for selected rulers, active-layer rulers, and direct/horizontal/vertical/Manhattan ruler modes, plus ID/length/angle/mode/layer/source-cell sort controls.
+- Added measurement-browser `key=value` selector search for reviewing ruler annotations by source cell, layer, mode, endpoints, deltas, lengths, angles, and bounds.
 - Added persisted ruler drawing modes for direct, horizontal, vertical, and Manhattan measurement annotations, with mode controls and property rows.
 - Added first-matching ruler selection, selected-ruler focus, selected-ruler deletion, and undoable visible-ruler cleanup from the measurement browser.
 - Added focused native-app coverage for bookmark restore, previous-view restore, named bookmark option and exchange round-trips, Bookmarks menu enablement/clear/export/import actions, app-session and layout/workspace JSON round-trip, child-cell/top-cell/flattened-merge layout JSON import, recent file reopening/reload, reference-image exchange/alignment/render toggles, UI screenshot export, and measurement property browsing/cleanup.
@@ -504,27 +593,135 @@ Started closing KLayout-style marker review gaps:
 - Added persisted DRC marker owner and signoff metadata with owner/signed-off filters, preset controls, property rows, and report JSON round-trip support.
 - Added persisted DRC marker key/value tags with tagged filters, preset controls, property rows, search indexing, and report JSON round-trip support.
 - Added custom DRC marker key/value tag apply/remove actions that use the browser search and replace fields for ad hoc marker metadata.
-- Added selected DRC marker RGBA snapshot export that focuses the marker, writes a deterministic native snapshot, stores screenshot path/bounds/size metadata as marker tags for report JSON exchange, and exposes that snapshot metadata in marker detail rows.
-- Added a selected-region DRC action that runs the current rule deck and caches only markers intersecting a selected top-level rectangle or polygon, decomposing non-convex selected regions into convex fragments.
+- Added active-report DRC marker tag clearing that removes key/value review tags while preserving other marker review state.
+- Added undoable browser replacement for active-report DRC marker review notes, owners, signoffs, and tag keys/values without invalidating the active DRC report.
+- Added `key=value` selector search for active-report DRC marker rule/state/geometry/review metadata and tag fields.
+- Added user-tagged DRC marker category directory grouping, directory filtering, category/directory selector search, and a category tag preset for review-driven marker organization.
+- Added KLayout `.lyrdb` imported category-part directory grouping so quoted category names containing `/`, `.`, or hyphens stay intact in marker directory rows and filters.
+- Added search and listed-directory summaries to DRC marker directory inspector rows so selector-filtered category groups are visible outside the marker browser list.
+- Added search and listed-marker summaries to DRC marker info rows so selector-filtered marker detail panes show their active match context.
+- Added top-level DRC report-database summary and preview rows for listed reports, stored markers/issues, and current/stale report counts.
+- Added active-report database context, aggregate stored-report summaries, and cross-probe target-count summaries to DRC marker info rows.
+- Added selected-marker source-object kind, layer, and source-local bounds summaries to DRC marker info rows.
+- Added DRC marker search and `key=value` selectors for source objects, source layers, source kinds, and source-local bounds.
+- Added DRC marker sort controls for source objects, source layers, source kinds, and source-local bounds.
+- Added source-object, source-layer, source-kind, source-local bounds, and cross-probe target summaries to selected DRC marker browser detail rows.
+- Added top-level DRC marker summaries for listed source objects, source cells, source occurrences, and aggregate cross-probe targets.
+- Added top-level DRC marker summaries for listed source layers, source kinds, and source-local bounds.
+- Added top-level DRC marker label summaries for listed source objects, source cells, and source occurrences.
+- Added top-level DRC marker summaries for listed rules, categories, and directories.
+- Added top-level DRC marker summaries for listed marker IDs and message previews.
+- Added top-level DRC marker geometry rollups for listed marker bounds, area, required values, and actual values.
+- Added top-level DRC marker review rollups for listed review states, signoff audit, tags, and snapshots.
+- Added accumulated per-party DRC marker signoff records with selected-marker summaries, selector search, browser replacement, report JSON round trips, and Calibre/RVE signoff seeding.
+- Added role and deterministic review-stamp metadata to DRC marker signoff records, including `signoff_role`/`signoff_at` selector search and Calibre/RVE metadata import.
+- Added native-browser wall-clock seconds to newly recorded DRC marker signoff audit stamps while preserving the layout-revision prefix for deterministic review sorting/search.
+- Added DRC marker sort controls for signoff status, signoff role, and newest signoff stamp so review queues can be scanned by signoff metadata.
+- Added DRC marker review-status filters for needs-review, accepted, and rejected signoffs, matching both current signoff metadata and accumulated per-party records.
+- Added listed DRC marker review-state summaries to the marker info pane so filtered review queues expose hidden/waived/visited/signoff/tag/snapshot counts.
+- Added listed DRC marker signoff-audit summaries to the marker info pane so filtered review queues expose signoff record, reviewer-party, status, role, and newest-stamp rollups.
+- Added listed DRC marker tag summaries to the marker info pane so filtered review queues expose tagged-marker counts, tag-key counts, and compact key/value tag previews.
+- Added listed DRC marker snapshot summaries to the marker info pane so filtered review queues expose snapshot counts plus format and size rollups.
+- Added shared-search filtering, `key=value` selectors, first-match selection, per-report delete controls, listed/total count titles, and no-match context to the active DRC report list.
+- Added marker-aware active DRC report-list search so stored reports can be found by contained marker rules, source objects, directories, tags, and signoff metadata.
+- Added selected DRC marker RGBA/PNG snapshot export that focuses the marker, writes a deterministic native snapshot, stores screenshot path/bounds/size/format metadata as marker tags for report JSON exchange, and exposes that snapshot metadata in marker detail rows.
+- Added thumbnail-capable, count/search-aware active-report DRC marker snapshot gallery rows with searched-empty context and selectable entries that cross-probe back to the source marker.
+- Added selected and active-report DRC marker snapshot metadata clearing that removes screenshot tags without deleting unrelated review tags.
+- Added active-report bulk clearing for persisted DRC marker review state, scoped to the markers in the current report without deleting report history.
+- Added a selected-region DRC action that runs the current rule deck and caches only markers intersecting a selected current-cell rectangle or polygon, decomposing non-convex selected regions into convex fragments.
 - Added a current-cell DRC action that runs the same physical rule deck with the active layout cell as the DRC root.
 - Added deterministic DRC report JSON export/import for the current run, including marker review state, without rerunning DRC on export.
-- Added Calibre/RVE-style text marker import for external polygon, rectangle, and edge marker geometry into the current DRC marker browser.
+- Added Calibre/RVE-style text marker import for external polygon, rectangle, edge, point, and circle marker geometry into the current DRC marker browser.
 - Added an undoable DRC marker output action that writes active markers into ordinary annotation-layer geometry.
 - Added DRC marker rule-family category grouping and filters for grid, width, area, spacing, enclosure, overlap, and other markers.
-- Added DRC marker rule-path directory rows and a selected-marker info pane with message, stable key, occurrence, geometry, and review metadata.
+- Added DRC marker rule-path directory rows/filter controls and a selected-marker info pane with message, stable key, occurrence, geometry, and review metadata.
+- Added selected-marker geometry/object info rows for center, size, area, shape IDs, and occurrence labels across the DRC marker info and property panes.
+- Added selected-marker source-object cross-probe controls that select marker source shapes, source cells, or exact source occurrences from the DRC marker browser.
+- Added selected-marker source-occurrence cross-probe buttons that restore the exact hierarchical occurrence path, active layer, and top-cell view for markers emitted from instances.
+- Added selected-marker source-cell cross-probe buttons that switch to the owning source cell and select the local marker shape when possible.
+- Added DRC marker category, directory, source-cell, size, area, required, and actual sort controls alongside ID/rule/state sorting.
+- Added DRC marker source-cell rows and `source_cell=` selector search for reviewing hierarchical markers by owning source cell.
+- Added DRC marker signoff signer/note metadata capture, rows, selector search, search-replace coverage, and JSON round-trip support.
+- Added a selected-shape DRC marker filter for reverse cross-probing from a selected layout object back to matching markers.
+- Added an active-layer DRC marker filter for reviewing only markers that touch the currently active layout layer.
+- Added live DRC marker filter counts plus active filter/category/directory/search row-count titles and select-first no-match context.
 - Added a bounded in-memory DRC report list for recent full/cell/region runs and imported marker reports, with active-report selection, delete, and clear controls.
 - Added deterministic DRC report-database JSON export/import for the whole bounded report list, preserving active-report selection and marker review state.
+- Added DRC report-database source metadata on imported reports with report-browser `source=`/`database=` selector search and stored-report source summaries.
+- Added append-load support for DRC report databases so multiple source-backed report databases can coexist in the bounded report browser.
+- Added DRC report database source-group controls and inspector summaries so appended/imported report sources can be selected directly.
+- Added selected-marker matching-report/source summaries for loaded DRC report databases.
+- Added source-level DRC report database removal so one loaded report source can be closed without clearing all reports.
+- Added gzip- and single-file-ZIP-aware import for DRC decks, DRC reports, DRC report databases including KLayout `.lyrdb` XML payloads, and Calibre/RVE text marker files.
+- Added first-class Tools-menu and DRC marker-panel KLayout `.lyrdb` report database export/import/append actions alongside the JSON report-database exchange actions.
+- Added KLayout `.lyrdb` XML report database import/append for common marker values (`box`, `edge`, `edge-pair`, `point`, `polygon`, `path` with begin/end extensions, `label`, legacy `rect`/`rectangle` and `edge_pair` aliases, legacy geometric `text`/DText, KLayout `text`/`float` scalar values including quoted leading/trailing, empty, and whitespace-only text payloads, and legacy `string` scalar imports) plus text-only diagnostic items, KLayout-compatible text-encoded item references and raw values, item category/cell/tags/tag-description/comment/visited/multiplicity metadata including KLayout-quoted item tag lists, original tag-name preservation for typed re-export, quoted and backslash-escaped category-path part preservation, declared category-description and declared tag-description metadata preservation, root description/top-cell/original-file/generator metadata preservation including native empty root elements, cell layout-name/reference metadata and declared cell metadata preservation including literal colon-containing cell names that collide with displayed cell variants, multiple/scaled/arbitrary-angle cell-reference transform paths represented as separate imported marker rows in the report top-cell context, current-layout hierarchy fallback when the RDB cell graph is incomplete, unique unqualified declared cell-variant fallback, supported tagged geometry value preservation for typed re-export, tagged item-reference value preservation, ordered item-value sequence preservation, KLayout-native `[#tag]`/`[#'tag name']` value-tag prefix preservation, and tagged raw preservation of unsupported item values attached to imported markers.
+- Added KLayout `.lyrdb` native `#'tag name'` item tag-list import so KLayout-authored item tags with spaces preserve their clean original tag names and descriptions on re-export.
+- Updated KLayout `.lyrdb` export to emit item tag lists with KLayout's native `#tag`/`#'tag name'` syntax.
+- Updated KLayout `.lyrdb` value-tag import/export to normalize native unquoted word tags such as `[#review_lane]` and emit KLayout's `[#tag]`/`[#'tag name']` form for value-level tags.
+- Added KLayout `.lyrdb` item-tag import for `#hidden`/`#hide` so hidden marker review state round-trips through the KLayout tag surface instead of coming back as a custom tag.
+- Updated KLayout `.lyrdb` cell-reference metadata import/export to accept KLayout-native `<ref>` nodes, retain legacy `<reference>` imports, and emit native `<ref>` nodes on export.
+- Added KLayout `.lyrdb` XML report database export when saving report databases to `.lyrdb` or gzip-compressed `.lyrdb.gz` paths, preserving marker bounds, messages, category/cell metadata including the empty-name All cells declaration for cell-less diagnostic items and literal colon-containing cell names separately from KLayout variants even when both share the same displayed `name:variant` text, original imported tag identifiers such as hyphenated tag names and escaped apostrophes through KLayout-quoted item tag lists, quoted category names containing `/`, `.`, hyphens, or apostrophes, root description/top-cell/original-file/generator metadata including native empty root elements, declared category-description metadata while leaving generated no-description categories as native empty `<description/>` elements with KLayout-style leaf `<categories>` containers, declared tag-description metadata, cell layout-name metadata including native empty `<layout-name/>` elements, KLayout-native cell-reference metadata with expanded empty `<references>` containers and native `<ref>` entries, declared cell metadata, original supported `box`/`edge`/`edge-pair`/`point`/`polygon`/`path`/`label` value payloads from imported RDB markers, ordered item-value sequences from imported RDB markers with legacy `string` scalars normalized to KLayout `text`, native unquoted simple text scalar payloads plus quoted leading/trailing, empty, and whitespace-only text payloads, legacy geometric `text` values normalized to KLayout `label`, legacy `rect`/`rectangle` aliases normalized to KLayout `box`, legacy `edge_pair` normalized to `edge-pair`, point values normalized to zero-size KLayout-compatible `box` values, item references normalized to KLayout-compatible `text: 'reference: ...'` payloads, and unsupported raw values normalized to KLayout-compatible `text: 'glassworks-raw-value: ...'` payloads while retaining KLayout-native escaped `[#tag]`/`[#'tag name']` value-tag prefixes, tagged geometry values, tagged item-reference metadata, tagged scalar item values, tagged raw item values, visited/hidden/important/waived/custom tag state with native empty item `<tags/>` output, item multiplicity, comments, diagnostic text items, and preserved raw item values.
+- Added KLayout `.lyrdb` embedded marker-image preservation, storing imported item image payloads and exporting embedded image payloads from imported RDB images or existing marker snapshot files.
+- Surfaced imported KLayout `.lyrdb` embedded marker images in marker snapshot labels, filters, summaries, and snapshot gallery entries.
+- Added canvas-backed DRC marker snapshot thumbnail rendering for native-window and snapshot-render paths, decoding embedded `.lyrdb` PNG image payloads plus PNG/RGBA marker snapshot files.
+- Added Calibre/RVE order-independent keyed geometry coordinate import for marker lines such as `x1=... y1=... x2=... y2=...`, origin-plus-width/height rectangles, and radius-first circles.
+- Added Calibre/RVE keyed center-plus-size rectangle parsing for forms such as `center=(x,y) width=... height=...`.
+- Added Calibre/RVE paired keyed coordinate import for compact tuples such as `ll=(x,y) ur=(x,y)` rectangles, `center=(x,y) r=...` circles, and `vertex0=(x,y)` polygons.
+- Added Calibre/RVE alternate keyed geometry tuple import for `ul/lr` rectangle corners, `start/end` edge endpoints, `loc/position` point centers, `rad` circle radius aliases, and `xc/yc`/`centre_x` center-size rectangle aliases.
+- Added Calibre/RVE tuple-valued rectangle size/corner import for forms such as `origin=(x,y) size=(w,h)`, `center=(x,y) size=(w,h)`, and `min/max` or `lower/upper` corner tuples.
+- Added Calibre/RVE bracketed and underscore-indexed keyed coordinate import for forms such as `x[0]=... y[0]=...`, `x_1=... y_1=...`, `vertex[1]=(x,y)`, and bracketed coordinate tuples like `center=[x,y]`.
+- Added Calibre/RVE keyed geometry-kind row import for forms such as `kind=rect ...`, `geometry_type: polygon ...`, `shape = point ...`, `1: type=edge ...`, and pending `marker_type: rectangle` coordinate rows.
+- Added Calibre/RVE labeled multi-line coordinate row import for pending geometry rows such as `coordinate: x y`, `vertex 1: x y`, `point[3]: x y`, `start: x y`, `end: x y`, and `location: x y`.
+- Added Calibre/RVE pending keyed coordinate row import for multi-line geometry rows such as `x 10 y 20`, `x: 10 y: 20`, `x=10 y=20`, and `cx 3000 cy 4000 radius 25nm`.
+- Added Calibre/RVE long-form metric unit aliases and scientific-notation parsing for coordinates and measurements, including `micrometer`, `micrometre`, `nanometre`, and `millimeter`/`mm` forms.
+- Added Calibre/RVE ASCII result-database signature parsing for top-cell precision headers, rule count/timestamp rows, `p`/`e` ordinal/count records, `CN` cell-space transforms, and attached result-property lines.
+- Added Calibre/RVE keyed circle diameter parsing for forms such as `diameter=...`, `diam=...`, `dia=...`, and `d=...`, normalizing them to marker radii.
+- Added Calibre/RVE marker geometry parsing for separated numeric/unit coordinate tokens such as `1 um` in both positional and keyed geometry fields.
+- Added Calibre/RVE marker geometry parsing for separated keyed fields such as `x 3 um`, `y = 4 um`, and `height: 50 nm`.
+- Added Calibre/RVE metadata and measurement parsing for separated separators such as `Cell = TOP`, `Layer : M1`, `@ owner = ...`, and `Required = ... Actual : ...`.
+- Added Calibre/RVE multi-word metadata label parsing for context fields such as `Cell Name: TOP`, `Source Cell = BLOCK`, `Layer Name: M1`, and `Source Layer = M1_PIN`.
+- Added Calibre/RVE `Rule Check Name:` rule-label aliases and result/marker/violation record delimiter handling so numbered RVE result headers do not replace the active rule name.
+- Added Calibre/RVE counted polygon import for numbered vertex rows such as `1: x y`, so row ordinals do not distort marker bounds or become stray rule names.
+- Added Calibre/RVE geometry keyword aliases and trailing-colon geometry labels such as `bbox: ...` and `poly ...`.
+- Added Calibre/RVE attached geometry-label parsing for no-space forms such as `bbox=...` and `points:...`.
+- Added Calibre/RVE plural and short geometry aliases such as `points: ...`, `circ: ...`, `rectangles`, and `segments`.
+- Added Calibre/RVE pending rectangle/edge coordinate collection for numbered rows such as `1: x y`, matching the counted polygon row-index handling.
+- Added Calibre/RVE pending point/circle coordinate collection for numbered rows such as `1: x y` and `1: cx cy r`, so row ordinals do not skew point centers or circle bounds.
+- Added Calibre/RVE whitespace-separated numbered coordinate row import for rows such as `1 x y`, matching the punctuated `1: x y` row-index handling.
+- Added Calibre/RVE numbered inline geometry row import for result-table rows such as `1: rect ...` and `2. edge ...`, so row ordinals do not become bogus rule names.
+- Added Calibre/RVE `@ tag`/`@ tags` item parsing for colon-separated key/value forms such as `defect_class: "edge, jog"` while preserving quoted delimiters.
+- Added Calibre/RVE `@ tag`/`@ tags` item parsing for whitespace-separated key/value forms such as `review_lane layout` and semicolon-separated `inspection_phase final; disposition accepted`.
+- Added Calibre/RVE quoted rule-label normalization so labeled rule names such as `RuleCheck: "QUOTED RULE"` do not retain quote wrappers in rule IDs or default marker messages.
 - Added app-session save/load support for the bounded DRC report list and active report selection, so marker review sessions survive ordinary session restore without a separate report-database exchange.
 - Added recent-file and reload-most-recent integration for DRC report JSON, DRC report-database JSON, and Calibre/RVE marker imports.
-- Added focused layout-model and native-app coverage for marker-state serialization, operation replay, selected-region and current-cell DRC, visited/important/noted/owned/signed-off/tagged marker browser workflows, custom marker tags, marker snapshot export metadata, rule-category marker filtering, DRC report JSON round-trip, DRC report-database JSON round-trip, Calibre/RVE marker import, marker annotation output, and report-list selection/delete/clear behavior.
+- Added lightweight Calibre/RVE `@ owner/note/signoff/tag` review metadata import so external marker text can seed owner, note, signoff, category, and custom marker tags.
+- Added Calibre/RVE quoted metadata value handling so external review fields do not retain surrounding quotes.
+- Added Calibre/RVE approval metadata aliases such as `approval_status`, `approved_by`, `approval_note`, `approval_role`, and `approval_at` so external review exports seed the same per-party signoff records.
+- Added Calibre/RVE `@ tags` multi-value metadata handling for semicolon- and comma-separated external review tags while preserving quoted delimiter characters inside tag values.
+- Added Calibre/RVE direct review tag metadata for fields such as `severity`, `classification`, `source`, `run_id`, `tool_version`, and `deck_name` so common external review attributes stay searchable instead of replacing marker messages.
+- Added Calibre/RVE DBU, um, and nm coordinate suffix parsing so mixed-unit external marker exports import to deterministic DBU marker bounds.
+- Added Calibre/RVE counted multi-line marker geometry collection so exports with `p 4` followed by coordinate rows import as one marker instead of skipped coordinate lines.
+- Added Calibre/RVE uncounted multi-line polygon collection so `polygon` followed by coordinate rows finalizes when the next marker record begins.
+- Added skipped-line accounting and capped warnings for incomplete Calibre/RVE multi-line marker geometry so partial external records are visible in import diagnostics.
+- Surfaced the first Calibre/RVE parser warning in native import status messages so partial external marker records are visible from the UI import flow.
+- Persisted Calibre/RVE parser warnings as imported report warning findings so diagnostics remain visible with the marker report after status text changes.
+- Kept marker browsing, category rows, directory rows, and marker summaries active when an imported report has non-fatal warning diagnostics, and exposed report warning/error summaries in marker info rows and report search selectors.
+- Preserved warning-only Calibre/RVE imports as diagnostic-only report history entries so malformed external marker files leave durable parser feedback instead of only transient status text.
+- Added DRC report-browser free-text and `key=value` selector search over stored diagnostic messages and severities, including Calibre/RVE parser warning reports.
+- Added aggregate ancestor rows and descendant filtering for DRC marker directory paths so rule and user category tags behave more like hierarchical marker directories.
+- Added selected-marker direct tag removal controls so individual custom marker tags can be edited without retyping the key into browser search.
+- Added Calibre/RVE labeled `RuleCheck:`, `Message:`, `Rule Description:`, `Cell:`, `Layer:`, and `Datatype:` handling so common non-`@` RVE record fields seed rule names, marker messages, and searchable context tags.
+- Added Calibre/RVE labeled and combined `Required:`/`Actual:` handling, including `key=value` forms and DBU/um/nm suffixes, so imported external markers populate the existing required/actual marker rows and sort/search surfaces.
+- Added Calibre/RVE free-form `@` message accumulation so multi-line external marker descriptions are preserved instead of being overwritten by the last comment line.
+- Added focused layout-model and native-app coverage for marker-state serialization, operation replay, selected-region and current-cell DRC including current-cell selected regions, visited/important/noted/owned/signed-off/tagged marker browser workflows, selected and active-report bulk marker-state clearing, active-report marker-tag clearing, selected-marker geometry/object info rows, custom marker tags and category-tag grouping, marker snapshot export plus selected and active-report metadata-clearing behavior, rule-category marker filtering, DRC report JSON round-trip, DRC report-database JSON round-trip, Calibre/RVE marker import, marker annotation output, and report-list selection/delete/clear behavior.
 
 Started closing KLayout-style PCell/library gaps:
 
 - Added a 2D cell-browser Library surface for a via-array primitive with editable row, column, via-size, and pitch parameters.
-- The generator uses the active technology's via1/metal1/metal2 layers and places the generated array as a top-level reusable instance.
+- The generator uses the active technology's via1/metal1/metal2 layers and places the generated array as a current-cell reusable instance.
 - Added stored cell properties for generated library macro cells, including the source macro and parameter values, and preserved those properties through layout JSON and Loro object materialization.
 - Added load/update actions so a selected generated via-array macro cell can restore its saved parameters into the controls and regenerate its local via geometry in place while preserving existing instances.
-- Added selected guide-shape conversion so a top-level rectangle, polygon, path, via, label, or measurement can be replaced by a placed via-array macro sized from its bounds.
+- Added selected guide-shape conversion so a current-cell rectangle, polygon, path, via, label, or measurement can be replaced by a placed via-array macro sized from its bounds.
 - Added a detach-to-static action that clears generated macro metadata from a selected library cell while keeping its geometry and existing instances.
 - Added four options-backed via-array library preset slots with save/load/place/clear controls for a minimal persistent reusable-macro catalog.
 - Added deterministic JSON export/import for the via-array library preset catalog.

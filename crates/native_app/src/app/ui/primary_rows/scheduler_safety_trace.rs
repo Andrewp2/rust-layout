@@ -49,7 +49,10 @@ pub(crate) fn scheduler_primary_rows(app: &GlassworksApp) -> Vec<PrimaryRow> {
                         recommendation.reason.clone(),
                     )
                     .action(
-                        format!("glassworks.viewctl.scheduler.tool.{}", recommendation.tool_id),
+                        format!(
+                            "glassworks.viewctl.scheduler.tool.{}",
+                            recommendation.tool_id
+                        ),
                         app.selected_scheduler_tool.as_ref() == Some(&recommendation.tool_id),
                     )
                 }),

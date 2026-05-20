@@ -494,7 +494,9 @@ pub(crate) fn validate_violation(
 }
 
 pub(crate) fn drc_violation_allows_external_geometry(violation: &DrcViolation) -> bool {
-    violation.rule.starts_with("calibre.") || violation.rule.starts_with("external.")
+    violation.rule.starts_with("calibre.")
+        || violation.rule.starts_with("klayout.")
+        || violation.rule.starts_with("external.")
 }
 
 pub fn violation_marker(point: Point, size: Coord) -> Rect {

@@ -289,10 +289,17 @@ impl GlassworksApp {
             .is_none_or(|cache| cache.revision != self.layout_revision);
         if needs_rebuild {
             let technology = self.active_connectivity_technology();
+            let technology_name = technology.name.clone();
             *cache = Some(ConnectivityReportCacheValue {
                 revision: self.layout_revision,
                 report: extract_connectivity(&self.workspace.document, &technology)
                     .map_err(|error| error.to_string()),
+                source: Some(LayoutConnectivityReportSource {
+                    label: "Extracted".to_string(),
+                    document_name: self.workspace.document.name.clone(),
+                    layout_revision: self.layout_revision,
+                    technology_name,
+                }),
             });
         }
         cache
@@ -331,6 +338,7 @@ impl GlassworksApp {
             id,
             revision: self.layout_revision,
             label: label.into(),
+            source: None,
             value: value.clone(),
         };
         *self.drc_report_cache.get_mut() = Some(DrcReportCacheEntry {
@@ -342,6 +350,7 @@ impl GlassworksApp {
             .truncate(MAX_LAYOUT_DRC_REPORT_HISTORY);
         self.layout_selected_drc_report_id = Some(id);
         self.layout_selected_drc_marker_key = None;
+        self.layout_drc_marker_directory_filter = None;
     }
 
     pub(crate) fn sync_selected_layout_drc_report_cache(&mut self) {
@@ -375,6 +384,7 @@ impl GlassworksApp {
                 id,
                 revision: report.layout_revision,
                 label,
+                source: report.source,
                 value: DrcReportCacheValue {
                     findings: report.findings,
                     violations: report.violations,
@@ -389,6 +399,7 @@ impl GlassworksApp {
         self.layout_drc_report_history = history;
         self.layout_selected_drc_marker_key = None;
         self.layout_drc_marker_category_filter = None;
+        self.layout_drc_marker_directory_filter = None;
         self.sync_selected_layout_drc_report_cache();
         if !self.layout_drc_report_history.is_empty() {
             self.show_drc_overlay = true;
@@ -492,7 +503,7 @@ impl GlassworksApp {
         let Some(hit) = self.hit_selected_layout_edge(world, self.layout_hit_tolerance()) else {
             return false;
         };
-        self.insert_layout_vertex(hit.shape_id, hit.edge, world);
+        self.insert_layout_vertex(hit.source_cell, hit.shape_id, hit.edge, world);
         true
     }
 
@@ -944,7 +955,7 @@ impl GlassworksApp {
     pub(crate) fn begin_layout_selection(&mut self, world: Point, modifiers: operad::KeyModifiers) {
         let tolerance = self.layout_hit_tolerance();
         if let Some(hit) = self.hit_selected_layout_vertex(world, tolerance) {
-            let Some(original_shape) = self.workspace.document.shapes.get(&hit.shape_id) else {
+            let Some(original_shape) = self.layout_cell_shape(hit.source_cell, hit.shape_id) else {
                 return;
             };
             let original_position = editable_vertex_points(&original_shape.kind)
@@ -952,6 +963,7 @@ impl GlassworksApp {
                 .copied()
                 .unwrap_or(world);
             self.layout_drag = Some(LayoutCanvasDrag::MoveVertex {
+                source_cell: hit.source_cell,
                 shape_id: hit.shape_id,
                 vertex: hit.vertex,
                 start_world: world,
@@ -966,10 +978,11 @@ impl GlassworksApp {
             return;
         }
         if let Some(hit) = self.hit_selected_layout_draggable_edge(world, tolerance) {
-            let Some(original_shape) = self.workspace.document.shapes.get(&hit.shape_id) else {
+            let Some(original_shape) = self.layout_cell_shape(hit.source_cell, hit.shape_id) else {
                 return;
             };
             self.layout_drag = Some(LayoutCanvasDrag::MoveEdge {
+                source_cell: hit.source_cell,
                 shape_id: hit.shape_id,
                 edge: hit.edge,
                 last_world: world,
@@ -994,11 +1007,16 @@ impl GlassworksApp {
             {
                 self.active_layer = shape.layer;
             }
-            if occurrence.is_top_level() && self.workspace.document.shapes.contains_key(&shape_id) {
+            if occurrence.is_top_level()
+                && let Some((source_cell, _, original_shape)) =
+                    self.selected_current_cell_layout_shape()
+            {
                 self.layout_drag = Some(LayoutCanvasDrag::MoveShape {
+                    source_cell,
                     shape_id,
                     start_world: world,
                     last_world: world,
+                    original_shape,
                     copy_on_drag: modifiers.alt,
                     added_shape: None,
                 });
@@ -1090,7 +1108,9 @@ impl GlassworksApp {
             if let Some(component) = self
                 .selected_layout_occurrence
                 .as_ref()
-                .and_then(|occurrence| report.component_for_occurrence(occurrence))
+                .and_then(|occurrence| {
+                    layout_component_for_occurrence_or_label(&report, occurrence)
+                })
                 .and_then(|component_id| report.component(component_id))
             {
                 return layout_label_text_for_component(component);
@@ -1218,29 +1238,47 @@ impl GlassworksApp {
 
     pub(crate) fn insert_layout_vertex(
         &mut self,
+        source_cell: CellId,
         shape_id: ShapeId,
         edge: usize,
         position: Point,
     ) -> bool {
-        let Some(old_shape) = self.workspace.document.shapes.get(&shape_id) else {
+        let Some(old_shape) = self.layout_cell_shape(source_cell, shape_id) else {
             return false;
         };
         let Some(new_shape) = shape_with_inserted_vertex(&old_shape, edge, position) else {
             self.status_message = "Vertex insertion needs a polygon or path edge".to_string();
             return false;
         };
-        self.replace_layout_shape(shape_id, old_shape, new_shape, "Inserted vertex")
+        self.replace_layout_shape(
+            source_cell,
+            shape_id,
+            old_shape,
+            new_shape,
+            "Inserted vertex",
+        )
     }
 
-    pub(crate) fn delete_layout_vertex(&mut self, shape_id: ShapeId, vertex: usize) -> bool {
-        let Some(old_shape) = self.workspace.document.shapes.get(&shape_id) else {
+    pub(crate) fn delete_layout_vertex(
+        &mut self,
+        source_cell: CellId,
+        shape_id: ShapeId,
+        vertex: usize,
+    ) -> bool {
+        let Some(old_shape) = self.layout_cell_shape(source_cell, shape_id) else {
             return false;
         };
         let Some(new_shape) = shape_with_deleted_vertex(&old_shape, vertex) else {
             self.status_message = "Cannot delete that vertex".to_string();
             return true;
         };
-        self.replace_layout_shape(shape_id, old_shape, new_shape, "Deleted vertex")
+        self.replace_layout_shape(
+            source_cell,
+            shape_id,
+            old_shape,
+            new_shape,
+            "Deleted vertex",
+        )
     }
 
     pub(crate) fn delete_layout_vertex_at_pointer(&mut self) -> bool {
@@ -1254,11 +1292,46 @@ impl GlassworksApp {
         let Some(hit) = self.hit_selected_layout_vertex(world, self.layout_hit_tolerance()) else {
             return false;
         };
-        self.delete_layout_vertex(hit.shape_id, hit.vertex)
+        self.delete_layout_vertex(hit.source_cell, hit.shape_id, hit.vertex)
+    }
+
+    pub(crate) fn shape_replacement_operations(
+        &self,
+        source_cell: CellId,
+        old_shape: Shape,
+        new_shape: Shape,
+    ) -> (Operation, Operation) {
+        if source_cell == self.workspace.document.top_cell {
+            return (
+                Operation::ReplaceShape {
+                    id: old_shape.id,
+                    shape: new_shape,
+                },
+                Operation::ReplaceShape {
+                    id: old_shape.id,
+                    shape: old_shape,
+                },
+            );
+        }
+        (
+            Operation::Batch {
+                operations: vec![
+                    self.shape_delete_operation(source_cell, old_shape.id),
+                    self.shape_add_operation(source_cell, new_shape),
+                ],
+            },
+            Operation::Batch {
+                operations: vec![
+                    self.shape_delete_operation(source_cell, old_shape.id),
+                    self.shape_add_operation(source_cell, old_shape),
+                ],
+            },
+        )
     }
 
     pub(crate) fn replace_layout_shape(
         &mut self,
+        source_cell: CellId,
         shape_id: ShapeId,
         old_shape: Shape,
         new_shape: Shape,
@@ -1267,16 +1340,10 @@ impl GlassworksApp {
         if old_shape == new_shape {
             return false;
         }
-        self.apply_layout_operation_with_history(
-            Operation::ReplaceShape {
-                id: shape_id,
-                shape: new_shape,
-            },
-            Operation::ReplaceShape {
-                id: shape_id,
-                shape: old_shape,
-            },
-        );
+        let (redo, undo) = self.shape_replacement_operations(source_cell, old_shape, new_shape);
+        self.apply_layout_operation_with_history(redo, undo);
+        self.layout_view_top_cell = source_cell;
+        self.layout_hidden_cells.remove(&source_cell);
         self.selected_layout_shape = Some(shape_id);
         self.selected_layout_occurrence = Some(ShapeOccurrenceId::top_level(shape_id));
         self.status_message = format!("{label} on shape #{}", shape_id.0);
@@ -1285,6 +1352,7 @@ impl GlassworksApp {
 
     pub(crate) fn replace_layout_shape_live(
         &mut self,
+        source_cell: CellId,
         shape_id: ShapeId,
         old_shape: Shape,
         new_shape: Shape,
@@ -1293,10 +1361,10 @@ impl GlassworksApp {
         if old_shape == new_shape {
             return false;
         }
-        self.apply_layout_operation_live(Operation::ReplaceShape {
-            id: shape_id,
-            shape: new_shape,
-        });
+        let (redo, _) = self.shape_replacement_operations(source_cell, old_shape, new_shape);
+        self.apply_layout_operation_live(redo);
+        self.layout_view_top_cell = source_cell;
+        self.layout_hidden_cells.remove(&source_cell);
         self.selected_layout_shape = Some(shape_id);
         self.selected_layout_occurrence = Some(ShapeOccurrenceId::top_level(shape_id));
         self.status_message = format!("{label} on shape #{}", shape_id.0);
@@ -1308,8 +1376,8 @@ impl GlassworksApp {
         world: Point,
         tolerance: Coord,
     ) -> Option<LayoutVertexHit> {
-        let shape_id = self.selected_layout_shape?;
-        let shape = self.selected_top_level_layout_shape()?;
+        let (source_cell, _, shape) = self.selected_current_cell_layout_shape()?;
+        let shape_id = shape.id;
         editable_vertex_points(&shape.kind)
             .into_iter()
             .enumerate()
@@ -1320,7 +1388,11 @@ impl GlassworksApp {
             .min_by(|(_, left), (_, right)| {
                 left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
             })
-            .map(|(vertex, _)| LayoutVertexHit { shape_id, vertex })
+            .map(|(vertex, _)| LayoutVertexHit {
+                source_cell,
+                shape_id,
+                vertex,
+            })
     }
 
     pub(crate) fn hit_selected_layout_edge(
@@ -1328,8 +1400,8 @@ impl GlassworksApp {
         world: Point,
         tolerance: Coord,
     ) -> Option<LayoutEdgeHit> {
-        let shape_id = self.selected_layout_shape?;
-        let shape = self.selected_top_level_layout_shape()?;
+        let (source_cell, _, shape) = self.selected_current_cell_layout_shape()?;
+        let shape_id = shape.id;
         editable_edges(&shape.kind)
             .into_iter()
             .enumerate()
@@ -1340,7 +1412,11 @@ impl GlassworksApp {
             .min_by(|(_, left), (_, right)| {
                 left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
             })
-            .map(|(edge, _)| LayoutEdgeHit { shape_id, edge })
+            .map(|(edge, _)| LayoutEdgeHit {
+                source_cell,
+                shape_id,
+                edge,
+            })
     }
 
     pub(crate) fn hit_selected_layout_draggable_edge(
@@ -1349,7 +1425,7 @@ impl GlassworksApp {
         tolerance: Coord,
     ) -> Option<LayoutEdgeHit> {
         let hit = self.hit_selected_layout_edge(world, tolerance)?;
-        let shape = self.workspace.document.shapes.get(&hit.shape_id)?;
+        let shape = self.layout_cell_shape(hit.source_cell, hit.shape_id)?;
         shape_edge_is_draggable(&shape.kind, hit.edge).then_some(hit)
     }
 
@@ -1395,25 +1471,40 @@ impl GlassworksApp {
     pub(crate) fn rollback_layout_drag(&mut self, drag: LayoutCanvasDrag) -> bool {
         match drag {
             LayoutCanvasDrag::MoveShape {
+                source_cell,
                 shape_id,
                 start_world,
                 last_world,
+                original_shape,
                 added_shape,
                 ..
             } => {
                 if added_shape.is_some() {
-                    return self
-                        .apply_layout_operation_live(Operation::DeleteShape { id: shape_id });
+                    return self.apply_layout_operation_live(
+                        self.shape_delete_operation(source_cell, shape_id),
+                    );
                 }
                 let total_delta =
                     Vector::new(last_world.x - start_world.x, last_world.y - start_world.y);
                 if total_delta == Vector::ZERO {
                     return false;
                 }
-                self.apply_layout_operation_live(Operation::MoveShape {
-                    id: shape_id,
-                    delta: Vector::new(-total_delta.dx, -total_delta.dy),
-                })
+                if source_cell == self.workspace.document.top_cell {
+                    self.apply_layout_operation_live(Operation::MoveShape {
+                        id: shape_id,
+                        delta: Vector::new(-total_delta.dx, -total_delta.dy),
+                    })
+                } else {
+                    let Some(current_shape) = self.layout_cell_shape(source_cell, shape_id) else {
+                        return false;
+                    };
+                    let (redo, _) = self.shape_replacement_operations(
+                        source_cell,
+                        current_shape,
+                        original_shape,
+                    );
+                    self.apply_layout_operation_live(redo)
+                }
             }
             LayoutCanvasDrag::MoveInstance {
                 parent,
@@ -1441,18 +1532,24 @@ impl GlassworksApp {
                 })
             }
             LayoutCanvasDrag::MoveVertex {
+                source_cell,
                 shape_id,
                 original_shape,
                 ..
             }
             | LayoutCanvasDrag::MoveEdge {
+                source_cell,
                 shape_id,
                 original_shape,
                 ..
-            } => self.apply_layout_operation_live(Operation::ReplaceShape {
-                id: shape_id,
-                shape: original_shape,
-            }),
+            } => {
+                let Some(current_shape) = self.layout_cell_shape(source_cell, shape_id) else {
+                    return false;
+                };
+                let (redo, _) =
+                    self.shape_replacement_operations(source_cell, current_shape, original_shape);
+                self.apply_layout_operation_live(redo)
+            }
             LayoutCanvasDrag::Rect { .. } => false,
         }
     }

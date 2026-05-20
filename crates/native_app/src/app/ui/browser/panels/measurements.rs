@@ -20,7 +20,7 @@ pub(crate) fn add_layout_measurement_browser(
         document,
         parent,
         "glassworks.layout.measurement_browser.title",
-        "Measurements",
+        layout_measurement_browser_title(app, entries.len()),
         text_style(ui_scale.value(12.0), FontWeight::BOLD, COLOR_TEXT_MUTED),
         layout::size(layout::percent(1.0), layout::px(ui_scale.value(22.0))),
     );
@@ -52,8 +52,22 @@ pub(crate) fn add_layout_measurement_browser(
                 "glassworks.viewctl.layout.measurement_filter.{}",
                 filter.slug()
             ),
-            format!("Filter {}", filter.label()),
+            format!(
+                "Filter {}",
+                layout_measurement_filter_button_label(app, filter)
+            ),
             app.layout_measurement_filter == filter,
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(24.0))),
+            ui_scale,
+        );
+    }
+    for sort in LayoutMeasurementBrowserSort::ALL {
+        add_button(
+            document,
+            parent,
+            format!("glassworks.viewctl.layout.measurement_sort.{}", sort.slug()),
+            format!("Sort {}", sort.label()),
+            app.layout_measurement_browser_sort == sort,
             layout::size(layout::percent(1.0), layout::px(ui_scale.value(24.0))),
             ui_scale,
         );

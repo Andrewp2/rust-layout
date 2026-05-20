@@ -69,12 +69,128 @@ pub(crate) fn layout_layer_panel_marks_used_and_unused_layers() {
         "glassworks.viewctl.layout.layer_usage_filter.all",
         "glassworks.viewctl.layout.layer_usage_filter.used",
         "glassworks.viewctl.layout.layer_usage_filter.empty",
+        "glassworks.viewctl.layout.layer_usage_filter.visible",
+        "glassworks.viewctl.layout.layer_usage_filter.hidden",
     ] {
         assert!(
             document.nodes().iter().any(|node| node.name() == node_name),
             "layer panel should expose group/visibility control {node_name}"
         );
     }
+    let filter_button_label = |document: &UiDocument, node_name: &str| -> String {
+        document
+            .nodes()
+            .iter()
+            .find(|node| node.name() == node_name)
+            .and_then(|node| node.accessibility())
+            .and_then(|accessibility| accessibility.label.clone())
+            .unwrap_or_else(|| panic!("{node_name} should expose an accessibility label"))
+    };
+    let expected_filter_label = |filter: LayoutLayerUsageFilter| -> String {
+        let usage = layout_layer_usage_counts(&app.workspace.document);
+        let count = app
+            .workspace
+            .document
+            .layers
+            .values()
+            .filter(|layer| app.layout_layer_group_filter.matches(layer.process))
+            .filter(|layer| {
+                filter.matches(usage.get(&layer.id).copied().unwrap_or(0), layer.visible)
+            })
+            .count();
+        format!("{} ({count})", filter.label())
+    };
+    assert_eq!(
+        filter_button_label(
+            &document,
+            "glassworks.viewctl.layout.layer_usage_filter.all"
+        ),
+        expected_filter_label(LayoutLayerUsageFilter::All)
+    );
+    assert_eq!(
+        filter_button_label(
+            &document,
+            "glassworks.viewctl.layout.layer_usage_filter.used"
+        ),
+        expected_filter_label(LayoutLayerUsageFilter::Used)
+    );
+    assert_eq!(
+        filter_button_label(
+            &document,
+            "glassworks.viewctl.layout.layer_usage_filter.empty"
+        ),
+        expected_filter_label(LayoutLayerUsageFilter::Empty)
+    );
+    assert_eq!(
+        filter_button_label(
+            &document,
+            "glassworks.viewctl.layout.layer_usage_filter.visible"
+        ),
+        expected_filter_label(LayoutLayerUsageFilter::Visible)
+    );
+    assert_eq!(
+        filter_button_label(
+            &document,
+            "glassworks.viewctl.layout.layer_usage_filter.hidden"
+        ),
+        expected_filter_label(LayoutLayerUsageFilter::Hidden)
+    );
+    let expected_visibility_label = |mode: &str, label: &str| -> String {
+        format!(
+            "{label} ({})",
+            layout_layer_visibility_preset_change_count(
+                &app.workspace.document,
+                app.active_layer,
+                mode
+            )
+            .expect("known layer visibility preset should count")
+        )
+    };
+    assert_eq!(
+        filter_button_label(
+            &document,
+            "glassworks.viewctl.layout.layer_visibility.show_all"
+        ),
+        expected_visibility_label("show_all", "All On")
+    );
+    assert_eq!(
+        filter_button_label(
+            &document,
+            "glassworks.viewctl.layout.layer_visibility.show_used"
+        ),
+        expected_visibility_label("show_used", "Used On")
+    );
+    assert_eq!(
+        filter_button_label(
+            &document,
+            "glassworks.viewctl.layout.layer_visibility.hide_empty"
+        ),
+        expected_visibility_label("hide_empty", "Empty Off")
+    );
+    assert_eq!(
+        filter_button_label(
+            &document,
+            "glassworks.viewctl.layout.layer_visibility.isolate_active"
+        ),
+        expected_visibility_label("isolate_active", "Solo Active")
+    );
+    assert_eq!(
+        filter_button_label(
+            &document,
+            "glassworks.viewctl.layout.layer_visibility.invert"
+        ),
+        expected_visibility_label("invert", "Invert")
+    );
+    assert_eq!(
+        filter_button_label(
+            &document,
+            "glassworks.viewctl.layout.layer_cleanup.delete_empty"
+        ),
+        format!(
+            "Prune Empty ({})",
+            layout_inactive_empty_layer_count(&app.workspace.document, app.active_layer)
+        )
+    );
     assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.layer_cleanup.delete_empty"));
     assert!(
         app.workspace
@@ -108,6 +224,11 @@ pub(crate) fn layout_layer_panel_marks_used_and_unused_layers() {
         .expect("demo document should include a used layer");
     assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.layer_usage_filter.used"));
     assert_eq!(app.layout_layer_usage_filter, LayoutLayerUsageFilter::Used);
+    assert!(
+        app.status_message().contains("Layer rows Used ("),
+        "{}",
+        app.status_message()
+    );
     assert_eq!(app.app_options.layout.layer_usage_filter, "used");
     let used_doc = app
         .build_operad_document(UiSize::new(1440.0, 920.0))
@@ -119,10 +240,9 @@ pub(crate) fn layout_layer_panel_marks_used_and_unused_layers() {
             .any(|node| node.name() == format!("glassworks.viewctl.layout.layer.{}", used_layer.0))
     );
     assert!(
-        !used_doc
-            .nodes()
-            .iter()
-            .any(|node| node.name() == format!("glassworks.viewctl.layout.layer.{}", unused_layer.0)),
+        !used_doc.nodes().iter().any(
+            |node| node.name() == format!("glassworks.viewctl.layout.layer.{}", unused_layer.0)
+        ),
         "used-only row filter should hide empty layer rows without changing visibility"
     );
     assert!(
@@ -139,10 +259,9 @@ pub(crate) fn layout_layer_panel_marks_used_and_unused_layers() {
         .build_operad_document(UiSize::new(1440.0, 920.0))
         .expect("empty layer filter document should build");
     assert!(
-        empty_doc
-            .nodes()
-            .iter()
-            .any(|node| node.name() == format!("glassworks.viewctl.layout.layer.{}", unused_layer.0))
+        empty_doc.nodes().iter().any(
+            |node| node.name() == format!("glassworks.viewctl.layout.layer.{}", unused_layer.0)
+        )
     );
     assert!(
         !empty_doc
@@ -160,6 +279,50 @@ pub(crate) fn layout_layer_panel_marks_used_and_unused_layers() {
             .expect("unused layer should exist")
             .visible,
         "hide-empty preset should hide unused layers"
+    );
+    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.layer_usage_filter.hidden"));
+    assert_eq!(
+        app.layout_layer_usage_filter,
+        LayoutLayerUsageFilter::Hidden
+    );
+    app.sync_app_options_from_state();
+    assert_eq!(app.app_options.layout.layer_usage_filter, "hidden");
+    let hidden_doc = app
+        .build_operad_document(UiSize::new(1440.0, 920.0))
+        .expect("hidden layer filter document should build");
+    assert!(
+        hidden_doc.nodes().iter().any(
+            |node| node.name() == format!("glassworks.viewctl.layout.layer.{}", unused_layer.0)
+        )
+    );
+    assert!(
+        !hidden_doc
+            .nodes()
+            .iter()
+            .any(|node| node.name() == format!("glassworks.viewctl.layout.layer.{}", used_layer.0)),
+        "hidden row filter should hide visible layer rows without changing visibility"
+    );
+    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.layer_usage_filter.visible"));
+    assert_eq!(
+        app.layout_layer_usage_filter,
+        LayoutLayerUsageFilter::Visible
+    );
+    app.sync_app_options_from_state();
+    assert_eq!(app.app_options.layout.layer_usage_filter, "visible");
+    let visible_doc = app
+        .build_operad_document(UiSize::new(1440.0, 920.0))
+        .expect("visible layer filter document should build");
+    assert!(
+        visible_doc
+            .nodes()
+            .iter()
+            .any(|node| node.name() == format!("glassworks.viewctl.layout.layer.{}", used_layer.0))
+    );
+    assert!(
+        !visible_doc.nodes().iter().any(
+            |node| node.name() == format!("glassworks.viewctl.layout.layer.{}", unused_layer.0)
+        ),
+        "visible row filter should hide hidden layer rows without changing visibility"
     );
     assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.layer_visibility.show_all"));
     assert!(
@@ -190,7 +353,9 @@ pub(crate) fn layout_layer_panel_marks_used_and_unused_layers() {
             .visible,
         "show-used preset should hide unused layers"
     );
-    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.layer_visibility.isolate_active"));
+    assert!(
+        app.apply_clicked_node_name("glassworks.viewctl.layout.layer_visibility.isolate_active")
+    );
     assert!(
         app.workspace
             .document
@@ -265,6 +430,33 @@ pub(crate) fn layout_technology_stack_browser_exposes_connectivity_and_rule_coun
         }),
         "metal1 should participate in the default connectivity stack"
     );
+    let total_technology_rows = rows.len();
+    app.set_layout_browser_search("stack=1");
+    let stack_rows = layout_technology_stack_rows(&app)
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(
+        stack_rows.get("Listed entries"),
+        Some(&format!("1 / {total_technology_rows} entries"))
+    );
+    assert!(
+        stack_rows.contains_key("Stack 1"),
+        "technology stack selector search should keep the matching stack link: {stack_rows:?}"
+    );
+    assert!(
+        !stack_rows.contains_key("Stack 2"),
+        "technology stack selector search should hide non-matching stack links: {stack_rows:?}"
+    );
+    app.set_layout_browser_search("active_layer=metal1");
+    let active_layer_rows = layout_technology_stack_rows(&app)
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert!(
+        active_layer_rows.contains_key("Active layer")
+            && active_layer_rows.contains_key("Active stack links"),
+        "technology stack active-layer selector should keep active-layer rows: {active_layer_rows:?}"
+    );
+    app.set_layout_browser_search("");
     assert!(
         layout_editor_inspector_sections(&app)
             .iter()
@@ -419,14 +611,31 @@ pub(crate) fn layout_connectivity_stack_link_toggle_limits_net_extraction() {
             .any(|(key, value)| key == "Stack 2" && value.contains("disabled")),
         "technology stack rows should mark the disabled link"
     );
+    let total_technology_rows = rows.len();
+    app.set_layout_browser_search("state=disabled");
+    let disabled_stack_rows = layout_technology_stack_rows(&app)
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(
+        disabled_stack_rows.get("Listed entries"),
+        Some(&format!("1 / {total_technology_rows} entries"))
+    );
+    assert!(
+        disabled_stack_rows.contains_key("Stack 2"),
+        "technology stack state selector search should keep the disabled link: {disabled_stack_rows:?}"
+    );
+    assert!(
+        !disabled_stack_rows.contains_key("Stack 1"),
+        "technology stack state selector search should hide enabled stack links: {disabled_stack_rows:?}"
+    );
+    app.set_layout_browser_search("");
     let document = app
         .build_operad_document(UiSize::new(1440.0, 920.0))
         .expect("layout document should build");
     assert!(
-        document
-            .nodes()
-            .iter()
-            .any(|node| { node.name() == "glassworks.viewctl.layout.connectivity_links.enable_all" }),
+        document.nodes().iter().any(|node| {
+            node.name() == "glassworks.viewctl.layout.connectivity_links.enable_all"
+        }),
         "layer panel should expose a control to re-enable disabled stack links"
     );
 
@@ -489,6 +698,37 @@ pub(crate) fn layout_layer_group_filter_limits_layer_panel_rows_and_options() {
             .any(|section| section.title == "Layer Groups"),
         "layout inspector should expose the layer group directory"
     );
+    app.set_layout_browser_search("group_slug=routing_metal");
+    let group_rows = layout_layer_group_directory_rows(&app)
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(
+        group_rows.get("Listed groups").map(String::as_str),
+        Some("1 / 10 groups")
+    );
+    assert!(
+        group_rows.contains_key("Routing / Metals"),
+        "layer-group selector search should keep the matching group: {group_rows:?}"
+    );
+    assert!(
+        !group_rows.contains_key("Routing / Vias"),
+        "layer-group selector search should hide non-matching groups: {group_rows:?}"
+    );
+    app.set_layout_browser_search("parent=routing");
+    let group_rows = layout_layer_group_directory_rows(&app)
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(
+        group_rows.get("Listed groups").map(String::as_str),
+        Some("3 / 10 groups")
+    );
+    assert!(
+        group_rows.contains_key("Routing / Contacts")
+            && group_rows.contains_key("Routing / Metals")
+            && group_rows.contains_key("Routing / Vias"),
+        "layer-group parent selector search should keep child groups: {group_rows:?}"
+    );
+    app.set_layout_browser_search("");
     assert!(
         initial
             .nodes()
@@ -514,12 +754,70 @@ pub(crate) fn layout_layer_group_filter_limits_layer_panel_rows_and_options() {
             "layer panel should expose hierarchical group control {node_name}"
         );
     }
+    let group_button_label = |document: &UiDocument, node_name: &str| -> String {
+        document
+            .nodes()
+            .iter()
+            .find(|node| node.name() == node_name)
+            .and_then(|node| node.accessibility())
+            .and_then(|accessibility| accessibility.label.clone())
+            .unwrap_or_else(|| panic!("{node_name} should expose an accessibility label"))
+    };
+    let expected_group_label = |group: LayoutLayerGroupFilter, label: &str| -> String {
+        let count = layout_layer_row_filter_count(
+            &app.workspace.document,
+            group,
+            app.layout_layer_usage_filter,
+        );
+        format!("{label} ({count})")
+    };
+    assert_eq!(
+        group_button_label(&initial, "glassworks.viewctl.layout.layer_group.all"),
+        expected_group_label(LayoutLayerGroupFilter::All, "All")
+    );
+    assert_eq!(
+        group_button_label(&initial, "glassworks.viewctl.layout.layer_group.routing"),
+        expected_group_label(LayoutLayerGroupFilter::Routing, "Routing")
+    );
+    assert_eq!(
+        group_button_label(
+            &initial,
+            "glassworks.viewctl.layout.layer_group.routing_metal"
+        ),
+        expected_group_label(LayoutLayerGroupFilter::RoutingMetal, "Metal")
+    );
+    assert_eq!(
+        group_button_label(&initial, "glassworks.viewctl.layout.layer_group.annotation"),
+        expected_group_label(LayoutLayerGroupFilter::Annotation, "Text")
+    );
 
     assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.layer_group.routing"));
     assert_eq!(
         app.layout_layer_group_filter,
         LayoutLayerGroupFilter::Routing
     );
+    assert!(
+        app.status_message().contains("Layer group Routing ("),
+        "{}",
+        app.status_message()
+    );
+    app.set_layout_browser_search("state=current");
+    let active_group_rows = layout_layer_group_directory_rows(&app)
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(
+        active_group_rows.get("Listed groups").map(String::as_str),
+        Some("1 / 10 groups")
+    );
+    assert!(
+        active_group_rows.contains_key("Routing"),
+        "layer-group current-state selector search should keep the active group: {active_group_rows:?}"
+    );
+    assert!(
+        !active_group_rows.contains_key("All"),
+        "layer-group current-state selector search should hide inactive groups: {active_group_rows:?}"
+    );
+    app.set_layout_browser_search("");
     let routing = app
         .build_operad_document(UiSize::new(1440.0, 920.0))
         .expect("routing layer document should build");
@@ -1063,10 +1361,55 @@ pub(crate) fn layout_layer_sets_save_restore_visibility_and_options() {
             .any(|node| node.name() == "glassworks.viewctl.layout.layer_set.tab.2"),
         "layer panel should expose layer-set tabs"
     );
+    let layer_set_tab_accessibility_label = |document: &UiDocument, node_name: &str| -> String {
+        document
+            .nodes()
+            .iter()
+            .find(|node| node.name() == node_name)
+            .and_then(|node| node.accessibility())
+            .and_then(|accessibility| accessibility.label.clone())
+            .unwrap_or_else(|| panic!("{node_name} should expose an accessibility label"))
+    };
+    let saved_visible_layers = app
+        .layout_layer_sets
+        .get(&2)
+        .expect("slot 2 should still be saved")
+        .visible_layers
+        .len();
+    let text_by_node = document_text_by_node(&document);
+    let expected_tab_2 = format!("2:{saved_visible_layers}");
+    assert_eq!(
+        text_by_node
+            .get("glassworks.viewctl.layout.layer_set.tab.2.label")
+            .map(String::as_str),
+        Some(expected_tab_2.as_str()),
+        "saved layer-set tabs should show compact visible-layer counts"
+    );
+    assert_eq!(
+        text_by_node
+            .get("glassworks.viewctl.layout.layer_set.tab.8.label")
+            .map(String::as_str),
+        Some("8:-"),
+        "empty layer-set tabs should show compact empty status"
+    );
+    let tab_2_label =
+        layer_set_tab_accessibility_label(&document, "glassworks.viewctl.layout.layer_set.tab.2");
+    assert!(
+        tab_2_label.contains(&format!("Layer Set 2: {saved_visible_layers} visible"))
+            && tab_2_label.contains("Routing")
+            && tab_2_label.contains("Used rows")
+            && tab_2_label.contains("1 depth override"),
+        "saved layer-set tab should summarize saved setup details: {tab_2_label}"
+    );
+    assert_eq!(
+        layer_set_tab_accessibility_label(&document, "glassworks.viewctl.layout.layer_set.tab.8"),
+        "Layer Set 8: empty slot"
+    );
     for node_name in [
         "glassworks.viewctl.layout.layer_set.tab.8",
         "glassworks.viewctl.layout.layer_set.save.8",
         "glassworks.viewctl.layout.layer_set.restore.8",
+        "glassworks.viewctl.layout.layer_set.clear.8",
     ] {
         assert!(
             document.nodes().iter().any(|node| node.name() == node_name),
@@ -1088,8 +1431,100 @@ pub(crate) fn layout_layer_sets_save_restore_visibility_and_options() {
         "layer panel should expose layer-set import"
     );
     assert!(
+        document
+            .nodes()
+            .iter()
+            .any(|node| node.name() == "glassworks.viewctl.layout.layer_set.clear_all"),
+        "layer panel should expose layer-set clear-all"
+    );
+    assert!(
         document_visible_text(&document).contains("Layer Sets"),
         "layer panel should label saved layer sets"
+    );
+
+    app.set_layout_browser_search("slot=2");
+    let layer_set_rows = layout_layer_set_rows(&app)
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(
+        layer_set_rows.get("Listed layer sets").map(String::as_str),
+        Some("1 / 8 slots")
+    );
+    assert!(
+        layer_set_rows.contains_key("Set 2"),
+        "layer-set slot selector search should keep the matching set: {layer_set_rows:?}"
+    );
+    assert!(
+        !layer_set_rows.contains_key("Set 8"),
+        "layer-set slot selector search should hide non-matching slots: {layer_set_rows:?}"
+    );
+    app.set_layout_browser_search("group=routing");
+    let layer_set_rows = layout_layer_set_rows(&app)
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(
+        layer_set_rows.get("Listed layer sets").map(String::as_str),
+        Some("1 / 8 slots")
+    );
+    assert!(
+        layer_set_rows.contains_key("Set 2"),
+        "layer-set group selector search should keep the saved routing setup: {layer_set_rows:?}"
+    );
+    app.set_layout_browser_search(&format!("visible_layer_id={}", metal1.0));
+    let layer_set_rows = layout_layer_set_rows(&app)
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert!(
+        layer_set_rows.contains_key("Set 2"),
+        "layer-set visible-layer selector search should match saved visible layers: {layer_set_rows:?}"
+    );
+    app.set_layout_browser_search("");
+
+    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.layer_set.clear.2"));
+    assert!(!app.layout_layer_sets.contains_key(&2));
+    assert_eq!(app.layout_layer_set_name(2), "Layer Set 2");
+    assert!(
+        app.status_message().contains("Cleared Layer Set 2"),
+        "{}",
+        app.status_message()
+    );
+    let cleared_options = app.app_options().clone();
+    assert!(
+        cleared_options
+            .layout
+            .layer_sets
+            .iter()
+            .all(|layer_set| layer_set.slot != 2),
+        "cleared layer set should not persist to app options"
+    );
+    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.layer_set.restore.2"));
+    assert!(
+        app.status_message().contains("No Layer Set 2 saved"),
+        "{}",
+        app.status_message()
+    );
+
+    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.layer_set.save.2"));
+    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.layer_set.save.4"));
+    assert_eq!(app.layout_layer_sets.len(), 2);
+    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.layer_set.clear_all"));
+    assert!(app.layout_layer_sets.is_empty());
+    assert_eq!(app.layout_layer_set_name(2), "Layer Set 2");
+    assert_eq!(app.layout_layer_set_name(4), "Layer Set 4");
+    assert!(
+        app.app_options().layout.layer_sets.is_empty(),
+        "clearing all layer sets should persist to app options"
+    );
+    assert!(
+        app.status_message().contains("Cleared 2 layer sets"),
+        "{}",
+        app.status_message()
+    );
+    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.layer_set.clear_all"));
+    assert!(
+        app.status_message().contains("No layer sets saved"),
+        "{}",
+        app.status_message()
     );
 
     assert!(app.apply_clicked_node_name("glassworks.menu.item.edit.undo"));
@@ -1130,6 +1565,14 @@ pub(crate) fn layout_layer_sets_save_restore_visibility_and_options() {
     assert!(
         document_visible_text(&restored_document).contains("Routing"),
         "named layer-set tab should appear in the layer panel"
+    );
+    assert!(
+        layer_set_tab_accessibility_label(
+            &restored_document,
+            "glassworks.viewctl.layout.layer_set.tab.2"
+        )
+        .starts_with("Routing: "),
+        "named layer-set tab should expose its saved setup name"
     );
     assert!(restored_app.layout_layer_sets.get(&2).is_some_and(|state| {
         state.visible_layers.contains(&metal1)
@@ -1187,6 +1630,20 @@ pub(crate) fn layout_file_menu_saves_and_loads_layout_json() {
         ShapeKind::Rectangle(Rect::new(Point::new(-200, -100), Point::new(500, 400))),
     )
     .expect("test rectangle should be added");
+    let source_top = app.workspace.document.top_cell;
+    let source_child = app.workspace.document.create_cell("layout json child");
+    app.workspace
+        .document
+        .insert_shape_in_cell(
+            source_child,
+            metal1,
+            ShapeKind::Rectangle(Rect::new(Point::new(0, 0), Point::new(300, 200))),
+        )
+        .expect("source child rectangle should be inserted");
+    app.workspace
+        .document
+        .insert_instance(source_top, source_child, Transform::translate(800, 100))
+        .expect("source child should be instanced under source top");
     let expected_shapes = app.workspace.document.flattened_shape_count_estimate();
     let expected_cells = app.workspace.document.cells.len();
     let path = std::env::temp_dir().join(format!(
@@ -1478,6 +1935,120 @@ pub(crate) fn layout_file_menu_saves_and_loads_layout_json() {
     );
     assert_eq!(merged.workspace.document.cells.len(), merge_cells_before);
 
+    let mut hierarchy_merged = GlassworksApp::new_with_options(StartupOptions {
+        view_mode: Some(StartupView::Workflow),
+        ..Default::default()
+    });
+    hierarchy_merged.workspace.document = Document::new("target before hierarchy merge");
+    hierarchy_merged.reset_layout_document_state();
+    let hierarchy_merge_top = hierarchy_merged.workspace.document.top_cell;
+    let hierarchy_target_shape = hierarchy_merged
+        .add_layout_shape(
+            metal1,
+            ShapeKind::Rectangle(Rect::new(Point::new(6_000, 0), Point::new(6_400, 400))),
+        )
+        .expect("hierarchy merge target rectangle should be added");
+    let hierarchy_flattened_before = hierarchy_merged
+        .workspace
+        .document
+        .flattened_shape_count_estimate();
+    let hierarchy_top_shapes_before = hierarchy_merged.workspace.document.shapes.len();
+    let hierarchy_cells_before = hierarchy_merged.workspace.document.cells.len();
+    let hierarchy_instances_before = hierarchy_merged
+        .workspace
+        .document
+        .cell(hierarchy_merge_top)
+        .expect("hierarchy merge top cell should exist")
+        .instances
+        .len();
+    assert!(hierarchy_merged.merge_layout_json_hierarchy_from_path(&path));
+    assert_eq!(hierarchy_merged.active_view, StartupView::Layout2d);
+    assert!(
+        hierarchy_merged
+            .workspace
+            .document
+            .shapes
+            .contains_key(&hierarchy_target_shape),
+        "hierarchy merge should preserve existing top-level geometry"
+    );
+    assert_eq!(
+        hierarchy_merged.workspace.document.shapes.len(),
+        hierarchy_top_shapes_before + 1,
+        "hierarchy merge should splice only source-root local shapes into the top level"
+    );
+    assert_eq!(
+        hierarchy_merged.workspace.document.cells.len(),
+        hierarchy_cells_before + expected_cells - 1,
+        "hierarchy merge should preserve source child cells without adding a wrapper root cell"
+    );
+    let hierarchy_top_cell = hierarchy_merged
+        .workspace
+        .document
+        .cell(hierarchy_merge_top)
+        .expect("hierarchy merge top cell should exist");
+    assert_eq!(
+        hierarchy_top_cell.instances.len(),
+        hierarchy_instances_before + 1,
+        "hierarchy merge should splice source-root child instances into the target top cell"
+    );
+    let hierarchy_instance = hierarchy_top_cell
+        .instances
+        .values()
+        .find(|instance| {
+            hierarchy_merged
+                .workspace
+                .document
+                .cell(instance.cell)
+                .is_some_and(|cell| {
+                    cell.properties
+                        .get("import.source_cell")
+                        .map(String::as_str)
+                        == Some("layout json child")
+                })
+        })
+        .expect("hierarchy merge should preserve the imported child instance");
+    assert_eq!(hierarchy_instance.transform, Transform::translate(800, 100));
+    assert_eq!(
+        hierarchy_merged
+            .workspace
+            .document
+            .flattened_shape_count_estimate(),
+        hierarchy_flattened_before + expected_shapes
+    );
+    assert!(
+        hierarchy_merged
+            .selected_layout_occurrence
+            .as_ref()
+            .is_some_and(ShapeOccurrenceId::is_top_level),
+        "hierarchy merge should select a newly merged source-root local shape"
+    );
+    assert!(
+        hierarchy_merged
+            .status_message()
+            .contains("hierarchy into top cell"),
+        "{}",
+        hierarchy_merged.status_message()
+    );
+    assert!(hierarchy_merged.apply_clicked_node_name("glassworks.menu.item.edit.undo"));
+    assert_eq!(
+        hierarchy_merged.workspace.document.shapes.len(),
+        hierarchy_top_shapes_before
+    );
+    assert_eq!(
+        hierarchy_merged.workspace.document.cells.len(),
+        hierarchy_cells_before
+    );
+    assert_eq!(
+        hierarchy_merged
+            .workspace
+            .document
+            .cell(hierarchy_merge_top)
+            .expect("hierarchy merge top cell should exist after undo")
+            .instances
+            .len(),
+        hierarchy_instances_before
+    );
+
     let _ = std::fs::remove_file(&path);
 
     assert!(app.apply_clicked_node_name("glassworks.menu.file"));
@@ -1490,6 +2061,7 @@ pub(crate) fn layout_file_menu_saves_and_loads_layout_json() {
         "glassworks.menu.item.file.import_layout_cell",
         "glassworks.menu.item.file.import_layout_top_cell",
         "glassworks.menu.item.file.merge_layout",
+        "glassworks.menu.item.file.merge_layout_hierarchy",
     ] {
         let node = document
             .nodes()
@@ -1639,8 +2211,10 @@ pub(crate) fn layout_file_menu_saves_and_loads_app_session() {
     app.active_tool = ToolMode::Path;
     app.sync_app_options_from_state();
 
-    let path =
-        std::env::temp_dir().join(format!("glassworks-app-session-{}.json", std::process::id()));
+    let path = std::env::temp_dir().join(format!(
+        "glassworks-app-session-{}.json",
+        std::process::id()
+    ));
     let _ = std::fs::remove_file(&path);
 
     assert!(app.save_app_session_to_path(&path));

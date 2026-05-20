@@ -12,10 +12,11 @@ use std::{
 use drc::{
     DerivedForbiddenOverlapRule, DerivedLayerOperation, DerivedLayerRule, DrcIssueStore,
     DrcValidationFinding, DrcValidationSeverity, DrcViolation, EnclosureRule, ForbiddenOverlapRule,
-    RuleDeck, import_calibre_rve_markers, run_drc,
+    KlayoutRdbImportContext, RuleDeck, import_calibre_rve_markers,
+    import_klayout_rdb_markers_with_context, run_drc,
 };
 #[cfg(not(target_arch = "wasm32"))]
-use flate2::read::GzDecoder;
+use flate2::read::{DeflateDecoder, GzDecoder};
 use geometry_core::{Coord, Point, Polygon, Rect, Vector, distance_point_to_segment};
 #[cfg(not(target_arch = "wasm32"))]
 use layout_model::ShapeKindView;
@@ -82,11 +83,12 @@ use operad::wgpu_renderer::WgpuCanvasContext;
 use operad::wgpu_renderer::WgpuRenderer;
 use operad::widgets::{ButtonOptions, CollapsingHeaderOptions, button, collapsing_header};
 use operad::{
-    AccessibilityAction, AccessibilityMeta, AccessibilityRole, ApproxTextMeasurer,
-    CanvasInteractionPolicy, ClipBehavior, ColorRgba, FontWeight, InputBehavior, LayoutStyle,
-    PaintText, ScenePrimitive, ScrollAxes, StrokeStyle, TextHorizontalAlign, TextStyle,
-    TextVerticalAlign, TextWrap, UiContent, UiDocument, UiNode, UiNodeStyle, UiPoint, UiRect,
-    UiSize, UiVisual, WidgetActionBinding, layout, platform::PixelSize, root_style,
+    AccessibilityAction, AccessibilityMeta, AccessibilityRole, ApproxTextMeasurer, CanvasContent,
+    CanvasContextDescriptor, CanvasInteractionPolicy, ClipBehavior, ColorRgba, FontWeight,
+    InputBehavior, LayoutStyle, PaintText, ScenePrimitive, ScrollAxes, StrokeStyle,
+    TextHorizontalAlign, TextStyle, TextVerticalAlign, TextWrap, UiContent, UiDocument, UiNode,
+    UiNodeStyle, UiPoint, UiRect, UiSize, UiVisual, WidgetActionBinding, layout,
+    platform::PixelSize, root_style,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use operad_wgpu as wgpu;

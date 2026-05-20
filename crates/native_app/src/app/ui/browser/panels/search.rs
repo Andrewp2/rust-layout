@@ -150,7 +150,10 @@ pub(crate) fn add_layout_browser_search(
         add_button(
             document,
             parent,
-            format!("glassworks.viewctl.layout.browser_columns.{}", columns.slug()),
+            format!(
+                "glassworks.viewctl.layout.browser_columns.{}",
+                columns.slug()
+            ),
             format!("Cols {}", columns.label()),
             app.layout_browser_columns == columns,
             layout::size(layout::percent(1.0), layout::px(ui_scale.value(24.0))),

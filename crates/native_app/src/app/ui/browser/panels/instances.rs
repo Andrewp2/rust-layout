@@ -22,7 +22,7 @@ pub(crate) fn add_layout_instance_browser(
         document,
         parent,
         "glassworks.layout.instance_browser.title",
-        "Instance Browser",
+        layout_instance_browser_title(app, entries.len()),
         text_style(ui_scale.value(12.0), FontWeight::BOLD, COLOR_TEXT_MUTED),
         layout::size(layout::percent(1.0), layout::px(ui_scale.value(22.0))),
     );
@@ -50,7 +50,7 @@ pub(crate) fn add_layout_instance_browser(
                 "glassworks.viewctl.layout.instance_browser_filter.{}",
                 filter.slug()
             ),
-            filter.label(),
+            layout_instance_browser_filter_button_label(app, filter),
             app.layout_instance_browser_filter == filter,
             layout::size(layout::percent(1.0), layout::px(ui_scale.value(24.0))),
             ui_scale,

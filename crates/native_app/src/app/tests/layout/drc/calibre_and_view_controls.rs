@@ -18,10 +18,27 @@ pub(crate) fn layout_calibre_rve_import_populates_marker_browser() {
     ));
     let _ = std::fs::remove_file(&path);
     std::fs::write(
-            &path,
-            "M1_WIDTH\n@ minimum width from calibre\np 4 100 200 400 200 400 360 100 360\nM2_SPACE\nr 800 900 980 1040\n",
-        )
-        .expect("Calibre/RVE fixture should be written");
+        &path,
+        "M1_WIDTH
+@ minimum width from calibre
+@ owner: external-rve
+@ note: external review note
+@ approval_status: accepted
+@ approved_by: external-rve
+@ approval_note: external approval note
+@ approval_role: foundry
+@ approval_at: 2026-05-19T12:20:00Z
+@ tag category=Litho/Hotspots
+p 4 100 200 400 200 400 360 100 360
+M2_SPACE
+r 800 900 980 1040
+BROKEN_POLYGON
+p 4
+0 0
+100 0
+",
+    )
+    .expect("Calibre/RVE fixture should be written");
 
     assert!(app.import_layout_calibre_rve_markers_from_path(&path));
     assert!(
@@ -30,16 +47,92 @@ pub(crate) fn layout_calibre_rve_import_populates_marker_browser() {
         "{}",
         app.status_message()
     );
+    assert!(
+        app.status_message()
+            .contains("incomplete polygon marker geometry"),
+        "{}",
+        app.status_message()
+    );
     assert_eq!(app.app_options.files.recent_files[0].kind, "calibre_rve");
     let report = app
         .drc_report()
         .expect("Calibre/RVE import should populate the marker cache");
+    assert!(
+        report.findings.iter().any(|finding| {
+            finding.severity == DrcValidationSeverity::Warning
+                && finding
+                    .message
+                    .contains("incomplete polygon marker geometry")
+        }),
+        "Calibre/RVE parser warnings should be stored with the imported report"
+    );
     assert_eq!(report.violations.len(), 2);
     assert_eq!(report.violations[0].rule, "calibre.m1_width");
     assert_eq!(report.violations[0].shape_ids.len(), 0);
     assert_eq!(
         report.violations[0].bounds,
         Rect::new(Point::new(100, 200), Point::new(400, 360))
+    );
+    let first_key = report.violations[0].stable_key();
+    assert!(
+        app.workspace
+            .document
+            .marker_states
+            .get(&first_key)
+            .is_some_and(|state| {
+                state.owner.as_deref() == Some("external-rve")
+                    && state.note.as_deref() == Some("external review note")
+                    && state.signoff.as_deref() == Some("accepted")
+                    && state.signoff_by.as_deref() == Some("external-rve")
+                    && state.signoff_note.as_deref() == Some("external approval note")
+                    && state
+                        .signoff_records
+                        .get("external-rve")
+                        .is_some_and(|signoff| {
+                            signoff.status == "accepted"
+                                && signoff.role.as_deref() == Some("foundry")
+                                && signoff.by.as_deref() == Some("external-rve")
+                                && signoff.note.as_deref() == Some("external approval note")
+                                && signoff.recorded_at.as_deref() == Some("2026-05-19T12:20:00Z")
+                        })
+                    && state.tags.get("category").map(String::as_str) == Some("Litho/Hotspots")
+            })
+    );
+    let info_rows = layout_drc_marker_info_rows(&app);
+    assert!(
+        info_rows
+            .iter()
+            .any(|(key, value)| key == "Report diagnostics" && value == "1 warning"),
+        "Calibre/RVE parser warnings should be summarized without hiding markers: {info_rows:?}"
+    );
+    assert!(
+        info_rows.iter().any(|(key, value)| {
+            key == "Report warning 1" && value.contains("incomplete polygon marker geometry")
+        }),
+        "Calibre/RVE parser warning text should stay visible in marker info rows: {info_rows:?}"
+    );
+    assert!(
+        info_rows
+            .iter()
+            .any(|(key, value)| key == "Report markers" && value == "2"),
+        "Calibre/RVE report diagnostics should not suppress marker summaries: {info_rows:?}"
+    );
+    let marker_rows = layout_drc_marker_rows(&app);
+    assert!(
+        marker_rows
+            .iter()
+            .any(|(key, value)| key == "Report diagnostics" && value == "1 warning"),
+        "Calibre/RVE parser warnings should be visible in DRC marker rows: {marker_rows:?}"
+    );
+    assert!(
+        !layout_drc_marker_category_entries(&app).is_empty(),
+        "Calibre/RVE warning diagnostics should not suppress marker category rows"
+    );
+    assert!(
+        layout_drc_marker_directory_entries(&app)
+            .iter()
+            .any(|entry| entry.path.contains("Litho")),
+        "Calibre/RVE warning diagnostics should not suppress marker directory rows"
     );
     let entries = layout_drc_marker_entries(&app);
     assert_eq!(entries.len(), 2);
@@ -56,6 +149,35 @@ pub(crate) fn layout_calibre_rve_import_populates_marker_browser() {
         "{}",
         app.status_message()
     );
+    app.set_layout_browser_search("signoff_by=external-rve");
+    assert!(
+        layout_drc_marker_entries(&app)
+            .iter()
+            .any(|entry| entry.key == first_key),
+        "Calibre/RVE review metadata should be searchable in the marker browser"
+    );
+    app.set_layout_browser_search("signoff_party=external-rve");
+    assert!(
+        layout_drc_marker_entries(&app)
+            .iter()
+            .any(|entry| entry.key == first_key),
+        "Calibre/RVE imported signoff records should be searchable in the marker browser"
+    );
+    app.set_layout_browser_search("signoff_role=foundry");
+    assert!(
+        layout_drc_marker_entries(&app)
+            .iter()
+            .any(|entry| entry.key == first_key),
+        "Calibre/RVE imported signoff roles should be searchable in the marker browser"
+    );
+    app.set_layout_browser_search("signoff_at=2026-05-19");
+    assert!(
+        layout_drc_marker_entries(&app)
+            .iter()
+            .any(|entry| entry.key == first_key),
+        "Calibre/RVE imported signoff timestamps should be searchable in the marker browser"
+    );
+    app.set_layout_browser_search("");
     let document = app
         .build_operad_document(UiSize::new(1440.0, 920.0))
         .expect("layout document with imported Calibre markers should build");
@@ -68,6 +190,99 @@ pub(crate) fn layout_calibre_rve_import_populates_marker_browser() {
             "DRC marker browser should expose {node_name}"
         );
     }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+pub(crate) fn layout_calibre_rve_import_preserves_warning_only_report() {
+    let mut app = GlassworksApp::new_with_options(StartupOptions {
+        view_mode: Some(StartupView::Layout2d),
+        ..Default::default()
+    });
+    app.workspace.document = Document::new("calibre rve warning target");
+    app.reset_layout_document_state();
+    let path = std::env::temp_dir().join(format!(
+        "glassworks-calibre-rve-warning-only-{}.txt",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    std::fs::write(
+        &path,
+        "BROKEN_ONLY
+p 4
+0 0
+100 0
+",
+    )
+    .expect("Calibre/RVE warning-only fixture should be written");
+
+    assert!(app.import_layout_calibre_rve_markers_from_path(&path));
+    assert!(
+        app.status_message().contains("found no markers")
+            && app.status_message().contains("1 diagnostic")
+            && app
+                .status_message()
+                .contains("incomplete polygon marker geometry"),
+        "{}",
+        app.status_message()
+    );
+    assert_eq!(app.app_options.files.recent_files[0].kind, "calibre_rve");
+    let report = app
+        .drc_report()
+        .expect("Calibre/RVE warning-only import should preserve report diagnostics");
+    assert!(report.violations.is_empty());
+    assert!(
+        report.findings.iter().any(|finding| {
+            finding.severity == DrcValidationSeverity::Warning
+                && finding
+                    .message
+                    .contains("incomplete polygon marker geometry")
+        }),
+        "warning-only Calibre/RVE imports should store parser diagnostics"
+    );
+    let info_rows = layout_drc_marker_info_rows(&app);
+    assert!(
+        info_rows
+            .iter()
+            .any(|(key, value)| key == "Report diagnostics" && value == "1 warning"),
+        "warning-only Calibre/RVE diagnostics should be visible in marker info rows: {info_rows:?}"
+    );
+    assert!(
+        info_rows.iter().any(|(key, value)| {
+            key == "Report warning 1" && value.contains("incomplete polygon marker geometry")
+        }),
+        "warning-only Calibre/RVE warning text should be visible in marker info rows: {info_rows:?}"
+    );
+    let marker_rows = layout_drc_marker_rows(&app);
+    assert!(
+        marker_rows
+            .iter()
+            .any(|(key, value)| key == "Report diagnostics" && value == "1 warning"),
+        "warning-only Calibre/RVE diagnostics should be visible in marker rows: {marker_rows:?}"
+    );
+    let report_id = app
+        .layout_selected_drc_report_id
+        .expect("warning-only Calibre/RVE import should select its diagnostic report");
+    for query in [
+        "incomplete polygon marker geometry",
+        "diagnostic=incomplete polygon",
+        "warning=incomplete polygon",
+        "severity=warning",
+    ] {
+        app.layout_browser_search = query.to_string();
+        assert_eq!(
+            layout_drc_report_browser_entries(&app)
+                .into_iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+            vec![report_id],
+            "warning-only Calibre/RVE diagnostic report should be searchable by {query:?}"
+        );
+    }
+    assert!(layout_drc_marker_entries(&app).is_empty());
+    assert!(layout_drc_marker_category_entries(&app).is_empty());
+    assert!(layout_drc_marker_directory_entries(&app).is_empty());
     let _ = std::fs::remove_file(&path);
 }
 
@@ -250,7 +465,10 @@ pub(crate) fn open_menu_pointer_items_have_handlers() {
         let mut app = GlassworksApp::new_with_options(StartupOptions::default());
         assert!(app.apply_clicked_node_name("glassworks.menu.view"));
         assert!(
-            app.apply_clicked_node_name(&format!("glassworks.menu.item.view.group.{}", group.slug()))
+            app.apply_clicked_node_name(&format!(
+                "glassworks.menu.item.view.group.{}",
+                group.slug()
+            ))
         );
         let document = app
             .build_operad_document(UiSize::new(1280.0, 720.0))
@@ -362,7 +580,10 @@ pub(crate) fn primary_view_panels_show_domain_rows() {
         (StartupView::MaskPrep, "glassworks.mask.controls"),
         (StartupView::LayoutDiff, "glassworks.layout_diff.controls"),
         (StartupView::FabControl, "glassworks.fab_control.commands"),
-        (StartupView::Traceability, "glassworks.traceability.controls"),
+        (
+            StartupView::Traceability,
+            "glassworks.traceability.controls",
+        ),
     ] {
         let document = GlassworksApp::new_with_options(StartupOptions {
             view_mode: Some(view),
@@ -838,7 +1059,10 @@ pub(crate) fn yield_and_experiment_controls_update_state() {
     let mut yield_document = app
         .build_operad_document(UiSize::new(1440.0, 920.0))
         .expect("yield controls should build");
-    assert_clicked_node(&mut yield_document, "glassworks.viewctl.yield.filter.failing");
+    assert_clicked_node(
+        &mut yield_document,
+        "glassworks.viewctl.yield.filter.failing",
+    );
 
     app.set_active_view(StartupView::Experiment);
     assert!(!app.experiment_show_missing_only());
@@ -918,9 +1142,9 @@ pub(crate) fn workflow_controls_switch_focus_and_open_views() {
         .or(initial_focus)
         .expect("demo workflow should have a lot");
 
-    assert!(
-        app.apply_clicked_node_name(&format!("glassworks.viewctl.workflow.focus_lot.{target_lot}"))
-    );
+    assert!(app.apply_clicked_node_name(&format!(
+        "glassworks.viewctl.workflow.focus_lot.{target_lot}"
+    )));
     assert_eq!(app.workflow_focus_lot(), Some(target_lot.as_str()));
 
     assert!(app.apply_clicked_node_name("glassworks.viewctl.workflow.open.fab-control"));
@@ -934,7 +1158,10 @@ pub(crate) fn workflow_controls_switch_focus_and_open_views() {
             "glassworks.viewctl.workflow.open.environment",
             StartupView::Environment,
         ),
-        ("glassworks.viewctl.workflow.open.safety", StartupView::Safety),
+        (
+            "glassworks.viewctl.workflow.open.safety",
+            StartupView::Safety,
+        ),
         (
             "glassworks.viewctl.workflow.open.metrology",
             StartupView::Metrology,
@@ -959,7 +1186,10 @@ pub(crate) fn workflow_controls_switch_focus_and_open_views() {
     let mut document = app
         .build_operad_document(UiSize::new(1440.0, 920.0))
         .expect("workflow document should build");
-    assert_clicked_node(&mut document, "glassworks.viewctl.workflow.open.traceability");
+    assert_clicked_node(
+        &mut document,
+        "glassworks.viewctl.workflow.open.traceability",
+    );
     assert_clicked_node(&mut document, "glassworks.viewctl.workflow.load_demo");
 }
 
@@ -1082,9 +1312,9 @@ pub(crate) fn maintenance_and_environment_controls_update_state() {
         .expect("demo environment sensor should exist")
         .zone
         .clone();
-    assert!(
-        app.apply_clicked_node_name(&format!("glassworks.viewctl.environment.sensor.{sensor_id}"))
-    );
+    assert!(app.apply_clicked_node_name(&format!(
+        "glassworks.viewctl.environment.sensor.{sensor_id}"
+    )));
     assert_eq!(app.selected_environment_sensor(), Some(sensor_id.as_str()));
     assert!(app.apply_clicked_node_name(&format!("glassworks.viewctl.environment.zone.{zone}")));
     assert!(
@@ -1143,9 +1373,9 @@ pub(crate) fn inventory_scheduler_and_safety_controls_update_state() {
     assert_eq!(app.scheduler_min_priority(), 3);
     assert!(app.apply_clicked_node_name("glassworks.viewctl.scheduler.toggle_conflicts"));
     assert!(app.scheduler_conflicts_only());
-    assert!(
-        app.apply_clicked_node_name(&format!("glassworks.viewctl.scheduler.tool.{scheduler_tool}"))
-    );
+    assert!(app.apply_clicked_node_name(&format!(
+        "glassworks.viewctl.scheduler.tool.{scheduler_tool}"
+    )));
     assert_eq!(app.selected_scheduler_tool(), Some(&scheduler_tool));
     assert!(app.apply_clicked_node_name("glassworks.viewctl.scheduler.reset"));
     assert_eq!(app.scheduler_min_priority(), 0);
@@ -1167,9 +1397,10 @@ pub(crate) fn inventory_scheduler_and_safety_controls_update_state() {
         .first()
         .expect("demo safety lockout should exist")
         .clone();
-    assert!(
-        app.apply_clicked_node_name(&format!("glassworks.viewctl.safety.tool.{}", lockout.tool_id))
-    );
+    assert!(app.apply_clicked_node_name(&format!(
+        "glassworks.viewctl.safety.tool.{}",
+        lockout.tool_id
+    )));
     assert_eq!(app.selected_safety_tool(), Some(lockout.tool_id.as_str()));
     assert!(app.apply_clicked_node_name(&format!(
         "glassworks.viewctl.safety.ack.lockout.{}",
@@ -1221,7 +1452,10 @@ pub(crate) fn mask_prep_and_layout_diff_controls_update_state() {
     let mut mask_document = app
         .build_operad_document(UiSize::new(1440.0, 920.0))
         .expect("reticle prep controls should build");
-    assert_clicked_node(&mut mask_document, "glassworks.viewctl.mask.severity.errors");
+    assert_clicked_node(
+        &mut mask_document,
+        "glassworks.viewctl.mask.severity.errors",
+    );
 
     app.set_active_view(StartupView::LayoutDiff);
     assert!(app.apply_clicked_node_name("glassworks.viewctl.layout_diff.baseline.empty"));
@@ -1393,7 +1627,10 @@ pub(crate) fn traceability_and_notebook_controls_update_state() {
     let mut notebook_document = app
         .build_operad_document(UiSize::new(1440.0, 920.0))
         .expect("notebook controls should build");
-    assert_clicked_node(&mut notebook_document, "glassworks.viewctl.notebook.preview");
+    assert_clicked_node(
+        &mut notebook_document,
+        "glassworks.viewctl.notebook.preview",
+    );
     assert_clicked_node(
         &mut notebook_document,
         "glassworks.viewctl.notebook.entry_action.handoff",
@@ -1423,7 +1660,9 @@ pub(crate) fn process_flow_and_cross_section_controls_update_state() {
     );
     assert!(app.apply_clicked_node_name("glassworks.viewctl.process_flow.toggle_errors"));
     assert!(app.process_flow_errors_only());
-    assert!(app.apply_clicked_node_name(&format!("glassworks.viewctl.process_flow.node.{node_id}")));
+    assert!(
+        app.apply_clicked_node_name(&format!("glassworks.viewctl.process_flow.node.{node_id}"))
+    );
     assert_eq!(app.selected_process_node(), Some(&node_id));
     assert!(app.apply_clicked_node_name("glassworks.viewctl.process_flow.validate"));
     assert!(app.status_message().contains("Process flow"));
@@ -1556,7 +1795,10 @@ pub(crate) fn process_control_and_spc_controls_update_state() {
     let mut spc_document = app
         .build_operad_document(UiSize::new(1440.0, 920.0))
         .expect("SPC/FDC controls should build");
-    assert_clicked_node(&mut spc_document, "glassworks.viewctl.spc.severity.critical");
+    assert_clicked_node(
+        &mut spc_document,
+        "glassworks.viewctl.spc.severity.critical",
+    );
 }
 
 #[test]

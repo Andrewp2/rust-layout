@@ -154,26 +154,26 @@ pub(crate) fn index_bytes(indices: &[u32]) -> Vec<u8> {
 }
 
 pub(crate) const VIEWPORT_3D_SCENE_SHADER: &str = r#"
-pub(crate) struct Viewport3dUniforms {
-    pub(crate) view_projection: mat4x4<f32>,
-    pub(crate) rect_camera_position: vec4<f32>,
+struct Viewport3dUniforms {
+    view_projection: mat4x4<f32>,
+    rect_camera_position: vec4<f32>,
 };
 
 @group(0) @binding(0)
 var<uniform> viewport: Viewport3dUniforms;
 
-pub(crate) struct VertexInput {
+struct VertexInput {
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) color: vec4<f32>,
 };
 
-pub(crate) struct VertexOutput {
+struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) color: vec4<f32>,
 };
 
-pub(crate) fn shade_color(color: vec4<f32>, normal: vec3<f32>) -> vec4<f32> {
+fn shade_color(color: vec4<f32>, normal: vec3<f32>) -> vec4<f32> {
     let normal_length_squared = dot(normal, normal);
     if normal_length_squared < 0.000001 {
         return color;
@@ -188,7 +188,7 @@ pub(crate) fn shade_color(color: vec4<f32>, normal: vec3<f32>) -> vec4<f32> {
 }
 
 @vertex
-pub(crate) fn vertex_main(input: VertexInput) -> VertexOutput {
+fn vertex_main(input: VertexInput) -> VertexOutput {
     var output: VertexOutput;
     output.position = viewport.view_projection * vec4<f32>(input.position, 1.0);
     output.color = shade_color(input.color, input.normal);
@@ -196,34 +196,34 @@ pub(crate) fn vertex_main(input: VertexInput) -> VertexOutput {
 }
 
 @fragment
-pub(crate) fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
+fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     return input.color;
 }
 "#;
 
 pub(crate) const VIEWPORT_3D_RECT_SLAB_SHADER: &str = r#"
-pub(crate) struct Viewport3dUniforms {
-    pub(crate) view_projection: mat4x4<f32>,
-    pub(crate) rect_camera_position: vec4<f32>,
+struct Viewport3dUniforms {
+    view_projection: mat4x4<f32>,
+    rect_camera_position: vec4<f32>,
 };
 
 @group(0) @binding(0)
 var<uniform> viewport: Viewport3dUniforms;
 
-	pub(crate) struct InstanceInput {
+	struct InstanceInput {
 	    @location(0) corner: vec4<f32>,
 	    @location(1) rect: vec4<f32>,
 	    @location(2) z_range: vec2<f32>,
 	    @location(3) color: vec4<f32>,
 	};
 
-pub(crate) struct VertexOutput {
+struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) color: vec4<f32>,
 };
 
 	@vertex
-	pub(crate) fn vertex_main(input: InstanceInput) -> VertexOutput {
+	fn vertex_main(input: InstanceInput) -> VertexOutput {
 	    let rect_center = vec2<f32>(
 	        (input.rect.x + input.rect.z) * 0.5,
 	        (input.rect.y + input.rect.w) * 0.5,
@@ -271,7 +271,7 @@ pub(crate) struct VertexOutput {
 	}
 
 @fragment
-pub(crate) fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
+fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     return input.color;
 }
 "#;
@@ -282,13 +282,13 @@ var viewport_color: texture_2d<f32>;
 @group(0) @binding(1)
 var viewport_sampler: sampler;
 
-pub(crate) struct VertexOutput {
+struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) uv: vec2<f32>,
 };
 
 @vertex
-pub(crate) fn vertex_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
+fn vertex_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     var positions = array<vec2<f32>, 3>(
         vec2<f32>(-1.0, -1.0),
         vec2<f32>(3.0, -1.0),
@@ -302,7 +302,7 @@ pub(crate) fn vertex_main(@builtin(vertex_index) vertex_index: u32) -> VertexOut
 }
 
 @fragment
-pub(crate) fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
+fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     return textureSample(viewport_color, viewport_sampler, input.uv);
 }
 "#;

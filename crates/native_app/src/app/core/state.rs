@@ -38,6 +38,7 @@ pub struct GlassworksApp {
     pub(crate) layout_layer_depth_overrides: BTreeMap<LayerId, LayoutHierarchyDepth>,
     pub(crate) layout_measurement_mode: MeasurementMode,
     pub(crate) layout_measurement_filter: LayoutMeasurementFilter,
+    pub(crate) layout_measurement_browser_sort: LayoutMeasurementBrowserSort,
     pub(crate) layout_active_technology_index: usize,
     pub(crate) layout_active_technology: TechnologyFile,
     pub(crate) layout_disabled_connectivity_links: BTreeSet<usize>,
@@ -83,6 +84,7 @@ pub struct GlassworksApp {
     pub(crate) layout_drc_marker_filter: LayoutDrcMarkerFilter,
     pub(crate) layout_drc_marker_sort: LayoutDrcMarkerSort,
     pub(crate) layout_drc_marker_category_filter: Option<LayoutDrcMarkerCategory>,
+    pub(crate) layout_drc_marker_directory_filter: Option<String>,
     pub(crate) layout_selected_drc_marker_key: Option<String>,
     pub(crate) layout_trace_history: Vec<usize>,
     pub(crate) layout_clipboard_shapes: Vec<Shape>,
@@ -183,9 +185,11 @@ pub struct GlassworksApp {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum LayoutCanvasDrag {
     MoveShape {
+        source_cell: CellId,
         shape_id: ShapeId,
         start_world: Point,
         last_world: Point,
+        original_shape: Shape,
         copy_on_drag: bool,
         added_shape: Option<Shape>,
     },
@@ -198,6 +202,7 @@ pub(crate) enum LayoutCanvasDrag {
         added_instance: Option<CellInstance>,
     },
     MoveVertex {
+        source_cell: CellId,
         shape_id: ShapeId,
         vertex: usize,
         start_world: Point,
@@ -205,6 +210,7 @@ pub(crate) enum LayoutCanvasDrag {
         original_shape: Shape,
     },
     MoveEdge {
+        source_cell: CellId,
         shape_id: ShapeId,
         edge: usize,
         last_world: Point,

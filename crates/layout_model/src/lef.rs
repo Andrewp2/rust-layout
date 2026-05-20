@@ -1,8 +1,12 @@
-use std::{collections::BTreeMap, error::Error, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt,
+};
 
-use geometry_core::{Coord, DBU_PER_MICRON, Point, Polygon, Rect};
+use geometry_core::{Coord, Point, Polygon, Rect, DBU_PER_MICRON};
 
-use crate::{Document, LayerId, ProcessLayer, ShapeKind};
+use crate::{CellId, Document, LayerId, ProcessLayer, Shape, ShapeKind};
 
 #[derive(Debug)]
 pub enum LefError {
@@ -135,122 +139,6 @@ pub fn export_lef_with_report(document: &Document) -> Result<LefExportResult, Le
     }
     report.layer_count = layer_names.len();
 
-    let mut obstructions = Vec::new();
-    let mut pins = Vec::new();
-    let mut all_bounds = Vec::new();
-    for flattened in document.flattened_shapes() {
-        let mut shape = flattened.transformed_shape();
-        let Some(layer_name) = layer_names.get(&shape.layer).cloned() else {
-            report.skipped_shapes.push(format!(
-                "shape #{} references missing layer {}",
-                shape.id.0, shape.layer.0
-            ));
-            continue;
-        };
-        all_bounds.push(shape.kind.bounds());
-        match &mut shape.kind {
-            ShapeKind::Rectangle(rect) => {
-                obstructions.push(LefGeometry::Rect {
-                    layer_name,
-                    rect: *rect,
-                });
-                report.shape_count += 1;
-                report.obstruction_count += 1;
-            }
-            ShapeKind::Polygon(poly) => {
-                let points = cleanup_lef_points(poly.points.clone());
-                if points.len() < 3 {
-                    report
-                        .skipped_shapes
-                        .push(format!("polygon #{} has fewer than 3 points", shape.id.0));
-                    continue;
-                }
-                obstructions.push(LefGeometry::Polygon { layer_name, points });
-                report.shape_count += 1;
-                report.obstruction_count += 1;
-            }
-            ShapeKind::Path { points, width } => {
-                let points = cleanup_lef_points(points.clone());
-                if points.len() < 2 {
-                    report
-                        .skipped_shapes
-                        .push(format!("path #{} has fewer than 2 points", shape.id.0));
-                    continue;
-                }
-                let rects = path_segment_rects(&points, *width);
-                if rects.is_empty() {
-                    report.skipped_shapes.push(format!(
-                        "path #{} has no horizontal or vertical LEF obstruction segments",
-                        shape.id.0
-                    ));
-                    continue;
-                }
-                for rect in rects {
-                    obstructions.push(LefGeometry::Rect {
-                        layer_name: layer_name.clone(),
-                        rect,
-                    });
-                    report.obstruction_count += 1;
-                }
-                report.shape_count += 1;
-                report.warnings.push(format!(
-                    "path #{} exported as LEF obstruction rectangle(s)",
-                    shape.id.0
-                ));
-            }
-            ShapeKind::Via { center, size, .. } => {
-                let size = size.abs().max(1);
-                let min = Point::new(center.x - size / 2, center.y - size / 2);
-                obstructions.push(LefGeometry::Rect {
-                    layer_name,
-                    rect: Rect::from_min_size(min, size, size),
-                });
-                report.shape_count += 1;
-                report.obstruction_count += 1;
-                report.warnings.push(format!(
-                    "via #{} exported as a LEF obstruction rectangle",
-                    shape.id.0
-                ));
-            }
-            ShapeKind::Label { position, text } => {
-                pins.push(LefPin {
-                    layer_name,
-                    name: sanitize_lef_identifier(text, &format!("label_{}", shape.id.0)),
-                    rect: pin_marker_rect(*position, document.grid),
-                });
-                report.shape_count += 1;
-                report.pin_count += 1;
-            }
-            ShapeKind::Measurement { a, b, label, .. } => {
-                for rect in path_segment_rects(&[*a, *b], document.grid.max(1)) {
-                    obstructions.push(LefGeometry::Rect {
-                        layer_name: layer_name.clone(),
-                        rect,
-                    });
-                    report.obstruction_count += 1;
-                }
-                pins.push(LefPin {
-                    layer_name,
-                    name: sanitize_lef_identifier(label, &format!("measurement_{}", shape.id.0)),
-                    rect: pin_marker_rect(*b, document.grid),
-                });
-                report.shape_count += 1;
-                report.pin_count += 1;
-                report.warnings.push(format!(
-                    "measurement #{} exported as LEF obstruction and pin",
-                    shape.id.0
-                ));
-            }
-        }
-    }
-
-    let bounds = all_bounds
-        .into_iter()
-        .reduce(|left, right| left.union(right))
-        .unwrap_or_else(|| {
-            Rect::from_min_size(Point::ZERO, document.grid.max(1), document.grid.max(1))
-        });
-    let macro_name = sanitize_lef_identifier(&document.name, "glassworks");
     let mut text = String::new();
     text.push_str("VERSION 5.8 ;\n");
     text.push_str("BUSBITCHARS \"[]\" ;\n");
@@ -258,6 +146,188 @@ pub fn export_lef_with_report(document: &Document) -> Result<LefExportResult, Le
     text.push_str("UNITS\n");
     text.push_str(&format!("  DATABASE MICRONS {} ;\n", DBU_PER_MICRON));
     text.push_str("END UNITS\n");
+
+    for cell_id in lef_export_cells(document) {
+        let Some(cell) = document.cell(cell_id) else {
+            continue;
+        };
+        let macro_name = if cell_id == document.top_cell {
+            sanitize_lef_identifier(&document.name, "glassworks")
+        } else {
+            sanitize_lef_identifier(&cell.name, &format!("cell_{}", cell_id.0))
+        };
+        let mut obstructions = Vec::new();
+        let mut pins = Vec::new();
+        let mut all_bounds = Vec::new();
+        if cell_id == document.top_cell {
+            for shape in document.shapes.values() {
+                collect_lef_shape(
+                    &shape,
+                    &layer_names,
+                    &mut obstructions,
+                    &mut pins,
+                    &mut all_bounds,
+                    &mut report,
+                    document.grid,
+                );
+            }
+        }
+        for shape in cell.shapes.values() {
+            collect_lef_shape(
+                &shape,
+                &layer_names,
+                &mut obstructions,
+                &mut pins,
+                &mut all_bounds,
+                &mut report,
+                document.grid,
+            );
+        }
+        if cell.instances.values().next().is_some() {
+            report.warnings.push(format!(
+                "cell {} instance placements omitted from LEF macro library export",
+                cell.name
+            ));
+        }
+        write_lef_macro(
+            &mut text,
+            &macro_name,
+            &obstructions,
+            &pins,
+            &all_bounds,
+            document.grid,
+        );
+    }
+    text.push_str("END LIBRARY\n");
+    Ok(LefExportResult { text, report })
+}
+
+fn collect_lef_shape(
+    shape: &Shape,
+    layer_names: &BTreeMap<LayerId, String>,
+    obstructions: &mut Vec<LefGeometry>,
+    pins: &mut Vec<LefPin>,
+    all_bounds: &mut Vec<Rect>,
+    report: &mut LefExportReport,
+    grid: Coord,
+) {
+    let Some(layer_name) = layer_names.get(&shape.layer).cloned() else {
+        report.skipped_shapes.push(format!(
+            "shape #{} references missing layer {}",
+            shape.id.0, shape.layer.0
+        ));
+        return;
+    };
+    all_bounds.push(shape.kind.bounds());
+    match &shape.kind {
+        ShapeKind::Rectangle(rect) => {
+            obstructions.push(LefGeometry::Rect {
+                layer_name,
+                rect: *rect,
+            });
+            report.shape_count += 1;
+            report.obstruction_count += 1;
+        }
+        ShapeKind::Polygon(poly) => {
+            let points = cleanup_lef_points(poly.points.clone());
+            if points.len() < 3 {
+                report
+                    .skipped_shapes
+                    .push(format!("polygon #{} has fewer than 3 points", shape.id.0));
+                return;
+            }
+            obstructions.push(LefGeometry::Polygon { layer_name, points });
+            report.shape_count += 1;
+            report.obstruction_count += 1;
+        }
+        ShapeKind::Path { points, width } => {
+            let points = cleanup_lef_points(points.clone());
+            if points.len() < 2 {
+                report
+                    .skipped_shapes
+                    .push(format!("path #{} has fewer than 2 points", shape.id.0));
+                return;
+            }
+            let rects = path_segment_rects(&points, *width);
+            if rects.is_empty() {
+                report.skipped_shapes.push(format!(
+                    "path #{} has no horizontal or vertical LEF obstruction segments",
+                    shape.id.0
+                ));
+                return;
+            }
+            for rect in rects {
+                obstructions.push(LefGeometry::Rect {
+                    layer_name: layer_name.clone(),
+                    rect,
+                });
+                report.obstruction_count += 1;
+            }
+            report.shape_count += 1;
+            report.warnings.push(format!(
+                "path #{} exported as LEF obstruction rectangle(s)",
+                shape.id.0
+            ));
+        }
+        ShapeKind::Via { center, size, .. } => {
+            let size = size.abs().max(1);
+            let min = Point::new(center.x - size / 2, center.y - size / 2);
+            obstructions.push(LefGeometry::Rect {
+                layer_name,
+                rect: Rect::from_min_size(min, size, size),
+            });
+            report.shape_count += 1;
+            report.obstruction_count += 1;
+            report.warnings.push(format!(
+                "via #{} exported as a LEF obstruction rectangle",
+                shape.id.0
+            ));
+        }
+        ShapeKind::Label { position, text } => {
+            pins.push(LefPin {
+                layer_name,
+                name: sanitize_lef_identifier(text, &format!("label_{}", shape.id.0)),
+                rect: pin_marker_rect(*position, grid),
+            });
+            report.shape_count += 1;
+            report.pin_count += 1;
+        }
+        ShapeKind::Measurement { a, b, label, .. } => {
+            for rect in path_segment_rects(&[*a, *b], grid.max(1)) {
+                obstructions.push(LefGeometry::Rect {
+                    layer_name: layer_name.clone(),
+                    rect,
+                });
+                report.obstruction_count += 1;
+            }
+            pins.push(LefPin {
+                layer_name,
+                name: sanitize_lef_identifier(label, &format!("measurement_{}", shape.id.0)),
+                rect: pin_marker_rect(*b, grid),
+            });
+            report.shape_count += 1;
+            report.pin_count += 1;
+            report.warnings.push(format!(
+                "measurement #{} exported as LEF obstruction and pin",
+                shape.id.0
+            ));
+        }
+    }
+}
+
+fn write_lef_macro(
+    text: &mut String,
+    macro_name: &str,
+    obstructions: &[LefGeometry],
+    pins: &[LefPin],
+    all_bounds: &[Rect],
+    grid: Coord,
+) {
+    let bounds = all_bounds
+        .iter()
+        .copied()
+        .reduce(|left, right| left.union(right))
+        .unwrap_or_else(|| Rect::from_min_size(Point::ZERO, grid.max(1), grid.max(1)));
     text.push_str(&format!("MACRO {macro_name}\n"));
     text.push_str("  CLASS BLOCK ;\n");
     text.push_str("  ORIGIN 0 0 ;\n");
@@ -267,11 +337,16 @@ pub fn export_lef_with_report(document: &Document) -> Result<LefExportResult, Le
         format_lef_coord(bounds.width().max(1)),
         format_lef_coord(bounds.height().max(1))
     ));
-    write_lef_obstructions(&mut text, &obstructions);
-    write_lef_pins(&mut text, &pins);
+    write_lef_obstructions(text, obstructions);
+    write_lef_pins(text, pins);
     text.push_str(&format!("END {macro_name}\n"));
-    text.push_str("END LIBRARY\n");
-    Ok(LefExportResult { text, report })
+}
+
+fn lef_export_cells(document: &Document) -> Vec<CellId> {
+    let mut cells = BTreeSet::new();
+    cells.insert(document.top_cell);
+    cells.extend(document.cells.keys().copied());
+    cells.into_iter().collect()
 }
 
 pub fn import_lef(input: &str) -> Result<Document, LefError> {
@@ -292,11 +367,20 @@ pub fn import_lef_with_report(input: &str) -> Result<LefImportResult, LefError> 
                 let macro_name = cursor.next_required("LEF macro name")?;
                 if report.macro_count == 0 {
                     document.name = macro_name.clone();
+                    if let Some(cell) = document.cell_mut(document.top_cell) {
+                        cell.name = macro_name.clone();
+                    }
                 }
+                let macro_cell = if report.macro_count == 0 {
+                    document.top_cell
+                } else {
+                    document.create_cell(macro_name.clone())
+                };
                 report.macro_count += 1;
                 parse_macro_block(
                     &mut cursor,
                     &mut document,
+                    macro_cell,
                     &mut layer_map,
                     &mut report,
                     &macro_name,
@@ -416,6 +500,7 @@ fn parse_units_block(
 fn parse_macro_block(
     cursor: &mut TokenCursor,
     document: &mut Document,
+    target_cell: CellId,
     layer_map: &mut BTreeMap<String, LayerId>,
     report: &mut LefImportReport,
     macro_name: &str,
@@ -423,14 +508,21 @@ fn parse_macro_block(
 ) -> Result<(), LefError> {
     while let Some(token) = cursor.next() {
         match token.to_ascii_uppercase().as_str() {
-            "OBS" => {
-                parse_geometry_block(cursor, document, layer_map, report, database_microns, true)?
-            }
+            "OBS" => parse_geometry_block(
+                cursor,
+                document,
+                target_cell,
+                layer_map,
+                report,
+                database_microns,
+                true,
+            )?,
             "PIN" => {
                 let pin_name = cursor.next_required("LEF pin name")?;
                 parse_pin_block(
                     cursor,
                     document,
+                    target_cell,
                     layer_map,
                     report,
                     &pin_name,
@@ -459,6 +551,7 @@ fn parse_macro_block(
 fn parse_geometry_block(
     cursor: &mut TokenCursor,
     document: &mut Document,
+    target_cell: CellId,
     layer_map: &mut BTreeMap<String, LayerId>,
     report: &mut LefImportReport,
     database_microns: Coord,
@@ -489,7 +582,7 @@ fn parse_geometry_block(
                     continue;
                 }
                 if insert_obstructions {
-                    document.insert_shape(layer, ShapeKind::Rectangle(rect));
+                    document.insert_shape_in_cell(target_cell, layer, ShapeKind::Rectangle(rect));
                     report.obstruction_count += 1;
                     report.shape_count += 1;
                 }
@@ -512,7 +605,11 @@ fn parse_geometry_block(
                     continue;
                 }
                 if insert_obstructions {
-                    document.insert_shape(layer, ShapeKind::Polygon(Polygon::new(points)));
+                    document.insert_shape_in_cell(
+                        target_cell,
+                        layer,
+                        ShapeKind::Polygon(Polygon::new(points)),
+                    );
                     report.obstruction_count += 1;
                     report.shape_count += 1;
                 }
@@ -535,7 +632,8 @@ fn parse_geometry_block(
                     continue;
                 }
                 if insert_obstructions {
-                    document.insert_shape(
+                    document.insert_shape_in_cell(
+                        target_cell,
                         layer,
                         ShapeKind::Path {
                             points,
@@ -559,6 +657,7 @@ fn parse_geometry_block(
 fn parse_pin_block(
     cursor: &mut TokenCursor,
     document: &mut Document,
+    target_cell: CellId,
     layer_map: &mut BTreeMap<String, LayerId>,
     report: &mut LefImportReport,
     pin_name: &str,
@@ -604,7 +703,14 @@ fn parse_pin_block(
                         .push(format!("ignored degenerate LEF pin {pin_name} RECT"));
                     continue;
                 }
-                insert_lef_pin_label(document, layer, pin_name, rect.center(), report);
+                insert_lef_pin_label(
+                    document,
+                    target_cell,
+                    layer,
+                    pin_name,
+                    rect.center(),
+                    report,
+                );
                 inserted += 1;
             }
             "POLYGON" => {
@@ -618,7 +724,14 @@ fn parse_pin_block(
                 let points =
                     parse_lef_points_until_statement(cursor, database_microns, "LEF pin POLYGON")?;
                 if let Some(bounds) = Rect::from_points(&points) {
-                    insert_lef_pin_label(document, layer, pin_name, bounds.center(), report);
+                    insert_lef_pin_label(
+                        document,
+                        target_cell,
+                        layer,
+                        pin_name,
+                        bounds.center(),
+                        report,
+                    );
                     inserted += 1;
                 } else {
                     report
@@ -637,7 +750,14 @@ fn parse_pin_block(
                 let points =
                     parse_lef_points_until_statement(cursor, database_microns, "LEF pin PATH")?;
                 if let Some(bounds) = Rect::from_points(&points) {
-                    insert_lef_pin_label(document, layer, pin_name, bounds.center(), report);
+                    insert_lef_pin_label(
+                        document,
+                        target_cell,
+                        layer,
+                        pin_name,
+                        bounds.center(),
+                        report,
+                    );
                     inserted += 1;
                 } else {
                     report
@@ -662,12 +782,14 @@ fn parse_pin_block(
 
 fn insert_lef_pin_label(
     document: &mut Document,
+    target_cell: CellId,
     layer: LayerId,
     pin_name: &str,
     position: Point,
     report: &mut LefImportReport,
 ) {
-    document.insert_shape(
+    document.insert_shape_in_cell(
+        target_cell,
         layer,
         ShapeKind::Label {
             position,
@@ -859,7 +981,11 @@ fn format_lef_coord(value: Coord) -> String {
     if text.ends_with('.') {
         text.pop();
     }
-    if text == "-0" { "0".to_string() } else { text }
+    if text == "-0" {
+        "0".to_string()
+    } else {
+        text
+    }
 }
 
 fn tokenize_lef(input: &str) -> Vec<String> {
@@ -959,13 +1085,11 @@ mod tests {
         assert!(imported.document.shapes.values().any(|shape| {
             matches!(shape.kind, ShapeKind::Rectangle(rect) if rect.width() == 1_000 && rect.height() == 600)
         }));
-        assert!(
-            imported
-                .document
-                .shapes
-                .values()
-                .any(|shape| matches!(shape.kind, ShapeKind::Polygon(_)))
-        );
+        assert!(imported
+            .document
+            .shapes
+            .values()
+            .any(|shape| matches!(shape.kind, ShapeKind::Polygon(_))));
         assert!(imported.document.shapes.values().any(
             |shape| matches!(&shape.kind, ShapeKind::Label { text, .. } if text == "pad_label")
         ));
@@ -999,25 +1123,113 @@ END LIBRARY
         assert_eq!(imported.report.generated_layers.len(), 1);
         assert_eq!(imported.report.obstruction_count, 1);
         assert_eq!(imported.report.pin_count, 1);
-        assert!(
-            imported
-                .document
-                .layers
-                .values()
-                .any(|layer| layer.name == "CUSTOM")
-        );
-        assert!(
-            imported
-                .document
-                .shapes
-                .values()
-                .any(|shape| matches!(shape.kind, ShapeKind::Rectangle(rect)
-                if rect.width() == 100 && rect.height() == 50))
-        );
+        assert!(imported
+            .document
+            .layers
+            .values()
+            .any(|layer| layer.name == "CUSTOM"));
+        assert!(imported
+            .document
+            .shapes
+            .values()
+            .any(|shape| matches!(shape.kind, ShapeKind::Rectangle(rect)
+                if rect.width() == 100 && rect.height() == 50)));
         assert!(imported.document.shapes.values().any(
             |shape| matches!(&shape.kind, ShapeKind::Label { position, text }
                 if *position == Point::new(50, 60) && text == "PAD_A")
         ));
+    }
+
+    #[test]
+    fn lef_import_preserves_multiple_macros_as_cells() {
+        let input = "\
+VERSION 5.8 ;
+UNITS
+  DATABASE MICRONS 1000 ;
+END UNITS
+MACRO pad
+  OBS
+    LAYER metal1 ;
+      RECT 0 0 0.1 0.1 ;
+  END
+END pad
+MACRO tap
+  OBS
+    LAYER metal2 ;
+      RECT 0 0 0.2 0.05 ;
+  END
+  PIN TAP
+    PORT
+      LAYER metal2 ;
+        RECT 0.08 0.01 0.12 0.03 ;
+    END
+  END TAP
+END tap
+END LIBRARY
+";
+        let imported =
+            import_lef_with_report(input).expect("LEF import should preserve macro cells");
+        assert_eq!(imported.report.macro_count, 2);
+        assert_eq!(imported.report.obstruction_count, 2);
+        assert_eq!(imported.report.pin_count, 1);
+        assert_eq!(
+            imported
+                .document
+                .cell(imported.document.top_cell)
+                .expect("top cell should exist")
+                .name,
+            "pad"
+        );
+        assert!(imported
+            .document
+            .shapes
+            .values()
+            .any(|shape| matches!(shape.kind, ShapeKind::Rectangle(rect)
+                    if rect.width() == 100 && rect.height() == 100)));
+        let tap_cell = imported
+            .document
+            .cells
+            .values()
+            .find(|cell| cell.name == "tap")
+            .expect("second macro should import as a separate cell");
+        assert_eq!(tap_cell.shapes.values().count(), 2);
+        assert!(tap_cell
+            .shapes
+            .values()
+            .any(|shape| matches!(&shape.kind, ShapeKind::Label { text, .. } if text == "TAP")));
+    }
+
+    #[test]
+    fn lef_export_writes_local_cell_macros_without_flattening_instances() {
+        let mut document = Document::new("lef hierarchy");
+        let metal1 = document.layer_by_process(ProcessLayer::Metal1).unwrap();
+        let leaf = document.create_cell("leaf macro");
+        document.insert_shape_in_cell(
+            leaf,
+            metal1,
+            ShapeKind::Rectangle(Rect::new(Point::new(0, 0), Point::new(100, 100))),
+        );
+        document
+            .insert_instance_in_top(leaf, crate::Transform::translate(1_000, 2_000))
+            .expect("top instance should be inserted");
+
+        let exported = export_lef_with_report(&document).expect("LEF export should succeed");
+        assert!(exported.text.contains("MACRO lef_hierarchy"));
+        assert!(exported.text.contains("MACRO leaf_macro"));
+        assert_eq!(exported.report.obstruction_count, 1);
+        assert!(exported.report.warnings.iter().any(|warning| {
+            warning.contains("instance placements omitted from LEF macro library export")
+        }));
+
+        let imported = import_lef_with_report(&exported.text).expect("LEF import should succeed");
+        assert_eq!(imported.report.macro_count, 2);
+        let leaf_cell = imported
+            .document
+            .cells
+            .values()
+            .find(|cell| cell.name == "leaf_macro")
+            .expect("exported child macro should import as its own cell");
+        assert_eq!(leaf_cell.shapes.values().count(), 1);
     }
 
     #[test]

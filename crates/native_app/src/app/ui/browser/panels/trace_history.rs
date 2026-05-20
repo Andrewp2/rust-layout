@@ -13,11 +13,10 @@ pub(crate) fn add_layout_trace_history(
     {
         return;
     }
-    let selected_component = app.connectivity_report().ok().and_then(|report| {
-        app.selected_layout_occurrence
-            .as_ref()
-            .and_then(|occurrence| report.component_for_occurrence(occurrence))
-    });
+    let selected_component = app
+        .connectivity_report()
+        .ok()
+        .and_then(|report| selected_layout_net_component_id(app, &report));
 
     add_text(
         document,
@@ -72,6 +71,15 @@ pub(crate) fn add_layout_trace_history(
             label,
             selected_component == Some(component_id),
             layout::size(layout::percent(1.0), layout::px(ui_scale.value(28.0))),
+            ui_scale,
+        );
+        add_button(
+            document,
+            parent,
+            format!("glassworks.viewctl.layout.trace_history.remove.{component_id}"),
+            format!("Remove Net {component_id}"),
+            false,
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(24.0))),
             ui_scale,
         );
     }

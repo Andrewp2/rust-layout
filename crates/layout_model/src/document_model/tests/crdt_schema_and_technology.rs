@@ -813,6 +813,18 @@ pub(crate) fn marker_states_round_trip_with_document() {
             note: Some("known demo marker".to_string()),
             owner: Some("layout-team".to_string()),
             signoff: Some("accepted".to_string()),
+            signoff_by: Some("layout-team".to_string()),
+            signoff_note: Some("known demo marker".to_string()),
+            signoff_records: BTreeMap::from([(
+                "layout-team".to_string(),
+                MarkerSignoffRecord {
+                    status: "accepted".to_string(),
+                    role: Some("layout".to_string()),
+                    by: Some("layout-team".to_string()),
+                    note: Some("known demo marker".to_string()),
+                    recorded_at: Some("2026-05-19T12:00:00Z".to_string()),
+                },
+            )]),
             tags: BTreeMap::from([("action".to_string(), "fix".to_string())]),
         },
     );
@@ -830,6 +842,14 @@ pub(crate) fn marker_states_round_trip_with_document() {
     assert_eq!(state.note.as_deref(), Some("known demo marker"));
     assert_eq!(state.owner.as_deref(), Some("layout-team"));
     assert_eq!(state.signoff.as_deref(), Some("accepted"));
+    assert_eq!(state.signoff_by.as_deref(), Some("layout-team"));
+    assert_eq!(state.signoff_note.as_deref(), Some("known demo marker"));
+    let signoff = state.signoff_records.get("layout-team").unwrap();
+    assert_eq!(signoff.status, "accepted");
+    assert_eq!(signoff.role.as_deref(), Some("layout"));
+    assert_eq!(signoff.by.as_deref(), Some("layout-team"));
+    assert_eq!(signoff.note.as_deref(), Some("known demo marker"));
+    assert_eq!(signoff.recorded_at.as_deref(), Some("2026-05-19T12:00:00Z"));
     assert_eq!(state.tags.get("action").map(String::as_str), Some("fix"));
 }
 
@@ -925,6 +945,18 @@ pub(crate) fn marker_state_operations_set_and_remove_review_state() {
         note: Some("known test fixture marker".to_string()),
         owner: Some("signoff-owner".to_string()),
         signoff: Some("accepted".to_string()),
+        signoff_by: Some("signoff-owner".to_string()),
+        signoff_note: Some("known test fixture marker".to_string()),
+        signoff_records: BTreeMap::from([(
+            "signoff-owner".to_string(),
+            MarkerSignoffRecord {
+                status: "accepted".to_string(),
+                role: Some("owner".to_string()),
+                by: Some("signoff-owner".to_string()),
+                note: Some("known test fixture marker".to_string()),
+                recorded_at: Some("2026-05-19T12:05:00Z".to_string()),
+            },
+        )]),
         tags: BTreeMap::from([("disposition".to_string(), "false_positive".to_string())]),
     };
     let issue_state = MarkerState {
@@ -1122,6 +1154,8 @@ pub(crate) fn loro_log_replication_carries_review_state_operations() {
         note: Some("reviewed remotely".to_string()),
         owner: Some("remote-layout".to_string()),
         signoff: Some("needs_review".to_string()),
+        signoff_by: Some("remote-layout".to_string()),
+        signoff_note: Some("reviewed remotely".to_string()),
         tags: BTreeMap::from([("source".to_string(), "external".to_string())]),
         ..MarkerState::default()
     };

@@ -19,7 +19,7 @@ pub(crate) fn add_layout_shape_browser(
         document,
         parent,
         "glassworks.layout.shape_browser.title",
-        "Shape Browser",
+        layout_shape_browser_title(app, entries.len()),
         text_style(ui_scale.value(12.0), FontWeight::BOLD, COLOR_TEXT_MUTED),
         layout::size(layout::percent(1.0), layout::px(ui_scale.value(22.0))),
     );
@@ -32,7 +32,7 @@ pub(crate) fn add_layout_shape_browser(
                 "glassworks.viewctl.layout.shape_browser_filter.{}",
                 filter.slug()
             ),
-            filter.label(),
+            layout_shape_browser_filter_button_label(app, filter),
             app.layout_shape_browser_filter == filter,
             layout::size(layout::percent(1.0), layout::px(ui_scale.value(26.0))),
             ui_scale,
@@ -43,7 +43,10 @@ pub(crate) fn add_layout_shape_browser(
         add_button(
             document,
             parent,
-            format!("glassworks.viewctl.layout.shape_browser_sort.{}", sort.slug()),
+            format!(
+                "glassworks.viewctl.layout.shape_browser_sort.{}",
+                sort.slug()
+            ),
             format!("Sort {}", sort.label()),
             app.layout_shape_browser_sort == sort,
             layout::size(layout::percent(1.0), layout::px(ui_scale.value(26.0))),

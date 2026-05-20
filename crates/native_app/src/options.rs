@@ -43,7 +43,7 @@ const LAYOUT_LAYER_GROUP_SLUGS: &[&str] = &[
     "routing_via",
     "annotation",
 ];
-const LAYOUT_LAYER_USAGE_FILTER_SLUGS: &[&str] = &["all", "used", "empty"];
+const LAYOUT_LAYER_USAGE_FILTER_SLUGS: &[&str] = &["all", "used", "empty", "visible", "hidden"];
 const LAYOUT_MEASUREMENT_MODE_SLUGS: &[&str] = &["direct", "horizontal", "vertical", "manhattan"];
 const LAYOUT_TECHNOLOGY_SLUGS: &[&str] = &["glassworks_demo", "glassworks_high_density"];
 const LAYOUT_LIBRARY_PRESET_SLOTS: std::ops::RangeInclusive<u8> = 1..=4;
@@ -280,7 +280,8 @@ impl Default for LayoutEditorOptions {
 impl LayoutEditorOptions {
     fn normalized(mut self) -> Self {
         self.default_tool = normalize_slug(self.default_tool, TOOL_SLUGS, "select");
-        self.technology = normalize_slug(self.technology, LAYOUT_TECHNOLOGY_SLUGS, "glassworks_demo");
+        self.technology =
+            normalize_slug(self.technology, LAYOUT_TECHNOLOGY_SLUGS, "glassworks_demo");
         self.disabled_connectivity_links.retain(|index| *index < 64);
         self.disabled_connectivity_links.sort_unstable();
         self.disabled_connectivity_links.dedup();
@@ -1581,8 +1582,10 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn app_options_file_loads_and_saves_pretty_json() {
-        let path =
-            std::env::temp_dir().join(format!("glassworks-options-test-{}.json", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "glassworks-options-test-{}.json",
+            std::process::id()
+        ));
         let mut options = AppOptions::default();
         options.appearance.unit_display = "microns".to_string();
         options.layout.show_2d_grid = false;

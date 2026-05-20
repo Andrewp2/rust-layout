@@ -273,7 +273,10 @@ pub(crate) fn add_metrology_view_panel(
                     add_button(
                         document,
                         row,
-                        format!("glassworks.viewctl.metrology.die.{}|{}", die.column, die.row),
+                        format!(
+                            "glassworks.viewctl.metrology.die.{}|{}",
+                            die.column, die.row
+                        ),
                         compact_button_label(
                             &metrology_attention_site_label(*die, *score, true),
                             18,
@@ -289,7 +292,10 @@ pub(crate) fn add_metrology_view_panel(
                 add_button(
                     document,
                     triage,
-                    format!("glassworks.viewctl.metrology.die.{}|{}", die.column, die.row),
+                    format!(
+                        "glassworks.viewctl.metrology.die.{}|{}",
+                        die.column, die.row
+                    ),
                     metrology_attention_site_label(*die, *score, false),
                     app.selected_die == Some(*die),
                     primary_cell_layout(1.0),

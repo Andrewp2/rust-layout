@@ -28,16 +28,20 @@ pub(crate) fn layout_file_menu_loads_compressed_json_snapshots() {
         std::process::id()
     ));
     let layout_gz_path = layout_path.with_extension("json.gz");
+    let layout_zip_path = layout_path.with_extension("json.zip");
     let workspace_path = std::env::temp_dir().join(format!(
         "glassworks-compressed-workspace-{}.json",
         std::process::id()
     ));
     let workspace_gz_path = workspace_path.with_extension("json.gz");
+    let workspace_zip_path = workspace_path.with_extension("json.zip");
     for path in [
         &layout_path,
         &layout_gz_path,
+        &layout_zip_path,
         &workspace_path,
         &workspace_gz_path,
+        &workspace_zip_path,
     ] {
         let _ = std::fs::remove_file(path);
     }
@@ -45,10 +49,12 @@ pub(crate) fn layout_file_menu_loads_compressed_json_snapshots() {
     assert!(app.save_layout_json_to_path(&layout_path));
     let layout_bytes = std::fs::read(&layout_path).expect("layout JSON should be readable");
     write_gzip_test_file(&layout_gz_path, &layout_bytes);
+    write_single_file_zip_test_file(&layout_zip_path, "layout.json", &layout_bytes);
     assert!(app.save_workspace_session_to_path(&workspace_path));
     let workspace_bytes =
         std::fs::read(&workspace_path).expect("workspace JSON should be readable");
     write_gzip_test_file(&workspace_gz_path, &workspace_bytes);
+    write_single_file_zip_test_file(&workspace_zip_path, "workspace.json", &workspace_bytes);
 
     let mut loaded = GlassworksApp::new_with_options(StartupOptions {
         view_mode: Some(StartupView::Workflow),
@@ -68,6 +74,23 @@ pub(crate) fn layout_file_menu_loads_compressed_json_snapshots() {
         "{}",
         loaded.status_message()
     );
+
+    let mut loaded_zip = GlassworksApp::new_with_options(StartupOptions {
+        view_mode: Some(StartupView::Workflow),
+        ..Default::default()
+    });
+    loaded_zip.workspace.document = Document::new("empty before zipped layout load");
+    loaded_zip.reset_layout_document_state();
+    assert!(loaded_zip.load_layout_json_from_path(&layout_zip_path));
+    assert_eq!(loaded_zip.active_view, StartupView::Layout2d);
+    assert_eq!(
+        loaded_zip
+            .workspace
+            .document
+            .flattened_shape_count_estimate(),
+        expected_shapes
+    );
+    assert_eq!(loaded_zip.workspace.document.cells.len(), expected_cells);
 
     let mut imported = GlassworksApp::new_with_options(StartupOptions {
         view_mode: Some(StartupView::Workflow),
@@ -148,11 +171,32 @@ pub(crate) fn layout_file_menu_loads_compressed_json_snapshots() {
         workspace_loaded.status_message()
     );
 
+    let mut workspace_zip_loaded = GlassworksApp::new_with_options(StartupOptions {
+        view_mode: Some(StartupView::Workflow),
+        ..Default::default()
+    });
+    workspace_zip_loaded.workspace.document = Document::new("empty before zipped workspace load");
+    workspace_zip_loaded.reset_layout_document_state();
+    assert!(workspace_zip_loaded.load_workspace_session_from_path(&workspace_zip_path));
+    assert_eq!(
+        workspace_zip_loaded
+            .workspace
+            .document
+            .flattened_shape_count_estimate(),
+        expected_shapes
+    );
+    assert_eq!(
+        workspace_zip_loaded.workspace.document.cells.len(),
+        expected_cells
+    );
+
     for path in [
         &layout_path,
         &layout_gz_path,
+        &layout_zip_path,
         &workspace_path,
         &workspace_gz_path,
+        &workspace_zip_path,
     ] {
         let _ = std::fs::remove_file(path);
     }
@@ -624,7 +668,7 @@ pub(crate) fn layout_file_menu_tracks_and_opens_recent_files() {
 
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
-pub(crate) fn layout_ui_screenshot_export_writes_rgba_snapshot() {
+pub(crate) fn layout_ui_screenshot_export_writes_rgba_ppm_and_png_snapshots() {
     let mut app = GlassworksApp::new_with_options(StartupOptions {
         view_mode: Some(StartupView::Layout2d),
         ..Default::default()
@@ -664,6 +708,35 @@ pub(crate) fn layout_ui_screenshot_export_writes_rgba_snapshot() {
     assert_eq!(ppm.len(), header.len() + 64 * 40 * 3);
     let _ = std::fs::remove_file(&ppm_path);
 
+    let png_path = std::env::temp_dir().join(format!(
+        "glassworks-ui-screenshot-export-{}.png",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&png_path);
+    assert!(app.export_ui_screenshot_png_to_path(&png_path, 80, 48));
+    assert!(
+        app.status_message().contains("PNG"),
+        "{}",
+        app.status_message()
+    );
+    let png = std::fs::read(&png_path).expect("PNG screenshot export should write a file");
+    assert!(
+        png.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "PNG export should include a PNG signature"
+    );
+    assert_eq!(&png[12..16], b"IHDR");
+    assert_eq!(u32::from_be_bytes(png[16..20].try_into().unwrap()), 80);
+    assert_eq!(u32::from_be_bytes(png[20..24].try_into().unwrap()), 48);
+    assert!(
+        png.windows(4).any(|chunk| chunk == b"IDAT"),
+        "PNG export should contain image data"
+    );
+    assert!(
+        png.ends_with(&[0, 0, 0, 0, b'I', b'E', b'N', b'D', 0xae, 0x42, 0x60, 0x82]),
+        "PNG export should end with the IEND chunk"
+    );
+    let _ = std::fs::remove_file(&png_path);
+
     assert!(app.apply_clicked_node_name("glassworks.menu.file"));
     let document = app
         .build_operad_document(UiSize::new(1440.0, 920.0))
@@ -681,6 +754,13 @@ pub(crate) fn layout_ui_screenshot_export_writes_rgba_snapshot() {
             .iter()
             .any(|node| node.name() == "glassworks.menu.item.file.export_screenshot_ppm"),
         "File menu should expose PPM screenshot export"
+    );
+    assert!(
+        document
+            .nodes()
+            .iter()
+            .any(|node| node.name() == "glassworks.menu.item.file.export_screenshot_png"),
+        "File menu should expose PNG screenshot export"
     );
 }
 
@@ -708,8 +788,10 @@ pub(crate) fn layout_file_menu_exports_and_imports_gds() {
         std::process::id()
     ));
     let gz_path = path.with_extension("gds.gz");
+    let zip_path = path.with_extension("gds.zip");
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(&gz_path);
+    let _ = std::fs::remove_file(&zip_path);
 
     assert!(app.export_layout_gds_to_path(&path));
     assert!(
@@ -723,6 +805,7 @@ pub(crate) fn layout_file_menu_exports_and_imports_gds() {
     );
     let exported_bytes = std::fs::read(&path).expect("GDS export should be readable");
     write_gzip_test_file(&gz_path, &exported_bytes);
+    write_single_file_zip_test_file(&zip_path, "layout.gds", &exported_bytes);
 
     let mut imported = GlassworksApp::new_with_options(StartupOptions {
         view_mode: Some(StartupView::Workflow),
@@ -767,6 +850,30 @@ pub(crate) fn layout_file_menu_exports_and_imports_gds() {
             .flattened_shape_count_estimate()
             >= 1,
         "compressed GDS import should load layout geometry"
+    );
+    let mut imported_zip = GlassworksApp::new_with_options(StartupOptions {
+        view_mode: Some(StartupView::Workflow),
+        ..Default::default()
+    });
+    imported_zip.workspace.document = Document::new("empty before zipped GDS import");
+    imported_zip.reset_layout_document_state();
+    assert!(imported_zip.import_layout_gds_from_path(&zip_path));
+    assert_eq!(imported_zip.active_view, StartupView::Layout2d);
+    assert!(
+        imported_zip.status_message().contains("Imported GDS"),
+        "{}",
+        imported_zip.status_message()
+    );
+    assert_eq!(
+        imported_zip
+            .workspace
+            .document
+            .flattened_shape_count_estimate(),
+        expected_gds_shapes
+    );
+    assert_eq!(
+        imported_zip.workspace.document.cells.len(),
+        expected_gds_cells
     );
 
     let mut imported_cell = GlassworksApp::new_with_options(StartupOptions {
@@ -983,6 +1090,7 @@ pub(crate) fn layout_file_menu_exports_and_imports_gds() {
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(&gz_path);
+    let _ = std::fs::remove_file(&zip_path);
 
     assert!(app.apply_clicked_node_name("glassworks.menu.file"));
     let document = app
@@ -994,6 +1102,7 @@ pub(crate) fn layout_file_menu_exports_and_imports_gds() {
         "glassworks.menu.item.file.import_gds_cell",
         "glassworks.menu.item.file.import_gds_top_cell",
         "glassworks.menu.item.file.merge_gds",
+        "glassworks.menu.item.file.merge_gds_hierarchy",
     ] {
         let node = document
             .nodes()
@@ -1002,6 +1111,123 @@ pub(crate) fn layout_file_menu_exports_and_imports_gds() {
             .unwrap_or_else(|| panic!("File menu should expose {node_name}"));
         assert!(node.input().pointer, "{node_name} should be enabled");
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+pub(crate) fn layout_file_menu_hierarchy_merges_gds() {
+    let mut source = GlassworksApp::new_with_options(StartupOptions {
+        view_mode: Some(StartupView::Layout2d),
+        ..Default::default()
+    });
+    source.workspace.document = Document::new("gds hierarchy source");
+    source.reset_layout_document_state();
+    let metal1 = source
+        .workspace
+        .document
+        .layer_by_process(ProcessLayer::Metal1)
+        .expect("default technology should include metal1");
+    source
+        .add_layout_shape(
+            metal1,
+            ShapeKind::Rectangle(Rect::new(Point::new(0, 0), Point::new(500, 300))),
+        )
+        .expect("source top rectangle should be added");
+    let source_top = source.workspace.document.top_cell;
+    let source_child = source.workspace.document.create_cell("gds hierarchy child");
+    source
+        .workspace
+        .document
+        .insert_shape_in_cell(
+            source_child,
+            metal1,
+            ShapeKind::Rectangle(Rect::new(Point::new(0, 0), Point::new(160, 120))),
+        )
+        .expect("source child shape should be inserted");
+    source
+        .workspace
+        .document
+        .insert_instance(source_top, source_child, Transform::translate(1_200, 450))
+        .expect("source child instance should be inserted");
+    let expected_shapes = source.workspace.document.flattened_shape_count_estimate();
+    let expected_cells = source.workspace.document.cells.len();
+    let path = std::env::temp_dir().join(format!(
+        "glassworks-layout-menu-hierarchy-merge-{}.gds",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+
+    assert!(source.export_layout_gds_to_path(&path));
+
+    let mut target = GlassworksApp::new_with_options(StartupOptions {
+        view_mode: Some(StartupView::Workflow),
+        ..Default::default()
+    });
+    target.workspace.document = Document::new("target before gds hierarchy merge");
+    target.reset_layout_document_state();
+    let target_top = target.workspace.document.top_cell;
+    let target_shape = target
+        .add_layout_shape(
+            metal1,
+            ShapeKind::Rectangle(Rect::new(Point::new(5_000, 0), Point::new(5_500, 400))),
+        )
+        .expect("target rectangle should be added");
+    let flattened_before = target.workspace.document.flattened_shape_count_estimate();
+    let top_shapes_before = target.workspace.document.shapes.len();
+    let cells_before = target.workspace.document.cells.len();
+    let instances_before = target
+        .workspace
+        .document
+        .cell(target_top)
+        .expect("target top cell should exist")
+        .instances
+        .len();
+    assert!(target.merge_layout_gds_hierarchy_from_path(&path));
+    assert_eq!(target.active_view, StartupView::Layout2d);
+    assert!(
+        target.workspace.document.shapes.contains_key(&target_shape),
+        "hierarchy merge should preserve existing top-level geometry"
+    );
+    assert_eq!(
+        target.workspace.document.shapes.len(),
+        top_shapes_before + 1,
+        "hierarchy merge should splice source-root local geometry into the target top level"
+    );
+    assert_eq!(
+        target.workspace.document.cells.len(),
+        cells_before + expected_cells - 1
+    );
+    let target_top_cell = target
+        .workspace
+        .document
+        .cell(target_top)
+        .expect("target top cell should exist after hierarchy merge");
+    assert_eq!(target_top_cell.instances.len(), instances_before + 1);
+    assert_eq!(
+        target.workspace.document.flattened_shape_count_estimate(),
+        flattened_before + expected_shapes
+    );
+    assert!(
+        target.status_message().contains("Merged GDS")
+            && target.status_message().contains("hierarchy into top cell"),
+        "{}",
+        target.status_message()
+    );
+    assert!(target.apply_clicked_node_name("glassworks.menu.item.edit.undo"));
+    assert_eq!(target.workspace.document.shapes.len(), top_shapes_before);
+    assert_eq!(target.workspace.document.cells.len(), cells_before);
+    assert_eq!(
+        target
+            .workspace
+            .document
+            .cell(target_top)
+            .expect("target top cell should exist after undo")
+            .instances
+            .len(),
+        instances_before
+    );
+
+    let _ = std::fs::remove_file(&path);
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1251,6 +1477,7 @@ pub(crate) fn layout_file_menu_exports_and_imports_cif() {
         "glassworks.menu.item.file.import_cif_cell",
         "glassworks.menu.item.file.import_cif_top_cell",
         "glassworks.menu.item.file.merge_cif",
+        "glassworks.menu.item.file.merge_cif_hierarchy",
     ] {
         let node = document
             .nodes()
@@ -1509,6 +1736,7 @@ pub(crate) fn layout_file_menu_exports_and_imports_dxf() {
         "glassworks.menu.item.file.import_dxf_cell",
         "glassworks.menu.item.file.import_dxf_top_cell",
         "glassworks.menu.item.file.merge_dxf",
+        "glassworks.menu.item.file.merge_dxf_hierarchy",
     ] {
         let node = document
             .nodes()

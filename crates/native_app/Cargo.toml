@@ -21,11 +21,13 @@ path = "src/main.rs"
 required-features = ["native"]
 
 [dependencies]
+base64.workspace = true
 drc = { path = "../drc" }
 geometry_core = { path = "../geometry_core" }
 layout_model = { path = "../layout_model" }
 operad.workspace = true
 pollster.workspace = true
+png.workspace = true
 renderer = { path = "../renderer" }
 router = { path = "../router" }
 serde.workspace = true

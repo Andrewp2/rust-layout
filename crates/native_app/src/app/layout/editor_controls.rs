@@ -17,7 +17,11 @@ pub(crate) fn layout_editor_control_rows(app: &GlassworksApp) -> Vec<Vec<ViewCon
             ),
         ],
         vec![
-            ViewControlButton::new("glassworks.viewctl.layout.toggle_grid", "Grid", app.show_grid),
+            ViewControlButton::new(
+                "glassworks.viewctl.layout.toggle_grid",
+                "Grid",
+                app.show_grid,
+            ),
             ViewControlButton::new(
                 "glassworks.viewctl.layout.toggle_snap",
                 "Snap",
@@ -116,16 +120,16 @@ pub(crate) fn layout_editor_control_rows(app: &GlassworksApp) -> Vec<Vec<ViewCon
         );
     }
 
-    let mut shape_rows = layout_shape_ids(document)
+    let mut shape_rows = app
+        .layout_cell_shapes(app.layout_view_top_cell)
         .into_iter()
-        .filter_map(|shape_id| document.shapes.get(&shape_id))
         .filter(|shape| shape.layer == app.active_layer)
         .take(6)
         .collect::<Vec<_>>();
     if shape_rows.is_empty() {
-        shape_rows = layout_shape_ids(document)
+        shape_rows = app
+            .layout_cell_shapes(app.layout_view_top_cell)
             .into_iter()
-            .filter_map(|shape_id| document.shapes.get(&shape_id))
             .take(6)
             .collect();
     }
@@ -189,13 +193,18 @@ pub(crate) fn layout_editor_control_rows(app: &GlassworksApp) -> Vec<Vec<ViewCon
         ),
     ]);
     rows.push(vec![
-        ViewControlButton::new("glassworks.viewctl.layout.trace_all", "Trace All", false),
         ViewControlButton::new(
-            "glassworks.viewctl.layout.connectivity",
-            "Connectivity",
-            false,
+            "glassworks.viewctl.layout.route_points.clear",
+            "Clear Points",
+            !app.route_points.is_empty(),
         ),
+        ViewControlButton::new("glassworks.viewctl.layout.trace_all", "Trace All", false),
     ]);
+    rows.push(vec![ViewControlButton::new(
+        "glassworks.viewctl.layout.connectivity",
+        "Connectivity",
+        false,
+    )]);
     rows.push(vec![
         ViewControlButton::new(
             "glassworks.viewctl.layout.reference_images.align",
@@ -241,6 +250,62 @@ pub(crate) fn layout_editor_control_rows(app: &GlassworksApp) -> Vec<Vec<ViewCon
         .collect::<Vec<_>>();
     if !reference_image_buttons.is_empty() {
         rows.push(reference_image_buttons);
+    }
+    let reference_image_landmark_buttons = app
+        .workspace
+        .document
+        .reference_images
+        .iter()
+        .take(2)
+        .enumerate()
+        .flat_map(|(index, image)| {
+            [
+                ViewControlButton::new(
+                    format!(
+                        "glassworks.viewctl.layout.reference_image.landmarks.fit_selection.{index}"
+                    ),
+                    format!("Ref {} fit", index + 1),
+                    app.selected_layout_shape.is_some(),
+                ),
+                ViewControlButton::new(
+                    format!("glassworks.viewctl.layout.reference_image.landmarks.seed.{index}"),
+                    format!("Ref {} seed", index + 1),
+                    image.pixel_size.is_some(),
+                ),
+                ViewControlButton::new(
+                    format!("glassworks.viewctl.layout.reference_image.landmarks.align.{index}"),
+                    format!("Ref {} align", index + 1),
+                    image.landmarks.len() >= 2 && image.pixel_size.is_some(),
+                ),
+            ]
+        })
+        .collect::<Vec<_>>();
+    for chunk in reference_image_landmark_buttons.chunks(2) {
+        rows.push(chunk.to_vec());
+    }
+    if !app.workspace.document.reference_images.is_empty() {
+        rows.push(vec![
+            ViewControlButton::new(
+                "glassworks.viewctl.layout.reference_images.show_all",
+                "Show Refs",
+                app.show_reference_images
+                    && app
+                        .workspace
+                        .document
+                        .reference_images
+                        .iter()
+                        .all(|image| image.visible),
+            ),
+            ViewControlButton::new(
+                "glassworks.viewctl.layout.reference_images.hide_all",
+                "Hide Refs",
+                app.workspace
+                    .document
+                    .reference_images
+                    .iter()
+                    .all(|image| !image.visible),
+            ),
+        ]);
     }
     let reference_image_opacity_buttons = app
         .workspace
@@ -328,6 +393,24 @@ pub(crate) fn layout_editor_control_rows(app: &GlassworksApp) -> Vec<Vec<ViewCon
     if !reference_image_remove_buttons.is_empty() {
         rows.push(reference_image_remove_buttons);
     }
+    let reference_image_landmark_clear_buttons = app
+        .workspace
+        .document
+        .reference_images
+        .iter()
+        .take(2)
+        .enumerate()
+        .map(|(index, image)| {
+            ViewControlButton::new(
+                format!("glassworks.viewctl.layout.reference_image.landmarks.clear.{index}"),
+                format!("Clear Ref {} Marks", index + 1),
+                !image.landmarks.is_empty(),
+            )
+        })
+        .collect::<Vec<_>>();
+    if !reference_image_landmark_clear_buttons.is_empty() {
+        rows.push(reference_image_landmark_clear_buttons);
+    }
     rows.push(vec![ViewControlButton::new(
         "glassworks.viewctl.layout.reference_images.landmarks.clear",
         "Clear Ref Marks",
@@ -336,6 +419,11 @@ pub(crate) fn layout_editor_control_rows(app: &GlassworksApp) -> Vec<Vec<ViewCon
             .reference_images
             .iter()
             .any(|image| !image.landmarks.is_empty()),
+    )]);
+    rows.push(vec![ViewControlButton::new(
+        "glassworks.viewctl.layout.reference_images.clear",
+        "Clear Refs",
+        !app.workspace.document.reference_images.is_empty(),
     )]);
     rows.retain(|row| !row.is_empty());
     rows

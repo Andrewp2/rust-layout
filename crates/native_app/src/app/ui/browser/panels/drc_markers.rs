@@ -9,9 +9,16 @@ pub(crate) fn add_layout_drc_marker_browser(
 ) {
     let entries = layout_drc_marker_entries(app);
     let category_entries = layout_drc_marker_category_entries(app);
+    let report_source_entries = layout_drc_report_source_entries(app);
+    let snapshot_entries = layout_drc_marker_snapshot_entries(app);
+    let snapshot_total_count = layout_drc_marker_snapshot_total_count(app);
+    let show_snapshot_gallery = !snapshot_entries.is_empty()
+        || snapshot_total_count > 0 && !app.layout_browser_search.trim().is_empty();
     if entries.is_empty()
+        && snapshot_entries.is_empty()
         && app.layout_drc_marker_filter == LayoutDrcMarkerFilter::Active
         && app.layout_drc_marker_category_filter.is_none()
+        && app.layout_drc_marker_directory_filter.is_none()
         && app.layout_browser_search.trim().is_empty()
         && app.layout_drc_report_history.is_empty()
     {
@@ -22,7 +29,7 @@ pub(crate) fn add_layout_drc_marker_browser(
         document,
         parent,
         "glassworks.layout.drc_marker_browser.title",
-        "DRC Marker Browser",
+        layout_drc_marker_browser_title(app, entries.len()),
         text_style(ui_scale.value(12.0), FontWeight::BOLD, COLOR_TEXT_MUTED),
         layout::size(layout::percent(1.0), layout::px(ui_scale.value(22.0))),
     );
@@ -66,12 +73,96 @@ pub(crate) fn add_layout_drc_marker_browser(
     add_button(
         document,
         parent,
+        "glassworks.viewctl.layout.drc_report_database_append",
+        "Append Report Database",
+        false,
+        layout::size(layout::percent(1.0), layout::px(ui_scale.value(26.0))),
+        ui_scale,
+    );
+    add_button(
+        document,
+        parent,
+        "glassworks.viewctl.layout.klayout_rdb_export",
+        "Export KLayout RDB",
+        false,
+        layout::size(layout::percent(1.0), layout::px(ui_scale.value(26.0))),
+        ui_scale,
+    );
+    add_button(
+        document,
+        parent,
+        "glassworks.viewctl.layout.klayout_rdb_import",
+        "Import KLayout RDB",
+        false,
+        layout::size(layout::percent(1.0), layout::px(ui_scale.value(26.0))),
+        ui_scale,
+    );
+    add_button(
+        document,
+        parent,
+        "glassworks.viewctl.layout.klayout_rdb_append",
+        "Append KLayout RDB",
+        false,
+        layout::size(layout::percent(1.0), layout::px(ui_scale.value(26.0))),
+        ui_scale,
+    );
+    add_button(
+        document,
+        parent,
         "glassworks.viewctl.layout.calibre_rve_import",
         "Import Calibre/RVE Markers",
         false,
         layout::size(layout::percent(1.0), layout::px(ui_scale.value(26.0))),
         ui_scale,
     );
+    if !report_source_entries.is_empty() {
+        add_text(
+            document,
+            parent,
+            "glassworks.layout.drc_report_sources.title",
+            "Report Database Sources",
+            text_style(ui_scale.value(11.0), FontWeight::BOLD, COLOR_TEXT_MUTED),
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(20.0))),
+        );
+        add_button(
+            document,
+            parent,
+            "glassworks.viewctl.layout.drc_report_source.all",
+            "All Report Sources",
+            !app.layout_browser_search
+                .trim()
+                .to_ascii_lowercase()
+                .starts_with("source="),
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(24.0))),
+            ui_scale,
+        );
+        for (index, entry) in report_source_entries.iter().take(8).enumerate() {
+            add_button(
+                document,
+                parent,
+                format!("glassworks.viewctl.layout.drc_report_source.{index}"),
+                compact_button_label(
+                    &format!(
+                        "{} {}/{} reports, {} markers",
+                        entry.source, entry.listed_reports, entry.total_reports, entry.marker_count
+                    ),
+                    34,
+                ),
+                layout_drc_report_source_filter_is_active(app, &entry.source),
+                layout::size(layout::percent(1.0), layout::px(ui_scale.value(24.0))),
+                ui_scale,
+            );
+            add_button(
+                document,
+                parent,
+                format!("glassworks.viewctl.layout.drc_report_source.delete.{index}"),
+                compact_button_label(&format!("Delete Source {}", entry.source), 34),
+                false,
+                layout::size(layout::percent(1.0), layout::px(ui_scale.value(24.0))),
+                ui_scale,
+            );
+        }
+    }
     add_button(
         document,
         parent,
@@ -81,41 +172,101 @@ pub(crate) fn add_layout_drc_marker_browser(
         layout::size(layout::percent(1.0), layout::px(ui_scale.value(26.0))),
         ui_scale,
     );
+    if app
+        .drc_report()
+        .is_some_and(|report| !report.violations.is_empty())
+    {
+        add_button(
+            document,
+            parent,
+            "glassworks.viewctl.layout.drc_markers.clear_states",
+            "Clear Active Marker States",
+            false,
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(26.0))),
+            ui_scale,
+        );
+        add_button(
+            document,
+            parent,
+            "glassworks.viewctl.layout.drc_markers.clear_snapshots",
+            "Clear Active Marker Snapshots",
+            false,
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(26.0))),
+            ui_scale,
+        );
+        add_button(
+            document,
+            parent,
+            "glassworks.viewctl.layout.drc_markers.clear_tags",
+            "Clear Active Marker Tags",
+            false,
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(26.0))),
+            ui_scale,
+        );
+    }
 
     if !app.layout_drc_report_history.is_empty() {
+        let report_entries = layout_drc_report_browser_entries(app);
+        let listed_report_ids = report_entries
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>();
         add_text(
             document,
             parent,
             "glassworks.layout.drc_reports.title",
-            "DRC Reports",
+            layout_drc_report_browser_title(
+                app,
+                report_entries.len(),
+                app.layout_drc_report_history.len(),
+            ),
             text_style(ui_scale.value(11.0), FontWeight::BOLD, COLOR_TEXT_MUTED),
             layout::size(layout::percent(1.0), layout::px(ui_scale.value(20.0))),
         );
-        for entry in &app.layout_drc_report_history {
-            let summary = if entry.value.findings.is_empty() {
-                format!("{} marker(s)", entry.value.violations.len())
-            } else {
-                format!("{} issue(s)", entry.value.findings.len())
-            };
-            let freshness = if entry.revision == app.layout_revision {
-                "current"
-            } else {
-                "stale"
-            };
+        if report_entries.is_empty() {
+            add_text(
+                document,
+                parent,
+                "glassworks.layout.drc_reports.empty",
+                "No matching reports",
+                text_style(ui_scale.value(11.0), FontWeight::NORMAL, COLOR_TEXT_MUTED),
+                layout::size(layout::percent(1.0), layout::px(ui_scale.value(20.0))),
+            );
+        }
+        if !report_entries.is_empty() {
             add_button(
                 document,
                 parent,
-                format!("glassworks.viewctl.layout.drc_report.select.{}", entry.id),
-                compact_button_label(
-                    &format!("#{} {} {summary} {freshness}", entry.id, entry.label),
-                    30,
-                ),
-                app.layout_selected_drc_report_id == Some(entry.id),
+                "glassworks.viewctl.layout.drc_report_browser.select_first",
+                "Select First Report",
+                false,
                 layout::size(layout::percent(1.0), layout::px(ui_scale.value(24.0))),
                 ui_scale,
             );
         }
-        if let Some(report_id) = app.layout_selected_drc_report_id {
+        for entry in &report_entries {
+            add_button(
+                document,
+                parent,
+                format!("glassworks.viewctl.layout.drc_report.select.{}", entry.id),
+                layout_drc_report_button_label(app, entry),
+                app.layout_selected_drc_report_id == Some(entry.id),
+                layout::size(layout::percent(1.0), layout::px(ui_scale.value(24.0))),
+                ui_scale,
+            );
+            add_button(
+                document,
+                parent,
+                format!("glassworks.viewctl.layout.drc_report.delete.{}", entry.id),
+                format!("Delete Report #{}", entry.id),
+                false,
+                layout::size(layout::percent(1.0), layout::px(ui_scale.value(24.0))),
+                ui_scale,
+            );
+        }
+        if let Some(report_id) = app.layout_selected_drc_report_id
+            && !listed_report_ids.contains(&report_id)
+        {
             add_button(
                 document,
                 parent,
@@ -176,6 +327,41 @@ pub(crate) fn add_layout_drc_marker_browser(
         }
     }
 
+    let directory_entries = layout_drc_marker_directory_filter_entries(app);
+    if !directory_entries.is_empty() {
+        add_text(
+            document,
+            parent,
+            "glassworks.layout.drc_marker_directories.title",
+            "Marker Directories",
+            text_style(ui_scale.value(11.0), FontWeight::BOLD, COLOR_TEXT_MUTED),
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(20.0))),
+        );
+        add_button(
+            document,
+            parent,
+            "glassworks.viewctl.layout.drc_marker_directory.all",
+            "All Directories",
+            app.layout_drc_marker_directory_filter.is_none(),
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(24.0))),
+            ui_scale,
+        );
+        for (index, entry) in directory_entries.iter().take(8).enumerate() {
+            add_button(
+                document,
+                parent,
+                format!("glassworks.viewctl.layout.drc_marker_directory.{index}"),
+                compact_button_label(
+                    &format!("{} {}/{}", entry.path, entry.active, entry.total),
+                    30,
+                ),
+                app.layout_drc_marker_directory_filter.as_ref() == Some(&entry.path),
+                layout::size(layout::percent(1.0), layout::px(ui_scale.value(24.0))),
+                ui_scale,
+            );
+        }
+    }
+
     for filter in LayoutDrcMarkerFilter::ALL {
         add_button(
             document,
@@ -184,7 +370,7 @@ pub(crate) fn add_layout_drc_marker_browser(
                 "glassworks.viewctl.layout.drc_marker_filter.{}",
                 filter.slug()
             ),
-            filter.label(),
+            layout_drc_marker_filter_button_label(app, filter),
             app.layout_drc_marker_filter == filter,
             layout::size(layout::percent(1.0), layout::px(ui_scale.value(26.0))),
             ui_scale,
@@ -203,7 +389,113 @@ pub(crate) fn add_layout_drc_marker_browser(
         );
     }
 
+    if show_snapshot_gallery {
+        add_text(
+            document,
+            parent,
+            "glassworks.layout.drc_marker_snapshots.title",
+            layout_drc_marker_snapshot_title(app, snapshot_entries.len(), snapshot_total_count),
+            text_style(ui_scale.value(11.0), FontWeight::BOLD, COLOR_TEXT_MUTED),
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(20.0))),
+        );
+        if snapshot_entries.is_empty() {
+            add_text(
+                document,
+                parent,
+                "glassworks.layout.drc_marker_snapshots.empty",
+                "No matching snapshots",
+                text_style(ui_scale.value(11.0), FontWeight::NORMAL, COLOR_TEXT_MUTED),
+                layout::size(layout::percent(1.0), layout::px(ui_scale.value(20.0))),
+            );
+        }
+        for entry in snapshot_entries.iter().take(8) {
+            add_layout_drc_marker_snapshot_button(
+                document,
+                parent,
+                entry,
+                app.layout_selected_drc_marker_key.as_ref() == Some(&entry.key),
+                ui_scale,
+            );
+        }
+    }
+
     if app.layout_selected_drc_marker_key.is_some() {
+        if let Some(violation) = selected_layout_drc_marker_violation(app) {
+            let mut source_shapes = violation.shape_ids.clone();
+            for occurrence in &violation.occurrence_ids {
+                let shape_id = occurrence.source_shape_id();
+                if !source_shapes.contains(&shape_id) {
+                    source_shapes.push(shape_id);
+                }
+            }
+            if !source_shapes.is_empty() {
+                add_text(
+                    document,
+                    parent,
+                    "glassworks.layout.drc_marker_objects.title",
+                    "Marker Objects",
+                    text_style(ui_scale.value(11.0), FontWeight::BOLD, COLOR_TEXT_MUTED),
+                    layout::size(layout::percent(1.0), layout::px(ui_scale.value(20.0))),
+                );
+                for shape_id in source_shapes.iter().take(8) {
+                    add_button(
+                        document,
+                        parent,
+                        format!(
+                            "glassworks.viewctl.layout.drc_marker_source_shape.{}",
+                            shape_id.0
+                        ),
+                        format!("Select Shape #{}", shape_id.0),
+                        app.selected_layout_occurrence
+                            .as_ref()
+                            .is_some_and(|occurrence| occurrence.source_shape_id() == *shape_id)
+                            || app.selected_layout_shape == Some(*shape_id),
+                        layout::size(layout::percent(1.0), layout::px(ui_scale.value(24.0))),
+                        ui_scale,
+                    );
+                }
+                for occurrence in violation.occurrence_ids.iter().take(8) {
+                    add_button(
+                        document,
+                        parent,
+                        format!(
+                            "glassworks.viewctl.layout.drc_marker_source_occurrence.{}",
+                            layout_occurrence_action_key(occurrence)
+                        ),
+                        compact_button_label(
+                            &format!("Select {}", layout_occurrence_label(occurrence)),
+                            30,
+                        ),
+                        app.selected_layout_occurrence.as_ref() == Some(occurrence),
+                        layout::size(layout::percent(1.0), layout::px(ui_scale.value(24.0))),
+                        ui_scale,
+                    );
+                }
+                for cell_id in layout_drc_marker_source_cells(&app.workspace.document, &violation)
+                    .into_iter()
+                    .take(8)
+                {
+                    add_button(
+                        document,
+                        parent,
+                        format!(
+                            "glassworks.viewctl.layout.drc_marker_source_cell.{}",
+                            cell_id.0
+                        ),
+                        compact_button_label(
+                            &format!(
+                                "View {}",
+                                layout_cell_display_name(&app.workspace.document, cell_id)
+                            ),
+                            30,
+                        ),
+                        app.layout_view_top_cell == cell_id,
+                        layout::size(layout::percent(1.0), layout::px(ui_scale.value(24.0))),
+                        ui_scale,
+                    );
+                }
+            }
+        }
         add_button(
             document,
             parent,
@@ -343,11 +635,42 @@ pub(crate) fn add_layout_drc_marker_browser(
             layout::size(layout::percent(1.0), layout::px(ui_scale.value(24.0))),
             ui_scale,
         );
+        if let Some(tags) = selected_tags {
+            for (index, (tag_key, tag_value)) in tags.iter().take(6).enumerate() {
+                add_button(
+                    document,
+                    parent,
+                    format!("glassworks.viewctl.layout.drc_marker_tag.remove.{index}"),
+                    compact_button_label(&format!("Remove {tag_key}={tag_value}"), 40),
+                    false,
+                    layout::size(layout::percent(1.0), layout::px(ui_scale.value(24.0))),
+                    ui_scale,
+                );
+            }
+        }
         add_button(
             document,
             parent,
             "glassworks.viewctl.layout.drc_marker_snapshot",
             "Export Marker Snapshot",
+            false,
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(24.0))),
+            ui_scale,
+        );
+        add_button(
+            document,
+            parent,
+            "glassworks.viewctl.layout.drc_marker_snapshot_png",
+            "Export Marker PNG",
+            false,
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(24.0))),
+            ui_scale,
+        );
+        add_button(
+            document,
+            parent,
+            "glassworks.viewctl.layout.drc_marker_snapshot.clear",
+            "Clear Marker Snapshot",
             false,
             layout::size(layout::percent(1.0), layout::px(ui_scale.value(24.0))),
             ui_scale,
@@ -416,4 +739,86 @@ pub(crate) fn add_layout_drc_marker_browser(
             ui_scale,
         );
     }
+}
+
+fn add_layout_drc_marker_snapshot_button(
+    document: &mut UiDocument,
+    parent: operad::UiNodeId,
+    entry: &LayoutDrcMarkerSnapshotEntry,
+    selected: bool,
+    ui_scale: UiScale,
+) {
+    let name = format!(
+        "glassworks.viewctl.layout.drc_marker_snapshot_entry.{}",
+        entry.id
+    );
+    let fill = if selected {
+        COLOR_BUTTON_SELECTED
+    } else {
+        COLOR_BUTTON_BG
+    };
+    let stroke = Some(StrokeStyle::new(
+        if selected {
+            COLOR_BUTTON_STROKE_SELECTED
+        } else {
+            COLOR_PANEL_STROKE
+        },
+        ui_scale.value(1.0),
+    ));
+    let weight = if selected {
+        FontWeight::BOLD
+    } else {
+        FontWeight::NORMAL
+    };
+    let button_layout = layout::Layout::row()
+        .size(layout::LayoutSize::new(
+            layout::LayoutDimension::Percent(1.0),
+            layout::LayoutDimension::Points(ui_scale.value(42.0)),
+        ))
+        .align_items(layout::LayoutAlignment::Center)
+        .justify_content(layout::LayoutJustifyContent::FlexStart)
+        .gap(layout::LayoutGap::points(ui_scale.value(6.0), 0.0))
+        .to_layout_style();
+    let button_id = document.add_child(
+        parent,
+        UiNode::container(name.clone(), UiNodeStyle::clipped(button_layout))
+            .with_visual(UiVisual::panel(fill, stroke, ui_scale.value(2.0)))
+            .with_input(InputBehavior::BUTTON)
+            .with_action(WidgetActionBinding::action(name.clone()))
+            .with_accessibility(
+                AccessibilityMeta::new(AccessibilityRole::Button)
+                    .label(entry.label.clone())
+                    .focusable(),
+            ),
+    );
+    let canvas_layout =
+        layout::Layout::fixed(ui_scale.value(54.0), ui_scale.value(32.0)).to_layout_style();
+    let canvas_id = document.add_child(
+        button_id,
+        UiNode::canvas(
+            format!("{name}.image"),
+            LAYOUT_DRC_MARKER_SNAPSHOT_CANVAS_KEY,
+            canvas_layout,
+        )
+        .with_input(InputBehavior::NONE)
+        .with_accessibility(
+            AccessibilityMeta::new(AccessibilityRole::Image).label(entry.label.clone()),
+        ),
+    );
+    document.set_node_content(
+        canvas_id,
+        UiContent::Canvas(
+            CanvasContent::new(LAYOUT_DRC_MARKER_SNAPSHOT_CANVAS_KEY).context(
+                CanvasContextDescriptor::gpu_texture(entry.image_key.clone()),
+            ),
+        ),
+    );
+    add_text(
+        document,
+        button_id,
+        format!("{name}.label"),
+        entry.label.clone(),
+        text_style(ui_scale.value(12.0), weight, COLOR_TEXT),
+        layout::size(layout::percent(1.0), layout::px(ui_scale.value(32.0))),
+    );
 }

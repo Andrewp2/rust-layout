@@ -62,8 +62,16 @@ impl GlassworksApp {
             return self.restore_layout_layer_set(slot);
         }
 
+        if let Some(slot) = action.strip_prefix("layout.layer_set.clear.") {
+            return self.clear_layout_layer_set(slot);
+        }
+
         if let Some(slot) = action.strip_prefix("layout.layer_set.tab.") {
             return self.restore_layout_layer_set(slot);
+        }
+
+        if action == "layout.layer_set.clear_all" {
+            return self.clear_all_layout_layer_sets();
         }
 
         if action == "layout.layer_set.export" {
@@ -114,6 +122,14 @@ impl GlassworksApp {
             return self.set_layout_measurement_filter(filter);
         }
 
+        if let Some(slug) = action.strip_prefix("layout.measurement_sort.") {
+            if let Some(sort) = LayoutMeasurementBrowserSort::from_slug(slug) {
+                self.layout_measurement_browser_sort = sort;
+                self.status_message = format!("Measurement browser sort {}", sort.label());
+                return true;
+            }
+        }
+
         if let Some(value) = action.strip_prefix("layout.instance.") {
             return self.select_layout_instance(value);
         }
@@ -128,8 +144,9 @@ impl GlassworksApp {
 
         if let Some(slug) = action.strip_prefix("layout.instance_browser_filter.") {
             if let Some(filter) = LayoutInstanceBrowserFilter::from_slug(slug) {
+                let filter_label = layout_instance_browser_filter_button_label(self, filter);
                 self.layout_instance_browser_filter = filter;
-                self.status_message = format!("Instance browser filter {}", filter.label());
+                self.status_message = format!("Instance browser filter {filter_label}");
                 return true;
             }
         }
@@ -201,6 +218,12 @@ impl GlassworksApp {
             "layout.cell_visibility.show_children" => {
                 return self.set_layout_child_cells_visibility(false);
             }
+            "layout.cell_visibility.hide_siblings" => {
+                return self.set_layout_sibling_cells_visibility(true);
+            }
+            "layout.cell_visibility.show_siblings" => {
+                return self.set_layout_sibling_cells_visibility(false);
+            }
             "layout.cell_visibility.hide_descendants" => {
                 return self.set_layout_descendant_cells_visibility(true);
             }
@@ -218,6 +241,94 @@ impl GlassworksApp {
             return self.select_layout_net_component(value);
         }
 
+        if let Some(value) = action.strip_prefix("layout.net_component_source.") {
+            return self.select_layout_net_component_source_occurrence(value);
+        }
+
+        if let Some(value) = action.strip_prefix("layout.net_component_label.") {
+            return self.select_layout_net_component_label_occurrence(value);
+        }
+
+        if let Some(value) = action.strip_prefix("layout.netlist_device.") {
+            return self.select_layout_netlist_device(value);
+        }
+
+        if let Some(value) = action.strip_prefix("layout.netlist_issue.") {
+            return self.select_layout_netlist_issue(value);
+        }
+
+        if action == "layout.spice_compare_issue.select_first" {
+            return self.select_first_layout_spice_comparison_issue();
+        }
+
+        if action == "layout.spice_compare.clear" {
+            return self.clear_layout_spice_comparison();
+        }
+
+        if let Some(value) = action.strip_prefix("layout.spice_compare_issue.") {
+            return self.select_layout_spice_comparison_issue(value);
+        }
+
+        if action == "layout.trace_point.select_first" {
+            return self.select_first_layout_trace_point_match();
+        }
+
+        if let Some(value) = action.strip_prefix("layout.trace_point.remove.") {
+            return self.remove_layout_trace_point(value);
+        }
+
+        if let Some(value) = action.strip_prefix("layout.trace_point.") {
+            return self.select_layout_trace_point(value);
+        }
+
+        if action == "layout.trace_path_segment.select_first" {
+            return self.select_first_layout_trace_path_segment_match();
+        }
+
+        if action == "layout.trace_path_segment.focus_blocker" {
+            return self.focus_first_layout_trace_path_blocker();
+        }
+
+        if action == "layout.trace_path.select_net" {
+            return self.select_layout_trace_path_net();
+        }
+
+        if let Some(value) = action.strip_prefix("layout.trace_path_endpoint.") {
+            return self.select_layout_trace_path_endpoint_net(value);
+        }
+
+        if let Some(value) = action.strip_prefix("layout.trace_path_blocker_endpoint.") {
+            return self.select_layout_trace_path_blocker_endpoint_net(value);
+        }
+
+        if let Some(value) = action.strip_prefix("layout.trace_path_segment_endpoint.") {
+            return self.select_layout_trace_path_segment_endpoint_net(value);
+        }
+
+        if let Some(value) = action.strip_prefix("layout.trace_path_segment_net.") {
+            return self.select_layout_trace_path_segment_net(value);
+        }
+
+        if let Some(value) = action.strip_prefix("layout.trace_path_segment.") {
+            return self.focus_layout_trace_path_segment(value);
+        }
+
+        if let Some(value) = action.strip_prefix("layout.net_component_device.") {
+            return self.select_layout_net_component_device(value);
+        }
+
+        if let Some(value) = action.strip_prefix("layout.net_component_device_peer.") {
+            return self.select_layout_net_component_device_peer(value);
+        }
+
+        if let Some(value) = action.strip_prefix("layout.net_component_issue.") {
+            return self.select_layout_net_component_issue(value);
+        }
+
+        if let Some(value) = action.strip_prefix("layout.net_component_open_peer.") {
+            return self.select_layout_net_component_open_peer(value);
+        }
+
         if action == "layout.connectivity_links.enable_all" {
             return self.clear_disabled_connectivity_links();
         }
@@ -230,8 +341,16 @@ impl GlassworksApp {
             return self.clear_layout_trace_history();
         }
 
+        if action == "layout.trace_state.clear" {
+            return self.clear_layout_trace_state();
+        }
+
         if action == "layout.trace_history.select_first" {
             return self.select_first_layout_trace_history_match();
+        }
+
+        if let Some(value) = action.strip_prefix("layout.trace_history.remove.") {
+            return self.remove_layout_trace_history_entry(value);
         }
 
         if let Some(value) = action.strip_prefix("layout.trace_history.") {
@@ -308,8 +427,9 @@ impl GlassworksApp {
 
         if let Some(slug) = action.strip_prefix("layout.shape_browser_filter.") {
             if let Some(filter) = LayoutShapeBrowserFilter::from_slug(slug) {
+                let filter_label = layout_shape_browser_filter_button_label(self, filter);
                 self.layout_shape_browser_filter = filter;
-                self.status_message = format!("Shape browser filter {}", filter.label());
+                self.status_message = format!("Shape browser filter {filter_label}");
                 return true;
             }
         }
@@ -328,8 +448,9 @@ impl GlassworksApp {
 
         if let Some(slug) = action.strip_prefix("layout.cell_browser_filter.") {
             if let Some(filter) = LayoutCellBrowserFilter::from_slug(slug) {
+                let filter_label = layout_cell_browser_filter_button_label(self, filter);
                 self.layout_cell_browser_filter = filter;
-                self.status_message = format!("Cell browser filter {}", filter.label());
+                self.status_message = format!("Cell browser filter {filter_label}");
                 return true;
             }
         }
@@ -348,8 +469,14 @@ impl GlassworksApp {
 
         if let Some(slug) = action.strip_prefix("layout.net_browser_filter.") {
             if let Some(filter) = LayoutNetBrowserFilter::from_slug(slug) {
+                let report = self.connectivity_report().ok();
+                let label = layout_net_browser_filter_button_label(
+                    report.as_ref(),
+                    filter,
+                    self.layout_spice_comparison.as_ref(),
+                );
                 self.layout_net_browser_filter = filter;
-                self.status_message = format!("Net browser filter {}", filter.label());
+                self.status_message = format!("Net browser filter {label}");
                 return true;
             }
         }
@@ -366,6 +493,14 @@ impl GlassworksApp {
             return self.select_first_layout_net_browser_match();
         }
 
+        if action == "layout.netlist.select_first" {
+            return self.select_first_layout_netlist_match();
+        }
+
+        if action == "layout.net_browser.clear_selected" {
+            return self.clear_selected_layout_net_component();
+        }
+
         if let Some(slug) = action.strip_prefix("layout.trace_highlight.") {
             if let Some(mode) = LayoutTraceHighlightMode::from_slug(slug) {
                 self.layout_trace_highlight_mode = mode;
@@ -378,7 +513,9 @@ impl GlassworksApp {
         if let Some(slug) = action.strip_prefix("layout.drc_marker_filter.") {
             if let Some(filter) = LayoutDrcMarkerFilter::from_slug(slug) {
                 self.layout_drc_marker_filter = filter;
-                self.status_message = format!("DRC marker filter {}", filter.label());
+                self.layout_drc_marker_directory_filter = None;
+                let filter_label = layout_drc_marker_filter_button_label(self, filter);
+                self.status_message = format!("DRC marker filter {filter_label}");
                 return true;
             }
         }
@@ -394,14 +531,20 @@ impl GlassworksApp {
         if let Some(slug) = action.strip_prefix("layout.drc_marker_category.") {
             if slug == "all" {
                 self.layout_drc_marker_category_filter = None;
+                self.layout_drc_marker_directory_filter = None;
                 self.status_message = "DRC marker category All".to_string();
                 return true;
             }
             if let Some(category) = LayoutDrcMarkerCategory::from_slug(slug) {
                 self.layout_drc_marker_category_filter = Some(category);
+                self.layout_drc_marker_directory_filter = None;
                 self.status_message = format!("DRC marker category {}", category.label());
                 return true;
             }
+        }
+
+        if let Some(value) = action.strip_prefix("layout.drc_marker_directory.") {
+            return self.set_layout_drc_marker_directory_filter(value);
         }
 
         if let Some(value) = action.strip_prefix("layout.drc_report.select.") {
@@ -416,8 +559,36 @@ impl GlassworksApp {
             return self.clear_layout_drc_reports();
         }
 
+        if action == "layout.drc_report_browser.select_first" {
+            return self.select_first_layout_drc_report_browser_match();
+        }
+
+        if let Some(value) = action.strip_prefix("layout.drc_report_source.delete.") {
+            return self.delete_layout_drc_report_source(value);
+        }
+
+        if let Some(value) = action.strip_prefix("layout.drc_report_source.") {
+            return self.set_layout_drc_report_source_filter(value);
+        }
+
         if action == "layout.drc_marker_browser.select_first" {
             return self.select_first_layout_drc_marker_browser_match();
+        }
+
+        if let Some(value) = action.strip_prefix("layout.drc_marker_snapshot_entry.") {
+            return self.select_layout_drc_marker(value);
+        }
+
+        if let Some(value) = action.strip_prefix("layout.drc_marker_source_shape.") {
+            return self.select_layout_drc_marker_source_shape(value);
+        }
+
+        if let Some(value) = action.strip_prefix("layout.drc_marker_source_occurrence.") {
+            return self.select_layout_drc_marker_source_occurrence(value);
+        }
+
+        if let Some(value) = action.strip_prefix("layout.drc_marker_source_cell.") {
+            return self.select_layout_drc_marker_source_cell(value);
         }
 
         if let Some(value) = action.strip_prefix("layout.drc_marker.") {
@@ -440,6 +611,10 @@ impl GlassworksApp {
             return self.set_selected_layout_drc_marker_signoff(value);
         }
 
+        if let Some(value) = action.strip_prefix("layout.drc_marker_tag.remove.") {
+            return self.remove_selected_layout_drc_marker_tag_by_index(value);
+        }
+
         if let Some(value) = action.strip_prefix("layout.drc_marker_tag.") {
             return self.set_selected_layout_drc_marker_tag(value);
         }
@@ -456,8 +631,28 @@ impl GlassworksApp {
             return self.export_selected_layout_drc_marker_snapshot();
         }
 
+        if action == "layout.drc_marker_snapshot_png" {
+            return self.export_selected_layout_drc_marker_snapshot_png();
+        }
+
+        if action == "layout.drc_marker_snapshot.clear" {
+            return self.clear_selected_layout_drc_marker_snapshot();
+        }
+
         if action == "layout.drc_marker_clear_state" {
             return self.clear_selected_layout_drc_marker_state();
+        }
+
+        if action == "layout.drc_markers.clear_states" {
+            return self.clear_active_layout_drc_marker_states();
+        }
+
+        if action == "layout.drc_markers.clear_snapshots" {
+            return self.clear_active_layout_drc_marker_snapshots();
+        }
+
+        if action == "layout.drc_markers.clear_tags" {
+            return self.clear_active_layout_drc_marker_tags();
         }
 
         if action == "layout.drc_markers.write_layer" {
@@ -478,6 +673,22 @@ impl GlassworksApp {
 
         if action == "layout.drc_report_database_import" {
             return self.import_layout_drc_report_database();
+        }
+
+        if action == "layout.drc_report_database_append" {
+            return self.append_layout_drc_report_database();
+        }
+
+        if action == "layout.klayout_rdb_export" {
+            return self.export_layout_klayout_rdb_report_database();
+        }
+
+        if action == "layout.klayout_rdb_import" {
+            return self.import_layout_klayout_rdb_report_database();
+        }
+
+        if action == "layout.klayout_rdb_append" {
+            return self.append_layout_klayout_rdb_report_database();
         }
 
         if action == "layout.drc_deck_export" {
@@ -532,6 +743,14 @@ impl GlassworksApp {
             return self.toggle_layout_reference_images();
         }
 
+        if action == "layout.reference_images.show_all" {
+            return self.set_all_layout_reference_images_visible(true);
+        }
+
+        if action == "layout.reference_images.hide_all" {
+            return self.set_all_layout_reference_images_visible(false);
+        }
+
         if let Some(index) = action.strip_prefix("layout.reference_image.toggle.") {
             return self.toggle_layout_reference_image(index);
         }
@@ -562,6 +781,27 @@ impl GlassworksApp {
 
         if let Some(index) = action.strip_prefix("layout.reference_image.remove.") {
             return self.remove_layout_reference_image(index);
+        }
+
+        if let Some(index) = action.strip_prefix("layout.reference_image.landmarks.seed.") {
+            return self.seed_layout_reference_image_landmarks_at(index);
+        }
+
+        if let Some(index) = action.strip_prefix("layout.reference_image.landmarks.fit_selection.")
+        {
+            return self.fit_layout_reference_image_landmarks_to_selection_at(index);
+        }
+
+        if let Some(index) = action.strip_prefix("layout.reference_image.landmarks.align.") {
+            return self.align_layout_reference_image_at(index);
+        }
+
+        if let Some(index) = action.strip_prefix("layout.reference_image.landmarks.clear.") {
+            return self.clear_layout_reference_image_landmarks_at(index);
+        }
+
+        if action == "layout.reference_images.clear" {
+            return self.clear_layout_reference_images();
         }
 
         if action == "layout.reference_images.align" {
@@ -608,12 +848,28 @@ impl GlassworksApp {
             return self.make_selected_layout_instance_variant();
         }
 
+        if action == "layout.make_child_variants" {
+            return self.make_current_layout_cell_child_variants();
+        }
+
+        if action == "layout.make_descendant_child_variants" {
+            return self.make_descendant_layout_cell_child_variants();
+        }
+
+        if action == "layout.make_document_child_variants" {
+            return self.make_document_layout_cell_child_variants();
+        }
+
         if action == "layout.duplicate_current_cell" {
             return self.duplicate_layout_view_cell();
         }
 
         if action == "layout.flatten_selected_instance_one" {
             return self.flatten_selected_layout_instance(LayoutFlattenDepth::OneLevel);
+        }
+
+        if action == "layout.flatten_selected_instance" {
+            return self.flatten_selected_layout_instance(LayoutFlattenDepth::Deep);
         }
 
         if action == "layout.flatten_current_cell_one" {
@@ -624,12 +880,48 @@ impl GlassworksApp {
             return self.flatten_current_layout_cell(LayoutFlattenDepth::Deep);
         }
 
+        if action == "layout.flatten_descendant_cells_one" {
+            return self.flatten_descendant_layout_cells(LayoutFlattenDepth::OneLevel);
+        }
+
+        if action == "layout.flatten_descendant_cells" {
+            return self.flatten_descendant_layout_cells(LayoutFlattenDepth::Deep);
+        }
+
+        if action == "layout.flatten_document_cells_one" {
+            return self.flatten_document_layout_cells(LayoutFlattenDepth::OneLevel);
+        }
+
+        if action == "layout.flatten_document_cells" {
+            return self.flatten_document_layout_cells(LayoutFlattenDepth::Deep);
+        }
+
+        if action == "layout.resolve_array" {
+            return self.resolve_selected_layout_instance_array();
+        }
+
+        if action == "layout.resolve_current_cell_arrays" {
+            return self.resolve_current_layout_cell_arrays();
+        }
+
+        if action == "layout.resolve_descendant_cell_arrays" {
+            return self.resolve_descendant_layout_cell_arrays();
+        }
+
+        if action == "layout.resolve_document_arrays" {
+            return self.resolve_document_layout_cell_arrays();
+        }
+
         if action == "layout.cell_origin.selection" {
             return self.adjust_current_layout_cell_origin_to_selection();
         }
 
         if action == "layout.cell_origin.exact" {
             return self.adjust_current_layout_cell_origin_exact_from_search();
+        }
+
+        if action == "layout.cell_origin.descendant_leaves" {
+            return self.adjust_descendant_leaf_layout_cell_origins_to_bounds();
         }
 
         if let Some(axis) = action.strip_prefix("layout.cell_origin.") {
@@ -652,6 +944,10 @@ impl GlassworksApp {
 
         if action == "layout.delete_unused_cell" {
             return self.delete_unused_layout_view_cell();
+        }
+
+        if action == "layout.delete_unused_cells" {
+            return self.delete_unused_layout_cells();
         }
 
         if action == "layout.delete_cell_shallow" {
@@ -1364,6 +1660,7 @@ impl GlassworksApp {
             }
             "layout.run_route" => self.route_layout_between_points(),
             "layout.trace_between" => self.trace_layout_between_route_points(),
+            "layout.route_points.clear" => self.clear_layout_route_points(),
             "layout.trace_all" => self.trace_all_layout_nets(),
             "layout.connectivity" => {
                 self.status_message = self.connectivity_summary();

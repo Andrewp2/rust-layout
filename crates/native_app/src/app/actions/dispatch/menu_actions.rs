@@ -62,6 +62,12 @@ impl GlassworksApp {
             self.active_view_group = None;
             return;
         }
+        if action == "bookmarks.clear_layout_views" {
+            self.clear_all_layout_view_bookmarks();
+            self.active_menu = None;
+            self.active_view_group = None;
+            return;
+        }
         if action == "bookmarks.export_layout_views" {
             self.export_layout_view_bookmarks();
             self.active_menu = None;
@@ -123,6 +129,9 @@ impl GlassworksApp {
             "file.merge_layout" => {
                 self.merge_layout_json();
             }
+            "file.merge_layout_hierarchy" => {
+                self.merge_layout_json_hierarchy();
+            }
             "file.import_layer_offset.reset" => {
                 self.layout_import_layer_id_offset = 0;
                 self.status_message = format!(
@@ -171,6 +180,9 @@ impl GlassworksApp {
             "file.merge_gds" => {
                 self.merge_layout_gds();
             }
+            "file.merge_gds_hierarchy" => {
+                self.merge_layout_gds_hierarchy();
+            }
             "file.export_cif" => {
                 self.export_layout_cif();
             }
@@ -185,6 +197,9 @@ impl GlassworksApp {
             }
             "file.merge_cif" => {
                 self.merge_layout_cif();
+            }
+            "file.merge_cif_hierarchy" => {
+                self.merge_layout_cif_hierarchy();
             }
             "file.export_dxf" => {
                 self.export_layout_dxf();
@@ -201,6 +216,9 @@ impl GlassworksApp {
             "file.merge_dxf" => {
                 self.merge_layout_dxf();
             }
+            "file.merge_dxf_hierarchy" => {
+                self.merge_layout_dxf_hierarchy();
+            }
             "file.export_def" => {
                 self.export_layout_def();
             }
@@ -216,11 +234,26 @@ impl GlassworksApp {
             "file.merge_def" => {
                 self.merge_layout_def();
             }
+            "file.merge_def_hierarchy" => {
+                self.merge_layout_def_hierarchy();
+            }
             "file.export_lef" => {
                 self.export_layout_lef();
             }
             "file.import_lef" => {
                 self.import_layout_lef();
+            }
+            "file.import_lef_cell" => {
+                self.import_layout_lef_as_cell();
+            }
+            "file.import_lef_top_cell" => {
+                self.import_layout_lef_as_top_cell();
+            }
+            "file.merge_lef" => {
+                self.merge_layout_lef();
+            }
+            "file.merge_lef_hierarchy" => {
+                self.merge_layout_lef_hierarchy();
             }
             "file.export_reference_images" => {
                 self.export_layout_reference_images();
@@ -234,6 +267,9 @@ impl GlassworksApp {
             "file.export_screenshot_ppm" => {
                 self.export_ui_screenshot_ppm();
             }
+            "file.export_screenshot_png" => {
+                self.export_ui_screenshot_png();
+            }
             "file.collaboration" => {
                 self.status_message = "Collaboration connects through the sync server".to_string()
             }
@@ -245,6 +281,9 @@ impl GlassworksApp {
             }
             "edit.copy" => {
                 self.copy_layout_selection();
+            }
+            "edit.copy_active_layer" => {
+                self.copy_active_layer_layout_shapes();
             }
             "edit.paste" => {
                 self.paste_layout_clipboard();
@@ -261,11 +300,29 @@ impl GlassworksApp {
             "edit.duplicate_cell" => {
                 self.duplicate_layout_view_cell();
             }
+            "edit.delete_unused_cells" => {
+                self.delete_unused_layout_cells();
+            }
             "edit.delete_cell_shallow" => {
                 self.delete_layout_view_cell_shallow();
             }
+            "edit.delete_cell_deep" => {
+                self.delete_layout_view_cell_deep();
+            }
+            "edit.delete_cell_complete" => {
+                self.delete_layout_view_cell_complete();
+            }
             "edit.make_variant" => {
                 self.make_selected_layout_instance_variant();
+            }
+            "edit.make_child_variants" => {
+                self.make_current_layout_cell_child_variants();
+            }
+            "edit.make_descendant_child_variants" => {
+                self.make_descendant_layout_cell_child_variants();
+            }
+            "edit.make_document_child_variants" => {
+                self.make_document_layout_cell_child_variants();
             }
             "edit.flatten_instance" => {
                 self.flatten_selected_layout_instance(LayoutFlattenDepth::Deep);
@@ -279,8 +336,23 @@ impl GlassworksApp {
             "edit.flatten_cell_one" => {
                 self.flatten_current_layout_cell(LayoutFlattenDepth::OneLevel);
             }
+            "edit.flatten_descendant_cells" => {
+                self.flatten_descendant_layout_cells(LayoutFlattenDepth::Deep);
+            }
+            "edit.flatten_descendant_cells_one" => {
+                self.flatten_descendant_layout_cells(LayoutFlattenDepth::OneLevel);
+            }
+            "edit.flatten_document_cells" => {
+                self.flatten_document_layout_cells(LayoutFlattenDepth::Deep);
+            }
+            "edit.flatten_document_cells_one" => {
+                self.flatten_document_layout_cells(LayoutFlattenDepth::OneLevel);
+            }
             "edit.cell_origin_selection" => {
                 self.adjust_current_layout_cell_origin_to_selection();
+            }
+            "edit.cell_origin_descendant_leaves" => {
+                self.adjust_descendant_leaf_layout_cell_origins_to_bounds();
             }
             "edit.move_shape_up" => {
                 self.move_selected_layout_shape_up_hierarchy();
@@ -290,6 +362,15 @@ impl GlassworksApp {
             }
             "edit.resolve_array" => {
                 self.resolve_selected_layout_instance_array();
+            }
+            "edit.resolve_cell_arrays" => {
+                self.resolve_current_layout_cell_arrays();
+            }
+            "edit.resolve_descendant_cell_arrays" => {
+                self.resolve_descendant_layout_cell_arrays();
+            }
+            "edit.resolve_document_arrays" => {
+                self.resolve_document_layout_cell_arrays();
             }
             "edit.merge_layer_rects" => {
                 self.merge_active_layer_rectangles();
@@ -309,6 +390,18 @@ impl GlassworksApp {
             "edit.layer_xor_selection" => {
                 self.xor_active_layer_rectangles_with_selection();
             }
+            "edit.layer_and_clipboard" => {
+                self.boolean_active_layer_with_clipboard(LayoutShapeClipboardBoolean::And);
+            }
+            "edit.layer_or_clipboard" => {
+                self.boolean_active_layer_with_clipboard(LayoutShapeClipboardBoolean::Or);
+            }
+            "edit.layer_not_clipboard" => {
+                self.boolean_active_layer_with_clipboard(LayoutShapeClipboardBoolean::Not);
+            }
+            "edit.layer_xor_clipboard" => {
+                self.boolean_active_layer_with_clipboard(LayoutShapeClipboardBoolean::Xor);
+            }
             "edit.shape_and_clipboard" => {
                 self.boolean_selected_shape_with_clipboard(LayoutShapeClipboardBoolean::And);
             }
@@ -323,6 +416,9 @@ impl GlassworksApp {
             }
             "edit.create_clip_cell" => {
                 self.create_clip_cell_from_selected_region();
+            }
+            "edit.create_clip_cell_clipboard" => {
+                self.create_clip_cell_from_clipboard();
             }
             "edit.rotate90" => {
                 self.rotate_layout_selection_90();
@@ -339,17 +435,53 @@ impl GlassworksApp {
             "edit.shrink" => {
                 self.size_layout_selection(-self.layout_size_step());
             }
+            "edit.grow_x" => {
+                self.size_layout_selection_with_mode(self.layout_size_step(), LayoutSizeMode::X);
+            }
+            "edit.shrink_x" => {
+                self.size_layout_selection_with_mode(-self.layout_size_step(), LayoutSizeMode::X);
+            }
+            "edit.grow_y" => {
+                self.size_layout_selection_with_mode(self.layout_size_step(), LayoutSizeMode::Y);
+            }
+            "edit.shrink_y" => {
+                self.size_layout_selection_with_mode(-self.layout_size_step(), LayoutSizeMode::Y);
+            }
             "edit.chamfer_corners" => {
                 self.chamfer_selected_layout_shape();
             }
             "edit.round_corners" => {
                 self.round_selected_layout_shape();
             }
+            "edit.chamfer_layer_corners" => {
+                self.chamfer_active_layer_layout_shapes();
+            }
+            "edit.round_layer_corners" => {
+                self.round_active_layer_layout_shapes();
+            }
             "edit.grow_layer" => {
                 self.size_active_layer_shapes(self.layout_size_step());
             }
             "edit.shrink_layer" => {
                 self.size_active_layer_shapes(-self.layout_size_step());
+            }
+            "edit.grow_layer_x" => {
+                self.size_active_layer_shapes_with_mode(self.layout_size_step(), LayoutSizeMode::X);
+            }
+            "edit.shrink_layer_x" => {
+                self.size_active_layer_shapes_with_mode(
+                    -self.layout_size_step(),
+                    LayoutSizeMode::X,
+                );
+            }
+            "edit.grow_layer_y" => {
+                self.size_active_layer_shapes_with_mode(self.layout_size_step(), LayoutSizeMode::Y);
+            }
+            "edit.shrink_layer_y" => {
+                self.size_active_layer_shapes_with_mode(
+                    -self.layout_size_step(),
+                    LayoutSizeMode::Y,
+                );
             }
             "edit.align_left" => {
                 self.align_selected_layout_shape_to_active_layer_edge(LayoutAlignEdge::Left);
@@ -375,6 +507,24 @@ impl GlassworksApp {
             "edit.align_origin_y" => {
                 self.align_selected_layout_shape_to_active_layer_edge(LayoutAlignEdge::OriginY);
             }
+            "edit.align_layer_left" => {
+                self.align_active_layer_shapes_to_selected_shape(LayoutAlignEdge::Left);
+            }
+            "edit.align_layer_right" => {
+                self.align_active_layer_shapes_to_selected_shape(LayoutAlignEdge::Right);
+            }
+            "edit.align_layer_top" => {
+                self.align_active_layer_shapes_to_selected_shape(LayoutAlignEdge::Top);
+            }
+            "edit.align_layer_bottom" => {
+                self.align_active_layer_shapes_to_selected_shape(LayoutAlignEdge::Bottom);
+            }
+            "edit.align_layer_center_x" => {
+                self.align_active_layer_shapes_to_selected_shape(LayoutAlignEdge::CenterX);
+            }
+            "edit.align_layer_center_y" => {
+                self.align_active_layer_shapes_to_selected_shape(LayoutAlignEdge::CenterY);
+            }
             "bookmarks.save_layout_view" => {
                 self.save_layout_view_bookmark(1);
             }
@@ -383,6 +533,9 @@ impl GlassworksApp {
             }
             "bookmarks.previous_layout_view" => {
                 self.restore_previous_layout_view();
+            }
+            "bookmarks.clear_layout_views" => {
+                self.clear_all_layout_view_bookmarks();
             }
             "bookmarks.export_layout_views" => {
                 self.export_layout_view_bookmarks();
@@ -513,6 +666,18 @@ impl GlassworksApp {
             "layout.drc_report_database_import" => {
                 self.import_layout_drc_report_database();
             }
+            "layout.drc_report_database_append" => {
+                self.append_layout_drc_report_database();
+            }
+            "layout.klayout_rdb_export" => {
+                self.export_layout_klayout_rdb_report_database();
+            }
+            "layout.klayout_rdb_import" => {
+                self.import_layout_klayout_rdb_report_database();
+            }
+            "layout.klayout_rdb_append" => {
+                self.append_layout_klayout_rdb_report_database();
+            }
             "layout.drc_deck_export" => {
                 self.export_layout_drc_deck();
             }
@@ -530,6 +695,9 @@ impl GlassworksApp {
             }
             "layout.drc_marker_snapshot" => {
                 self.export_selected_layout_drc_marker_snapshot();
+            }
+            "layout.drc_marker_snapshot_png" => {
+                self.export_selected_layout_drc_marker_snapshot_png();
             }
             "layout.netlist_export" => {
                 self.export_layout_netlist();
@@ -1110,6 +1278,53 @@ impl GlassworksApp {
         true
     }
 
+    pub(crate) fn delete_unused_layout_cells(&mut self) -> bool {
+        let delete_cells = layout_unused_cell_ids(&self.workspace.document);
+        if delete_cells.is_empty() {
+            self.status_message = "No unused cells to delete".to_string();
+            return true;
+        }
+        let deleted_cells = delete_cells
+            .iter()
+            .filter_map(|cell_id| self.workspace.document.cell(*cell_id).cloned())
+            .collect::<Vec<_>>();
+        if deleted_cells.is_empty() {
+            self.status_message = "No unused cells to delete".to_string();
+            return true;
+        }
+
+        let redo = delete_cells
+            .iter()
+            .map(|cell_id| Operation::DeleteCell { id: *cell_id })
+            .collect::<Vec<_>>();
+        let undo = deleted_cells
+            .iter()
+            .cloned()
+            .map(|cell| Operation::AddCell { cell })
+            .collect::<Vec<_>>();
+        let deleted_count = deleted_cells.len();
+
+        self.apply_layout_operation_with_history(
+            Operation::Batch { operations: redo },
+            Operation::Batch { operations: undo },
+        );
+        self.selected_layout_shape = None;
+        self.selected_layout_occurrence = None;
+        if delete_cells.contains(&self.layout_view_top_cell) {
+            self.layout_view_top_cell = self.workspace.document.top_cell;
+        }
+        for deleted_cell in &delete_cells {
+            self.layout_hidden_cells.remove(deleted_cell);
+            self.layout_tree_collapsed_cells.remove(deleted_cell);
+        }
+        self.status_message = format!(
+            "Deleted {} unused cell{}",
+            deleted_count,
+            if deleted_count == 1 { "" } else { "s" }
+        );
+        true
+    }
+
     pub(crate) fn delete_layout_view_cell_shallow(&mut self) -> bool {
         let cell_id = self.layout_view_top_cell;
         if cell_id == self.workspace.document.top_cell {
@@ -1549,6 +1764,50 @@ impl GlassworksApp {
         true
     }
 
+    pub(crate) fn set_layout_sibling_cells_visibility(&mut self, hidden: bool) -> bool {
+        let Some(current_cell) = self.workspace.document.cell(self.layout_view_top_cell) else {
+            self.status_message = "Current view cell is missing".to_string();
+            return true;
+        };
+        let current_name = current_cell.name.clone();
+        let sibling_cells =
+            layout_sibling_cell_ids(&self.workspace.document, self.layout_view_top_cell);
+        if sibling_cells.is_empty() {
+            self.status_message = format!("{current_name} has no sibling cells to show or hide");
+            return true;
+        }
+
+        let mut changed = 0;
+        for cell in sibling_cells {
+            if hidden {
+                if self.layout_hidden_cells.insert(cell) {
+                    changed += 1;
+                }
+            } else if self.layout_hidden_cells.remove(&cell) {
+                changed += 1;
+            }
+        }
+        if changed == 0 {
+            self.status_message = format!(
+                "Sibling cells of {} are already {}",
+                current_name,
+                if hidden { "hidden" } else { "shown" }
+            );
+            return true;
+        }
+
+        self.invalidate_layout_view_caches();
+        self.repair_layout_selection_after_operation();
+        self.status_message = format!(
+            "{} {} sibling cell{} of {}",
+            if hidden { "Hid" } else { "Showed" },
+            changed,
+            if changed == 1 { "" } else { "s" },
+            current_name
+        );
+        true
+    }
+
     pub(crate) fn set_layout_descendant_cells_visibility(&mut self, hidden: bool) -> bool {
         let Some(current_cell) = self.workspace.document.cell(self.layout_view_top_cell) else {
             self.status_message = "Current view cell is missing".to_string();
@@ -1629,20 +1888,13 @@ impl GlassworksApp {
         let mut layers = self.workspace.document.layers.values().collect::<Vec<_>>();
         layers.sort_by_key(|layer| (layer.display_order, layer.id));
         for layer in layers {
-            let used = usage.get(&layer.id).copied().unwrap_or(0) > 0;
-            let visible = match mode {
-                "show_all" => true,
-                "show_used" => used,
-                "isolate_active" => layer.id == self.active_layer,
-                "invert" => !layer.visible,
-                "hide_empty" => {
-                    if used {
-                        layer.visible
-                    } else {
-                        false
-                    }
-                }
-                _ => return false,
+            let Some(visible) = layout_layer_visibility_preset_target_visible(
+                mode,
+                layer,
+                usage.get(&layer.id).copied().unwrap_or(0),
+                self.active_layer,
+            ) else {
+                return false;
             };
             if layer.visible == visible {
                 continue;

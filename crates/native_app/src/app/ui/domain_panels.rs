@@ -1180,7 +1180,9 @@ pub(crate) fn add_maintenance_audit_panel(
                 let button_name = action
                     .strip_prefix("glassworks.viewctl.")
                     .map(|action| format!("glassworks.primary.action.mainthist{index}.{action}"))
-                    .unwrap_or_else(|| format!("glassworks.maintenance.history.row.{index}.action"));
+                    .unwrap_or_else(|| {
+                        format!("glassworks.maintenance.history.row.{index}.action")
+                    });
                 add_button(
                     document,
                     row,

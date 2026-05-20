@@ -110,9 +110,10 @@ pub(crate) fn add_layout_layers_panel(
         .copied()
         .filter(|layer| {
             app.layout_layer_group_filter.matches(layer.process)
-                && app
-                    .layout_layer_usage_filter
-                    .matches(layer_usage.get(&layer.id).copied().unwrap_or(0))
+                && app.layout_layer_usage_filter.matches(
+                    layer_usage.get(&layer.id).copied().unwrap_or(0),
+                    layer.visible,
+                )
         })
         .collect::<Vec<_>>();
     add_text(
@@ -155,35 +156,66 @@ pub(crate) fn add_layout_layers_panel(
             "glassworks.layers.usage_filter.controls",
             layout::with_gap_all(
                 layout::with_size(
-                    layout::row(),
+                    layout::column(),
                     layout::percent(1.0),
-                    layout::px(ui_scale.value(28.0)),
+                    layout::px(ui_scale.value(58.0)),
                 ),
-                ui_scale.value(6.0),
+                ui_scale.value(4.0),
             ),
         ),
     );
-    for filter in LayoutLayerUsageFilter::ALL {
-        let width = match filter {
-            LayoutLayerUsageFilter::All => 44.0,
-            LayoutLayerUsageFilter::Used => 54.0,
-            LayoutLayerUsageFilter::Empty => 62.0,
-        };
-        add_button(
-            document,
+    for (row_name, filters) in [
+        (
+            "glassworks.layers.usage_filter.usage_controls",
+            &LayoutLayerUsageFilter::ALL[..3],
+        ),
+        (
+            "glassworks.layers.usage_filter.visibility_controls",
+            &LayoutLayerUsageFilter::ALL[3..],
+        ),
+    ] {
+        let row = document.add_child(
             usage_filter_row,
-            format!(
-                "glassworks.viewctl.layout.layer_usage_filter.{}",
-                filter.slug()
+            UiNode::container(
+                row_name,
+                layout::with_gap_all(
+                    layout::with_size(
+                        layout::row(),
+                        layout::percent(1.0),
+                        layout::px(ui_scale.value(26.0)),
+                    ),
+                    ui_scale.value(6.0),
+                ),
             ),
-            filter.label(),
-            app.layout_layer_usage_filter == filter,
-            layout::size(
-                layout::px(ui_scale.value(width)),
-                layout::px(ui_scale.value(26.0)),
-            ),
-            ui_scale,
         );
+        for &filter in filters {
+            let width = match filter {
+                LayoutLayerUsageFilter::All => 44.0,
+                LayoutLayerUsageFilter::Used => 54.0,
+                LayoutLayerUsageFilter::Empty => 62.0,
+                LayoutLayerUsageFilter::Visible => 62.0,
+                LayoutLayerUsageFilter::Hidden => 62.0,
+            };
+            add_button(
+                document,
+                row,
+                format!(
+                    "glassworks.viewctl.layout.layer_usage_filter.{}",
+                    filter.slug()
+                ),
+                layout_layer_usage_filter_button_label(
+                    &app.workspace.document,
+                    app.layout_layer_group_filter,
+                    filter,
+                ),
+                app.layout_layer_usage_filter == filter,
+                layout::size(
+                    layout::px(ui_scale.value(width + 18.0)),
+                    layout::px(ui_scale.value(26.0)),
+                ),
+                ui_scale,
+            );
+        }
     }
     let group_row = document.add_child(
         panel,
@@ -211,10 +243,15 @@ pub(crate) fn add_layout_layers_panel(
             document,
             group_row,
             format!("glassworks.viewctl.layout.layer_group.{}", group.slug()),
-            group.label(),
+            layout_layer_group_filter_button_label(
+                &app.workspace.document,
+                group,
+                app.layout_layer_usage_filter,
+                group.label(),
+            ),
             app.layout_layer_group_filter == group,
             layout::size(
-                layout::px(ui_scale.value(width)),
+                layout::px(ui_scale.value(width + 24.0)),
                 layout::px(ui_scale.value(26.0)),
             ),
             ui_scale,
@@ -258,10 +295,15 @@ pub(crate) fn add_layout_layers_panel(
                 document,
                 child_row,
                 format!("glassworks.viewctl.layout.layer_group.{}", group.slug()),
-                label,
+                layout_layer_group_filter_button_label(
+                    &app.workspace.document,
+                    *group,
+                    app.layout_layer_usage_filter,
+                    label,
+                ),
                 app.layout_layer_group_filter == *group,
                 layout::size(
-                    layout::px(ui_scale.value(width)),
+                    layout::px(ui_scale.value(width + 24.0)),
                     layout::px(ui_scale.value(26.0)),
                 ),
                 ui_scale,
@@ -314,10 +356,15 @@ pub(crate) fn add_layout_layers_panel(
             document,
             visibility_row,
             format!("glassworks.viewctl.layout.layer_visibility.{slug}"),
-            label,
+            layout_layer_visibility_preset_button_label(
+                &app.workspace.document,
+                app.active_layer,
+                slug,
+                label,
+            ),
             false,
             layout::size(
-                layout::px(ui_scale.value(width)),
+                layout::px(ui_scale.value(width + 24.0)),
                 layout::px(ui_scale.value(26.0)),
             ),
             ui_scale,
@@ -341,10 +388,15 @@ pub(crate) fn add_layout_layers_panel(
         document,
         isolate_row,
         "glassworks.viewctl.layout.layer_visibility.isolate_active",
-        "Solo Active",
+        layout_layer_visibility_preset_button_label(
+            &app.workspace.document,
+            app.active_layer,
+            "isolate_active",
+            "Solo Active",
+        ),
         false,
         layout::size(
-            layout::px(ui_scale.value(104.0)),
+            layout::px(ui_scale.value(128.0)),
             layout::px(ui_scale.value(26.0)),
         ),
         ui_scale,
@@ -353,10 +405,15 @@ pub(crate) fn add_layout_layers_panel(
         document,
         isolate_row,
         "glassworks.viewctl.layout.layer_visibility.invert",
-        "Invert",
+        layout_layer_visibility_preset_button_label(
+            &app.workspace.document,
+            app.active_layer,
+            "invert",
+            "Invert",
+        ),
         false,
         layout::size(
-            layout::px(ui_scale.value(72.0)),
+            layout::px(ui_scale.value(96.0)),
             layout::px(ui_scale.value(26.0)),
         ),
         ui_scale,
@@ -379,10 +436,10 @@ pub(crate) fn add_layout_layers_panel(
         document,
         cleanup_row,
         "glassworks.viewctl.layout.layer_cleanup.delete_empty",
-        "Prune Empty",
+        layout_inactive_empty_layer_cleanup_button_label(&app.workspace.document, app.active_layer),
         false,
         layout::size(
-            layout::px(ui_scale.value(108.0)),
+            layout::px(ui_scale.value(132.0)),
             layout::px(ui_scale.value(26.0)),
         ),
         ui_scale,
@@ -480,10 +537,10 @@ pub(crate) fn add_layout_layers_panel(
         document,
         exchange_row,
         "glassworks.viewctl.layout.layer_set.export",
-        "Export Sets",
+        "Export",
         false,
         layout::size(
-            layout::px(ui_scale.value(104.0)),
+            layout::px(ui_scale.value(72.0)),
             layout::px(ui_scale.value(26.0)),
         ),
         ui_scale,
@@ -492,10 +549,22 @@ pub(crate) fn add_layout_layers_panel(
         document,
         exchange_row,
         "glassworks.viewctl.layout.layer_set.import",
-        "Import Sets",
+        "Import",
         false,
         layout::size(
-            layout::px(ui_scale.value(104.0)),
+            layout::px(ui_scale.value(72.0)),
+            layout::px(ui_scale.value(26.0)),
+        ),
+        ui_scale,
+    );
+    add_button(
+        document,
+        exchange_row,
+        "glassworks.viewctl.layout.layer_set.clear_all",
+        "Clear All",
+        false,
+        layout::size(
+            layout::px(ui_scale.value(72.0)),
             layout::px(ui_scale.value(26.0)),
         ),
         ui_scale,
@@ -517,11 +586,13 @@ pub(crate) fn add_layout_layers_panel(
     );
     for slot in LAYOUT_LAYER_SET_SLOTS {
         let saved_state = app.layout_layer_sets.get(&slot);
-        add_button(
+        let set_name = app.layout_layer_set_name(slot);
+        add_button_with_accessibility_label(
             document,
             tab_row,
             format!("glassworks.viewctl.layout.layer_set.tab.{slot}"),
-            slot.to_string(),
+            layout_layer_set_tab_label(slot, saved_state),
+            layout_layer_set_tab_accessibility_label(&set_name, saved_state),
             saved_state == Some(&current_layer_set_state),
             layout::size(
                 layout::px(ui_scale.value(48.0)),
@@ -554,7 +625,7 @@ pub(crate) fn add_layout_layers_panel(
             compact_button_label(&set_name, 12),
             saved_state == Some(&current_layer_set_state),
             layout::size(
-                layout::px(ui_scale.value(92.0)),
+                layout::px(ui_scale.value(78.0)),
                 layout::px(ui_scale.value(26.0)),
             ),
             ui_scale,
@@ -566,7 +637,19 @@ pub(crate) fn add_layout_layers_panel(
             "Save",
             false,
             layout::size(
-                layout::px(ui_scale.value(64.0)),
+                layout::px(ui_scale.value(52.0)),
+                layout::px(ui_scale.value(26.0)),
+            ),
+            ui_scale,
+        );
+        add_button(
+            document,
+            row,
+            format!("glassworks.viewctl.layout.layer_set.clear.{slot}"),
+            "Clear",
+            false,
+            layout::size(
+                layout::px(ui_scale.value(52.0)),
                 layout::px(ui_scale.value(26.0)),
             ),
             ui_scale,
@@ -824,6 +907,32 @@ pub(crate) fn add_layout_layers_panel(
             );
         }
     }
+}
+
+fn layout_layer_set_tab_label(slot: u8, state: Option<&LayoutLayerSetState>) -> String {
+    state
+        .map(|state| format!("{slot}:{}", state.visible_layers.len()))
+        .unwrap_or_else(|| format!("{slot}:-"))
+}
+
+fn layout_layer_set_tab_accessibility_label(
+    set_name: &str,
+    state: Option<&LayoutLayerSetState>,
+) -> String {
+    state
+        .map(|state| {
+            let depth_count = state.layer_depth_overrides.len();
+            format!(
+                "{}: {} visible, {}, {} rows, {} depth override{}",
+                set_name,
+                state.visible_layers.len(),
+                state.layer_group_filter.path_label(),
+                state.layer_usage_filter.label(),
+                depth_count,
+                if depth_count == 1 { "" } else { "s" }
+            )
+        })
+        .unwrap_or_else(|| format!("{set_name}: empty slot"))
 }
 
 pub(crate) fn add_layout_3d_stack_panel_rows(

@@ -61,6 +61,45 @@ pub(crate) fn write_gzip_test_file(path: &Path, bytes: &[u8]) {
     encoder.finish().expect("gzip test file should finish");
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn write_single_file_zip_test_file(path: &Path, entry_name: &str, bytes: &[u8]) {
+    use std::io::Write as _;
+
+    let mut encoder =
+        flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder
+        .write_all(bytes)
+        .expect("ZIP test payload should be deflated");
+    let compressed = encoder.finish().expect("ZIP test payload should finish");
+    let mut file = std::fs::File::create(path).expect("ZIP test file should be created");
+    let name = entry_name.as_bytes();
+    file.write_all(&0x0403_4b50u32.to_le_bytes())
+        .expect("ZIP local header signature should write");
+    file.write_all(&20u16.to_le_bytes())
+        .expect("ZIP version should write");
+    file.write_all(&0u16.to_le_bytes())
+        .expect("ZIP flags should write");
+    file.write_all(&8u16.to_le_bytes())
+        .expect("ZIP method should write");
+    file.write_all(&0u16.to_le_bytes())
+        .expect("ZIP mtime should write");
+    file.write_all(&0u16.to_le_bytes())
+        .expect("ZIP mdate should write");
+    file.write_all(&0u32.to_le_bytes())
+        .expect("ZIP crc should write");
+    file.write_all(&(compressed.len() as u32).to_le_bytes())
+        .expect("ZIP compressed size should write");
+    file.write_all(&(bytes.len() as u32).to_le_bytes())
+        .expect("ZIP uncompressed size should write");
+    file.write_all(&(name.len() as u16).to_le_bytes())
+        .expect("ZIP file name length should write");
+    file.write_all(&0u16.to_le_bytes())
+        .expect("ZIP extra length should write");
+    file.write_all(name).expect("ZIP entry name should write");
+    file.write_all(&compressed)
+        .expect("ZIP compressed payload should write");
+}
+
 pub(crate) fn shape_kind_area2_abs(kind: &ShapeKind) -> i128 {
     match kind {
         ShapeKind::Rectangle(rect) => rect.width() as i128 * rect.height() as i128 * 2,
@@ -363,6 +402,342 @@ pub(crate) fn app_menu_contract_matches_d43277f_shell() {
 }
 
 #[test]
+pub(crate) fn layout_cell_browser_filters_hidden_and_visible_cells() {
+    let mut app = GlassworksApp::new_with_options(StartupOptions {
+        view_mode: Some(StartupView::Layout2d),
+        ..Default::default()
+    });
+    let metal1 = app
+        .workspace
+        .document
+        .layer_by_process(ProcessLayer::Metal1)
+        .expect("default technology should include metal1");
+    let hidden = app.workspace.document.create_cell("hidden_browser_cell");
+    let visible = app.workspace.document.create_cell("visible_browser_cell");
+    app.workspace
+        .document
+        .insert_shape_in_cell(
+            hidden,
+            metal1,
+            ShapeKind::Rectangle(Rect::from_min_size(Point::new(0, 0), 50, 50)),
+        )
+        .expect("hidden test shape should be inserted");
+    app.workspace
+        .document
+        .insert_shape_in_cell(
+            visible,
+            metal1,
+            ShapeKind::Rectangle(Rect::from_min_size(Point::new(100, 0), 50, 50)),
+        )
+        .expect("visible test shape should be inserted");
+    app.workspace
+        .document
+        .insert_instance_in_top(hidden, Transform::translate(0, 0))
+        .expect("hidden cell should be instanced");
+    app.workspace
+        .document
+        .insert_instance_in_top(visible, Transform::translate(200, 0))
+        .expect("visible cell should be instanced");
+    app.layout_hidden_cells.insert(hidden);
+
+    let document = app
+        .build_operad_document(UiSize::new(1440.0, 920.0))
+        .expect("layout document should build with cell browser filters");
+    for node_name in [
+        "glassworks.viewctl.layout.cell_browser_filter.hidden",
+        "glassworks.viewctl.layout.cell_browser_filter.visible",
+    ] {
+        assert!(
+            document.nodes().iter().any(|node| node.name() == node_name),
+            "cell browser should expose {node_name}"
+        );
+    }
+
+    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.cell_browser_filter.hidden"));
+    assert_eq!(
+        app.layout_cell_browser_filter,
+        LayoutCellBrowserFilter::Hidden
+    );
+    let hidden_cells = layout_cell_browser_cells(&app);
+    assert_eq!(
+        hidden_cells.iter().map(|cell| cell.id).collect::<Vec<_>>(),
+        vec![hidden]
+    );
+
+    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.cell_browser_filter.visible"));
+    assert_eq!(
+        app.layout_cell_browser_filter,
+        LayoutCellBrowserFilter::Visible
+    );
+    let visible_cell_ids = layout_cell_browser_cells(&app)
+        .into_iter()
+        .map(|cell| cell.id)
+        .collect::<Vec<_>>();
+    assert!(visible_cell_ids.contains(&app.workspace.document.top_cell));
+    assert!(visible_cell_ids.contains(&visible));
+    assert!(!visible_cell_ids.contains(&hidden));
+}
+
+#[test]
+pub(crate) fn layout_cell_browser_sorts_by_hierarchy_depth() {
+    let mut app = GlassworksApp::new_with_options(StartupOptions {
+        view_mode: Some(StartupView::Layout2d),
+        ..Default::default()
+    });
+    app.workspace.document = Document::new("cell browser depth sort");
+    app.reset_layout_document_state();
+    let top = app.workspace.document.top_cell;
+    let sibling = app.workspace.document.create_cell("a sibling");
+    let parent = app.workspace.document.create_cell("z parent");
+    let grandchild = app.workspace.document.create_cell("a grandchild");
+    let unused = app.workspace.document.create_cell("unused");
+    app.workspace
+        .document
+        .insert_instance(top, parent, Transform::IDENTITY)
+        .expect("parent cell should be instanced under top");
+    app.workspace
+        .document
+        .insert_instance(top, sibling, Transform::IDENTITY)
+        .expect("sibling cell should be instanced under top");
+    app.workspace
+        .document
+        .insert_instance(parent, grandchild, Transform::IDENTITY)
+        .expect("grandchild cell should be instanced under parent");
+
+    let document = app
+        .build_operad_document(UiSize::new(1440.0, 920.0))
+        .expect("layout document should build with cell browser depth sort");
+    assert!(
+        document
+            .nodes()
+            .iter()
+            .any(|node| { node.name() == "glassworks.viewctl.layout.cell_browser_sort.depth" }),
+        "cell browser should expose hierarchy-depth sorting"
+    );
+
+    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.cell_browser_sort.depth"));
+    assert_eq!(app.layout_cell_browser_sort, LayoutCellBrowserSort::Depth);
+    let depth_sorted = layout_cell_browser_cells(&app)
+        .into_iter()
+        .map(|cell| cell.id)
+        .collect::<Vec<_>>();
+    assert_eq!(depth_sorted, vec![top, sibling, parent, grandchild, unused]);
+    assert!(
+        layout_cell_browser_rows(&app)
+            .iter()
+            .any(|(key, value)| key == "Sort" && value == "Depth"),
+        "cell browser rows should show the depth sort"
+    );
+    app.set_layout_browser_search("hierarchy depth 2");
+    let searched = layout_cell_browser_cells(&app)
+        .into_iter()
+        .map(|cell| cell.id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        searched,
+        vec![grandchild],
+        "cell browser search should match hierarchy-depth rows"
+    );
+
+    assert!(app.apply_clicked_node_name(&format!(
+        "glassworks.viewctl.layout.top_cell.{}",
+        grandchild.0
+    )));
+    let rows = layout_cell_browser_rows(&app);
+    assert!(
+        rows.iter()
+            .any(|(key, value)| key == "Depth" && value == "2"),
+        "cell browser detail rows should show selected-cell hierarchy depth: {rows:?}"
+    );
+    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.browser_columns.relations"));
+    let rows = layout_cell_browser_rows(&app);
+    assert!(
+        rows.iter()
+            .any(|(key, value)| key == "Parent cells" && value.contains("z parent")),
+        "cell browser relation rows should show parent cell names: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|(key, value)| key == "Ancestors" && value == "2"),
+        "cell browser relation rows should count ancestor cells: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|(key, value)| key == "Ancestor cells" && value.contains("z parent")),
+        "cell browser relation rows should show ancestor cell names: {rows:?}"
+    );
+
+    app.set_layout_browser_search("");
+    assert!(
+        app.apply_clicked_node_name(&format!("glassworks.viewctl.layout.top_cell.{}", parent.0))
+    );
+    let rows = layout_cell_browser_rows(&app);
+    assert!(
+        rows.iter()
+            .any(|(key, value)| key == "Child cell names" && value.contains("a grandchild")),
+        "cell browser relation rows should show child cell names: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|(key, value)| key == "Sibling cells" && value.contains("a sibling")),
+        "cell browser relation rows should show sibling cell names: {rows:?}"
+    );
+
+    app.set_layout_browser_search("sibling a sibling");
+    let searched = layout_cell_browser_cells(&app)
+        .into_iter()
+        .map(|cell| cell.id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        searched,
+        vec![parent],
+        "cell browser search should match sibling relation rows"
+    );
+    app.set_layout_browser_search("");
+
+    assert!(app.apply_clicked_node_name(&format!("glassworks.viewctl.layout.top_cell.{}", top.0)));
+    let rows = layout_cell_browser_rows(&app);
+    assert!(
+        rows.iter()
+            .any(|(key, value)| key == "Descendants" && value == "3"),
+        "cell browser relation rows should count descendant cells: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|(key, value)| key == "Descendant cells" && value.contains("a grandchild")),
+        "cell browser relation rows should show deep descendant cell names: {rows:?}"
+    );
+
+    app.set_layout_browser_search("descendant a grandchild");
+    let searched = layout_cell_browser_cells(&app)
+        .into_iter()
+        .map(|cell| cell.id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        searched,
+        vec![top, parent],
+        "cell browser search should match ancestor/descendant relation rows"
+    );
+}
+
+#[test]
+pub(crate) fn layout_cell_browser_searches_by_selector_metadata() {
+    let mut app = GlassworksApp::new_with_options(StartupOptions {
+        view_mode: Some(StartupView::Layout2d),
+        ..Default::default()
+    });
+    app.workspace.document = Document::new("cell selector search");
+    app.reset_layout_document_state();
+    let top = app.workspace.document.top_cell;
+    let metal1 = app
+        .workspace
+        .document
+        .layer_by_process(ProcessLayer::Metal1)
+        .expect("default technology should include metal1");
+    let sibling = app.workspace.document.create_cell("a sibling");
+    let parent = app.workspace.document.create_cell("z parent");
+    let grandchild = app.workspace.document.create_cell("a grandchild");
+    let unused = app.workspace.document.create_cell("scratch unused");
+    app.workspace
+        .document
+        .insert_shape_in_cell(
+            grandchild,
+            metal1,
+            ShapeKind::Rectangle(Rect::from_min_size(Point::new(10, 20), 30, 40)),
+        )
+        .expect("grandchild should have local geometry");
+    app.workspace
+        .document
+        .cell_mut(unused)
+        .expect("unused cell should be mutable")
+        .properties
+        .insert("purpose".to_string(), "scratch".to_string());
+    app.workspace
+        .document
+        .insert_instance(top, parent, Transform::IDENTITY)
+        .expect("parent cell should be instanced under top");
+    app.workspace
+        .document
+        .insert_instance(top, sibling, Transform::IDENTITY)
+        .expect("sibling cell should be instanced under top");
+    app.workspace
+        .document
+        .insert_instance(parent, grandchild, Transform::IDENTITY)
+        .expect("grandchild cell should be instanced under parent");
+
+    app.set_layout_browser_search(&format!("cell_id={}", grandchild.0));
+    let cell_summary_rows = layout_cell_hierarchy_rows(&app)
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(
+        cell_summary_rows
+            .get("Listed cell rows")
+            .map(String::as_str),
+        Some("1 / 8 rows")
+    );
+    assert!(
+        cell_summary_rows.contains_key("a grandchild"),
+        "Cells inspector selector search should keep the matching cell summary: {cell_summary_rows:?}"
+    );
+    assert!(
+        !cell_summary_rows.contains_key("z parent"),
+        "Cells inspector selector search should hide non-matching cell summaries: {cell_summary_rows:?}"
+    );
+    app.set_layout_browser_search("child_instances=1");
+    let cell_summary_rows = layout_cell_hierarchy_rows(&app)
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert!(
+        cell_summary_rows.contains_key("z parent"),
+        "Cells inspector child-instance selector should keep parent cell summaries: {cell_summary_rows:?}"
+    );
+    app.set_layout_browser_search("");
+
+    let listed_cells = |app: &GlassworksApp| {
+        layout_cell_browser_cells_with_filter(app, LayoutCellBrowserFilter::All, true)
+            .into_iter()
+            .map(|cell| cell.id)
+            .collect::<Vec<_>>()
+    };
+
+    app.set_layout_browser_search("name=z parent");
+    assert_eq!(listed_cells(&app), vec![parent]);
+    app.set_layout_browser_search("hierarchy_depth=2");
+    assert_eq!(listed_cells(&app), vec![grandchild]);
+    app.set_layout_browser_search("parent_cell=z parent");
+    assert_eq!(listed_cells(&app), vec![grandchild]);
+    app.set_layout_browser_search("ancestor_cell=z parent");
+    assert_eq!(listed_cells(&app), vec![grandchild]);
+    app.set_layout_browser_search("child_cell=a grandchild");
+    assert_eq!(listed_cells(&app), vec![parent]);
+    app.set_layout_browser_search("descendant_cell=a grandchild");
+    assert_eq!(
+        listed_cells(&app).into_iter().collect::<BTreeSet<_>>(),
+        BTreeSet::from([top, parent])
+    );
+    app.set_layout_browser_search("bounds=10,20 30x40");
+    assert_eq!(listed_cells(&app), vec![grandchild]);
+    app.set_layout_browser_search("role=unused");
+    assert_eq!(listed_cells(&app), vec![unused]);
+    app.set_layout_browser_search("purpose=scratch");
+    assert_eq!(listed_cells(&app), vec![unused]);
+
+    app.set_layout_browser_search("parent_cell=z parent");
+    let document = app
+        .build_operad_document(UiSize::new(1440.0, 920.0))
+        .expect("layout document with parent-cell search should build");
+    assert!(
+        document
+            .nodes()
+            .iter()
+            .any(|node| node.name() == "glassworks.viewctl.layout.cell_browser.select_first"),
+        "cell browser should expose select-first control for parent-cell selector search"
+    );
+    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.cell_browser.select_first"));
+    assert_eq!(app.layout_view_top_cell, grandchild);
+}
+
+#[test]
 pub(crate) fn app_options_apply_and_ui_actions_share_state() {
     let mut options = AppOptions::default();
     options.appearance.theme = options::ThemePreference::Light;
@@ -492,7 +867,9 @@ pub(crate) fn app_options_apply_and_ui_actions_share_state() {
         "errors"
     );
     assert!(
-        app.apply_clicked_node_name("glassworks.options.proxy.glassworks.viewctl.mask.severity.all")
+        app.apply_clicked_node_name(
+            "glassworks.options.proxy.glassworks.viewctl.mask.severity.all"
+        )
     );
     assert_eq!(app.app_options().domains.mask_prep.severity_filter, "all");
 
@@ -500,7 +877,9 @@ pub(crate) fn app_options_apply_and_ui_actions_share_state() {
     assert_eq!(app.layout_pan(), [0.0, 0.0]);
     assert_eq!(app.app_options().layout.pan, [0.0, 0.0]);
     assert!(
-        app.apply_clicked_node_name("glassworks.options.proxy.glassworks.viewctl.spc.clear_context")
+        app.apply_clicked_node_name(
+            "glassworks.options.proxy.glassworks.viewctl.spc.clear_context"
+        )
     );
     assert!(app.app_options().domains.spc_fdc.context_filter.is_empty());
 
@@ -730,9 +1109,11 @@ pub(crate) fn operad_click_actions_switch_views_and_menus() {
     );
     for group in ModuleGroup::ALL {
         assert!(
-            document.nodes().iter().any(
-                |node| node.name() == format!("glassworks.menu.item.view.group.{}", group.slug())
-            ),
+            document
+                .nodes()
+                .iter()
+                .any(|node| node.name()
+                    == format!("glassworks.menu.item.view.group.{}", group.slug())),
             "{} group should be in View menu",
             group.label()
         );
@@ -1568,7 +1949,9 @@ pub(crate) fn layout_2d_view_top_cell_uses_child_cell_coordinates() {
     let view_revision = app.layout_view_revision;
 
     assert_ne!(full_bounds, child_bounds);
-    assert!(app.apply_clicked_node_name(&format!("glassworks.viewctl.layout.top_cell.{}", child.0)));
+    assert!(
+        app.apply_clicked_node_name(&format!("glassworks.viewctl.layout.top_cell.{}", child.0))
+    );
 
     assert_eq!(app.layout_revision, layout_revision);
     assert_ne!(app.layout_view_revision, view_revision);
@@ -1623,8 +2006,9 @@ pub(crate) fn layout_cell_browser_exposes_every_cell_as_view_top_action() {
     }
 
     let last_cell = *cell_ids.last().expect("test should have cells");
-    assert!(
-        app.apply_clicked_node_name(&format!("glassworks.viewctl.layout.top_cell.{}", last_cell.0))
-    );
+    assert!(app.apply_clicked_node_name(&format!(
+        "glassworks.viewctl.layout.top_cell.{}",
+        last_cell.0
+    )));
     assert_eq!(app.layout_view_top_cell, last_cell);
 }

@@ -644,6 +644,20 @@ pub struct LoggedOperation {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarkerSignoffRecord {
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub by: Option<String>,
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub recorded_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MarkerState {
     #[serde(default)]
     pub hidden: bool,
@@ -659,6 +673,12 @@ pub struct MarkerState {
     pub owner: Option<String>,
     #[serde(default)]
     pub signoff: Option<String>,
+    #[serde(default)]
+    pub signoff_by: Option<String>,
+    #[serde(default)]
+    pub signoff_note: Option<String>,
+    #[serde(default)]
+    pub signoff_records: BTreeMap<String, MarkerSignoffRecord>,
     #[serde(default)]
     pub tags: BTreeMap<String, String>,
 }

@@ -1059,6 +1059,27 @@ pub(crate) fn spice_schematic_compare_accepts_matching_connectivity() {
                 net_id: None,
             },
         ],
+        devices: vec![ExtractedDevice {
+            id: 1,
+            kind: "resistor".to_string(),
+            model: "poly".to_string(),
+            terminals: vec![
+                ExtractedDeviceTerminal {
+                    name: "A".to_string(),
+                    component: Some(1),
+                    net_name: None,
+                },
+                ExtractedDeviceTerminal {
+                    name: "B".to_string(),
+                    component: Some(2),
+                    net_name: None,
+                },
+            ],
+            bounds: Rect::from_min_size(Point::new(0, 0), 300, 100),
+            width: 100,
+            length: 300,
+            occurrences: Vec::new(),
+        }],
         ..Default::default()
     };
     let schematic =

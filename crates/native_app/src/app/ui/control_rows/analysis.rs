@@ -8,7 +8,10 @@ pub(crate) fn process_control_rows(app: &GlassworksApp) -> Vec<Vec<ViewControlBu
             .iter()
             .map(|filter| {
                 ViewControlButton::new(
-                    format!("glassworks.viewctl.process_control.filter.{}", filter.slug()),
+                    format!(
+                        "glassworks.viewctl.process_control.filter.{}",
+                        filter.slug()
+                    ),
                     filter.label(),
                     app.process_control_loop_filter == *filter,
                 )
@@ -91,6 +94,7 @@ pub(crate) fn spc_fdc_control_rows(
         .map(|trace| trace.id.clone())
         .or_else(|| app.selected_fdc_trace.clone());
     let chunk_size = if compact_rows { 2 } else { 4 };
+    let measurement_label_chars = if compact_rows { 11 } else { 18 };
     let mut rows = Vec::new();
 
     rows.push(
@@ -136,7 +140,7 @@ pub(crate) fn spc_fdc_control_rows(
                             "{} ({})",
                             compact_button_label(
                                 &display_measurement_identifier(&chart.metric),
-                                18
+                                measurement_label_chars
                             ),
                             chart.violations.len()
                         ),
@@ -164,7 +168,7 @@ pub(crate) fn spc_fdc_control_rows(
                             "{} ({})",
                             compact_button_label(
                                 &display_measurement_identifier(&trace.sensor_name),
-                                18
+                                measurement_label_chars
                             ),
                             trace.violations.len()
                         ),

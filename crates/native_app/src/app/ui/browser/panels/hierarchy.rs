@@ -8,7 +8,8 @@ pub(crate) fn add_layout_hierarchy_tree(
     ui_scale: UiScale,
 ) {
     let rows = layout_hierarchy_tree_rows(app);
-    if rows.is_empty() {
+    let search_active = !app.layout_browser_search.trim().is_empty();
+    if rows.is_empty() && !search_active {
         return;
     }
 
@@ -16,7 +17,7 @@ pub(crate) fn add_layout_hierarchy_tree(
         document,
         parent,
         "glassworks.layout.hierarchy_tree.title",
-        "Hierarchy Tree",
+        layout_hierarchy_tree_title(app, rows.len().min(32)),
         text_style(ui_scale.value(12.0), FontWeight::BOLD, COLOR_TEXT_MUTED),
         layout::size(layout::percent(1.0), layout::px(ui_scale.value(22.0))),
     );
@@ -55,6 +56,18 @@ pub(crate) fn add_layout_hierarchy_tree(
             layout::with_flex(layout::row(), 1.0, 1.0, layout::px(ui_scale.value(0.0))),
             ui_scale,
         );
+    }
+
+    if rows.is_empty() {
+        add_text(
+            document,
+            parent,
+            "glassworks.layout.hierarchy_tree.empty",
+            "No matching cells",
+            text_style(ui_scale.value(11.0), FontWeight::NORMAL, COLOR_TEXT_MUTED),
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(20.0))),
+        );
+        return;
     }
 
     for (row_index, row) in rows.into_iter().take(32).enumerate() {
@@ -148,15 +161,84 @@ pub(crate) fn add_layout_hierarchy_context(
     };
     let parent_cells = layout_parent_cells(layout, app.layout_view_top_cell);
     let child_cells = layout_child_cells(layout, app.layout_view_top_cell);
+    let current_cell_array_count = current_cell
+        .instances
+        .values()
+        .filter(|instance| !instance.array.normalized().is_single())
+        .count();
+    let descendant_array_count = layout_descendant_cell_ids(layout, app.layout_view_top_cell)
+        .into_iter()
+        .filter(|cell| *cell != app.layout_view_top_cell)
+        .filter_map(|cell| layout.cell(cell))
+        .flat_map(|cell| cell.instances.values())
+        .filter(|instance| !instance.array.normalized().is_single())
+        .count();
+    let descendant_flatten_cell_count =
+        layout_descendant_cell_ids(layout, app.layout_view_top_cell)
+            .into_iter()
+            .filter(|cell| *cell != app.layout_view_top_cell)
+            .filter_map(|cell| layout.cell(cell))
+            .filter(|cell| !cell.instances.is_empty())
+            .count();
+    let descendant_variant_instance_count =
+        layout_descendant_cell_ids(layout, app.layout_view_top_cell)
+            .into_iter()
+            .filter(|cell| *cell != app.layout_view_top_cell)
+            .filter_map(|cell| layout.cell(cell))
+            .flat_map(|cell| cell.instances.values())
+            .filter(|instance| instance.cell != layout.top_cell)
+            .count();
+    let document_variant_instance_count = layout
+        .cells
+        .values()
+        .flat_map(|cell| cell.instances.values())
+        .filter(|instance| instance.cell != layout.top_cell)
+        .count();
+    let descendant_leaf_origin_count = layout_descendant_cell_ids(layout, app.layout_view_top_cell)
+        .into_iter()
+        .filter(|cell| *cell != app.layout_view_top_cell)
+        .filter_map(|cell| layout.cell(cell))
+        .filter(|cell| cell.instances.is_empty())
+        .filter(|cell| {
+            cell.shapes
+                .values()
+                .map(|shape| shape.kind.bounds())
+                .reduce(|left, right| left.union(right))
+                .is_some_and(|bounds| bounds.min != Point::ZERO)
+        })
+        .count();
+    let document_flatten_cell_count = layout
+        .cells
+        .values()
+        .filter(|cell| !cell.instances.is_empty())
+        .count();
+    let document_array_count = layout
+        .cells
+        .values()
+        .flat_map(|cell| cell.instances.values())
+        .filter(|instance| !instance.array.normalized().is_single())
+        .count();
+    let sibling_count = layout_sibling_cell_ids(layout, app.layout_view_top_cell).len();
     let descendant_count = layout_descendant_cell_ids(layout, app.layout_view_top_cell)
         .into_iter()
         .filter(|cell| *cell != layout.top_cell && *cell != app.layout_view_top_cell)
         .count();
     let has_document_top_parent = parent_cells.iter().any(|cell| cell.id == layout.top_cell);
     let selected_instance = app.selected_layout_instance_context();
-    let selected_local_instance = selected_instance
+    let selected_shape_can_move_up = app
+        .selected_layout_occurrence
         .as_ref()
-        .is_some_and(|(parent, _, _)| *parent == app.layout_view_top_cell);
+        .and_then(|occurrence| {
+            layout
+                .shape_view_for_occurrence_from_cell(app.layout_view_top_cell, occurrence)
+                .map(|view| view.source_cell)
+        })
+        .is_some_and(|cell| {
+            cell != layout.top_cell && !layout_cell_instance_refs(layout, cell).is_empty()
+        });
+    let selected_instance_can_move_up = selected_instance.as_ref().is_some_and(|(parent, _, _)| {
+        *parent != layout.top_cell && !layout_cell_instance_refs(layout, *parent).is_empty()
+    });
 
     add_text(
         document,
@@ -192,6 +274,26 @@ pub(crate) fn add_layout_hierarchy_context(
             parent,
             "glassworks.viewctl.layout.cell_visibility.show_children",
             "Show child cells",
+            false,
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(28.0))),
+            ui_scale,
+        );
+    }
+    if sibling_count > 0 {
+        add_button(
+            document,
+            parent,
+            "glassworks.viewctl.layout.cell_visibility.hide_siblings",
+            "Hide sibling cells",
+            false,
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(28.0))),
+            ui_scale,
+        );
+        add_button(
+            document,
+            parent,
+            "glassworks.viewctl.layout.cell_visibility.show_siblings",
+            "Show sibling cells",
             false,
             layout::size(layout::percent(1.0), layout::px(ui_scale.value(28.0))),
             ui_scale,
@@ -237,6 +339,39 @@ pub(crate) fn add_layout_hierarchy_context(
         layout::size(layout::percent(1.0), layout::px(ui_scale.value(28.0))),
         ui_scale,
     );
+    if !current_cell.instances.is_empty() {
+        add_button(
+            document,
+            parent,
+            "glassworks.viewctl.layout.make_child_variants",
+            format!("Variant child instances ({})", current_cell.instances.len()),
+            false,
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(28.0))),
+            ui_scale,
+        );
+    }
+    if descendant_variant_instance_count > 0 {
+        add_button(
+            document,
+            parent,
+            "glassworks.viewctl.layout.make_descendant_child_variants",
+            format!("Variant descendant instances ({descendant_variant_instance_count})"),
+            false,
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(28.0))),
+            ui_scale,
+        );
+    }
+    if document_variant_instance_count > 0 {
+        add_button(
+            document,
+            parent,
+            "glassworks.viewctl.layout.make_document_child_variants",
+            format!("Variant document instances ({document_variant_instance_count})"),
+            false,
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(28.0))),
+            ui_scale,
+        );
+    }
     if let Some((_, id, instance)) = selected_instance
         && let Some(child) = layout.cell(instance.cell)
     {
@@ -271,6 +406,26 @@ pub(crate) fn add_layout_hierarchy_context(
             layout::size(layout::percent(1.0), layout::px(ui_scale.value(28.0))),
             ui_scale,
         );
+        add_button(
+            document,
+            parent,
+            "glassworks.viewctl.layout.flatten_selected_instance",
+            format!("Flatten #{}", id.0),
+            false,
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(28.0))),
+            ui_scale,
+        );
+        if !instance.array.normalized().is_single() {
+            add_button(
+                document,
+                parent,
+                "glassworks.viewctl.layout.resolve_array",
+                format!("Resolve array #{}", id.0),
+                false,
+                layout::size(layout::percent(1.0), layout::px(ui_scale.value(28.0))),
+                ui_scale,
+            );
+        }
     }
     if !current_cell.instances.is_empty() {
         add_button(
@@ -287,6 +442,79 @@ pub(crate) fn add_layout_hierarchy_context(
             parent,
             "glassworks.viewctl.layout.flatten_current_cell",
             "Flatten cell",
+            false,
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(28.0))),
+            ui_scale,
+        );
+    }
+    if descendant_flatten_cell_count > 0 {
+        add_button(
+            document,
+            parent,
+            "glassworks.viewctl.layout.flatten_descendant_cells_one",
+            format!("Flatten descendant cells 1 level ({descendant_flatten_cell_count})"),
+            false,
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(28.0))),
+            ui_scale,
+        );
+        add_button(
+            document,
+            parent,
+            "glassworks.viewctl.layout.flatten_descendant_cells",
+            format!("Flatten descendant cells ({descendant_flatten_cell_count})"),
+            false,
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(28.0))),
+            ui_scale,
+        );
+    }
+    if document_flatten_cell_count > 0 {
+        add_button(
+            document,
+            parent,
+            "glassworks.viewctl.layout.flatten_document_cells_one",
+            format!("Flatten document cells 1 level ({document_flatten_cell_count})"),
+            false,
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(28.0))),
+            ui_scale,
+        );
+        add_button(
+            document,
+            parent,
+            "glassworks.viewctl.layout.flatten_document_cells",
+            format!("Flatten document cells ({document_flatten_cell_count})"),
+            false,
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(28.0))),
+            ui_scale,
+        );
+    }
+    if current_cell_array_count > 0 {
+        add_button(
+            document,
+            parent,
+            "glassworks.viewctl.layout.resolve_current_cell_arrays",
+            format!("Resolve cell arrays ({current_cell_array_count})"),
+            false,
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(28.0))),
+            ui_scale,
+        );
+    }
+    if descendant_array_count > 0 {
+        add_button(
+            document,
+            parent,
+            "glassworks.viewctl.layout.resolve_descendant_cell_arrays",
+            format!("Resolve descendant arrays ({descendant_array_count})"),
+            false,
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(28.0))),
+            ui_scale,
+        );
+    }
+    if document_array_count > 0 {
+        add_button(
+            document,
+            parent,
+            "glassworks.viewctl.layout.resolve_document_arrays",
+            format!("Resolve document arrays ({document_array_count})"),
             false,
             layout::size(layout::percent(1.0), layout::px(ui_scale.value(28.0))),
             ui_scale,
@@ -312,6 +540,17 @@ pub(crate) fn add_layout_hierarchy_context(
         layout::size(layout::percent(1.0), layout::px(ui_scale.value(28.0))),
         ui_scale,
     );
+    if descendant_leaf_origin_count > 0 {
+        add_button(
+            document,
+            parent,
+            "glassworks.viewctl.layout.cell_origin.descendant_leaves",
+            format!("Origin descendant leaves ({descendant_leaf_origin_count})"),
+            false,
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(28.0))),
+            ui_scale,
+        );
+    }
     for (action, label) in [
         ("x_neg", "Origin -X"),
         ("x_pos", "Origin +X"),
@@ -328,13 +567,7 @@ pub(crate) fn add_layout_hierarchy_context(
             ui_scale,
         );
     }
-    if app.layout_view_top_cell != layout.top_cell
-        && app
-            .selected_layout_occurrence
-            .as_ref()
-            .is_some_and(ShapeOccurrenceId::is_top_level)
-        && !parent_cells.is_empty()
-    {
+    if selected_shape_can_move_up {
         add_button(
             document,
             parent,
@@ -345,10 +578,7 @@ pub(crate) fn add_layout_hierarchy_context(
             ui_scale,
         );
     }
-    if app.layout_view_top_cell != layout.top_cell
-        && selected_local_instance
-        && !parent_cells.is_empty()
-    {
+    if selected_instance_can_move_up {
         add_button(
             document,
             parent,
@@ -368,6 +598,18 @@ pub(crate) fn add_layout_hierarchy_context(
                 layout.top_cell.0
             ),
             "Document top",
+            false,
+            layout::size(layout::percent(1.0), layout::px(ui_scale.value(28.0))),
+            ui_scale,
+        );
+    }
+    let unused_cells = layout_unused_cell_ids(layout).len();
+    if unused_cells > 0 {
+        add_button(
+            document,
+            parent,
+            "glassworks.viewctl.layout.delete_unused_cells",
+            format!("Delete unused cells ({unused_cells})"),
             false,
             layout::size(layout::percent(1.0), layout::px(ui_scale.value(28.0))),
             ui_scale,
@@ -443,7 +685,10 @@ pub(crate) fn add_layout_hierarchy_context(
         add_button(
             document,
             parent,
-            format!("glassworks.viewctl.layout.context_parent_cell.{}", cell.id.0),
+            format!(
+                "glassworks.viewctl.layout.context_parent_cell.{}",
+                cell.id.0
+            ),
             format!("Up {}", compact_button_label(&cell.name, 14)),
             false,
             layout::size(layout::percent(1.0), layout::px(ui_scale.value(28.0))),

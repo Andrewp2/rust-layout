@@ -1,6 +1,7 @@
 #![allow(unused_imports)]
 use super::*;
 use crate::*;
+use layout_model::MarkerSignoffRecord;
 
 #[test]
 pub(crate) fn layout_browser_search_replace_updates_shape_text_and_properties() {
@@ -364,6 +365,151 @@ pub(crate) fn layout_browser_search_replace_updates_shape_text_and_properties() 
         Some("bus_value")
     );
     assert_eq!(layer_name(&app).as_deref(), Some("bus_metal1"));
+}
+
+#[test]
+pub(crate) fn layout_browser_replace_updates_active_drc_marker_review_metadata() {
+    let mut app = GlassworksApp::new_with_options(StartupOptions {
+        view_mode: Some(StartupView::Layout2d),
+        ..Default::default()
+    });
+    app.workspace.document = Document::new("browser replace marker metadata test");
+    app.reset_layout_document_state();
+    let metal1 = app
+        .workspace
+        .document
+        .layer_by_process(ProcessLayer::Metal1)
+        .expect("default technology should include metal1");
+    let shape = app
+        .add_layout_shape(
+            metal1,
+            ShapeKind::Rectangle(Rect::from_min_size(Point::new(0, 0), 40, 40)),
+        )
+        .expect("marker source shape should be added");
+    let violation = DrcViolation {
+        id: 1,
+        rule: "min_width".to_string(),
+        message: "review marker".to_string(),
+        shape_ids: vec![shape],
+        occurrence_ids: vec![ShapeOccurrenceId::top_level(shape)],
+        bounds: Rect::from_min_size(Point::new(0, 0), 40, 40),
+        required: 100,
+        actual: 40.0,
+    };
+    let marker_key = violation.stable_key();
+    *app.drc_report_cache.get_mut() = Some(DrcReportCacheEntry {
+        revision: app.layout_revision,
+        value: DrcReportCacheValue {
+            findings: Vec::new(),
+            violations: vec![violation],
+        },
+    });
+    app.workspace.document.marker_states.insert(
+        marker_key.clone(),
+        MarkerState {
+            waived: true,
+            note: Some("needle note".to_string()),
+            owner: Some("needle owner".to_string()),
+            signoff: Some("needs needle signoff".to_string()),
+            signoff_by: Some("needle signer".to_string()),
+            signoff_note: Some("needle signoff note".to_string()),
+            signoff_records: std::collections::BTreeMap::from([(
+                "needle signer".to_string(),
+                MarkerSignoffRecord {
+                    status: "needs needle signoff".to_string(),
+                    role: Some("needle role".to_string()),
+                    by: Some("needle signer".to_string()),
+                    note: Some("needle signoff note".to_string()),
+                    recorded_at: Some("needle review timestamp".to_string()),
+                },
+            )]),
+            tags: std::collections::BTreeMap::from([
+                ("review.needle".to_string(), "needle value".to_string()),
+                ("keep".to_string(), "stable".to_string()),
+            ]),
+            ..Default::default()
+        },
+    );
+
+    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.browser_search.set.needle"));
+    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.browser_replace.set.bus"));
+    let revision = app.layout_revision;
+    let undo_len = app.layout_undo.len();
+    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.browser_replace.apply"));
+    assert_eq!(
+        app.layout_revision, revision,
+        "marker metadata replace should not invalidate layout geometry"
+    );
+    assert_eq!(app.layout_undo.len(), undo_len + 1);
+    assert!(
+        app.drc_report().is_some(),
+        "marker metadata replace should keep the active DRC report available"
+    );
+    let state = app
+        .workspace
+        .document
+        .marker_states
+        .get(&marker_key)
+        .expect("marker state should remain after replace");
+    assert!(state.waived);
+    assert_eq!(state.note.as_deref(), Some("bus note"));
+    assert_eq!(state.owner.as_deref(), Some("bus owner"));
+    assert_eq!(state.signoff.as_deref(), Some("needs bus signoff"));
+    assert_eq!(state.signoff_by.as_deref(), Some("bus signer"));
+    assert_eq!(state.signoff_note.as_deref(), Some("bus signoff note"));
+    let signoff = state.signoff_records.get("bus signer").unwrap();
+    assert_eq!(signoff.status, "needs bus signoff");
+    assert_eq!(signoff.role.as_deref(), Some("bus role"));
+    assert_eq!(signoff.by.as_deref(), Some("bus signer"));
+    assert_eq!(signoff.note.as_deref(), Some("bus signoff note"));
+    assert_eq!(signoff.recorded_at.as_deref(), Some("bus review timestamp"));
+    assert_eq!(
+        state.tags.get("review.bus").map(String::as_str),
+        Some("bus value")
+    );
+    assert!(state.tags.get("review.needle").is_none());
+    assert_eq!(state.tags.get("keep").map(String::as_str), Some("stable"));
+
+    assert!(app.undo_layout_operation());
+    let state = app
+        .workspace
+        .document
+        .marker_states
+        .get(&marker_key)
+        .expect("undo should restore marker state");
+    assert_eq!(state.note.as_deref(), Some("needle note"));
+    assert_eq!(state.owner.as_deref(), Some("needle owner"));
+    assert_eq!(state.signoff.as_deref(), Some("needs needle signoff"));
+    assert_eq!(state.signoff_by.as_deref(), Some("needle signer"));
+    assert_eq!(state.signoff_note.as_deref(), Some("needle signoff note"));
+    let signoff = state.signoff_records.get("needle signer").unwrap();
+    assert_eq!(signoff.role.as_deref(), Some("needle role"));
+    assert_eq!(
+        signoff.recorded_at.as_deref(),
+        Some("needle review timestamp")
+    );
+    assert_eq!(
+        state.tags.get("review.needle").map(String::as_str),
+        Some("needle value")
+    );
+
+    assert!(app.redo_layout_operation());
+    let state = app
+        .workspace
+        .document
+        .marker_states
+        .get(&marker_key)
+        .expect("redo should reapply marker state replacement");
+    assert_eq!(state.note.as_deref(), Some("bus note"));
+    assert_eq!(state.signoff_by.as_deref(), Some("bus signer"));
+    assert_eq!(state.signoff_note.as_deref(), Some("bus signoff note"));
+    let signoff = state.signoff_records.get("bus signer").unwrap();
+    assert_eq!(signoff.role.as_deref(), Some("bus role"));
+    assert_eq!(signoff.recorded_at.as_deref(), Some("bus review timestamp"));
+    assert_eq!(
+        state.tags.get("review.bus").map(String::as_str),
+        Some("bus value")
+    );
 }
 
 #[test]
@@ -943,6 +1089,135 @@ pub(crate) fn layout_make_instance_variant_retargets_only_selected_instance_and_
 }
 
 #[test]
+pub(crate) fn layout_make_nested_instance_variant_retargets_deep_selected_instance_and_undoes() {
+    let mut app = GlassworksApp::new_with_options(StartupOptions {
+        view_mode: Some(StartupView::Layout2d),
+        ..Default::default()
+    });
+    let metal1 = app
+        .workspace
+        .document
+        .layer_by_process(ProcessLayer::Metal1)
+        .expect("default technology should include metal1");
+    let mid = app.workspace.document.create_cell("nested_variant_mid");
+    let leaf = app.workspace.document.create_cell("nested_variant_leaf");
+    let source_shape = app
+        .workspace
+        .document
+        .insert_shape_in_cell(
+            leaf,
+            metal1,
+            ShapeKind::Rectangle(Rect::from_min_size(Point::new(0, 0), 40, 20)),
+        )
+        .expect("source shape should be inserted");
+    let selected_leaf_instance = app
+        .workspace
+        .document
+        .insert_instance(mid, leaf, Transform::translate(70, 90))
+        .expect("selected leaf instance should be inserted");
+    let sibling_leaf_instance = app
+        .workspace
+        .document
+        .insert_instance(mid, leaf, Transform::translate(170, 90))
+        .expect("sibling leaf instance should be inserted");
+    let top = app.workspace.document.top_cell;
+    let mid_instance = app
+        .workspace
+        .document
+        .insert_instance_in_top(mid, Transform::translate(1_000, 2_000))
+        .expect("mid instance should be inserted");
+    let selected_occurrence = ShapeOccurrenceId::from_instance_path(
+        source_shape,
+        &[mid_instance, selected_leaf_instance],
+    );
+    let before_bounds = app
+        .workspace
+        .document
+        .shape_view_for_occurrence_from_cell(top, &selected_occurrence)
+        .expect("nested selected instance shape should be visible")
+        .bounds;
+
+    assert!(app.apply_clicked_node_name(&format!(
+        "glassworks.viewctl.layout.occurrence.{}",
+        layout_occurrence_action_key(&selected_occurrence)
+    )));
+    let hierarchy_document = app
+        .build_operad_document(UiSize::new(1440.0, 920.0))
+        .expect("layout document should build with nested variant context");
+    assert!(
+        hierarchy_document
+            .nodes()
+            .iter()
+            .any(|node| node.name() == "glassworks.viewctl.layout.make_cell_variant"),
+        "hierarchy context should expose make-variant for nested selected instances"
+    );
+
+    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.make_cell_variant"));
+    assert_eq!(
+        app.layout_view_top_cell, mid,
+        "making a nested variant should switch to the edited parent cell"
+    );
+    let variant = app
+        .workspace
+        .document
+        .instance(mid, selected_leaf_instance)
+        .expect("selected leaf instance should remain")
+        .cell;
+    assert_ne!(variant, leaf);
+    assert_eq!(
+        app.workspace
+            .document
+            .instance(mid, sibling_leaf_instance)
+            .expect("sibling leaf instance should remain")
+            .cell,
+        leaf,
+        "making a nested variant should not retarget sibling child instances"
+    );
+    let variant_cell = app
+        .workspace
+        .document
+        .cell(variant)
+        .expect("variant cell should exist");
+    assert_eq!(variant_cell.shapes.values().count(), 1);
+    assert!(
+        variant_cell.shapes.get(&source_shape).is_none(),
+        "nested variant should copy local shapes with fresh shape ids"
+    );
+    let copied_occurrence =
+        first_layout_occurrence_for_instance(&app.workspace.document, mid, selected_leaf_instance)
+            .expect("variant instance should expose copied shape geometry");
+    let top_occurrence = ShapeOccurrenceId::from_instance_path(
+        copied_occurrence.source_shape_id(),
+        &[mid_instance, selected_leaf_instance],
+    );
+    let after_view = app
+        .workspace
+        .document
+        .shape_view_for_occurrence_from_cell(top, &top_occurrence)
+        .expect("nested variant occurrence should resolve from the document top");
+    assert_eq!(
+        after_view.bounds, before_bounds,
+        "nested variant retargeting should preserve selected instance placement"
+    );
+    assert_ne!(copied_occurrence.source_shape_id(), source_shape);
+    assert!(app.status_message().contains("Made cell variant"));
+
+    assert!(app.apply_clicked_node_name("glassworks.menu.item.edit.undo"));
+    assert_eq!(
+        app.workspace
+            .document
+            .instance(mid, selected_leaf_instance)
+            .expect("undo should restore selected instance")
+            .cell,
+        leaf
+    );
+    assert!(
+        app.workspace.document.cell(variant).is_none(),
+        "undo should delete the unreferenced nested variant cell"
+    );
+}
+
+#[test]
 pub(crate) fn layout_flatten_current_cell_replaces_child_instances_with_local_shapes() {
     let mut app = GlassworksApp::new_with_options(StartupOptions {
         view_mode: Some(StartupView::Layout2d),
@@ -1198,12 +1473,27 @@ pub(crate) fn layout_flatten_selected_instance_one_level_promotes_nested_instanc
         .build_operad_document(UiSize::new(1440.0, 920.0))
         .expect("layout document should build with selected instance context");
     assert!(
-        hierarchy_document
-            .nodes()
-            .iter()
-            .any(|node| { node.name() == "glassworks.viewctl.layout.flatten_selected_instance_one" }),
+        hierarchy_document.nodes().iter().any(|node| {
+            node.name() == "glassworks.viewctl.layout.flatten_selected_instance_one"
+        }),
         "hierarchy context should expose one-level selected-instance flattening"
     );
+    assert!(app.apply_clicked_node_name("glassworks.menu.edit"));
+    let menu_document = app
+        .build_operad_document(UiSize::new(1440.0, 920.0))
+        .expect("edit menu should build with hierarchy flatten actions");
+    for node_name in [
+        "glassworks.menu.item.edit.flatten_instance_one",
+        "glassworks.menu.item.edit.flatten_cell_one",
+    ] {
+        assert!(
+            menu_document
+                .nodes()
+                .iter()
+                .any(|node| node.name() == node_name),
+            "Edit menu should expose {node_name}"
+        );
+    }
 
     assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.flatten_selected_instance_one"));
     assert!(
@@ -1267,6 +1557,121 @@ pub(crate) fn layout_flatten_selected_instance_one_level_promotes_nested_instanc
             .all(|instance| instance.cell != leaf),
         "undo should remove promoted top-level instances"
     );
+}
+
+#[test]
+pub(crate) fn layout_flatten_selected_nested_occurrence_replaces_deep_instance() {
+    let mut app = GlassworksApp::new_with_options(StartupOptions {
+        view_mode: Some(StartupView::Layout2d),
+        ..Default::default()
+    });
+    let metal1 = app
+        .workspace
+        .document
+        .layer_by_process(ProcessLayer::Metal1)
+        .expect("default technology should include metal1");
+    let mid = app.workspace.document.create_cell("nested_flatten_mid");
+    let leaf = app.workspace.document.create_cell("nested_flatten_leaf");
+    let leaf_shape = app
+        .workspace
+        .document
+        .insert_shape_in_cell(
+            leaf,
+            metal1,
+            ShapeKind::Rectangle(Rect::from_min_size(Point::new(0, 0), 12, 16)),
+        )
+        .expect("leaf shape should be inserted");
+    let leaf_instance = app
+        .workspace
+        .document
+        .insert_instance(mid, leaf, Transform::translate(30, 40))
+        .expect("leaf instance should be inserted");
+    let top = app.workspace.document.top_cell;
+    let mid_instance = app
+        .workspace
+        .document
+        .insert_instance_in_top(mid, Transform::translate(1_000, 2_000))
+        .expect("mid instance should be inserted");
+    let occurrence =
+        ShapeOccurrenceId::from_instance_path(leaf_shape, &[mid_instance, leaf_instance]);
+    let before_bounds = app
+        .workspace
+        .document
+        .shape_view_for_occurrence_from_cell(top, &occurrence)
+        .expect("nested occurrence should be visible from the document top")
+        .bounds;
+
+    assert!(app.apply_clicked_node_name(&format!(
+        "glassworks.viewctl.layout.occurrence.{}",
+        layout_occurrence_action_key(&occurrence)
+    )));
+    assert_eq!(app.selected_layout_occurrence, Some(occurrence));
+    let hierarchy_document = app
+        .build_operad_document(UiSize::new(1440.0, 920.0))
+        .expect("layout document should build with deep selected-instance flatten action");
+    assert!(
+        hierarchy_document
+            .nodes()
+            .iter()
+            .any(|node| node.name() == "glassworks.viewctl.layout.flatten_selected_instance"),
+        "hierarchy context should expose deep selected-instance flattening"
+    );
+
+    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.flatten_selected_instance"));
+    assert_eq!(
+        app.layout_view_top_cell, mid,
+        "flattening a nested occurrence should switch to the edited parent cell"
+    );
+    assert!(
+        app.workspace
+            .document
+            .instance(mid, leaf_instance)
+            .is_none(),
+        "flatten should remove the deep selected instance"
+    );
+    assert!(
+        app.workspace.document.instance(top, mid_instance).is_some(),
+        "flattening the deep instance should keep its ancestor placement"
+    );
+    let flattened_id = app
+        .selected_layout_shape()
+        .expect("flattened nested replacement should be selected");
+    let mid_cell = app
+        .workspace
+        .document
+        .cell(mid)
+        .expect("mid cell should remain after flattening");
+    assert_eq!(
+        mid_cell
+            .shapes
+            .get(&flattened_id)
+            .expect("flattened replacement should be stored in the deep parent")
+            .kind
+            .bounds(),
+        Rect::from_min_size(Point::new(30, 40), 12, 16)
+    );
+    let after_bounds = app
+        .workspace
+        .document
+        .shape_view_for_occurrence_from_cell(
+            top,
+            &ShapeOccurrenceId::from_instance_path(flattened_id, &[mid_instance]),
+        )
+        .expect("flattened replacement should remain visible through the ancestor instance")
+        .bounds;
+    assert_eq!(
+        after_bounds, before_bounds,
+        "nested flatten should preserve document-top placed geometry"
+    );
+
+    assert!(app.apply_clicked_node_name("glassworks.menu.item.edit.undo"));
+    let mid_cell = app
+        .workspace
+        .document
+        .cell(mid)
+        .expect("mid cell should remain after undo");
+    assert!(mid_cell.instances.get(&leaf_instance).is_some());
+    assert!(mid_cell.shapes.get(&flattened_id).is_none());
 }
 
 #[test]
@@ -1363,7 +1768,9 @@ pub(crate) fn layout_cell_origin_to_selection_preserves_parent_placement() {
         .expect("flattened child shape should be visible")
         .bounds;
 
-    assert!(app.apply_clicked_node_name(&format!("glassworks.viewctl.layout.top_cell.{}", child.0)));
+    assert!(
+        app.apply_clicked_node_name(&format!("glassworks.viewctl.layout.top_cell.{}", child.0))
+    );
     app.selected_layout_shape = Some(shape_id);
     app.selected_layout_occurrence = Some(ShapeOccurrenceId::top_level(shape_id));
     let hierarchy_document = app
@@ -1451,7 +1858,9 @@ pub(crate) fn layout_cell_origin_nudge_preserves_parent_placement_and_undoes() {
         .bounds;
     let step = app.layout_size_step();
 
-    assert!(app.apply_clicked_node_name(&format!("glassworks.viewctl.layout.top_cell.{}", child.0)));
+    assert!(
+        app.apply_clicked_node_name(&format!("glassworks.viewctl.layout.top_cell.{}", child.0))
+    );
     let hierarchy_document = app
         .build_operad_document(UiSize::new(1440.0, 920.0))
         .expect("layout document should build with hierarchy context");
@@ -1541,7 +1950,9 @@ pub(crate) fn layout_cell_origin_exact_from_search_preserves_parent_placement_an
         .expect("flattened child shape should be visible")
         .bounds;
 
-    assert!(app.apply_clicked_node_name(&format!("glassworks.viewctl.layout.top_cell.{}", child.0)));
+    assert!(
+        app.apply_clicked_node_name(&format!("glassworks.viewctl.layout.top_cell.{}", child.0))
+    );
     app.set_layout_browser_search("35, 45");
     let hierarchy_document = app
         .build_operad_document(UiSize::new(1440.0, 920.0))
@@ -1684,7 +2095,9 @@ pub(crate) fn layout_move_shape_up_materializes_parent_shape_and_undoes() {
         .expect("flattened child shape should be visible")
         .bounds;
 
-    assert!(app.apply_clicked_node_name(&format!("glassworks.viewctl.layout.top_cell.{}", child.0)));
+    assert!(
+        app.apply_clicked_node_name(&format!("glassworks.viewctl.layout.top_cell.{}", child.0))
+    );
     app.selected_layout_shape = Some(shape_id);
     app.selected_layout_occurrence = Some(ShapeOccurrenceId::top_level(shape_id));
     let hierarchy_document = app
@@ -1730,4 +2143,120 @@ pub(crate) fn layout_move_shape_up_materializes_parent_shape_and_undoes() {
         "undo should restore the child-cell shape"
     );
     assert!(!app.workspace.document.shapes.contains_key(&moved_id));
+}
+
+#[test]
+pub(crate) fn layout_move_nested_shape_up_materializes_parent_shape_and_undoes() {
+    let mut app = GlassworksApp::new_with_options(StartupOptions {
+        view_mode: Some(StartupView::Layout2d),
+        ..Default::default()
+    });
+    let metal1 = app
+        .workspace
+        .document
+        .layer_by_process(ProcessLayer::Metal1)
+        .expect("default technology should include metal1");
+    let mid = app.workspace.document.create_cell("move_nested_shape_mid");
+    let leaf = app.workspace.document.create_cell("move_nested_shape_leaf");
+    let shape_id = app
+        .workspace
+        .document
+        .insert_shape_in_cell(
+            leaf,
+            metal1,
+            ShapeKind::Rectangle(Rect::from_min_size(Point::new(10, 20), 30, 40)),
+        )
+        .expect("leaf shape should be inserted");
+    let leaf_instance = app
+        .workspace
+        .document
+        .insert_instance(mid, leaf, Transform::translate(70, 90))
+        .expect("leaf instance should be inserted");
+    let top = app.workspace.document.top_cell;
+    let mid_instance = app
+        .workspace
+        .document
+        .insert_instance_in_top(mid, Transform::translate(500, 600))
+        .expect("mid instance should be inserted");
+    let occurrence =
+        ShapeOccurrenceId::from_instance_path(shape_id, &[mid_instance, leaf_instance]);
+    let before_bounds = app
+        .workspace
+        .document
+        .shape_view_for_occurrence_from_cell(top, &occurrence)
+        .expect("nested shape should be visible from the document top")
+        .bounds;
+
+    assert!(app.apply_clicked_node_name(&format!(
+        "glassworks.viewctl.layout.occurrence.{}",
+        layout_occurrence_action_key(&occurrence)
+    )));
+    let hierarchy_document = app
+        .build_operad_document(UiSize::new(1440.0, 920.0))
+        .expect("layout document should build with nested shape context");
+    assert!(
+        hierarchy_document
+            .nodes()
+            .iter()
+            .any(|node| node.name() == "glassworks.viewctl.layout.move_shape_up"),
+        "hierarchy context should expose move-shape-up for nested selected shapes"
+    );
+
+    assert!(app.apply_clicked_node_name("glassworks.viewctl.layout.move_shape_up"));
+    assert_eq!(app.layout_view_top_cell, mid);
+    assert!(
+        app.workspace
+            .document
+            .cell(leaf)
+            .and_then(|cell| cell.shapes.get(&shape_id))
+            .is_none(),
+        "move up should remove the source leaf-cell shape"
+    );
+    let moved_id = app
+        .selected_layout_shape()
+        .expect("moved parent shape should be selected");
+    let mid_cell = app
+        .workspace
+        .document
+        .cell(mid)
+        .expect("mid cell should remain after moving the shape");
+    assert_eq!(
+        mid_cell
+            .shapes
+            .get(&moved_id)
+            .expect("moved shape should be stored in the parent cell")
+            .kind
+            .bounds(),
+        Rect::from_min_size(Point::new(80, 110), 30, 40)
+    );
+    let after_bounds = app
+        .workspace
+        .document
+        .shape_view_for_occurrence_from_cell(
+            top,
+            &ShapeOccurrenceId::from_instance_path(moved_id, &[mid_instance]),
+        )
+        .expect("moved shape should remain visible through the ancestor instance")
+        .bounds;
+    assert_eq!(
+        after_bounds, before_bounds,
+        "nested shape move-up should preserve document-top placed geometry"
+    );
+    assert!(app.status_message().contains("Moved shape"));
+
+    assert!(app.apply_clicked_node_name("glassworks.menu.item.edit.undo"));
+    assert!(
+        app.workspace
+            .document
+            .cell(leaf)
+            .and_then(|cell| cell.shapes.get(&shape_id))
+            .is_some(),
+        "undo should restore the leaf-cell shape"
+    );
+    assert!(
+        app.workspace
+            .document
+            .cell(mid)
+            .is_some_and(|cell| !cell.shapes.contains_key(&moved_id))
+    );
 }

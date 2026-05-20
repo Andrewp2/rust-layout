@@ -34,7 +34,12 @@ pub(crate) fn add_control_panel_with_button_width(
     let padding = ui_scale.value(8.0);
     let base_button_width = ui_scale.value(button_width.min(124.0));
     let group_height = label_height + ui_scale.value(2.0) + button_height;
-    let max_group_row_width = (body_width - ui_scale.value(44.0)).max(ui_scale.value(240.0));
+    let max_group_row_width = (body_width - ui_scale.value(220.0)).max(ui_scale.value(180.0));
+    let max_group_row_width = if body_width < ui_scale.value(700.0) {
+        max_group_row_width.min(ui_scale.value(286.0))
+    } else {
+        max_group_row_width
+    };
     let groups = control_panel_group_rows(
         &rows,
         base_button_width,

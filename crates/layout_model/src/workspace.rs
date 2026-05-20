@@ -624,6 +624,66 @@ fn validate_issue_state_keys(
         {
             report.push_error(format!("{label} state {key:?} has an empty signoff"));
         }
+        if state
+            .signoff_by
+            .as_deref()
+            .is_some_and(|signoff_by| signoff_by.trim().is_empty())
+        {
+            report.push_error(format!("{label} state {key:?} has an empty signoff signer"));
+        }
+        if state
+            .signoff_note
+            .as_deref()
+            .is_some_and(|signoff_note| signoff_note.trim().is_empty())
+        {
+            report.push_error(format!("{label} state {key:?} has an empty signoff note"));
+        }
+        for (party, signoff) in &state.signoff_records {
+            if party.trim().is_empty() {
+                report.push_error(format!("{label} state {key:?} has an empty signoff party"));
+            }
+            if signoff.status.trim().is_empty() {
+                report.push_error(format!(
+                    "{label} state {key:?} signoff party {party:?} has an empty status"
+                ));
+            }
+            if signoff
+                .role
+                .as_deref()
+                .is_some_and(|role| role.trim().is_empty())
+            {
+                report.push_error(format!(
+                    "{label} state {key:?} signoff party {party:?} has an empty role"
+                ));
+            }
+            if signoff
+                .by
+                .as_deref()
+                .is_some_and(|signer| signer.trim().is_empty())
+            {
+                report.push_error(format!(
+                    "{label} state {key:?} signoff party {party:?} has an empty signer"
+                ));
+            }
+            if signoff
+                .note
+                .as_deref()
+                .is_some_and(|note| note.trim().is_empty())
+            {
+                report.push_error(format!(
+                    "{label} state {key:?} signoff party {party:?} has an empty note"
+                ));
+            }
+            if signoff
+                .recorded_at
+                .as_deref()
+                .is_some_and(|recorded_at| recorded_at.trim().is_empty())
+            {
+                report.push_error(format!(
+                    "{label} state {key:?} signoff party {party:?} has an empty review timestamp"
+                ));
+            }
+        }
         for (tag_key, tag_value) in &state.tags {
             if tag_key.trim().is_empty() {
                 report.push_error(format!("{label} state {key:?} has an empty tag key"));
@@ -1012,7 +1072,7 @@ fn empty_experiment_plan() -> ExperimentPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{MarkerState, ShapeKind};
+    use crate::{MarkerSignoffRecord, MarkerState, ShapeKind};
 
     #[test]
     fn blank_and_demo_workspace_validate_without_app_shell() {
@@ -1784,6 +1844,18 @@ mod tests {
                 note: Some("reviewed".to_string()),
                 owner: Some("layout".to_string()),
                 signoff: Some("accepted".to_string()),
+                signoff_by: Some("layout".to_string()),
+                signoff_note: Some("reviewed".to_string()),
+                signoff_records: BTreeMap::from([(
+                    "layout".to_string(),
+                    MarkerSignoffRecord {
+                        status: "accepted".to_string(),
+                        role: Some("layout".to_string()),
+                        by: Some("layout".to_string()),
+                        note: Some("reviewed".to_string()),
+                        recorded_at: Some("2026-05-19T12:10:00Z".to_string()),
+                    },
+                )]),
                 tags: BTreeMap::from([("action".to_string(), "fix".to_string())]),
                 ..MarkerState::default()
             },
@@ -1818,6 +1890,27 @@ mod tests {
                 .as_deref(),
             Some("accepted")
         );
+        assert_eq!(
+            restored.document.marker_states["drc|fixture"]
+                .signoff_by
+                .as_deref(),
+            Some("layout")
+        );
+        assert_eq!(
+            restored.document.marker_states["drc|fixture"]
+                .signoff_note
+                .as_deref(),
+            Some("reviewed")
+        );
+        let signoff = restored.document.marker_states["drc|fixture"]
+            .signoff_records
+            .get("layout")
+            .unwrap();
+        assert_eq!(signoff.status, "accepted");
+        assert_eq!(signoff.role.as_deref(), Some("layout"));
+        assert_eq!(signoff.by.as_deref(), Some("layout"));
+        assert_eq!(signoff.note.as_deref(), Some("reviewed"));
+        assert_eq!(signoff.recorded_at.as_deref(), Some("2026-05-19T12:10:00Z"));
         assert_eq!(
             restored.document.marker_states["drc|fixture"]
                 .tags
@@ -1869,6 +1962,18 @@ mod tests {
                 note: Some("   ".to_string()),
                 owner: Some(" ".to_string()),
                 signoff: Some(" ".to_string()),
+                signoff_by: Some(" ".to_string()),
+                signoff_note: Some(" ".to_string()),
+                signoff_records: BTreeMap::from([(
+                    " ".to_string(),
+                    MarkerSignoffRecord {
+                        status: " ".to_string(),
+                        role: Some(" ".to_string()),
+                        by: Some(" ".to_string()),
+                        note: Some(" ".to_string()),
+                        recorded_at: Some(" ".to_string()),
+                    },
+                )]),
                 tags: BTreeMap::from([
                     ("".to_string(), "bad".to_string()),
                     ("valid".to_string(), " ".to_string()),
@@ -1893,6 +1998,54 @@ mod tests {
                 .errors
                 .iter()
                 .any(|error| error.contains("empty note")),
+            "{:?}",
+            validation.errors
+        );
+        assert!(
+            validation
+                .errors
+                .iter()
+                .any(|error| error.contains("empty signoff signer")),
+            "{:?}",
+            validation.errors
+        );
+        assert!(
+            validation
+                .errors
+                .iter()
+                .any(|error| error.contains("empty signoff note")),
+            "{:?}",
+            validation.errors
+        );
+        assert!(
+            validation
+                .errors
+                .iter()
+                .any(|error| error.contains("empty signoff party")),
+            "{:?}",
+            validation.errors
+        );
+        assert!(
+            validation
+                .errors
+                .iter()
+                .any(|error| error.contains("empty status")),
+            "{:?}",
+            validation.errors
+        );
+        assert!(
+            validation
+                .errors
+                .iter()
+                .any(|error| error.contains("empty role")),
+            "{:?}",
+            validation.errors
+        );
+        assert!(
+            validation
+                .errors
+                .iter()
+                .any(|error| error.contains("empty review timestamp")),
             "{:?}",
             validation.errors
         );
